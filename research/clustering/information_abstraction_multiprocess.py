@@ -6,26 +6,14 @@ Important Run Notes
 --Cd into research/clustering, the program will try to output to data/information_abstraction.py
 ----If you are not that directory the program will fail
 --Run with `python information_abstraction.py`
---Budget an hour to run with a 10 card deck, you may want to cmd + F "num_simulations" and reduce the defaults to test
 
 This is a naive implementation of https://www.aaai.org/ocs/index.php/AAAI/AAAI14/paper/view/8459/8487
 
-Notes on running for deck size 20 on MacBook Pro with 16 GB RAM
-- Creating combinations is relatively quick, I decided to do reduced combination space (considering AsKsJs|Qs
-the same as AsKsJs|Qs) - not sure how this will affect equilibrium finding, but should work ok for a "toy" product
-at first
-- FLOP: 155040 combos (20C2 * 18C3), runtime ~6 hrs, dict from flop_lossy.pkl .02GB
-- TURN: 581400 combos (20C2 * 18C4), runtime ~10 hrs, dict from turn_lossy.pkl .005 GB
-- RIVER: 1627920 combos (20C2 * 18C5), runtime ~12 hrs, dict from river_lossy.pkl .08 GB
-
-river ehs, from information_abstraction.pkl: '_flop_potential_aware_distributions': .04GB
-flop potential aware dist, from information_abstraction.pkl: '_turn_ehs_distributions':.06GB
-turn ehs distributions, from information_abstraction.pkl: 'river_ehs': 0.23256
-
-All in for 28 hrs, will need to work on some improvements for clustering 52 card deck..
+Notes on multiprocessing on MacBook Pro with 16 GB RAM:
+- This version outperforms my other with a speedup between 1.5x and 2x
 
 Next Steps/Future Enhancements
-- Try rolling out to full short deck (36 cards) using multi-processing
+- Try rolling out to full short deck (36 cards)
 - Implement isomorphisms to canonicalize hands (estimated 24x reduction)
 - Switch to non-naive implementation where vectors are tuples of (index,weight) or use sparse representation
 - Switch to https://www.cs.cmu.edu/~sandholm/hierarchical.aamas15.pdf for parallelization of blueprint algo (?)
@@ -40,6 +28,7 @@ import random
 import time
 from itertools import combinations
 from typing import List
+import concurrent.futures
 
 import dill as pickle
 import numpy as np
@@ -54,32 +43,6 @@ from pluribus.poker.deck import get_all_suits
 from pluribus.poker.evaluation import Evaluator
 
 
-class ShortDeck:
-    """
-    Extends Deck - A smaller Deck based on the number of cards requested
-    --not sure how well it extends beyond 10 atm
-    TODO: maybe I should just use _cards rather than _evals? but, _evals directly might have better performance?
-
-    """
-
-    def __init__(self):
-        super().__init__()
-
-        self._cards = [
-            Card(rank, suit) for suit in get_all_suits() for rank in range(10, 15)
-        ]  # hardcoding removal of 2-9
-        self._evals = [c.eval_card for c in self._cards]
-        self._evals_to_cards = {i.eval_card: i for i in self._cards}
-
-    def get_card_combos(self, num_cards: int) -> np.ndarray:
-        """
-
-        :param num_cards: number of cards you want returned
-        :return: combos of cards (Card.eval_card) -> np.array
-        """
-        return np.asarray(list(combinations(self._evals, num_cards)))
-
-
 class GameUtility:
     """
     This class takes care of some game related functions
@@ -88,7 +51,6 @@ class GameUtility:
     def __init__(self, our_hand: List[int], board: List[int], cards: List[int]):
 
         self._evaluator = Evaluator()
-        # TODO: this is what takes forever, find a better way
         self.available_cards = [x for x in cards if x not in board + our_hand]
         self.our_hand = our_hand
         self.board = board
@@ -122,9 +84,28 @@ class GameUtility:
         :return: two cards for the opponent (Card.eval_card)
         """
         return random.sample(self.available_cards, 2)
+    
+
+def create_info_combos(start_combos: np.array, publics: np.array) -> np.ndarray:
+    """
+    Combinations of private information (hole cards) and public information (board)
+    Uses the logic that a AsKsJs on flop with a 10s on turn is different than AsKs10s on flop and Js on turn
+    That logic is used within the literature
+
+    :param start_combos: starting combination of cards (beginning with hole cards)
+    :param publics: np.array of public combinations being added
+    :return: Combinations of private information (hole cards) and public information (board)
+    """
+    our_cards = []
+    for combos in tqdm(start_combos):
+        for public_combo in publics:
+            # TODO: need a way to create these combos with better performance?
+            if not np.any(np.isin(combos, public_combo)):
+                our_cards.append(np.concatenate((combos, public_combo)))
+    return np.array(our_cards)
 
 
-class InfoSets(ShortDeck):
+class InfoSets:
     """
     This class stores combinations of cards (histories) per street (for flop, turn, river)
     # TODO: should this be isomorphic/lossless to reduce the program run time?
@@ -133,31 +114,28 @@ class InfoSets(ShortDeck):
     def __init__(self):
         super().__init__()
 
+        self._cards = [
+            Card(rank, suit) for suit in get_all_suits() for rank in range(10, 15)
+        ][:-3]
+        random.shuffle(self._cards)
+        self._evals = [c.eval_card for c in self._cards]
+        self._evals_to_cards = {i.eval_card: i for i in self._cards}
         self.starting_hands = self.get_card_combos(2)
-        self.flop = self.create_info_combos(
-            self.starting_hands, self.get_card_combos(3)
-        )
-        self.turn = self.create_info_combos(self.starting_hands, self.get_card_combos(4))  # will this work??
-        self.river = self.create_info_combos(self.starting_hands, self.get_card_combos(5))  # will this work??
+        self.flop = create_info_combos(self.starting_hands, self.get_card_combos(3))
+        self.turn = create_info_combos(
+            self.starting_hands, self.get_card_combos(4)
+        )  # will this work??
+        self.river = create_info_combos(
+            self.starting_hands, self.get_card_combos(5)
+        )  # will this work??
 
-    @staticmethod
-    def create_info_combos(start_combos: np.array, publics: np.array) -> np.ndarray:
+    def get_card_combos(self, num_cards: int) -> np.ndarray:
         """
-        Combinations of private information (hole cards) and public information (board)
-        Uses the logic that a AsKsJs on flop with a 10s on turn is different than AsKs10s on flop and Js on turn
-        That logic is used within the literature
 
-        :param start_combos: starting combination of cards (beginning with hole cards)
-        :param publics: np.array of public combinations being added
-        :return: Combinations of private information (hole cards) and public information (board)
+        :param num_cards: number of cards you want returned
+        :return: combos of cards (Card.eval_card) -> np.array
         """
-        our_cards = []
-        for combos in tqdm(start_combos):
-            for public_combo in publics:
-                # TODO: need a way to create these combos with better performance?
-                if not np.any(np.isin(combos, public_combo)):
-                    our_cards.append(np.concatenate((combos, public_combo)))
-        return np.array(our_cards)
+        return np.asarray(list(combinations(self._evals, num_cards)))
 
 
 class InfoBucketMaker(InfoSets):
@@ -172,27 +150,55 @@ class InfoBucketMaker(InfoSets):
 
         overarching_start = time.time()
         start = time.time()
-        self._river_ehs = self.get_river_ehs(num_print=1000)
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            self._river_ehs = list(
+                tqdm(
+                    executor.map(
+                        self.process_river_ehs,
+                        self.river,
+                        chunksize=len(self.river) // 160,
+                    ),
+                    total=len(self.river),
+                )
+            )
         self._river_centroids, self._river_clusters = self.cluster(
-            num_clusters=50, X=self._river_ehs
+            num_clusters=40, X=self._river_ehs
         )
         end = time.time()
         print(f"Finding River EHS Took {end - start} Seconds")
 
         start = time.time()
-        self._turn_ehs_distributions = self.get_turn_ehs_distributions(num_print=100)
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            self._turn_ehs_distributions = list(
+                tqdm(
+                    executor.map(
+                        self.process_turn_ehs_distributions,
+                        self.turn,
+                        chunksize=len(self.turn) // 160,
+                    ),
+                    total=len(self.turn),
+                )
+            )
         self._turn_centroids, self._turn_clusters = self.cluster(
-            num_clusters=50, X=self._turn_ehs_distributions
+            num_clusters=40, X=self._turn_ehs_distributions
         )
         end = time.time()
         print(f"Finding Turn EHS Distributions Took {end - start} Seconds")
 
         start = time.time()
-        self._flop_potential_aware_distributions = self.get_flop_potential_aware_distributions(
-            num_print=100
-        )
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            self._flop_potential_aware_distributions = list(
+                tqdm(
+                    executor.map(
+                        self.process_flop_potential_aware_distributions,
+                        self.flop,
+                        chunksize=len(self.flop) // 160,
+                    ),
+                    total=len(self.flop),
+                )
+            )
         self._flop_centroids, self._flop_clusters = self.cluster(
-            num_clusters=50, X=self._flop_potential_aware_distributions
+            num_clusters=40, X=self._flop_potential_aware_distributions
         )
         end = time.time()
         print(f"Finding Flop Potential Aware Distributions Took {end - start} Seconds")
@@ -201,7 +207,6 @@ class InfoBucketMaker(InfoSets):
         print(f"Whole Process Took {overarching_end - overarching_start} Seconds")
 
     def __call__(self):
-        # TODO: switch to log
         self.dump_data(location="data/information_abstraction.pkl")
         self.print_cluster_example(
             X=self._river_ehs,
@@ -287,130 +292,87 @@ class InfoBucketMaker(InfoSets):
             turn_ehs_distribution[min_idx] += 1 / num_simulations
         return turn_ehs_distribution
 
-    def get_river_ehs(self, num_print: int) -> np.ndarray:
+    def process_river_ehs(self, public: List[int]) -> List[float]:
         """
 
-        :param num_print: number of simulations of opponents cards for calculating ehs
-        :return: np.ndarray of arrays containing [win_rate, loss_rate, tie_rate]
+        :param public: this is just all the cards private + public (ie; hole cards plus public cards)
+        :return: [win_rate, loss_rate, tie_rate]
         """
-        start = time.time()
-        river_ehs = [0] * len(self.river)
+        our_hand = list(public[:2])
+        board = list(public[2:7])
 
-        # iterate over possible boards/hole cards
-        for i, public in enumerate(tqdm(self.river)):
+        # get expected hand strength
+        game = GameUtility(our_hand=our_hand, board=board, cards=self._evals)
+
+        return self.simulate_get_ehs(game)
+
+    def process_turn_ehs_distributions(self, public: List[int]) -> List[float]:
+        """
+
+        :param public: this is just all the cards private + public (ie; hole cards plus public cards)
+        :return: list of distribution aware turn distributions
+        """
+        available_cards = [x for x in self._evals if x not in public]
+
+        # sample river cards and run a simulation
+        turn_ehs_distribution = self.simulate_get_turn_ehs_distributions(
+            available_cards, the_board=list(public[2:6]), our_hand=list(public[:2])
+        )
+
+        return turn_ehs_distribution
+
+    def process_flop_potential_aware_distributions(
+        self, public: List[int], num_simulations: int = 5
+    ) -> List[float]:
+        """
+
+        :param public: this is just all the cards private + public (ie; hole cards plus public cards)
+        :param num_simulations: number of simulations
+        :return: list of potential aware histograms
+        """
+        available_cards = [x for x in self._evals if x not in public]
+
+        potential_aware_distribution_flop = [0] * len(self._turn_centroids)
+        for j in range(num_simulations):
+
+            # randomly generating turn
+            turn_card = random.sample(available_cards, 1)
 
             our_hand = list(public[:2])
-            board = list(public[2:7])
+            board = public[2:5]
+            the_board = np.append(board, turn_card).tolist()
 
-            # get expected hand strength
-            game = GameUtility(our_hand=our_hand, board=board, cards=self._evals)
-            river_ehs[i] = self.simulate_get_ehs(game)
+            # getting available cards
+            available_cards_turn = [x for x in available_cards if x != turn_card[0]]
 
-            if i % num_print == 0:
-                tqdm.write(
-                    f"Finding River Expected Hand Strength, iteration {i} of {len(self.river)}"
-                )
-        end = time.time()
-        print(f"Finding River Expected Hand Strength Took {end - start} Seconds")
-        return np.array(river_ehs)
-
-    def get_turn_ehs_distributions(self, num_print: int) -> np.ndarray:
-        """
-
-        :param num_print: frequency at which to print
-        :return: np.ndarray of distribution aware turn distributions
-        """
-        start = time.time()
-        turn_ehs_distributions = [0] * len(self.turn)
-
-        for i, public in enumerate(tqdm(self.turn)):
-            available_cards = [
-                x
-                for x in self._evals
-                if x not in public  # TODO need better implementation of this
-            ]
-
-            # sample river cards and run a simulation
             turn_ehs_distribution = self.simulate_get_turn_ehs_distributions(
-                available_cards, the_board=list(public[2:6]), our_hand=list(public[:2])
+                available_cards_turn, the_board=the_board, our_hand=our_hand
             )
+            for idx, turn_centroid in enumerate(self._turn_centroids):
 
-            turn_ehs_distributions[i] = turn_ehs_distribution
-            if i % num_print == 0:
-                tqdm.write(
-                    f"Finding Turn Distribution Aware Histograms, iteration {i} of {len(self.turn)}"
-                )
-        end = time.time()
-        print(f"Finding Turn Distribution Aware Histograms Took {end - start} Seconds")
-        return np.array(turn_ehs_distributions)
+                # earth mover distance
+                emd = wasserstein_distance(turn_ehs_distribution, turn_centroid)
 
-    def get_flop_potential_aware_distributions(
-        self, num_print: int, num_simulations: int = 5
-    ) -> np.ndarray:
-        """
-
-        :param num_print: frequency at which to print
-        :param num_simulations: number of simulations
-        :return: ndarray of potential aware histograms
-        """
-        start = time.time()
-        potential_aware_distribution_flops = [0] * len(self.flop)
-
-        for i, public in enumerate(tqdm(self.flop)):
-            available_cards = [
-                x for x in self._evals if x not in public
-            ]  # TODO: find better implementation of this
-
-            potential_aware_distribution_flop = [0] * len(self._turn_centroids)
-            for j in range(num_simulations):
-
-                # randomly generating turn
-                turn_card = random.sample(available_cards, 1)
-
-                our_hand = list(public[:2])
-                board = public[2:5]
-                the_board = np.append(board, turn_card).tolist()
-
-                # getting available cards
-                available_cards_turn = [
-                    x for x in available_cards if x != turn_card[0]
-                ]  # TODO: get better implementation of this
-
-                turn_ehs_distribution = self.simulate_get_turn_ehs_distributions(
-                    available_cards_turn, the_board=the_board, our_hand=our_hand
-                )
-                for idx, turn_centroid in enumerate(self._turn_centroids):
-
-                    # earth mover distance
-                    emd = wasserstein_distance(turn_ehs_distribution, turn_centroid)
-
-                    if idx == 0:
+                if idx == 0:
+                    min_idx = idx
+                    min_emd = emd
+                else:
+                    if emd < min_emd:
                         min_idx = idx
                         min_emd = emd
-                    else:
-                        if emd < min_emd:
-                            min_idx = idx
-                            min_emd = emd
 
-                # ok, now increment the cluster to which it belongs -
-                potential_aware_distribution_flop[min_idx] += 1 / num_simulations
+            # ok, now increment the cluster to which it belongs -
+            potential_aware_distribution_flop[min_idx] += 1 / num_simulations
 
-                # object for storing flop potential aware expected hand strength distributions
-            potential_aware_distribution_flops[i] = potential_aware_distribution_flop
-            if i % num_print == 0:
-                tqdm.write(
-                    f"Finding Flop Potential Aware Histogram, iteration {i} of {len(self.flop)}"
-                )
-        end = time.time()
-        print(f"Finding Flop Potential Aware Distributions Took {end - start} Seconds")
-        return np.array(potential_aware_distribution_flops)
+            # object for storing flop potential aware expected hand strength distributions
+        return potential_aware_distribution_flop
 
     @staticmethod
-    def cluster(num_clusters: int, X: np.array):
-
+    def cluster(num_clusters: int, X: List):
+        X = np.array(X)  # see if this is ok
         km = KMeans(
-            n_clusters=num_clusters,
-            init="random",  # would be 200 in our example
+            n_clusters=num_clusters,  # would be 200 in our example
+            init="random",
             n_init=10,
             max_iter=300,
             tol=1e-04,
@@ -425,7 +387,7 @@ class InfoBucketMaker(InfoSets):
 
     @staticmethod
     def print_cluster_example(
-        X: np.ndarray, clusters: np.ndarray, cluster_name: str, cluster_id: int = 4
+        X: List, clusters: np.ndarray, cluster_name: str, cluster_id: int = 4
     ):
         """
 
@@ -435,6 +397,7 @@ class InfoBucketMaker(InfoSets):
         :param cluster_id: id to look at (just an example - can inspect dumped object)
         :return: just prints
         """
+        X = np.array(X)  # see if this is ok
         print(f"####{cluster_name} Example for Cluster Number {str(cluster_id)}:")
         print(X[clusters == cluster_id])
 
@@ -467,7 +430,7 @@ class InfoBucketMaker(InfoSets):
             20: "#0a0a0a",
         }
 
-        X = self._river_ehs
+        X = np.array(self._river_ehs)
         y_km = self._river_clusters
         fig = plt.figure()
         ax = fig.add_subplot(111, projection="3d")
@@ -494,7 +457,7 @@ class InfoBucketMaker(InfoSets):
 
         plt.show()
 
-    def dump_data(self, location: str = "data/information_abstraction_3.pkl"):
+    def dump_data(self, location: str = "data/information_abstraction.pkl"):
         """
         Should be in research/clustering or it will fail
         :param location: string for location and file name off the data

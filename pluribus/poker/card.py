@@ -1,6 +1,6 @@
 from typing import List, Set, Union
 
-from pluribus.game.evaluation.eval_card import EvaluationCard
+from pluribus.poker.evaluation.eval_card import EvaluationCard
 
 
 def get_all_suits() -> Set[str]:
@@ -47,6 +47,24 @@ class Card:
         rank_char = self._rank_to_char(rank)
         suit_char = self.suit.lower()[0]
         self._eval_card = EvaluationCard.new(f"{rank_char}{suit_char}")
+
+    def __lt__(self, other):
+        return self.rank_int < other.rank_int
+
+    def __le__(self, other):
+        return self.rank_int <= other.rank_int
+
+    def __gt__(self, other):
+        return self.rank_int > other.rank_int
+
+    def __ge__(self, other):
+        return self.rank_int >= other.rank_int
+
+    def __eq__(self, other):
+        return self.rank_int == other.rank_int
+
+    def __ne__(self, other):
+        return self.rank_int != other.rank_int
 
     @property
     def eval_card(self) -> EvaluationCard:

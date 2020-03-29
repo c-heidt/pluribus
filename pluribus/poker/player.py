@@ -5,18 +5,18 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import List, TYPE_CHECKING
 
-from pluribus.game.actions import Call, Fold, Raise
-from pluribus.game.state import PokerGameState
+from pluribus.poker.actions import Call, Fold, Raise
+from pluribus.poker.state import PokerGameState
 
 if TYPE_CHECKING:
-    from pluribus.game.cards import Card
-    from pluribus.game.pot import Pot
+    from pluribus.poker.cards import Card
+    from pluribus.poker.pot import Pot
 
 
 logger = logging.getLogger(__name__)
 
 
-class Player(ABC):
+class Player:
     """Abstract base class for all poker-playing agents.
 
     All agents should inherit from this class and implement the take_action
@@ -34,19 +34,9 @@ class Player(ABC):
         self.n_chips: int = initial_chips
         self.cards: List[Card] = []
         self._is_active = True
-        self._id = int(uuid.uuid4().hex, 16)
+        self.id = int(uuid.uuid4().hex, 16)
         self.pot = pot
         self.order = None
-
-    def __hash__(self):
-        """Make player hashable so we can index the pot like `pot[player]`."""
-        return self._id
-
-    def __eq__(self, other):
-        """Is the player equal to another reference?"""
-        if isinstance(other, Player):
-            return self._id == other._id
-        return False
 
     def __repr__(self):
         """"""
@@ -107,7 +97,7 @@ class Player(ABC):
         """Add a private card to this player."""
         self.cards.append(card)
 
-    @abstractmethod
+    # @abstractmethod
     def take_action(self, game_state: PokerGameState) -> PokerGameState:
         """All poker strategy is implemented here.
 

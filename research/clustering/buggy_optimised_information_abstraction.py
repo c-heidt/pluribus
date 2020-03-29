@@ -2,7 +2,7 @@
 Script to get information abstraction buckets for flop, turn, river
 (the pre-flop information buckets are just the 169 lossless hands)
 
-Important Run Notes
+Important Notes
 --Cd into research/clustering, the program will try to output to data/information_abstraction.py
 ----If you are not that directory the program will fail
 --Run with `python information_abstraction.py`
@@ -11,22 +11,11 @@ Important Run Notes
 This is a naive implementation of https://www.aaai.org/ocs/index.php/AAAI/AAAI14/paper/view/8459/8487
 
 Notes on running for deck size 20 on MacBook Pro with 16 GB RAM
-- Creating combinations is relatively quick, I decided to do reduced combination space (considering AsKsJs|Qs
-the same as AsKsJs|Qs) - not sure how this will affect equilibrium finding, but should work ok for a "toy" product
-at first
-- FLOP: 155040 combos (20C2 * 18C3), runtime ~6 hrs, dict from flop_lossy.pkl .02GB
-- TURN: 581400 combos (20C2 * 18C4), runtime ~10 hrs, dict from turn_lossy.pkl .005 GB
-- RIVER: 1627920 combos (20C2 * 18C5), runtime ~12 hrs, dict from river_lossy.pkl .08 GB
+- Creating Combinations
 
-river ehs, from information_abstraction.pkl: '_flop_potential_aware_distributions': .04GB
-flop potential aware dist, from information_abstraction.pkl: '_turn_ehs_distributions':.06GB
-turn ehs distributions, from information_abstraction.pkl: 'river_ehs': 0.23256
-
-All in for 28 hrs, will need to work on some improvements for clustering 52 card deck..
 
 Next Steps/Future Enhancements
-- Try rolling out to full short deck (36 cards) using multi-processing
-- Implement isomorphisms to canonicalize hands (estimated 24x reduction)
+- Try rolling out to full short deck (36 cards)
 - Switch to non-naive implementation where vectors are tuples of (index,weight) or use sparse representation
 - Switch to https://www.cs.cmu.edu/~sandholm/hierarchical.aamas15.pdf for parallelization of blueprint algo (?)
 -- This will make 52 card game combos tractable as well
@@ -44,7 +33,7 @@ from typing import List
 import dill as pickle
 import numpy as np
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+from pathos import multiprocessing
 from sklearn.cluster import KMeans
 from scipy.stats import wasserstein_distance
 from tqdm import tqdm
@@ -52,32 +41,6 @@ from tqdm import tqdm
 from pluribus.poker.card import Card
 from pluribus.poker.deck import get_all_suits
 from pluribus.poker.evaluation import Evaluator
-
-
-class ShortDeck:
-    """
-    Extends Deck - A smaller Deck based on the number of cards requested
-    --not sure how well it extends beyond 10 atm
-    TODO: maybe I should just use _cards rather than _evals? but, _evals directly might have better performance?
-
-    """
-
-    def __init__(self):
-        super().__init__()
-
-        self._cards = [
-            Card(rank, suit) for suit in get_all_suits() for rank in range(10, 15)
-        ]  # hardcoding removal of 2-9
-        self._evals = [c.eval_card for c in self._cards]
-        self._evals_to_cards = {i.eval_card: i for i in self._cards}
-
-    def get_card_combos(self, num_cards: int) -> np.ndarray:
-        """
-
-        :param num_cards: number of cards you want returned
-        :return: combos of cards (Card.eval_card) -> np.array
-        """
-        return np.asarray(list(combinations(self._evals, num_cards)))
 
 
 class GameUtility:
@@ -109,11 +72,12 @@ class GameUtility:
         our_hand_rank = self.evaluate_hand(self.our_hand)
         opp_hand_rank = self.evaluate_hand(self.opp_hand)
         if our_hand_rank > opp_hand_rank:  # maybe some mod magic here
-            return 0
+            x = 0
         elif our_hand_rank < opp_hand_rank:
-            return 1
+            x = 1
         elif our_hand_rank == opp_hand_rank:
-            return 2
+            x = 2
+        return x
 
     @property
     def opp_hand(self) -> List[int]:
@@ -121,10 +85,44 @@ class GameUtility:
 
         :return: two cards for the opponent (Card.eval_card)
         """
-        return random.sample(self.available_cards, 2)
+        try:
+            return random.sample(self.available_cards, 2)
+        except ValueError as e:
+            import ipdb
+
+            ipdb.set_trace()
+            tqdm.write(f"cards: {self.available_cards}")
+            raise e
 
 
-class InfoSets(ShortDeck):
+def create_info_combos(start_combos: np.array, publics: np.array) -> np.ndarray:
+    """
+    Combinations of private information (hole cards) and public information (board)
+    Uses the logic that a AsKsJs on flop with a 10s on turn is different than AsKs10s on flop and Js on turn
+    That logic is used within the literature
+
+    :param start_combos: starting combination of cards (beginning with hole cards)
+    :param publics: np.array of public combinations being added
+    :return: Combinations of private information (hole cards) and public information (board)
+    """
+
+    def worker(combos):
+        matches = []
+        for public_combo in publics:
+            if not np.any(np.isin(combos, public_combo)):
+                matches += [np.concatenate([combos, public_combo])]
+        return matches
+
+    with multiprocessing.Pool(multiprocessing.cpu_count() - 1) as pool:
+        our_cards = list(
+            tqdm(
+                pool.imap(worker, start_combos), desc="combos", total=len(start_combos),
+            )
+        )
+    return np.concatenate(our_cards)
+
+
+class InfoSets:
     """
     This class stores combinations of cards (histories) per street (for flop, turn, river)
     # TODO: should this be isomorphic/lossless to reduce the program run time?
@@ -132,32 +130,61 @@ class InfoSets(ShortDeck):
 
     def __init__(self):
         super().__init__()
-
+        self._cards = [
+            Card(rank, suit) for suit in get_all_suits() for rank in range(10, 15)
+        ]
+        random.shuffle(self._cards)
+        self._evals = [c.eval_card for c in self._cards]
+        self._evals_to_cards = {i.eval_card: i for i in self._cards}
         self.starting_hands = self.get_card_combos(2)
-        self.flop = self.create_info_combos(
-            self.starting_hands, self.get_card_combos(3)
-        )
-        self.turn = self.create_info_combos(self.starting_hands, self.get_card_combos(4))  # will this work??
-        self.river = self.create_info_combos(self.starting_hands, self.get_card_combos(5))  # will this work??
+        self.flop = create_info_combos(self.starting_hands, self.get_card_combos(3))
+        self.turn = create_info_combos(
+            self.starting_hands, self.get_card_combos(4)
+        )  # will this work??
+        self.river = create_info_combos(
+            self.starting_hands, self.get_card_combos(5)
+        )  # will this work??
 
-    @staticmethod
-    def create_info_combos(start_combos: np.array, publics: np.array) -> np.ndarray:
+    def get_card_combos(self, num_cards: int) -> np.ndarray:
         """
-        Combinations of private information (hole cards) and public information (board)
-        Uses the logic that a AsKsJs on flop with a 10s on turn is different than AsKs10s on flop and Js on turn
-        That logic is used within the literature
+        :param num_cards: number of cards you want returned
+        :return: combos of cards (Card.eval_card) -> np.array
+        """
+        return np.asarray(list(combinations(self._evals, num_cards)))
 
-        :param start_combos: starting combination of cards (beginning with hole cards)
-        :param publics: np.array of public combinations being added
-        :return: Combinations of private information (hole cards) and public information (board)
-        """
-        our_cards = []
-        for combos in tqdm(start_combos):
-            for public_combo in publics:
-                # TODO: need a way to create these combos with better performance?
-                if not np.any(np.isin(combos, public_combo)):
-                    our_cards.append(np.concatenate((combos, public_combo)))
-        return np.array(our_cards)
+
+def simulate_get_ehs(game: GameUtility, num_simulations: int = 10) -> List[float]:
+    """
+    # TODO: probably want to increase simulations..
+    :param game: GameState for help with determining winner and sampling opponent hand
+    :param num_simulations: how many simulations you want to do
+    :return: [win_rate, loss_rate, tie_rate]
+    """
+    ehs = [0] * 3
+    for _ in range(num_simulations):
+        idx = game.get_winner()
+        # increment win rate for winner/tie
+        ehs[idx] += 1 / num_simulations
+    return ehs
+
+
+def apply_func_async_multiprocess(func, input_data, *extra_args):
+    n_elements = len(input_data)
+    output_data = []
+    bar = tqdm(total=n_elements)
+    start = time.time()
+    # iterate over possible boards/hole cards
+    with multiprocessing.Pool(multiprocessing.cpu_count() - 1) as pool:
+        for i, input_datum in enumerate(input_data):
+            pool.apply_async(
+                func, args=(input_datum, *extra_args), callback=output_data.append
+            )
+    while len(output_data) != len(input_data):
+        bar.update(len(output_data) - bar.n)
+        time.sleep(0.01)
+    end = time.time()
+    print(f"Took {end - start} Seconds")
+    return np.array(output_data)
 
 
 class InfoBucketMaker(InfoSets):
@@ -170,35 +197,20 @@ class InfoBucketMaker(InfoSets):
     def __init__(self):
         super().__init__()
 
-        overarching_start = time.time()
-        start = time.time()
         self._river_ehs = self.get_river_ehs(num_print=1000)
         self._river_centroids, self._river_clusters = self.cluster(
             num_clusters=50, X=self._river_ehs
         )
-        end = time.time()
-        print(f"Finding River EHS Took {end - start} Seconds")
-
-        start = time.time()
         self._turn_ehs_distributions = self.get_turn_ehs_distributions(num_print=100)
         self._turn_centroids, self._turn_clusters = self.cluster(
             num_clusters=50, X=self._turn_ehs_distributions
         )
-        end = time.time()
-        print(f"Finding Turn EHS Distributions Took {end - start} Seconds")
-
-        start = time.time()
         self._flop_potential_aware_distributions = self.get_flop_potential_aware_distributions(
             num_print=100
         )
         self._flop_centroids, self._flop_clusters = self.cluster(
             num_clusters=50, X=self._flop_potential_aware_distributions
         )
-        end = time.time()
-        print(f"Finding Flop Potential Aware Distributions Took {end - start} Seconds")
-        overarching_end = time.time()
-
-        print(f"Whole Process Took {overarching_end - overarching_start} Seconds")
 
     def __call__(self):
         # TODO: switch to log
@@ -223,24 +235,6 @@ class InfoBucketMaker(InfoSets):
         )
         self.plot_river_clusters()
 
-    @staticmethod
-    def simulate_get_ehs(game: GameUtility, num_simulations: int = 10) -> List[float]:
-        """
-        # TODO: probably want to increase simulations..
-        :param game: GameState for help with determining winner and sampling opponent hand
-        :param num_simulations: how many simulations you want to do
-        :return: [win_rate, loss_rate, tie_rate]
-        """
-        ehs = [0] * 3
-        for _ in range(num_simulations):
-
-            idx = game.get_winner()
-
-            # increment win rate for winner/tie
-            ehs[idx] += 1 / num_simulations
-
-        return ehs
-
     def simulate_get_turn_ehs_distributions(
         self,
         available_cards: List[int],
@@ -261,14 +255,11 @@ class InfoBucketMaker(InfoSets):
 
         # sample river cards and run a simulation
         for _ in range(num_simulations):
-
             river_card = random.sample(available_cards, 1)
             board = list(the_board)  # copy list
             board = board + river_card
-
             game = GameUtility(our_hand=our_hand, board=board, cards=self._evals)
-            ehs = self.simulate_get_ehs(game)
-
+            ehs = simulate_get_ehs(game)
             # get EMD for expected hand strength against each river centroid
             # to which does it belong?
             for idx, river_centroid in enumerate(self._river_centroids):
@@ -289,30 +280,23 @@ class InfoBucketMaker(InfoSets):
 
     def get_river_ehs(self, num_print: int) -> np.ndarray:
         """
-
         :param num_print: number of simulations of opponents cards for calculating ehs
         :return: np.ndarray of arrays containing [win_rate, loss_rate, tie_rate]
         """
-        start = time.time()
-        river_ehs = [0] * len(self.river)
 
-        # iterate over possible boards/hole cards
-        for i, public in enumerate(tqdm(self.river)):
-
+        def worker(public, evals):
             our_hand = list(public[:2])
             board = list(public[2:7])
-
             # get expected hand strength
-            game = GameUtility(our_hand=our_hand, board=board, cards=self._evals)
-            river_ehs[i] = self.simulate_get_ehs(game)
+            game = GameUtility(our_hand=our_hand, board=board, cards=evals)
+            ehs = simulate_get_ehs(game)
+            return ehs
 
-            if i % num_print == 0:
-                tqdm.write(
-                    f"Finding River Expected Hand Strength, iteration {i} of {len(self.river)}"
-                )
-        end = time.time()
-        print(f"Finding River Expected Hand Strength Took {end - start} Seconds")
-        return np.array(river_ehs)
+        river_ehs = apply_func_async_multiprocess(worker, self.river, self._evals)
+        import ipdb
+
+        ipdb.set_trace()
+        return river_ehs
 
     def get_turn_ehs_distributions(self, num_print: int) -> np.ndarray:
         """
@@ -494,7 +478,7 @@ class InfoBucketMaker(InfoSets):
 
         plt.show()
 
-    def dump_data(self, location: str = "data/information_abstraction_3.pkl"):
+    def dump_data(self, location: str = "data/information_abstraction.pkl"):
         """
         Should be in research/clustering or it will fail
         :param location: string for location and file name off the data

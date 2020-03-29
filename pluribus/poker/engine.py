@@ -6,12 +6,12 @@ import logging
 import operator
 from typing import Dict, List, TYPE_CHECKING
 
-from pluribus.game.evaluation.evaluator import Evaluator
-from pluribus.game.state import PokerGameState
+from pluribus.poker.evaluation.evaluator import Evaluator
+from pluribus.poker.state import PokerGameState
 
 if TYPE_CHECKING:
-    from pluribus.game.player import Player
-    from pluribus.game.table import PokerTable
+    from pluribus.poker.player import Player
+    from pluribus.poker.table import PokerTable
 
 
 logger = logging.getLogger(__name__)
@@ -36,12 +36,12 @@ class PokerEngine:
 
     def play_one_round(self):
         """"""
-        self._round_setup()
+        self.round_setup()
         self._all_dealing_and_betting_rounds()
-        self._compute_winners()
+        self.compute_winners()
         self._round_cleanup()
 
-    def _round_setup(self):
+    def round_setup(self):
         """Code that must be done to setup the round before the game starts."""
         self.table.pot.reset()
         self._assign_order_to_players()
@@ -58,7 +58,7 @@ class PokerEngine:
         self.table.dealer.deal_river(self.table)
         self._betting_round()
 
-    def _compute_winners(self):
+    def compute_winners(self):
         """Compute winners and payout the chips to respective players."""
         # From the active players on the table, compute the winners.
         ranked_player_groups = self._rank_players_by_best_hand()
