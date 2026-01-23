@@ -5,6 +5,7 @@
 #SBATCH --job-name=pluribus-cluster
 #SBATCH --output=logs/cluster-%j.out
 #SBATCH --error=logs/cluster-%j_error.out
+#SBATCH --partition=cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=12:00:00
