@@ -33,6 +33,7 @@ Options:
   --help                         Show this message and exit.
 """
 import click
+from typing import Optional
 
 from poker_ai.clustering.card_info_lut_builder import CardInfoLutBuilder
 
@@ -110,6 +111,15 @@ from poker_ai.clustering.card_info_lut_builder import CardInfoLutBuilder
         "centroids."
     )
 )
+@click.option(
+    "--workers",
+    default=None,
+    type=int,
+    help=(
+        "Number of worker processes to use for clustering. "
+        "Defaults to number of CPUs detected by the system."
+    ),
+)
 def cluster(
     low_card_rank: int,
     high_card_rank: int,
@@ -120,6 +130,7 @@ def cluster(
     n_simulations_turn: int,
     n_simulations_flop: int,
     save_dir: str,
+    workers: Optional[int],
 ):
     """Run clustering."""
     builder = CardInfoLutBuilder(
@@ -128,7 +139,8 @@ def cluster(
         n_simulations_flop,
         low_card_rank,
         high_card_rank,
-        save_dir
+        save_dir,
+        workers=workers,
     )
     builder.compute(
         n_river_clusters,

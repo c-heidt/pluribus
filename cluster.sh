@@ -4,16 +4,22 @@
 #   sbatch cluster.sh
 #SBATCH --job-name=pluribus-cluster
 #SBATCH --output=logs/cluster-%j.out
+#SBATCH --error=logs/cluster-%j_error.out
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --time=12:00:00
-#SBATCH --partition=standard
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --mail-type=All
+#SBATCH --mail-user=uvizo@student.kit.edu
+
 
 set -euo pipefail
 
 # User-configurable
 CONDA_ENV=${CONDA_ENV:-pluribus}
 PROJECT_DIR=${PROJECT_DIR:-"$HOME/pluribus"}
+# Number of worker processes to use for clustering (defaults to 4)
+WORKERS=${WORKERS:-4}
 
 mkdir -p "$PROJECT_DIR/logs"
 
@@ -42,5 +48,6 @@ SAVE_DIR=${SAVE_DIR:-"$PROJECT_DIR/data/clustering"}
 # Ensure save directory exists
 mkdir -p "$SAVE_DIR"
 
-poker_ai cluster --save_dir "$SAVE_DIR"
+echo "Running clustering with $WORKERS worker(s) and $SLURM_CPUS_PER_TASK CPU(s) allocated."
+poker_ai cluster --save_dir "$SAVE_DIR" --workers "$WORKERS"
 
