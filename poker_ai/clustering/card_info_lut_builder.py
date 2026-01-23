@@ -1,8 +1,9 @@
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import concurrent.futures
+import os
 
 import joblib
 import numpy as np
@@ -38,10 +39,13 @@ class CardInfoLutBuilder(CardCombos):
         low_card_rank: int,
         high_card_rank: int,
         save_dir: str,
+        workers: Optional[int] = None,
     ):
         self.n_simulations_river = n_simulations_river
         self.n_simulations_turn = n_simulations_turn
         self.n_simulations_flop = n_simulations_flop
+        # number of worker processes to use for parallel stages
+        self.workers = workers
         super().__init__(
             low_card_rank, high_card_rank,
         )
@@ -90,13 +94,15 @@ class CardInfoLutBuilder(CardCombos):
         """Compute river clusters and create lookup table."""
         log.info("Starting computation of river clusters.")
         start = time.time()
-        with concurrent.futures.ProcessPoolExecutor() as executor:
+        workers = int(self.workers) if self.workers and int(self.workers) > 0 else os.cpu_count() or 1
+        chunksize = max(1, len(self.river) // (workers * 4))
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
             self._river_ehs = list(
                 tqdm(
                     executor.map(
                         self.process_river_ehs,
                         self.river,
-                        chunksize=len(self.river) // 160,
+                        chunksize=chunksize,
                     ),
                     total=len(self.river),
                 )
@@ -114,13 +120,15 @@ class CardInfoLutBuilder(CardCombos):
         """Compute turn clusters and create lookup table."""
         log.info("Starting computation of turn clusters.")
         start = time.time()
-        with concurrent.futures.ProcessPoolExecutor() as executor:
+        workers = int(self.workers) if self.workers and int(self.workers) > 0 else os.cpu_count() or 1
+        chunksize = max(1, len(self.turn) // (workers * 4))
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
             self._turn_ehs_distributions = list(
                 tqdm(
                     executor.map(
                         self.process_turn_ehs_distributions,
                         self.turn,
-                        chunksize=len(self.turn) // 160,
+                        chunksize=chunksize,
                     ),
                     total=len(self.turn),
                 )
@@ -136,13 +144,15 @@ class CardInfoLutBuilder(CardCombos):
         """Compute flop clusters and create lookup table."""
         log.info("Starting computation of flop clusters.")
         start = time.time()
-        with concurrent.futures.ProcessPoolExecutor() as executor:
+        workers = int(self.workers) if self.workers and int(self.workers) > 0 else os.cpu_count() or 1
+        chunksize = max(1, len(self.flop) // (workers * 4))
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
             self._flop_potential_aware_distributions = list(
                 tqdm(
                     executor.map(
                         self.process_flop_potential_aware_distributions,
                         self.flop,
-                        chunksize=len(self.flop) // 160,
+                        chunksize=chunksize,
                     ),
                     total=len(self.flop),
                 )
