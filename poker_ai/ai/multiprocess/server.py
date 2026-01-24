@@ -39,9 +39,20 @@ class Server:
         sync_discount: bool = False,
         sync_serialise: bool = False,
         start_timestep: int = 1,
-        n_processes: int = mp.cpu_count() - 1,
+        n_processes: Optional[int] = None,
     ):
         """Set up the optimisation server."""
+        # Determine number of processes to use
+        if n_processes is None:
+            # Check if running under Slurm
+            slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+            if slurm_cpus is not None:
+                n_processes = int(slurm_cpus) - 1
+                log.info(f"Using {n_processes} processes (SLURM_CPUS_PER_TASK={slurm_cpus})")
+            else:
+                n_processes = mp.cpu_count() - 1
+                log.info(f"Using {n_processes} processes (cpu_count={mp.cpu_count()})")
+        
         self._strategy_interval = strategy_interval
         self._n_iterations = n_iterations
         self._lcfr_threshold = lcfr_threshold
