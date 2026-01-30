@@ -18,7 +18,10 @@ logger = logging.getLogger("poker_ai.games.short_deck.state")
 
 
 def new_game(
-    n_players: int, card_info_lut: InfoSetLookupTable = {}, **kwargs
+    n_players: int, 
+    card_info_lut: InfoSetLookupTable = {}, 
+    deck_size: int = 20,
+    **kwargs
 ) -> ShortDeckPokerState:
     """
     Create a new game of short deck poker.
@@ -31,6 +34,11 @@ def new_game(
         Number of players.
     card_info_lut : InfoSetLookupTable
         Card information cluster lookup table.
+    deck_size : int
+        Size of deck to use. Options:
+        - 20: Ranks 10-A (5 ranks, 20 cards)
+        - 36: Ranks 6-A (9 ranks, 36 cards, standard Short Deck)
+        Default is 20.
 
     Returns
     -------
@@ -47,6 +55,7 @@ def new_game(
         state = ShortDeckPokerState(
             players=players,
             load_card_lut=False,
+            deck_size=deck_size,
             **kwargs
         )
         state.card_info_lut = card_info_lut
@@ -54,6 +63,7 @@ def new_game(
         # Load massive files.
         state = ShortDeckPokerState(
             players=players,
+            deck_size=deck_size,
             **kwargs
         )
     return state
@@ -65,18 +75,50 @@ class ShortDeckPokerState(PokerState):
     The class is immutable and new state can be instantiated from once an
     action is applied via the `apply_action` method.
     
-    Short Deck poker uses only ranks 10-A (36 cards total).
+    Supports two deck configurations:
+    - 20 cards (ranks 10-A): 5 ranks × 4 suits
+    - 36 cards (ranks 6-A): 9 ranks × 4 suits (standard Short Deck)
+    
+    Note: With 20 cards, any flush requires all 5 cards of a suit (10-J-Q-K-A),
+    which is always a straight flush. Therefore, only the "Three of a Kind > Straight"
+    ranking change applies in 20-card gameplay. With 36 cards, both ranking changes
+    (Flush > Full House and Three of a Kind > Straight) apply in actual gameplay.
     """
 
+    def __init__(self, deck_size: int = 20, **kwargs):
+        """Initialize Short Deck Poker state.
+        
+        Parameters
+        ----------
+        deck_size : int
+            Size of deck to use. Options:
+            - 20: Ranks 10-A (5 ranks, 20 cards)
+            - 36: Ranks 6-A (9 ranks, 36 cards, standard Short Deck)
+            Default is 20.
+        **kwargs
+            Additional arguments passed to PokerState base class.
+        """
+        if deck_size not in (20, 36):
+            raise ValueError(
+                f"deck_size must be 20 or 36, got {deck_size}. "
+                f"Use 20 for ranks 10-A or 36 for ranks 6-A."
+            )
+        self._deck_size = deck_size
+        super().__init__(**kwargs)
+
     def _get_deck_ranks(self) -> List[int]:
-        """Return ranks for Short Deck: 10, J, Q, K, A.
+        """Return ranks for Short Deck based on deck configuration.
         
         Returns
         -------
         ranks : List[int]
-            List containing [10, 11, 12, 13, 14].
+            - For 20-card deck: [10, 11, 12, 13, 14] (10, J, Q, K, A)
+            - For 36-card deck: [6, 7, 8, 9, 10, 11, 12, 13, 14] (6-A)
         """
-        return [10, 11, 12, 13, 14]
+        if self._deck_size == 20:
+            return [10, 11, 12, 13, 14]
+        else:  # 36-card deck
+            return [6, 7, 8, 9, 10, 11, 12, 13, 14]
 
     def _get_evaluator(self):
         """Return Short Deck hand evaluator with adjusted rankings.
