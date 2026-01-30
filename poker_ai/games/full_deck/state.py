@@ -10,18 +10,18 @@ import joblib
 
 from poker_ai import utils
 from poker_ai.games.base.state import PokerState, InfoSetLookupTable
-from poker_ai.games.short_deck.player import ShortDeckPokerPlayer
-from poker_ai.poker.evaluation.short_deck_evaluator import ShortDeckEvaluator
+from poker_ai.games.full_deck.player import FullDeckPokerPlayer
+from poker_ai.poker.evaluation.evaluator import Evaluator
 from poker_ai.poker.pot import Pot
 
-logger = logging.getLogger("poker_ai.games.short_deck.state")
+logger = logging.getLogger("poker_ai.games.full_deck.state")
 
 
 def new_game(
-    n_players: int, card_info_lut: InfoSetLookupTable = {}, **kwargs
-) -> ShortDeckPokerState:
+    n_players: int, card_info_lut: InfoSetLookupTable = None, **kwargs
+) -> FullDeckPokerState:
     """
-    Create a new game of short deck poker.
+    Create a new game of full deck poker (Texas Hold'em).
 
     ...
 
@@ -34,17 +34,17 @@ def new_game(
 
     Returns
     -------
-    state : ShortDeckPokerState
+    state : FullDeckPokerState
         Current state of the game
     """
     pot = Pot()
     players = [
-        ShortDeckPokerPlayer(player_i=player_i, initial_chips=10000, pot=pot)
+        FullDeckPokerPlayer(player_i=player_i, initial_chips=10000, pot=pot)
         for player_i in range(n_players)
     ]
-    if card_info_lut:
+    if card_info_lut is not None:
         # Don't reload massive files, it takes ages.
-        state = ShortDeckPokerState(
+        state = FullDeckPokerState(
             players=players,
             load_card_lut=False,
             **kwargs
@@ -52,49 +52,49 @@ def new_game(
         state.card_info_lut = card_info_lut
     else:
         # Load massive files.
-        state = ShortDeckPokerState(
+        state = FullDeckPokerState(
             players=players,
             **kwargs
         )
     return state
 
 
-class ShortDeckPokerState(PokerState):
-    """The state of a Short Deck Poker game at some given point in time.
+class FullDeckPokerState(PokerState):
+    """The state of a Full Deck Poker (Texas Hold'em) game at some point in time.
 
     The class is immutable and new state can be instantiated from once an
     action is applied via the `apply_action` method.
     
-    Short Deck poker uses only ranks 10-A (36 cards total).
+    Full Deck poker uses all standard ranks 2-A (52 cards total).
     """
 
     def _get_deck_ranks(self) -> List[int]:
-        """Return ranks for Short Deck: 10, J, Q, K, A.
+        """Return ranks for Full Deck: 2, 3, 4, 5, 6, 7, 8, 9, 10, J, Q, K, A.
         
         Returns
         -------
         ranks : List[int]
-            List containing [10, 11, 12, 13, 14].
+            List containing [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14].
         """
-        return [10, 11, 12, 13, 14]
+        return [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
 
     def _get_evaluator(self):
-        """Return Short Deck hand evaluator with adjusted rankings.
+        """Return standard hand evaluator with traditional poker rankings.
         
         Returns
         -------
-        evaluator : ShortDeckEvaluator
-            Evaluator that correctly ranks hands for Short Deck poker
-            (Flush > Full House, Three of a Kind > Straight).
+        evaluator : Evaluator
+            Standard evaluator with traditional poker hand rankings
+            (Full House > Flush, Straight > Three of a Kind).
         """
-        return ShortDeckEvaluator()
+        return Evaluator()
 
     @staticmethod
     def load_card_lut(
         lut_path: str = ".",
         pickle_dir: bool = False
     ) -> Dict[str, Dict[Tuple[int, ...], str]]:
-        """Load card information lookup table for Short Deck poker.
+        """Load card information lookup table for Full Deck poker.
 
         Parameters
         ----------
@@ -170,5 +170,3 @@ class ShortDeckPokerState(PokerState):
         return json.dumps(
             info_set_dict, separators=(",", ":"), cls=utils.io.NumpyJSONEncoder
         )
-
-
