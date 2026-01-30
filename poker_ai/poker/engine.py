@@ -4,7 +4,7 @@ import collections
 import copy
 import logging
 import operator
-from typing import Dict, List, TYPE_CHECKING
+from typing import Dict, List, Optional, TYPE_CHECKING
 
 from poker_ai.poker.evaluation.evaluator import Evaluator
 from poker_ai.poker.state import PokerGameState
@@ -25,12 +25,31 @@ class PokerEngine:
     hand, but should generally not change during a session on the table.
     """
 
-    def __init__(self, table: PokerTable, small_blind: int, big_blind: int):
-        """"""
+    def __init__(
+        self,
+        table: PokerTable,
+        small_blind: int,
+        big_blind: int,
+        evaluator: Optional[Evaluator] = None,
+    ):
+        """
+        Initialize the poker engine.
+        
+        Parameters
+        ----------
+        table : PokerTable
+            The poker table with players.
+        small_blind : int
+            Small blind amount.
+        big_blind : int
+            Big blind amount.
+        evaluator : Optional[Evaluator]
+            Hand evaluator to use. If None, uses standard Evaluator.
+        """
         self.table = table
         self.small_blind = small_blind
         self.big_blind = big_blind
-        self.evaluator = Evaluator()
+        self.evaluator = evaluator if evaluator is not None else Evaluator()
         self.state = PokerGameState.new_hand(self.table)
         self.wins_and_losses = []
 
