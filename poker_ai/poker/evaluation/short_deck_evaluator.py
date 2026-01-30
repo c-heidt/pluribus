@@ -1,7 +1,8 @@
 """Short Deck Poker hand evaluator with adjusted rankings.
 
 In Short Deck (6+ Hold'em), the hand rankings differ from standard poker
-due to the reduced deck size (36 cards: ranks 10-A only):
+due to the reduced deck size. This implementation follows theoretical Short Deck
+ranking rules.
 
 Standard Poker Rankings:
     Royal Flush > Straight Flush > Four of a Kind > Full House > 
@@ -12,8 +13,21 @@ Short Deck Poker Rankings:
     Full House > Three of a Kind > Straight > Two Pair > Pair > High Card
 
 Key differences:
-    - Flush > Full House (flushes are harder with only 4 cards per suit per rank range)
+    - Flush > Full House (flushes are harder with reduced ranks)
     - Three of a Kind > Straight (straights are more common with reduced ranks)
+
+IMPORTANT NOTE ON 20-CARD CONFIGURATION:
+    The current implementation uses a 20-card deck (ranks 10-A only).
+    With only 5 cards per suit, ANY flush requires all 5 cards of that suit,
+    which automatically forms a straight (10-J-Q-K-A). Therefore:
+    
+    - Regular flushes CANNOT occur in actual gameplay (all are straight flushes)
+    - The "Flush > Full House" rule is theoretical/unused in practice
+    - Three of a Kind > Straight is the only ranking change that applies
+    
+    This evaluator correctly implements theoretical Short Deck rankings for
+    consistency with standard Short Deck rules. If using a larger deck
+    (e.g., 36 cards with ranks 6-A), both ranking changes would apply in practice.
 """
 
 import itertools
@@ -72,6 +86,11 @@ class ShortDeckEvaluator(Evaluator):
         - Straight (std: 1600-1609) <-> Three of a Kind (std: 1610-2467)
         
         The remapping ensures lower ranks remain better.
+        
+        NOTE: With a 20-card deck (10-A), regular flushes never occur in practice
+        (all 5-card same-suit hands are straight flushes). The flush remapping is
+        included for theoretical correctness and compatibility with larger Short Deck
+        configurations (e.g., 36-card deck with ranks 6-A).
         """
         std = LookupTable
         
