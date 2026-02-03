@@ -22,12 +22,15 @@ from poker_ai.utils.algos import rotate_list
 @click.option('--agent', required=False, default="offline", type=str)
 @click.option('--strategy_path', required=False, default="", type=str)
 @click.option('--debug_quick_start/--no_debug_quick_start', default=False)
+@click.option('--n_players', required=False, default=2, type=click.IntRange(2, 6),
+              help='Number of players (2-6). Player 1 is always human.')
 def run_terminal_app(
     lut_path: str,
     pickle_dir: bool,
     agent: str = "offline",
     strategy_path: str = "",
-    debug_quick_start: bool = False
+    debug_quick_start: bool = False,
+    n_players: int = 2
 ):
     """Start up terminal app to play against your poker AI.
 
@@ -43,12 +46,12 @@ def run_terminal_app(
         --agent offline                                                      \
         --pickle_dir ./research/blueprint_algo                               \
         --strategy_path ./agent.joblib                                       \
+        --n_players 3                                                        \
         --no_debug_quick_start
     ```
     """
     term = Terminal()
     log = AsciiLogger(term)
-    n_players: int = 3
     if debug_quick_start:
         state: ShortDeckPokerState = new_game(n_players, {}, load_card_lut=False)
     else:
@@ -59,8 +62,13 @@ def run_terminal_app(
         )
     n_table_rotations: int = 0
     selected_action_i: int = 0
-    positions = ["left", "middle", "right"]
-    names = {"left": "BOT 1", "middle": "BOT 2", "right": "HUMAN"}
+    # Generate positions and names dynamically based on number of players
+    # Player 1 (position 0) is always HUMAN, rest are BOTs
+    positions = [f"player_{i}" for i in range(n_players)]
+    names = {positions[0]: "HUMAN"}
+    for i in range(1, n_players):
+        names[positions[i]] = f"BOT {i}"
+    human_position = positions[0]
     if not debug_quick_start and agent in {"offline", "online"}:
         offline_strategy_dict = joblib.load(strategy_path)
         offline_strategy = offline_strategy_dict['strategy']
@@ -105,7 +113,7 @@ def run_terminal_app(
                 human_should_interact = True
             else:
                 og_current_name = state.current_player.name
-                human_should_interact = og_name_to_position[og_current_name] == "right"
+                human_should_interact = og_name_to_position[og_current_name] == human_position
                 if human_should_interact:
                     legal_actions = state.legal_actions
                 else:

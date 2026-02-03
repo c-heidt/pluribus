@@ -74,16 +74,26 @@ def print_table(
     n_spaces_between_cards: int = 4,
     n_chips_in_pot: int = 0,
 ):
-    left_player = players["left"]
-    middle_player = players["middle"]
-    right_player = players["right"]
     for line in public_cards.lines:
         print(term.center(line))
     print(term.center(f"chips in pot: {n_chips_in_pot}"))
     print("\n\n")
     spacing = " " * n_spaces_between_cards
-    for l, m, r in zip(left_player.lines, middle_player.lines, right_player.lines):
-        print(term.center(f"{l}{spacing}{m}{spacing}{r}"))
+    # Get all players in order (keys are player_0, player_1, etc.)
+    player_keys = sorted(players.keys())
+    player_list = [players[k] for k in player_keys]
+    # Print players in rows of 3
+    players_per_row = 3
+    if player_list:
+        n_lines = len(player_list[0].lines)
+        for row_start in range(0, len(player_list), players_per_row):
+            row_players = player_list[row_start:row_start + players_per_row]
+            for line_i in range(n_lines):
+                line_parts = [p.lines[line_i] for p in row_players]
+                print(term.center(spacing.join(line_parts)))
+            # Add spacing between rows if there are more players
+            if row_start + players_per_row < len(player_list):
+                print("")
 
 
 def print_log(term: Terminal, log: AsciiLogger):
