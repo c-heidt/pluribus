@@ -1,13 +1,13 @@
 """
 Usage: poker_ai cluster [OPTIONS]
 
-  Run clustering.
+  Run clustering with memory-efficient chunked processing and checkpointing.
 
 Options:
   --low_card_rank INTEGER        The starting hand rank from 2 through 14 for
                                  the deck we want to cluster. We recommend
                                  starting small.
-  --high_card_rank INTEGER       The starting hand rank from 2 through 14 for
+  --high_card_rank INTEGER       The ending hand rank from 2 through 14 for
                                  the deck we want to cluster. We recommend
                                  starting small.
   --n_river_clusters INTEGER     The number of card information buckets we
@@ -29,7 +29,15 @@ Options:
                                  would like to run on the flop. We recommend
                                  to start small.
   --save_dir TEXT                Path to directory to save card info lookup
-                                 table and betting stage centroids.
+                                 table, betting stage centroids, and checkpoints.
+  --workers INTEGER              Number of worker processes to use for clustering.
+                                 Defaults to number of CPUs detected by the system.
+  --chunk_size INTEGER           Number of card combinations to process per chunk.
+                                 Larger chunks use more memory but may be faster.
+                                 Default 10000.
+  --use_mini_batch/--no_mini_batch  Use MiniBatchKMeans for large datasets
+                                 (>50000 samples). More memory efficient but
+                                 slightly less accurate. Default True.
   --help                         Show this message and exit.
 """
 import click
@@ -120,6 +128,23 @@ from poker_ai.clustering.card_info_lut_builder import CardInfoLutBuilder
         "Defaults to number of CPUs detected by the system."
     ),
 )
+@click.option(
+    "--chunk_size",
+    default=10000,
+    type=int,
+    help=(
+        "Number of card combinations to process per chunk. Larger chunks use "
+        "more memory but may be faster. Default 10000."
+    ),
+)
+@click.option(
+    "--use_mini_batch/--no_mini_batch",
+    default=True,
+    help=(
+        "Use MiniBatchKMeans for large datasets (>50000 samples). "
+        "More memory efficient but slightly less accurate. Default True."
+    ),
+)
 def cluster(
     low_card_rank: int,
     high_card_rank: int,
@@ -131,8 +156,10 @@ def cluster(
     n_simulations_flop: int,
     save_dir: str,
     workers: Optional[int],
+    chunk_size: int,
+    use_mini_batch: bool,
 ):
-    """Run clustering."""
+    """Run clustering with memory-efficient chunked processing and checkpointing."""
     builder = CardInfoLutBuilder(
         n_simulations_river,
         n_simulations_turn,
@@ -141,6 +168,8 @@ def cluster(
         high_card_rank,
         save_dir,
         workers=workers,
+        chunk_size=chunk_size,
+        use_mini_batch=use_mini_batch,
     )
     builder.compute(
         n_river_clusters,
