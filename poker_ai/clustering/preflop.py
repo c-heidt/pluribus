@@ -5,64 +5,102 @@ import math
 from poker_ai.poker.card import Card
 
 
-def make_starting_hand_lossless(starting_hand, short_deck) -> int:
-    """"""
-    ranks = []
-    suits = []
-    for card in starting_hand:
-        ranks.append(card.rank_int)
-        suits.append(card.suit)
-    if len(set(suits)) == 1:
-        suited = True
+def make_starting_hand_bucket(starting_hand, rank_to_index: Dict[int, int]) -> int:
+    """
+    Compute preflop abstraction bucket for any deck size.
+    
+    Uses a canonical representation:
+    - Pairs: single bucket per rank (13 total for full deck)
+    - Suited hands: one bucket per unique rank pair (78 total for full deck)
+    - Offsuit hands: one bucket per unique rank pair (78 total for full deck)
+    
+    Total buckets: n_ranks + C(n_ranks, 2) * 2
+    - 20-card (5 ranks): 5 + 10*2 = 25 buckets
+    - 36-card (9 ranks): 9 + 36*2 = 81 buckets
+    - 52-card (13 ranks): 13 + 78*2 = 169 buckets
+    
+    Parameters
+    ----------
+    starting_hand : List[Card]
+        Two-card starting hand
+    rank_to_index : Dict[int, int]
+        Mapping from card rank to 0-indexed position (e.g., {2:0, 3:1, ..., 14:12})
+        
+    Returns
+    -------
+    int
+        Bucket ID (0-indexed)
+    """
+    ranks = [card.rank_int for card in starting_hand]
+    suits = [card.suit for card in starting_hand]
+    
+    # Normalize to higher rank first
+    r1, r2 = sorted(ranks, reverse=True)
+    suited = (len(set(suits)) == 1)
+    
+    # Convert to 0-indexed positions
+    idx1 = rank_to_index[r1]
+    idx2 = rank_to_index[r2]
+    n_ranks = len(rank_to_index)
+    
+    if r1 == r2:
+        # Pair: first n_ranks buckets
+        return idx1
     else:
-        suited = False
-    if all(c_rank == 14 for c_rank in ranks):
-        return 0
-    elif all(c_rank == 13 for c_rank in ranks):
-        return 1
-    elif all(c_rank == 12 for c_rank in ranks):
-        return 2
-    elif all(c_rank == 11 for c_rank in ranks):
-        return 3
-    elif all(c_rank == 10 for c_rank in ranks):
-        return 4
-    elif 14 in ranks and 13 in ranks:
-        return 5 if suited else 15
-    elif 14 in ranks and 12 in ranks:
-        return 6 if suited else 16
-    elif 14 in ranks and 11 in ranks:
-        return 7 if suited else 17
-    elif 14 in ranks and 10 in ranks:
-        return 8 if suited else 18
-    elif 13 in ranks and 12 in ranks:
-        return 9 if suited else 19
-    elif 13 in ranks and 11 in ranks:
-        return 10 if suited else 20
-    elif 13 in ranks and 10 in ranks:
-        return 11 if suited else 21
-    elif 12 in ranks and 11 in ranks:
-        return 12 if suited else 22
-    elif 12 in ranks and 10 in ranks:
-        return 13 if suited else 23
-    elif 11 in ranks and 10 in ranks:
-        return 14 if suited else 24
+        # Non-pair: compute combinatorial index
+        # Number of pairs with rank >= r1
+        n_pairs_above = idx1
+        # Number of suited/offsuit combos with high rank > r1
+        n_combos_above = idx1 * (idx1 - 1) // 2 if idx1 > 0 else 0
+        # Number of combos with high rank == r1 and low rank > r2
+        n_combos_same_high = idx2 - idx1 - 1
+        
+        # Offset for this specific (r1, r2) pair
+        combo_offset = n_combos_above + n_combos_same_high
+        
+        if suited:
+            # Suited: buckets n_ranks to n_ranks + C(n_ranks, 2) - 1
+            return n_ranks + combo_offset
+        else:
+            # Offsuit: buckets n_ranks + C(n_ranks, 2) to end
+            n_unique_pairs = n_ranks * (n_ranks - 1) // 2
+            return n_ranks + n_unique_pairs + combo_offset
 
 
 def compute_preflop_lossless_abstraction(builder) -> Dict[Tuple[Card, Card], int]:
-    """Compute the preflop abstraction dictionary.
-
-    Only works for the short deck presently.
     """
-    # Making sure this is 20 card deck with 2-9 removed
-    allowed_ranks = {10, 11, 12, 13, 14}
-    found_ranks = set([c.rank_int for c in builder._cards])
-    if found_ranks != allowed_ranks:
+    Compute the preflop abstraction dictionary.
+    
+    Supports 52-card (13 ranks), 36-card (9 ranks), and 20-card (5 ranks) decks.
+    
+    Parameters
+    ----------
+    builder : CardInfoLutBuilder
+        Builder with _cards and starting_hands attributes
+        
+    Returns
+    -------
+    Dict[Tuple[Card, Card], int]
+        Mapping from starting hand tuples to bucket IDs
+    """
+    # Get all ranks in the deck
+    found_ranks = sorted(set([c.rank_int for c in builder._cards]))
+    n_ranks = len(found_ranks)
+    
+    # Create rank-to-index mapping (e.g., {2:0, 3:1, ..., 14:12} for full deck)
+    rank_to_index = {rank: idx for idx, rank in enumerate(found_ranks)}
+    
+    # Validate deck configuration
+    if n_ranks not in [5, 9, 13]:
         raise ValueError(
-            f"Preflop lossless abstraction only works for a short deck with "
-            f"ranks [10, jack, queen, king, ace]. What was specified="
-            f"{found_ranks} doesn't equal what is allowed={allowed_ranks}"
+            f"Preflop abstraction supports 20-card (5 ranks), 36-card (9 ranks), "
+            f"or 52-card (13 ranks) decks. Found {n_ranks} ranks: {found_ranks}"
         )
-    # Getting combos and indexing with lossless abstraction
+    
+    # Compute expected number of buckets
+    expected_buckets = n_ranks + n_ranks * (n_ranks - 1)  # pairs + suited + offsuit
+    
+    # Getting combos and indexing with abstraction
     preflop_lossless: Dict[Tuple[Card, Card], int] = {}
     for starting_hand in builder.starting_hands:
         starting_hand = sorted(
@@ -70,7 +108,15 @@ def compute_preflop_lossless_abstraction(builder) -> Dict[Tuple[Card, Card], int
             key=operator.attrgetter("eval_card"),
             reverse=True
         )
-        preflop_lossless[tuple(starting_hand)] = make_starting_hand_lossless(
-            starting_hand, builder
+        bucket = make_starting_hand_bucket(starting_hand, rank_to_index)
+        preflop_lossless[tuple(starting_hand)] = bucket
+    
+    # Validate that all buckets are used (sanity check)
+    unique_buckets = set(preflop_lossless.values())
+    if len(unique_buckets) != expected_buckets:
+        print(
+            f"Warning: Expected {expected_buckets} buckets but found "
+            f"{len(unique_buckets)} unique buckets"
         )
+    
     return preflop_lossless

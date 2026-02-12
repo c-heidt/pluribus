@@ -1,15 +1,47 @@
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 
 from poker_ai.poker.evaluation import Evaluator
+from poker_ai.poker.evaluation.short_deck_evaluator import ShortDeckEvaluator
 
 
 class GameUtility:
     """This class takes care of some game related functions."""
 
-    def __init__(self, our_hand: np.ndarray, board: np.ndarray, cards: np.ndarray):
-        self._evaluator = Evaluator()
+    def __init__(
+        self, 
+        our_hand: np.ndarray, 
+        board: np.ndarray, 
+        cards: np.ndarray,
+        evaluator: Optional[Evaluator] = None
+    ):
+        """
+        Initialize GameUtility with optional evaluator.
+        
+        Parameters
+        ----------
+        our_hand : np.ndarray
+            Our hole cards
+        board : np.ndarray
+            Board cards
+        cards : np.ndarray
+            All cards in the deck
+        evaluator : Optional[Evaluator]
+            Evaluator to use. If None, selects based on deck size:
+            - 20 or 36 cards: ShortDeckEvaluator
+            - 52 cards: Standard Evaluator
+        """
+        if evaluator is None:
+            # Auto-select evaluator based on deck size
+            n_cards = len(cards)
+            if n_cards in [20, 36]:
+                self._evaluator = ShortDeckEvaluator()
+            else:
+                self._evaluator = Evaluator()
+        else:
+            self._evaluator = evaluator
+        
         unavailable_cards = np.concatenate([board, our_hand], axis=0)
         self.available_cards = np.array(
             [c for c in cards if c not in unavailable_cards]
