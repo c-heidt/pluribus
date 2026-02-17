@@ -281,8 +281,13 @@ def cfrp(
         explored: Dict[str, bool] = {action: False for action in state.legal_actions}
         # Get the regret for this state.
         this_info_sets_regret = agent.regret.get(state.info_set, state.initial_regret)
+        
+        # Disable pruning in the last betting round (river)
+        is_river = state._betting_stage == "river"
+        
         for action in state.legal_actions:
-            if this_info_sets_regret[action] > c:
+            # Skip pruning condition for river - explore all actions
+            if is_river or this_info_sets_regret[action] > c:
                 new_state: ShortDeckPokerState = state.apply_action(action)
                 voa[action] = cfrp(agent, new_state, i, t, c, locks)
                 explored[action] = True
