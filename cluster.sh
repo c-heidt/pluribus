@@ -9,7 +9,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=24:00:00
-#SBATCH --cpus-per-task=30
+#SBATCH --cpus-per-task=32
 #SBATCH --mail-type=All
 #SBATCH --mail-user=uvizo@student.kit.edu
 
@@ -19,8 +19,10 @@ set -euo pipefail
 # User-configurable
 CONDA_ENV=${CONDA_ENV:-pluribus}
 PROJECT_DIR=${PROJECT_DIR:-"$HOME/pluribus"}
-# Number of worker processes to use for clustering (defaults to 4)
-WORKERS=${WORKERS:-4}
+# Number of worker processes to use for clustering 
+WORKERS=${WORKERS:-30}
+# Computation method: monte_carlo or exact 
+METHOD=${METHOD:-monte_carlo}
 
 mkdir -p "$PROJECT_DIR/logs"
 
@@ -50,5 +52,6 @@ SAVE_DIR=${SAVE_DIR:-"$PROJECT_DIR/data/clustering"}
 mkdir -p "$SAVE_DIR"
 
 echo "Running clustering with $WORKERS worker(s) and $SLURM_CPUS_PER_TASK CPU(s) allocated."
-poker_ai cluster --save_dir "$SAVE_DIR" --workers "$WORKERS"
+echo "Method: $METHOD"
+poker_ai cluster --save_dir "$SAVE_DIR" --workers "$WORKERS" --method "$METHOD"
 
