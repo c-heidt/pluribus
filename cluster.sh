@@ -5,11 +5,12 @@
 #SBATCH --job-name=pluribus-cluster
 #SBATCH --output=logs/cluster-%j.out
 #SBATCH --error=logs/cluster-%j_error.out
-#SBATCH --partition=cpu
+#SBATCH --partition=highmem
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=32
+#SBATCH --mem=2300000mb
 #SBATCH --mail-type=All
 #SBATCH --mail-user=uvizo@student.kit.edu
 

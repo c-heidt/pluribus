@@ -6,11 +6,12 @@
 #SBATCH --job-name=pluribus-cluster
 #SBATCH --output=logs/cluster-%j.out
 #SBATCH --error=logs/cluster-%j_error.out
-#SBATCH --partition=cpu
+#SBATCH --partition=highmem
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=32
+#SBATCH --mem=2300000mb
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=uvizo@student.kit.edu
 
@@ -21,22 +22,22 @@ set -euo pipefail
 CONDA_ENV=${CONDA_ENV:-pluribus}
 PROJECT_DIR=${PROJECT_DIR:-"$HOME/pluribus"}
 WORKERS=${WORKERS:-30}
-SAVE_DIR=${SAVE_DIR:-"$PROJECT_DIR/data/clustering"}
+SAVE_DIR=${SAVE_DIR:-"$PROJECT_DIR/data/clustering/20cards_exact"}
 
 # Clustering parameters (adjust as needed)
-LOW_CARD_RANK=${LOW_CARD_RANK:-2}
+LOW_CARD_RANK=${LOW_CARD_RANK:-10}
 HIGH_CARD_RANK=${HIGH_CARD_RANK:-14}
-N_RIVER_CLUSTERS=${N_RIVER_CLUSTERS:-200}
-N_TURN_CLUSTERS=${N_TURN_CLUSTERS:-200}
-N_FLOP_CLUSTERS=${N_FLOP_CLUSTERS:-200}
-N_SIMULATIONS_RIVER=${N_SIMULATIONS_RIVER:-1000}
-N_SIMULATIONS_TURN=${N_SIMULATIONS_TURN:-100}
-N_SIMULATIONS_FLOP=${N_SIMULATIONS_FLOP:-100}
+N_RIVER_CLUSTERS=${N_RIVER_CLUSTERS:-50}
+N_TURN_CLUSTERS=${N_TURN_CLUSTERS:-50}
+N_FLOP_CLUSTERS=${N_FLOP_CLUSTERS:-50}
+N_SIMULATIONS_RIVER=${N_SIMULATIONS_RIVER:-100}
+N_SIMULATIONS_TURN=${N_SIMULATIONS_TURN:-200}
+N_SIMULATIONS_FLOP=${N_SIMULATIONS_FLOP:-1000}
 CHUNK_SIZE=${CHUNK_SIZE:-10000}
 MAX_RESUBMISSIONS=${MAX_RESUBMISSIONS:-2}
 # Computation method: monte_carlo or exact 
 # If exact, N_SIMULATIONS_* parameters are ignored
-METHOD=${METHOD:-monte_carlo}
+METHOD=${METHOD:-exact}
 
 mkdir -p "$PROJECT_DIR/logs"
 mkdir -p "$SAVE_DIR"
