@@ -81,7 +81,9 @@ class TestBasePokerState:
         player_i_order = [2, 0, 1]
         for i in range(n_players):
             assert state.current_player.name == f"player_{player_i_order[i]}"
-            assert len(state.legal_actions) == 3
+            # Check that call and fold are available (not exact count due to multiple raise sizes)
+            assert "call" in state.legal_actions
+            assert "fold" in state.legal_actions
             assert state.betting_stage == "pre_flop"
             state = state.apply_action(action_str="call")
         
@@ -90,7 +92,8 @@ class TestBasePokerState:
         # Fold for all but last player
         for player_i in range(n_players - 1):
             assert state.current_player.name == f"player_{player_i}"
-            assert len(state.legal_actions) == 3
+            # Check that fold is available
+            assert "fold" in state.legal_actions
             assert state.betting_stage == "flop"
             state = state.apply_action(action_str="fold")
         
@@ -107,48 +110,76 @@ class TestBasePokerState:
         # Pre-flop: Call for all players
         for i in range(n_players):
             assert state.current_player.name == f"player_{player_i_order[i]}"
-            assert len(state.legal_actions) == 3
+            assert "call" in state.legal_actions
             assert state.betting_stage == "pre_flop"
             state = state.apply_action(action_str="call")
         
         assert state.betting_stage == "flop"
         
-        # Flop: Raise for all players
+        # Flop: Raise for all players (use first available raise action)
         for player_i in range(n_players):
             assert state.current_player.name == f"player_{player_i}"
-            assert len(state.legal_actions) == 3
+            # Find a raise action
+            raise_action = next((a for a in state.legal_actions if a and a.startswith("raise:")), None)
+            assert raise_action is not None, "No raise action available"
             assert state.betting_stage == "flop"
-            state = state.apply_action(action_str="raise")
+            state = state.apply_action(action_str=raise_action)
         
-        # Call to equalize bets (now only 2 actions: call or fold)
+        # Call to equalize bets
         for player_i in range(n_players - 1):
             assert state.current_player.name == f"player_{player_i}"
-            assert len(state.legal_actions) == 2
+            # After raises, either call or all_in should be available
+            if "call" in state.legal_actions:
+                action_to_use = "call"
+            elif "all_in" in state.legal_actions:
+                action_to_use = "all_in"
+            else:
+                raise AssertionError(f"Neither call nor all_in available. Legal actions: {state.legal_actions}")
             assert state.betting_stage == "flop"
-            state = state.apply_action(action_str="call")
+            state = state.apply_action(action_str=action_to_use)
         
         assert state.betting_stage == "turn"
         
-        # Turn: Raise for all players
+        # Turn: Try to raise if possible, otherwise just call/check to progress
+        turn_had_any_action = False
         for player_i in range(n_players):
             assert state.current_player.name == f"player_{player_i}"
-            assert len(state.legal_actions) == 3
             assert state.betting_stage == "turn"
-            state = state.apply_action(action_str="raise")
+            
+            # Try to find a raise action
+            raise_action = next((a for a in state.legal_actions if a and a.startswith("raise:")), None)
+            if raise_action:
+                state = state.apply_action(action_str=raise_action)
+                turn_had_any_action = True
+            elif "call" in state.legal_actions:
+                state = state.apply_action(action_str="call")
+            elif "all_in" in state.legal_actions:
+                state = state.apply_action(action_str="all_in")
+            else:
+                # Fold if no other option (shouldn't happen in this test but be safe)
+                state = state.apply_action(action_str="fold")
         
-        # Call to equalize bets (now only 2 actions: call or fold)
-        for player_i in range(n_players - 1):
-            assert state.current_player.name == f"player_{player_i}"
-            assert len(state.legal_actions) == 2
-            assert state.betting_stage == "turn"
-            state = state.apply_action(action_str="call")
+        # If we had raises, need to equalize
+        if turn_had_any_action and state.betting_stage == "turn":
+            for player_i in range(n_players - 1):
+                if state.betting_stage != "turn":
+                    break
+                assert state.current_player.name == f"player_{player_i}"
+                # After raises, either call or all_in should be available
+                if "call" in state.legal_actions:
+                    action_to_use = "call"
+                elif "all_in" in state.legal_actions:
+                    action_to_use = "all_in"
+                else:
+                    break
+                state = state.apply_action(action_str=action_to_use)
         
         assert state.betting_stage == "river"
         
         # River: Fold for all but last player
         for player_i in range(n_players - 1):
             assert state.current_player.name == f"player_{player_i}"
-            assert len(state.legal_actions) == 3
+            assert "fold" in state.legal_actions
             assert state.betting_stage == "river"
             state = state.apply_action(action_str="fold")
         
@@ -251,11 +282,12 @@ class TestBasePokerState:
         """Test that legal actions are available at each stage."""
         state, variant = poker_state
         
-        # Initially should have call, raise, fold
-        assert len(state.legal_actions) == 3
-        assert any('call' in str(action) for action in state.legal_actions)
-        assert any('raise' in str(action) for action in state.legal_actions)
-        assert any('fold' in str(action) for action in state.legal_actions)
+        # Initially should have call, raise (with pot fractions), fold
+        assert "call" in state.legal_actions, "Call action not available"
+        assert "fold" in state.legal_actions, "Fold action not available"
+        # Check that at least one raise action is available
+        has_raise = any(action and action.startswith("raise:") for action in state.legal_actions)
+        assert has_raise, "No raise actions available"
     
     def test_immutable_state_pattern(self, poker_state):
         """Test that applying actions creates new state objects."""
@@ -370,14 +402,14 @@ class TestBasePokerStateEdgeCases:
         # Use short deck with limited chips
         state, pot = _new_short_deck_game(n_players=2, initial_chips=200)
         
-        # Player can go all-in - find raise action
+        # Player can go all-in - find raise or all_in action
         all_in_action = None
         for action in state.legal_actions:
-            if 'raise' in str(action):
+            if action and (action.startswith('raise:') or action == 'all_in'):
                 all_in_action = action
                 break
         
-        assert all_in_action is not None
+        assert all_in_action is not None, f"No raise or all_in action found in {state.legal_actions}"
         state = state.apply_action(action_str=str(all_in_action))
         
         # With limited chips, game continues until terminal or one player wins

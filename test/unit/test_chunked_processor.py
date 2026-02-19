@@ -76,7 +76,8 @@ class TestChunkedProcessorChunks:
             processor.mark_chunk_complete("river", 0)
             
             loaded_data, loaded_combos = processor.load_chunk("river", 0)
-            assert np.allclose(loaded_data, data)
+            # Use atol=1e-3 because default storage_dtype is float16
+            assert np.allclose(loaded_data, data, atol=1e-3)
             assert np.array_equal(loaded_combos, combos)
     
     def test_mark_chunk_complete(self):
@@ -119,7 +120,8 @@ class TestChunkedProcessorMerge:
             expected_data = np.concatenate(all_data, axis=0)
             assert merged_data.shape == (150, 3)
             assert len(merged_combos) == 150
-            assert np.allclose(merged_data, expected_data)
+            # Use atol=1e-3 because default storage_dtype is float16
+            assert np.allclose(merged_data, expected_data, atol=1e-3)
 
 
 class TestChunkedProcessorResume:
