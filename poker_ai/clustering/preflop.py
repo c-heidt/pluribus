@@ -1,11 +1,10 @@
 from typing import Dict, Tuple, List
 import operator
-import math
 
 from poker_ai.poker.card import Card
 
 
-def make_starting_hand_bucket(starting_hand, rank_to_index: Dict[int, int]) -> int:
+def make_starting_hand_bucket(starting_hand: List[Card], rank_to_index: Dict[int, int]) -> int:
     """
     Compute preflop abstraction bucket for any deck size.
     
@@ -22,7 +21,7 @@ def make_starting_hand_bucket(starting_hand, rank_to_index: Dict[int, int]) -> i
     Parameters
     ----------
     starting_hand : List[Card]
-        Two-card starting hand
+        Two-card starting hand (Card objects).
     rank_to_index : Dict[int, int]
         Mapping from card rank to 0-indexed position (e.g., {2:0, 3:1, ..., 14:12})
         
@@ -48,12 +47,11 @@ def make_starting_hand_bucket(starting_hand, rank_to_index: Dict[int, int]) -> i
         return idx1
     else:
         # Non-pair: compute combinatorial index
-        # Number of pairs with rank >= r1
-        n_pairs_above = idx1
         # Number of suited/offsuit combos with high rank > r1
         n_combos_above = idx1 * (idx1 - 1) // 2 if idx1 > 0 else 0
         # Number of combos with high rank == r1 and low rank > r2
-        n_combos_same_high = idx2 - idx1 - 1
+        # (counts intermediate ranks between idx1 and idx2)
+        n_combos_same_high = idx1 - idx2 - 1
         
         # Offset for this specific (r1, r2) pair
         combo_offset = n_combos_above + n_combos_same_high
@@ -76,7 +74,7 @@ def compute_preflop_lossless_abstraction(builder) -> Dict[Tuple[Card, Card], int
     Parameters
     ----------
     builder : CardInfoLutBuilder
-        Builder with _cards and starting_hands attributes
+        Builder with _cards, starting_hands (int arrays), and int_to_cards() method
         
     Returns
     -------
@@ -101,15 +99,19 @@ def compute_preflop_lossless_abstraction(builder) -> Dict[Tuple[Card, Card], int
     expected_buckets = n_ranks + n_ranks * (n_ranks - 1)  # pairs + suited + offsuit
     
     # Getting combos and indexing with abstraction
+    # starting_hands are now integer arrays, convert back to Card objects
     preflop_lossless: Dict[Tuple[Card, Card], int] = {}
-    for starting_hand in builder.starting_hands:
-        starting_hand = sorted(
-            list(starting_hand),
+    for starting_hand_ints in builder.starting_hands:
+        # Convert integer array to Card objects
+        starting_hand_cards = builder.int_to_cards(starting_hand_ints)
+        # Sort by eval_card descending
+        starting_hand_cards = sorted(
+            starting_hand_cards,
             key=operator.attrgetter("eval_card"),
             reverse=True
         )
-        bucket = make_starting_hand_bucket(starting_hand, rank_to_index)
-        preflop_lossless[tuple(starting_hand)] = bucket
+        bucket = make_starting_hand_bucket(starting_hand_cards, rank_to_index)
+        preflop_lossless[tuple(starting_hand_cards)] = bucket
     
     # Validate that all buckets are used (sanity check)
     unique_buckets = set(preflop_lossless.values())

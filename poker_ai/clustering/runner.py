@@ -21,13 +21,13 @@ Options:
                                  recommend to start small.
   --n_simulations_river INTEGER  The number of opponent hand simulations we
                                  would like to run on the river. We recommend
-                                 to start small.
+                                 to start small. (Ignored if --method exact)
   --n_simulations_turn INTEGER   The number of river card hand simulations we
                                  would like to run on the turn. We recommend
-                                 to start small.
+                                 to start small. (Ignored if --method exact)
   --n_simulations_flop INTEGER   The number of turn card hand simulations we
                                  would like to run on the flop. We recommend
-                                 to start small.
+                                 to start small. (Ignored if --method exact)
   --save_dir TEXT                Path to directory to save card info lookup
                                  table, betting stage centroids, and checkpoints.
   --workers INTEGER              Number of worker processes to use for clustering.
@@ -38,12 +38,16 @@ Options:
   --use_mini_batch/--no_mini_batch  Use MiniBatchKMeans for large datasets
                                  (>50000 samples). More memory efficient but
                                  slightly less accurate. Default True.
+  --method [monte_carlo|exact]   Computation method for hand strength. 'monte_carlo'
+                                 uses sampling (faster). 'exact' uses exhaustive
+                                 enumeration (slower but precise). Default 'monte_carlo'.
   --help                         Show this message and exit.
 """
 import click
 from typing import Optional
 
 from poker_ai.clustering.card_info_lut_builder import CardInfoLutBuilder
+from poker_ai.clustering.exact_lut_builder import ExactHandStrengthBuilder
 
 
 @click.command()
@@ -145,6 +149,17 @@ from poker_ai.clustering.card_info_lut_builder import CardInfoLutBuilder
         "More memory efficient but slightly less accurate. Default True."
     ),
 )
+@click.option(
+    "--method",
+    default="monte_carlo",
+    type=click.Choice(["monte_carlo", "exact"], case_sensitive=False),
+    help=(
+        "Computation method for hand strength. 'monte_carlo' uses sampling "
+        "(faster, configurable via n_simulations_*). 'exact' uses exhaustive "
+        "enumeration (slower but precise, ignores n_simulations_* options). "
+        "Default 'monte_carlo'."
+    ),
+)
 def cluster(
     low_card_rank: int,
     high_card_rank: int,
@@ -158,19 +173,35 @@ def cluster(
     workers: Optional[int],
     chunk_size: int,
     use_mini_batch: bool,
+    method: str,
 ):
     """Run clustering with memory-efficient chunked processing and checkpointing."""
-    builder = CardInfoLutBuilder(
-        n_simulations_river,
-        n_simulations_turn,
-        n_simulations_flop,
-        low_card_rank,
-        high_card_rank,
-        save_dir,
-        workers=workers,
-        chunk_size=chunk_size,
-        use_mini_batch=use_mini_batch,
-    )
+    
+    # Choose builder based on method
+    if method.lower() == "exact":
+        # Exact computation doesn't use simulation parameters
+        builder = ExactHandStrengthBuilder(
+            low_card_rank=low_card_rank,
+            high_card_rank=high_card_rank,
+            save_dir=save_dir,
+            workers=workers,
+            chunk_size=chunk_size,
+            use_mini_batch=use_mini_batch,
+        )
+    else:
+        # Monte Carlo computation (default)
+        builder = CardInfoLutBuilder(
+            n_simulations_river,
+            n_simulations_turn,
+            n_simulations_flop,
+            low_card_rank,
+            high_card_rank,
+            save_dir,
+            workers=workers,
+            chunk_size=chunk_size,
+            use_mini_batch=use_mini_batch,
+        )
+    
     builder.compute(
         n_river_clusters,
         n_turn_clusters,
