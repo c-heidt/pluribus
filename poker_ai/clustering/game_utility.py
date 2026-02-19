@@ -7,7 +7,11 @@ from poker_ai.poker.evaluation.short_deck_evaluator import ShortDeckEvaluator
 
 
 class GameUtility:
-    """This class takes care of some game related functions."""
+    """
+    This class takes care of some game related functions.
+    
+    Works with integer card representation (eval_card values) for memory efficiency.
+    """
 
     def __init__(
         self, 
@@ -22,11 +26,11 @@ class GameUtility:
         Parameters
         ----------
         our_hand : np.ndarray
-            Our hole cards
+            Our hole cards (as integers/eval_card values).
         board : np.ndarray
-            Board cards
+            Board cards (as integers/eval_card values).
         cards : np.ndarray
-            All cards in the deck
+            All cards in the deck (as integers/eval_card values).
         evaluator : Optional[Evaluator]
             Evaluator to use. If None, selects based on deck size:
             - 20 or 36 cards: ShortDeckEvaluator
@@ -42,12 +46,14 @@ class GameUtility:
         else:
             self._evaluator = evaluator
         
-        unavailable_cards = np.concatenate([board, our_hand], axis=0)
+        # Convert to sets for O(1) lookup
+        unavailable_set = set(int(c) for c in our_hand) | set(int(c) for c in board)
         self.available_cards = np.array(
-            [c for c in cards if c not in unavailable_cards]
+            [c for c in cards if int(c) not in unavailable_set],
+            dtype=np.int32
         )
-        self.our_hand = our_hand
-        self.board = board
+        self.our_hand = np.asarray(our_hand, dtype=np.int32)
+        self.board = np.asarray(board, dtype=np.int32)
 
     def evaluate_hand(self, hand: np.ndarray) -> int:
         """
@@ -56,15 +62,15 @@ class GameUtility:
         Parameters
         ----------
         hand : np.ndarray
-            Hand to evaluate.
+            Hand to evaluate (as integers/eval_card values).
 
         Returns
         -------
-            Evaluation of hand
+            Evaluation of hand (lower is better).
         """
         return self._evaluator.evaluate(
-            board=self.board.astype(np.int).tolist(),
-            cards=hand.astype(np.int).tolist(),
+            board=self.board.astype(np.int64).tolist(),
+            cards=[int(c) for c in hand],
         )
 
     def get_winner(self) -> int:
@@ -85,11 +91,11 @@ class GameUtility:
             return 2
 
     @property
-    def opp_hand(self) -> List[int]:
-        """Get random card.
+    def opp_hand(self) -> np.ndarray:
+        """Get random opponent hand.
 
         Returns
         -------
-            Two cards for the opponent (Card)
+            Two cards for the opponent (as integers).
         """
         return np.random.choice(self.available_cards, 2, replace=False)

@@ -28,7 +28,19 @@ from poker_ai.clustering.chunked_processor import ChunkedProcessor
 from poker_ai.clustering.game_utility import GameUtility
 from poker_ai.clustering.preflop import compute_preflop_lossless_abstraction
 
-log = logging.getLogger("poker_ai.clustering.runner")
+log = logging.getLogger("poker_ai.clustering.card_info_lut_builder")
+
+
+def atomic_joblib_dump(obj: Any, path: Path):
+    """Save an object with joblib atomically using temp file."""
+    temp_path = path.with_suffix(".tmp.joblib")
+    try:
+        joblib.dump(obj, temp_path)
+        shutil.move(str(temp_path), str(path))
+    except Exception as e:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise RuntimeError(f"Failed to save {path}: {e}")
 
 
 class CardInfoLutBuilder(CardCombos):
@@ -175,27 +187,31 @@ class CardInfoLutBuilder(CardCombos):
             self.card_info_lut["pre_flop"] = compute_preflop_lossless_abstraction(
                 builder=self
             )
-            joblib.dump(self.card_info_lut, self.card_info_lut_path)
+            atomic_joblib_dump(self.card_info_lut, self.card_info_lut_path)
         
         if "river" not in self.card_info_lut:
             self.card_info_lut["river"] = self._compute_river_clusters(
                 n_river_clusters,
             )
-            joblib.dump(self.card_info_lut, self.card_info_lut_path)
-            joblib.dump(self.centroids, self.centroid_path)
+            atomic_joblib_dump(self.card_info_lut, self.card_info_lut_path)
+            atomic_joblib_dump(self.centroids, self.centroid_path)
         
         if "turn" not in self.card_info_lut:
             self.card_info_lut["turn"] = self._compute_turn_clusters(n_turn_clusters)
-            joblib.dump(self.card_info_lut, self.card_info_lut_path)
-            joblib.dump(self.centroids, self.centroid_path)
+            atomic_joblib_dump(self.card_info_lut, self.card_info_lut_path)
+            atomic_joblib_dump(self.centroids, self.centroid_path)
         
         if "flop" not in self.card_info_lut:
             self.card_info_lut["flop"] = self._compute_flop_clusters(n_flop_clusters)
-            joblib.dump(self.card_info_lut, self.card_info_lut_path)
-            joblib.dump(self.centroids, self.centroid_path)
+            atomic_joblib_dump(self.card_info_lut, self.card_info_lut_path)
+            atomic_joblib_dump(self.centroids, self.centroid_path)
         
         end = time.time()
         log.info(f"Finished computation of clusters - took {end - start:.2f} seconds.")
+        
+        # Final cleanup: remove any remaining intermediate files
+        log.info("Performing final cleanup of intermediate files...")
+        self.chunked_processor.cleanup_all_intermediate_files()
 
     def _compute_river_clusters(self, n_river_clusters: int) -> Dict:
         """
@@ -234,10 +250,14 @@ class CardInfoLutBuilder(CardCombos):
             log.info(f"Loading existing clustering results for {street}")
             self.centroids["river"] = self.chunked_processor.load_centroids(street)
             clusters = self.chunked_processor.load_clusters(street)
-            _, all_combos = self.chunked_processor.merge_chunks_to_memmap(street)
+            _, all_combos = self.chunked_processor.get_or_merge_data(street)
         else:
-            # Merge and cluster
-            merged_data, all_combos = self.chunked_processor.merge_chunks_to_memmap(street)
+            # Merge (or load if already merged) and cluster
+            merged_data, all_combos = self.chunked_processor.get_or_merge_data(street)
+            
+            # Build lookup index for later use (e.g., by turn stage)
+            log.info(f"Building lookup index for {street}...")
+            self.chunked_processor.get_or_build_index(street, all_combos)
             
             self.centroids["river"], clusters = self._cluster(
                 num_clusters=n_river_clusters,
@@ -249,6 +269,11 @@ class CardInfoLutBuilder(CardCombos):
             self.chunked_processor.save_centroids(street, self.centroids["river"])
             self.chunked_processor.save_clusters(street, clusters)
             self.chunked_processor.mark_clustering_done(street)
+            
+            # Cleanup intermediate files (chunks no longer needed)
+            log.info(f"Cleaning up intermediate chunk files for {street}...")
+            self.chunked_processor.cleanup_chunks(street)
+            self.chunked_processor.cleanup_partial_clustering(street)
         
         end = time.time()
         log.info(f"Finished computation of {street} clusters - took {end - start:.2f} seconds.")
@@ -346,10 +371,14 @@ class CardInfoLutBuilder(CardCombos):
             log.info(f"Loading existing clustering results for {street}")
             self.centroids["turn"] = self.chunked_processor.load_centroids(street)
             clusters = self.chunked_processor.load_clusters(street)
-            _, all_combos = self.chunked_processor.merge_chunks_to_memmap(street)
+            _, all_combos = self.chunked_processor.get_or_merge_data(street)
         else:
-            # Merge and cluster
-            merged_data, all_combos = self.chunked_processor.merge_chunks_to_memmap(street)
+            # Merge (or load if already merged) and cluster
+            merged_data, all_combos = self.chunked_processor.get_or_merge_data(street)
+            
+            # Build lookup index for later use (e.g., by flop stage)
+            log.info(f"Building lookup index for {street}...")
+            self.chunked_processor.get_or_build_index(street, all_combos)
             
             self.centroids["turn"], clusters = self._cluster(
                 num_clusters=n_turn_clusters,
@@ -361,6 +390,11 @@ class CardInfoLutBuilder(CardCombos):
             self.chunked_processor.save_centroids(street, self.centroids["turn"])
             self.chunked_processor.save_clusters(street, clusters)
             self.chunked_processor.mark_clustering_done(street)
+            
+            # Cleanup intermediate files (chunks no longer needed)
+            log.info(f"Cleaning up intermediate chunk files for {street}...")
+            self.chunked_processor.cleanup_chunks(street)
+            self.chunked_processor.cleanup_partial_clustering(street)
         
         end = time.time()
         log.info(f"Finished computation of {street} clusters - took {end - start:.2f} seconds.")
@@ -458,10 +492,14 @@ class CardInfoLutBuilder(CardCombos):
             log.info(f"Loading existing clustering results for {street}")
             self.centroids["flop"] = self.chunked_processor.load_centroids(street)
             clusters = self.chunked_processor.load_clusters(street)
-            _, all_combos = self.chunked_processor.merge_chunks_to_memmap(street)
+            _, all_combos = self.chunked_processor.get_or_merge_data(street)
         else:
-            # Merge and cluster
-            merged_data, all_combos = self.chunked_processor.merge_chunks_to_memmap(street)
+            # Merge (or load if already merged) and cluster
+            merged_data, all_combos = self.chunked_processor.get_or_merge_data(street)
+            
+            # Build lookup index (though flop is final stage)
+            log.info(f"Building lookup index for {street}...")
+            self.chunked_processor.get_or_build_index(street, all_combos)
             
             self.centroids["flop"], clusters = self._cluster(
                 num_clusters=n_flop_clusters,
@@ -473,6 +511,11 @@ class CardInfoLutBuilder(CardCombos):
             self.chunked_processor.save_centroids(street, self.centroids["flop"])
             self.chunked_processor.save_clusters(street, clusters)
             self.chunked_processor.mark_clustering_done(street)
+            
+            # Cleanup intermediate files (chunks no longer needed)
+            log.info(f"Cleaning up intermediate chunk files for {street}...")
+            self.chunked_processor.cleanup_chunks(street)
+            self.chunked_processor.cleanup_partial_clustering(street)
         
         end = time.time()
         log.info(f"Finished computation of {street} clusters - took {end - start:.2f} seconds.")
@@ -651,9 +694,12 @@ class CardInfoLutBuilder(CardCombos):
             centroids = km.cluster_centers_
             
             # Remove partial checkpoint after successful completion
-            for p in [partial_km_path, progress_path]:
-                if p.exists():
-                    p.unlink()
+            if partial_km_path.exists():
+                partial_km_path.unlink()
+            if progress_path.exists():
+                progress_path.unlink()
+            
+            log.info(f"Cleaned up partial clustering checkpoints for {street}")
         else:
             log.info(f"Using standard KMeans for {street}")
             km = KMeans(
@@ -789,7 +835,7 @@ class CardInfoLutBuilder(CardCombos):
             game = GameUtility(
                 our_hand=our_hand, 
                 board=board, 
-                cards=self._cards,
+                cards=self._card_ints,
                 evaluator=self._evaluator
             )
             ehs = self.simulate_get_ehs(game)
@@ -819,7 +865,7 @@ class CardInfoLutBuilder(CardCombos):
         game = GameUtility(
             our_hand=our_hand, 
             board=board, 
-            cards=self._cards,
+            cards=self._card_ints,
             evaluator=self._evaluator
         )
         return self.simulate_get_ehs(game)
@@ -859,7 +905,7 @@ class CardInfoLutBuilder(CardCombos):
             Potential aware turn distributions
         """
         available_cards: np.ndarray = self.get_available_cards(
-            cards=self._cards, unavailable_cards=public
+            cards=self._card_ints, unavailable_cards=public
         )
         # sample river cards and run a simulation
         turn_ehs_distribution = self.simulate_get_turn_ehs_distributions(
@@ -883,7 +929,7 @@ class CardInfoLutBuilder(CardCombos):
             Potential aware flop distributions
         """
         available_cards: np.ndarray = self.get_available_cards(
-            cards=self._cards, unavailable_cards=public
+            cards=self._card_ints, unavailable_cards=public
         )
         
         n_turn_centroids = len(self.centroids["turn"])

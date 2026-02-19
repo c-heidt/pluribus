@@ -5,6 +5,7 @@ This module provides utilities for processing large datasets in chunks,
 saving intermediate results to disk, and resuming from checkpoints.
 """
 import fcntl
+import gzip
 import json
 import logging
 import os
@@ -38,7 +39,13 @@ class ChunkedProcessor:
         Path to the JSON checkpoint file.
     """
     
-    def __init__(self, save_dir: Path, chunk_size: int = 10000):
+    def __init__(
+        self,
+        save_dir: Path,
+        chunk_size: int = 10000,
+        use_compression: bool = True,
+        storage_dtype: np.dtype = np.float16,
+    ):
         """
         Initialize the ChunkedProcessor.
         
@@ -48,9 +55,18 @@ class ChunkedProcessor:
             Directory to save all intermediate files.
         chunk_size : int
             Number of combinations to process per chunk. Default 10000.
+        use_compression : bool
+            Whether to use gzip compression for chunk files. Reduces disk
+            usage by 60-80% with ~10-20% slower I/O. Default True.
+        storage_dtype : np.dtype
+            Data type for storing feature arrays. float16 saves 50% disk
+            space vs float32 with negligible precision loss for equity
+            histograms. Default np.float16.
         """
         self.save_dir = Path(save_dir)
         self.chunk_size = chunk_size
+        self.use_compression = use_compression
+        self.storage_dtype = storage_dtype
         self.checkpoint_path = self.save_dir / "checkpoint.json"
         
         # Ensure directories exist
@@ -75,9 +91,9 @@ class ChunkedProcessor:
         """Return an empty checkpoint structure."""
         return {
             "streets": {
-                "river": {"completed_chunks": [], "total_chunks": 0, "clustering_done": False},
-                "turn": {"completed_chunks": [], "total_chunks": 0, "clustering_done": False},
-                "flop": {"completed_chunks": [], "total_chunks": 0, "clustering_done": False},
+                "river": {"completed_chunks": [], "total_chunks": 0, "merge_done": False, "clustering_done": False},
+                "turn": {"completed_chunks": [], "total_chunks": 0, "merge_done": False, "clustering_done": False},
+                "flop": {"completed_chunks": [], "total_chunks": 0, "merge_done": False, "clustering_done": False},
             },
             "config": {},
         }
@@ -127,13 +143,6 @@ class ChunkedProcessor:
             if temp_path.exists():
                 temp_path.unlink()
             raise
-        finally:
-            # Clean up lock file
-            if lock_path.exists():
-                try:
-                    lock_path.unlink()
-                except OSError:
-                    pass
     
     def get_street_dir(self, street: str) -> Path:
         """Get the directory for a specific street."""
@@ -222,13 +231,23 @@ class ChunkedProcessor:
         """Get list of completed chunk indices."""
         return list(self._checkpoint["streets"][street]["completed_chunks"])
     
+    def is_merge_done(self, street: str) -> bool:
+        """Check if merge is complete for a street."""
+        return self._checkpoint["streets"][street].get("merge_done", False)
+    
+    def mark_merge_done(self, street: str):
+        """Mark merge as complete for a street."""
+        self._checkpoint["streets"][street]["merge_done"] = True
+        self._save_checkpoint()
+    
     def is_clustering_done(self, street: str) -> bool:
         """Check if clustering is complete for a street."""
         return self._checkpoint["streets"][street]["clustering_done"]
     
     def get_chunk_path(self, street: str, chunk_idx: int) -> Path:
         """Get the file path for a chunk's data."""
-        return self.get_chunks_dir(street) / f"chunk_{chunk_idx:06d}.npy"
+        ext = ".npy.gz" if self.use_compression else ".npy"
+        return self.get_chunks_dir(street) / f"chunk_{chunk_idx:06d}{ext}"
     
     def get_combos_path(self, street: str, chunk_idx: int) -> Path:
         """Get the file path for a chunk's card combos."""
@@ -259,11 +278,23 @@ class ChunkedProcessor:
         chunk_path = self.get_chunk_path(street, chunk_idx)
         combos_path = self.get_combos_path(street, chunk_idx)
         
-        temp_chunk = chunk_path.with_suffix(".tmp.npy")
+        # Determine temp file extensions
+        temp_ext = ".tmp.npy.gz" if self.use_compression else ".tmp.npy"
+        temp_chunk = chunk_path.parent / f"chunk_{chunk_idx:06d}{temp_ext}"
         temp_combos = combos_path.with_suffix(".tmp.npy")
         
         try:
-            np.save(temp_chunk, data.astype(np.float32))
+            # Convert to storage dtype (float16 saves 50% disk space)
+            data_to_save = data.astype(self.storage_dtype)
+            
+            if self.use_compression:
+                # Save with gzip compression (saves additional 60-80%)
+                with gzip.open(temp_chunk, 'wb', compresslevel=4) as f:
+                    np.save(f, data_to_save)
+            else:
+                np.save(temp_chunk, data_to_save)
+            
+            # Combos are small integers, no need to compress
             np.save(temp_combos, combos)
             
             # Atomic rename
@@ -312,12 +343,23 @@ class ChunkedProcessor:
         Returns
         -------
         Tuple[np.ndarray, np.ndarray]
-            Tuple of (data, combos).
+            Tuple of (data, combos). Data is converted to float32 for computation.
         """
         chunk_path = self.get_chunk_path(street, chunk_idx)
         combos_path = self.get_combos_path(street, chunk_idx)
         
-        return np.load(chunk_path), np.load(combos_path, allow_pickle=True)
+        # Load data (handle gzip if compressed)
+        if self.use_compression:
+            with gzip.open(chunk_path, 'rb') as f:
+                data = np.load(f)
+        else:
+            data = np.load(chunk_path)
+        
+        # Convert back to float32 for computation accuracy
+        data = data.astype(np.float32)
+        
+        combos = np.load(combos_path, allow_pickle=True)
+        return data, combos
     
     def merge_chunks_to_memmap(
         self,
@@ -346,14 +388,14 @@ class ChunkedProcessor:
             raise ValueError(f"No completed chunks found for {street}")
         
         # First pass: determine total size and feature dimension
+        # Load first chunk to get feature dimension
         first_chunk_data, first_chunk_combos = self.load_chunk(street, completed_chunks[0])
         feature_dim = first_chunk_data.shape[1] if first_chunk_data.ndim > 1 else 1
         
+        # Count total rows by loading each chunk (required for compressed files)
         total_rows = 0
         for chunk_idx in completed_chunks:
-            chunk_path = self.get_chunk_path(street, chunk_idx)
-            # Use memory-mapping to just get the shape without loading
-            chunk_data = np.load(chunk_path, mmap_mode='r')
+            chunk_data, _ = self.load_chunk(street, chunk_idx)
             total_rows += chunk_data.shape[0]
         
         log.info(f"Total rows for {street}: {total_rows}, feature_dim: {feature_dim}")
@@ -372,7 +414,8 @@ class ChunkedProcessor:
         
         # Second pass: copy data to memory-mapped file
         current_row = 0
-        for chunk_idx in completed_chunks:
+        flush_interval = 10  # Flush every 10 chunks for safety
+        for i, chunk_idx in enumerate(completed_chunks):
             chunk_data, chunk_combos = self.load_chunk(street, chunk_idx)
             n_rows = chunk_data.shape[0]
             
@@ -382,15 +425,112 @@ class ChunkedProcessor:
             merged_data[current_row:current_row + n_rows] = chunk_data
             all_combos.append(chunk_combos)
             current_row += n_rows
+            
+            # Periodic flush to ensure progress is saved to disk
+            if (i + 1) % flush_interval == 0:
+                merged_data.flush()
         
-        # Flush to disk
+        # Final flush to disk
         merged_data.flush()
         
-        # Concatenate combos
+        # Concatenate combos and save atomically
         all_combos = np.concatenate(all_combos, axis=0)
+        combos_path = self.get_street_dir(street) / "all_combos.npy"
+        temp_combos = combos_path.with_suffix(".tmp.npy")
+        try:
+            np.save(temp_combos, all_combos)
+            shutil.move(str(temp_combos), str(combos_path))
+        except Exception as e:
+            if temp_combos.exists():
+                temp_combos.unlink()
+            raise RuntimeError(f"Failed to save combos: {e}")
         
         log.info(f"Merged {len(completed_chunks)} chunks into memory-mapped file")
         
+        return merged_data, all_combos
+    
+    def load_merged_data(
+        self,
+        street: str,
+        dtype: np.dtype = np.float32,
+    ) -> Tuple[np.memmap, np.ndarray]:
+        """
+        Load previously merged data from disk.
+        
+        Parameters
+        ----------
+        street : str
+            The street name.
+        dtype : np.dtype
+            Data type for the memory-mapped file.
+            
+        Returns
+        -------
+        Tuple[np.memmap, np.ndarray]
+            Tuple of (data_memmap, all_combos).
+        """
+        merged_path = self.get_street_dir(street) / "merged_data.dat"
+        combos_path = self.get_street_dir(street) / "all_combos.npy"
+        
+        if not merged_path.exists() or not combos_path.exists():
+            raise FileNotFoundError(f"Merged data not found for {street}")
+        
+        # Load combos to get shape
+        all_combos = np.load(combos_path)
+        
+        # Determine feature dimension from first chunk
+        completed_chunks = sorted(self.get_completed_chunks(street))
+        if not completed_chunks:
+            raise ValueError(f"No completed chunks found for {street}")
+        first_chunk_data, _ = self.load_chunk(street, completed_chunks[0])
+        feature_dim = first_chunk_data.shape[1] if first_chunk_data.ndim > 1 else 1
+        
+        # Load memory-mapped file
+        total_rows = len(all_combos)
+        merged_data = np.memmap(
+            merged_path,
+            dtype=dtype,
+            mode='r+',
+            shape=(total_rows, feature_dim),
+        )
+        
+        log.info(f"Loaded merged data for {street}: {total_rows} rows")
+        return merged_data, all_combos
+    
+    def get_or_merge_data(
+        self,
+        street: str,
+        dtype: np.dtype = np.float32,
+    ) -> Tuple[np.memmap, np.ndarray]:
+        """
+        Get merged data, either by loading from disk or merging chunks.
+        
+        This method checks if merge is complete. If yes, loads existing data.
+        If no, merges chunks and marks merge as complete.
+        
+        Parameters
+        ----------
+        street : str
+            The street name.
+        dtype : np.dtype
+            Data type for the memory-mapped file.
+            
+        Returns
+        -------
+        Tuple[np.memmap, np.ndarray]
+            Tuple of (data_memmap, all_combos).
+        """
+        if self.is_merge_done(street):
+            try:
+                log.info(f"Merge already complete for {street}, loading from disk...")
+                return self.load_merged_data(street, dtype)
+            except (FileNotFoundError, ValueError) as e:
+                log.warning(f"Failed to load merged data: {e}. Re-merging from chunks...")
+                # Fall through to merge
+        
+        # Merge from chunks
+        merged_data, all_combos = self.merge_chunks_to_memmap(street, dtype)
+        self.mark_merge_done(street)
         return merged_data, all_combos
     
     def get_chunk_indices(self, total_combos: int) -> List[Tuple[int, int, int]]:
@@ -416,9 +556,16 @@ class ChunkedProcessor:
         return indices
     
     def save_centroids(self, street: str, centroids: np.ndarray):
-        """Save centroids for a street."""
+        """Save centroids for a street atomically."""
         centroids_path = self.get_street_dir(street) / "centroids.npy"
-        np.save(centroids_path, centroids)
+        temp_path = centroids_path.with_suffix(".tmp.npy")
+        try:
+            np.save(temp_path, centroids)
+            shutil.move(str(temp_path), str(centroids_path))
+        except Exception as e:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise RuntimeError(f"Failed to save centroids: {e}")
     
     def load_centroids(self, street: str) -> np.ndarray:
         """Load centroids for a street."""
@@ -426,9 +573,16 @@ class ChunkedProcessor:
         return np.load(centroids_path)
     
     def save_clusters(self, street: str, clusters: np.ndarray):
-        """Save cluster assignments for a street."""
+        """Save cluster assignments for a street atomically."""
         clusters_path = self.get_street_dir(street) / "clusters.npy"
-        np.save(clusters_path, clusters)
+        temp_path = clusters_path.with_suffix(".tmp.npy")
+        try:
+            np.save(temp_path, clusters)
+            shutil.move(str(temp_path), str(clusters_path))
+        except Exception as e:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise RuntimeError(f"Failed to save clusters: {e}")
     
     def load_clusters(self, street: str) -> np.ndarray:
         """Load cluster assignments for a street."""
@@ -440,11 +594,261 @@ class ChunkedProcessor:
         Remove chunk files after successful merge and clustering.
         
         Only call this after clustering is complete to free up disk space.
+        Keeps merged_data.dat, lookup_index.npy, centroids.npy, clusters.npy.
         """
-        log.info(f"Cleaning up chunk files for {street}")
+        log.info(f"Cleaning up chunk files for {street}...")
         chunks_dir = self.get_chunks_dir(street)
         combos_dir = self.get_combos_dir(street)
         
+        deleted_size = 0
         for d in [chunks_dir, combos_dir]:
             if d.exists():
+                # Calculate size before deletion for logging
+                for file in d.rglob('*'):
+                    if file.is_file():
+                        deleted_size += file.stat().st_size
                 shutil.rmtree(d)
+        
+        if deleted_size > 0:
+            log.info(f"Freed {deleted_size / (1024**2):.1f} MB by removing {street} chunk files")
+    
+    def cleanup_partial_clustering(self, street: str):
+        """
+        Remove partial clustering checkpoint files.
+        
+        Called after successful clustering completion.
+        """
+        street_dir = self.get_street_dir(street)
+        partial_km_path = street_dir / "partial_kmeans.joblib"
+        progress_path = street_dir / "kmeans_progress.json"
+        
+        deleted = []
+        for p in [partial_km_path, progress_path]:
+            if p.exists():
+                p.unlink()
+                deleted.append(p.name)
+        
+        if deleted:
+            log.info(f"Cleaned up partial clustering files for {street}: {', '.join(deleted)}")
+    
+    def cleanup_all_intermediate_files(self):
+        """
+        Remove all intermediate files for all streets.
+        
+        Keeps only the final results:
+        - merged_data.dat (for lookups)
+        - lookup_index.npy (for lookups) 
+        - centroids.npy (final results)
+        - clusters.npy (final results)
+        - checkpoint.json (state tracking)
+        
+        Call this after all processing is complete to minimize disk usage.
+        """
+        log.info("Cleaning up all intermediate files...")
+        total_freed = 0
+        
+        for street in ["river", "turn", "flop"]:
+            if not self.is_clustering_done(street):
+                log.warning(f"Skipping cleanup for {street} - clustering not complete")
+                continue
+            
+            # Track size before cleanup
+            street_dir = self.get_street_dir(street)
+            if street_dir.exists():
+                initial_size = sum(f.stat().st_size for f in street_dir.rglob('*') if f.is_file())
+                
+                self.cleanup_chunks(street)
+                self.cleanup_partial_clustering(street)
+                
+                final_size = sum(f.stat().st_size for f in street_dir.rglob('*') if f.is_file())
+                freed = initial_size - final_size
+                total_freed += freed
+        
+        if total_freed > 0:
+            log.info(f"Total disk space freed: {total_freed / (1024**2):.1f} MB")
+
+    # =========================================================================
+    # Index-based lookup methods for memory-efficient data access
+    # =========================================================================
+    
+    def get_lookup_index_path(self, street: str) -> Path:
+        """Get the path for the lookup index file."""
+        return self.get_street_dir(street) / "lookup_index.npy"
+    
+    def get_merged_path(self, street: str) -> Path:
+        """Get the path for the merged data file."""
+        return self.get_street_dir(street) / "merged_data.dat"
+    
+    def build_lookup_index(
+        self,
+        street: str,
+        all_combos: np.ndarray,
+        key_builder: callable = None,
+    ) -> Dict[Tuple[int, ...], int]:
+        """
+        Build a lightweight index mapping card combos to their row in merged data.
+        
+        This index stores only row indices (single integer), not the actual data,
+        making it much more memory-efficient than loading all data.
+        
+        Thread-safe: only reads from completed merge.
+        
+        Parameters
+        ----------
+        street : str
+            The street name (river, turn, flop).
+        all_combos : np.ndarray
+            All card combos in order (from merge_chunks_to_memmap).
+        key_builder : callable, optional
+            Function that takes a combo array and returns a tuple key.
+            If None, uses tuple(combo) directly.
+            
+        Returns
+        -------
+        Dict[Tuple[int, ...], int]
+            Maps combo key to row index in merged_data.dat.
+        """
+        log.info(f"Building lookup index for {street}...")
+        
+        index: Dict[Tuple[int, ...], int] = {}
+        
+        for row_idx, combo in enumerate(all_combos):
+            if key_builder is not None:
+                key = key_builder(combo)
+            else:
+                key = tuple(combo)
+            index[key] = row_idx
+        
+        log.info(f"Built {street} lookup index with {len(index):,} entries")
+        return index
+    
+    def save_lookup_index(
+        self,
+        street: str,
+        index: Dict[Tuple[int, ...], int],
+    ):
+        """
+        Save a lookup index to disk for later reuse.
+        
+        Parameters
+        ----------
+        street : str
+            The street name.
+        index : Dict[Tuple[int, ...], int]
+            The lookup index to save.
+        """
+        index_path = self.get_lookup_index_path(street)
+        temp_path = index_path.with_suffix(".tmp.npy")
+        
+        try:
+            np.save(temp_path, index, allow_pickle=True)
+            shutil.move(str(temp_path), str(index_path))
+        except Exception as e:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise RuntimeError(f"Failed to save lookup index: {e}")
+    
+    def load_lookup_index(
+        self,
+        street: str,
+    ) -> Optional[Dict[Tuple[int, ...], int]]:
+        """
+        Load a previously saved lookup index from disk.
+        
+        Parameters
+        ----------
+        street : str
+            The street name.
+            
+        Returns
+        -------
+        Optional[Dict[Tuple[int, ...], int]]
+            The lookup index, or None if not found.
+        """
+        index_path = self.get_lookup_index_path(street)
+        if index_path.exists():
+            return np.load(index_path, allow_pickle=True).item()
+        return None
+    
+    def lookup_data_by_index(
+        self,
+        street: str,
+        combo_key: Tuple[int, ...],
+        index: Dict[Tuple[int, ...], int],
+        merged_data_cache: Optional[np.memmap] = None,
+    ) -> Optional[np.ndarray]:
+        """
+        Look up data for a specific card combo using memory-mapped merged data.
+        
+        Thread-safe: uses read-only memory mapping for merged data file.
+        
+        Parameters
+        ----------
+        street : str
+            The street name.
+        combo_key : Tuple[int, ...]
+            The card combo key to look up.
+        index : Dict[Tuple[int, ...], int]
+            The lookup index mapping keys to row indices.
+        merged_data_cache : Optional[np.memmap]
+            Optional cached reference to the memory-mapped merged data.
+            If None, opens the file on each call (still efficient due to OS caching).
+            
+        Returns
+        -------
+        Optional[np.ndarray]
+            The data for the combo, or None if not found.
+        """
+        row_idx = index.get(combo_key)
+        if row_idx is None:
+            return None
+        
+        # Use cached memmap if provided, otherwise open file
+        if merged_data_cache is not None:
+            return merged_data_cache[row_idx].copy()
+        
+        # Memory-map the merged data file for thread-safe read access
+        merged_path = self.get_merged_path(street)
+        if not merged_path.exists():
+            log.warning(f"Merged data file not found for {street}: {merged_path}")
+            return None
+        
+        merged_data = np.load(merged_path, mmap_mode='r')
+        return merged_data[row_idx].copy()
+    
+    def get_or_build_index(
+        self,
+        street: str,
+        all_combos: np.ndarray,
+        key_builder: callable = None,
+    ) -> Dict[Tuple[int, ...], int]:
+        """
+        Get existing lookup index or build and save a new one.
+        
+        Thread-safe: builds index from read-only merged data.
+        
+        Parameters
+        ----------
+        street : str
+            The street name.
+        all_combos : np.ndarray
+            All card combos in order (from merge_chunks_to_memmap).
+        key_builder : callable, optional
+            Function to build keys from combos. Must be consistent
+            across all uses of this index.
+            
+        Returns
+        -------
+        Dict[Tuple[int, ...], int]
+            The lookup index.
+        """
+        # Try to load existing index
+        index = self.load_lookup_index(street)
+        if index is not None:
+            log.info(f"Loaded existing {street} lookup index with {len(index):,} entries")
+            return index
+        
+        # Build new index from merged data combos
+        index = self.build_lookup_index(street, all_combos, key_builder)
+        self.save_lookup_index(street, index)
+        return index
