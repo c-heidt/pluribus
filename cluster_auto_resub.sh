@@ -10,7 +10,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=24:00:00
-#SBATCH --cpus-per-task=30
+#SBATCH --cpus-per-task=32
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=uvizo@student.kit.edu
 
@@ -27,13 +27,16 @@ SAVE_DIR=${SAVE_DIR:-"$PROJECT_DIR/data/clustering"}
 LOW_CARD_RANK=${LOW_CARD_RANK:-2}
 HIGH_CARD_RANK=${HIGH_CARD_RANK:-14}
 N_RIVER_CLUSTERS=${N_RIVER_CLUSTERS:-200}
-N_TURN_CLUSTERS=${N_TURN_CLUSTERS:-500}
-N_FLOP_CLUSTERS=${N_FLOP_CLUSTERS:-1000}
+N_TURN_CLUSTERS=${N_TURN_CLUSTERS:-200}
+N_FLOP_CLUSTERS=${N_FLOP_CLUSTERS:-200}
 N_SIMULATIONS_RIVER=${N_SIMULATIONS_RIVER:-1000}
 N_SIMULATIONS_TURN=${N_SIMULATIONS_TURN:-100}
 N_SIMULATIONS_FLOP=${N_SIMULATIONS_FLOP:-100}
 CHUNK_SIZE=${CHUNK_SIZE:-10000}
 MAX_RESUBMISSIONS=${MAX_RESUBMISSIONS:-2}
+# Computation method: monte_carlo or exact 
+# If exact, N_SIMULATIONS_* parameters are ignored
+METHOD=${METHOD:-monte_carlo}
 
 mkdir -p "$PROJECT_DIR/logs"
 mkdir -p "$SAVE_DIR"
@@ -90,9 +93,12 @@ fi
 
 echo "Starting/resuming clustering with $WORKERS workers..."
 echo "Configuration:"
+echo "  Method: $METHOD"
 echo "  Cards: $LOW_CARD_RANK-$HIGH_CARD_RANK"
 echo "  Clusters: River=$N_RIVER_CLUSTERS, Turn=$N_TURN_CLUSTERS, Flop=$N_FLOP_CLUSTERS"
-echo "  Simulations: River=$N_SIMULATIONS_RIVER, Turn=$N_SIMULATIONS_TURN, Flop=$N_SIMULATIONS_FLOP"
+if [ "$METHOD" = "monte_carlo" ]; then
+  echo "  Simulations: River=$N_SIMULATIONS_RIVER, Turn=$N_SIMULATIONS_TURN, Flop=$N_SIMULATIONS_FLOP"
+fi
 echo "  Chunk size: $CHUNK_SIZE"
 echo "  Save directory: $SAVE_DIR"
 
@@ -108,7 +114,8 @@ poker_ai cluster \
   --n_simulations_river "$N_SIMULATIONS_RIVER" \
   --n_simulations_turn "$N_SIMULATIONS_TURN" \
   --n_simulations_flop "$N_SIMULATIONS_FLOP" \
-  --chunk_size "$CHUNK_SIZE"
+  --chunk_size "$CHUNK_SIZE" \
+  --method "$METHOD"
 
 # Check if clustering completed
 if [ -f "$CARD_INFO_LUT" ]; then
