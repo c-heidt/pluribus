@@ -11,7 +11,7 @@
 #SBATCH --ntasks=1
 #SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=2300000mb
+#SBATCH --mem=380001mb
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=uvizo@student.kit.edu
 
