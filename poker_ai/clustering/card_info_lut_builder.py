@@ -319,9 +319,7 @@ class CardInfoLutBuilder(CardCombos):
                         np.array(chunk_results, dtype=np.float32),
                         chunk_combos,
                     )
-                    # Defer checkpoint save until batch is complete
-                    is_last_in_batch = chunk_idx == chunk_batch[-1]
-                    self.chunked_processor.mark_chunk_complete("river", chunk_idx, defer_save=not is_last_in_batch)
+                    self.chunked_processor.mark_chunk_complete("river", chunk_idx)
                 
                 # Progress update every few batches
                 if (batch_idx + 1) % 10 == 0 or batch_idx == 0:
@@ -440,9 +438,7 @@ class CardInfoLutBuilder(CardCombos):
                         np.array(chunk_results, dtype=np.float32),
                         chunk_combos,
                     )
-                    # Defer checkpoint save until batch is complete
-                    is_last_in_batch = chunk_idx == chunk_batch[-1]
-                    self.chunked_processor.mark_chunk_complete("turn", chunk_idx, defer_save=not is_last_in_batch)
+                    self.chunked_processor.mark_chunk_complete("turn", chunk_idx)
                 
                 # Progress update every few batches
                 if (batch_idx + 1) % 10 == 0 or batch_idx == 0:
@@ -561,9 +557,7 @@ class CardInfoLutBuilder(CardCombos):
                         np.array(chunk_results, dtype=np.float32),
                         chunk_combos,
                     )
-                    # Defer checkpoint save until batch is complete
-                    is_last_in_batch = chunk_idx == chunk_batch[-1]
-                    self.chunked_processor.mark_chunk_complete("flop", chunk_idx, defer_save=not is_last_in_batch)
+                    self.chunked_processor.mark_chunk_complete("flop", chunk_idx)
                 
                 # Progress update every few batches
                 if (batch_idx + 1) % 10 == 0 or batch_idx == 0:

@@ -131,7 +131,7 @@ class ExactHandStrengthBuilder(CardInfoLutBuilder):
         
         # Need to build index - requires all_combos from merge
         log.info(f"Index not found for {street}, building from merged data...")
-        _, all_combos = self.chunked_processor.merge_chunks_to_memmap(street)
+        _, all_combos = self.chunked_processor.get_or_merge_data(street)
         return self.chunked_processor.get_or_build_index(street, all_combos)
     
     def _lookup_ehs_data(

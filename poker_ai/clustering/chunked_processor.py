@@ -183,6 +183,7 @@ class ChunkedProcessor:
             self._checkpoint["streets"][street] = {
                 "completed_chunks": [],
                 "total_chunks": n_chunks,
+                "merge_done": False,
                 "clustering_done": False,
             }
             # Clear old chunk files if configuration changed
@@ -242,7 +243,7 @@ class ChunkedProcessor:
     
     def is_clustering_done(self, street: str) -> bool:
         """Check if clustering is complete for a street."""
-        return self._checkpoint["streets"][street]["clustering_done"]
+        return self._checkpoint["streets"][street].get("clustering_done", False)
     
     def get_chunk_path(self, street: str, chunk_idx: int) -> Path:
         """Get the file path for a chunk's data."""
@@ -351,9 +352,9 @@ class ChunkedProcessor:
         # Load data (handle gzip if compressed)
         if self.use_compression:
             with gzip.open(chunk_path, 'rb') as f:
-                data = np.load(f)
+                data = np.load(f, allow_pickle=True)
         else:
-            data = np.load(chunk_path)
+            data = np.load(chunk_path, allow_pickle=True)
         
         # Convert back to float32 for computation accuracy
         data = data.astype(np.float32)
@@ -476,7 +477,7 @@ class ChunkedProcessor:
             raise FileNotFoundError(f"Merged data not found for {street}")
         
         # Load combos to get shape
-        all_combos = np.load(combos_path)
+        all_combos = np.load(combos_path, allow_pickle=True)
         
         # Determine feature dimension from first chunk
         completed_chunks = sorted(self.get_completed_chunks(street))
@@ -570,7 +571,7 @@ class ChunkedProcessor:
     def load_centroids(self, street: str) -> np.ndarray:
         """Load centroids for a street."""
         centroids_path = self.get_street_dir(street) / "centroids.npy"
-        return np.load(centroids_path)
+        return np.load(centroids_path, allow_pickle=True)
     
     def save_clusters(self, street: str, clusters: np.ndarray):
         """Save cluster assignments for a street atomically."""
@@ -587,7 +588,7 @@ class ChunkedProcessor:
     def load_clusters(self, street: str) -> np.ndarray:
         """Load cluster assignments for a street."""
         clusters_path = self.get_street_dir(street) / "clusters.npy"
-        return np.load(clusters_path)
+        return np.load(clusters_path, allow_pickle=True)
     
     def cleanup_chunks(self, street: str):
         """
