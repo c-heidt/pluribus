@@ -23,6 +23,98 @@ from poker_ai.clustering.card_info_lut_builder import CardInfoLutBuilder
 log = logging.getLogger("poker_ai.clustering.exact_hand_strength")
 
 
+# ============================================================================
+# Module-level cache for multiprocessing support
+# ============================================================================
+# When using ProcessPoolExecutor, instance variables don't serialize to workers.
+# Each worker process maintains its own module-level cache (lazy loaded on first use).
+# This allows efficient lookups across all workers without passing large data structures.
+
+_PROCESS_CACHE = {
+    "river_index": None,
+    "turn_index": None,
+    "river_memmap": None,
+    "turn_memmap": None,
+    "river_centroids": None,
+    "turn_centroids": None,
+    "save_dir": None,
+}
+
+
+def _get_process_cache(street: str, save_dir: str):
+    """
+    Get or load lookup data for a street in the current process.
+    
+    This function is called by worker processes to lazily load the index
+    and memmap data they need. Each process loads once and caches.
+    
+    Parameters
+    ----------
+    street : str
+        The street name ("river" or "turn").
+    save_dir : str
+        The save directory containing merged data.
+        
+    Returns
+    -------
+    Tuple[Dict[Tuple, int], np.memmap, np.ndarray]
+        The index, memmap, and centroids for the street.
+        Returns (None, None, None) if not available.
+    """
+    from pathlib import Path
+    
+    # Update save_dir if changed (for different calls to the builder)
+    if _PROCESS_CACHE["save_dir"] != save_dir:
+        _PROCESS_CACHE["save_dir"] = save_dir
+        # Clear cache if save_dir changed
+        _PROCESS_CACHE["river_index"] = None
+        _PROCESS_CACHE["turn_index"] = None
+        _PROCESS_CACHE["river_memmap"] = None
+        _PROCESS_CACHE["turn_memmap"] = None
+        _PROCESS_CACHE["river_centroids"] = None
+        _PROCESS_CACHE["turn_centroids"] = None
+    
+    index_key = f"{street}_index"
+    memmap_key = f"{street}_memmap"
+    centroids_key = f"{street}_centroids"
+    
+    # Return cached if available
+    if _PROCESS_CACHE[index_key] is not None:
+        return _PROCESS_CACHE[index_key], _PROCESS_CACHE[memmap_key], _PROCESS_CACHE[centroids_key]
+    
+    # Load index
+    index_path = Path(save_dir) / "chunks" / street / "lookup_index.joblib"
+    if not index_path.exists():
+        log.warning(f"Index not found for {street} at {index_path}")
+        return None, None, None
+    
+    import joblib
+    index = joblib.load(index_path)
+    _PROCESS_CACHE[index_key] = index
+    
+    # Load memmap
+    merged_path = Path(save_dir) / "chunks" / street / "merged_data.dat"
+    if not merged_path.exists():
+        log.warning(f"Merged data not found for {street} at {merged_path}")
+        return index, None, None
+    
+    memmap = np.load(merged_path, mmap_mode='r', allow_pickle=True)
+    _PROCESS_CACHE[memmap_key] = memmap
+    
+    # Load centroids
+    centroids_path = Path(save_dir) / "chunks" / street / "centroids.npy"
+    if not centroids_path.exists():
+        log.warning(f"Centroids not found for {street} at {centroids_path}")
+        # Return what we have so far
+        return index, memmap, None
+    
+    centroids = np.load(centroids_path, allow_pickle=True)
+    _PROCESS_CACHE[centroids_key] = centroids
+    
+    log.debug(f"Loaded {street} lookup data in process (index: {len(index)}, centroids: {len(centroids)})")
+    return index, memmap, centroids
+
+
 class ExactHandStrengthBuilder(CardInfoLutBuilder):
     """
     Computes exact hand strength using exhaustive enumeration.
@@ -39,16 +131,8 @@ class ExactHandStrengthBuilder(CardInfoLutBuilder):
     Inherits all chunked processing and clustering infrastructure from
     CardInfoLutBuilder.
     
-    Attributes
-    ----------
-    _river_ehs_index : Dict[Tuple, int]
-        Lightweight index mapping river card combos to row index in merged_data.dat.
-        Used for memory-mapped lookups into the merged data file.
-    _turn_dist_index : Dict[Tuple, int]
-        Lightweight index mapping turn card combos to row index in merged_data.dat.
-        Used for memory-mapped lookups into the merged data file.
-    _merged_data_cache : Dict[str, np.memmap]
-        Cache for memory-mapped merged data arrays per street to reduce file access overhead.
+    Uses module-level caching for multiprocessing support - each worker process
+    loads indices, memmaps, and centroids once and reuses them.
     """
 
     def __init__(
@@ -97,80 +181,6 @@ class ExactHandStrengthBuilder(CardInfoLutBuilder):
         self._config.pop("n_simulations_river", None)
         self._config.pop("n_simulations_turn", None)
         self._config.pop("n_simulations_flop", None)
-        
-        # Lightweight indices mapping card combos to row indices in merged data (lazy loaded)
-        # These only store row indices (single integer), not actual data
-        self._river_ehs_index: Optional[Dict[Tuple, int]] = None
-        self._turn_dist_index: Optional[Dict[Tuple, int]] = None
-        
-        # Cache for memory-mapped merged data arrays (one per street)
-        self._merged_data_cache: Dict[str, np.memmap] = {}
-
-    def _get_or_build_index(self, street: str) -> Dict[Tuple, int]:
-        """
-        Get or build a lightweight lookup index for a street.
-        
-        Uses ChunkedProcessor's index-building functionality which only
-        stores row indices (single integer), not the actual EHS data.
-        Thread-safe: uses file locking and read-only memory mapping.
-        
-        Parameters
-        ----------
-        street : str
-            The street name (river, turn, flop).
-            
-        Returns
-        -------
-        Dict[Tuple, int]
-            Lightweight index mapping card combos to row indices in merged_data.dat.
-        """
-        # Load index if it exists, otherwise need to build it from merged data
-        index = self.chunked_processor.load_lookup_index(street)
-        if index is not None:
-            return index
-        
-        # Need to build index - requires all_combos from merge
-        log.info(f"Index not found for {street}, building from merged data...")
-        _, all_combos = self.chunked_processor.get_or_merge_data(street)
-        return self.chunked_processor.get_or_build_index(street, all_combos)
-    
-    def _lookup_ehs_data(
-        self,
-        street: str,
-        combo_key: Tuple[int, ...],
-        index: Dict[Tuple, int],
-    ) -> Optional[np.ndarray]:
-        """
-        Look up EHS data for a card combo using memory-mapped merged data access.
-        
-        Thread-safe: uses read-only memory mapping.
-        
-        Parameters
-        ----------
-        street : str
-            The street name.
-        combo_key : Tuple[int, ...]
-            The card combo key to look up.
-        index : Dict[Tuple, int]
-            The lookup index.
-            
-        Returns
-        -------
-        Optional[np.ndarray]
-            The EHS data for the combo, or None if not found.
-        """
-        # Load merged data into cache if not already present
-        if street not in self._merged_data_cache:
-            merged_path = self.chunked_processor.get_merged_path(street)
-            if merged_path.exists():
-                self._merged_data_cache[street] = np.load(merged_path, mmap_mode='r')
-            else:
-                log.warning(f"Merged data not found for {street}")
-                return None
-        
-        return self.chunked_processor.lookup_data_by_index(
-            street, combo_key, index, self._merged_data_cache.get(street)
-        )
 
     def compute(
         self,
@@ -266,34 +276,6 @@ class ExactHandStrengthBuilder(CardInfoLutBuilder):
     # Turn: Override to use exact EHS distribution computation
     # =========================================================================
     
-    def _make_lut_key(
-        self,
-        our_hand: np.ndarray,
-        board: np.ndarray,
-    ) -> Tuple[int, ...]:
-        """
-        Create a properly sorted LUT key for lookup.
-        
-        Keys in card_info_lut are stored as tuples with:
-        - Hole cards sorted by eval_card descending
-        - Board cards sorted by eval_card descending
-        
-        Parameters
-        ----------
-        our_hand : np.ndarray
-            Our two hole cards (eval_card values).
-        board : np.ndarray
-            The community cards (eval_card values).
-            
-        Returns
-        -------
-        Tuple[int, ...]
-            Sorted key for LUT lookup.
-        """
-        sorted_hand = sorted(our_hand.tolist(), reverse=True)
-        sorted_board = sorted(board.tolist(), reverse=True)
-        return tuple(sorted_hand + sorted_board)
-    
     def compute_exact_turn_ehs_distribution(
         self,
         our_hand: np.ndarray,
@@ -304,6 +286,8 @@ class ExactHandStrengthBuilder(CardInfoLutBuilder):
         
         For each possible river card, looks up the pre-computed river EHS values
         from chunk files instead of recomputing hand evaluations.
+        
+        Uses module-level cache for multiprocessing compatibility.
         
         Parameters
         ----------
@@ -317,39 +301,53 @@ class ExactHandStrengthBuilder(CardInfoLutBuilder):
         np.ndarray
             Distribution over river clusters (normalized frequencies).
         """
-        # Ensure river centroids are available
-        if "river" not in self.centroids or self.centroids["river"] is None:
-            self.centroids["river"] = self.chunked_processor.load_centroids("river")
+        # Get river lookup data from process cache (multiprocessing-safe)
+        # This loads index, memmap, AND centroids to avoid repeated disk I/O
+        river_index, river_memmap, river_centroids = _get_process_cache("river", self._config["save_dir"])
         
-        # Build river EHS index if not already loaded (lightweight, only stores row indices)
-        if self._river_ehs_index is None:
-            self._river_ehs_index = self._get_or_build_index("river")
+        # Fallback to instance centroids if not in cache (shouldn't happen normally)
+        if river_centroids is None:
+            if "river" not in self.centroids or self.centroids["river"] is None:
+                self.centroids["river"] = self.chunked_processor.load_centroids("river")
+            river_centroids = self.centroids["river"]
         
         # Cards not available for river
         unavailable_cards = set(our_hand.tolist() + board.tolist())
         available_cards = [c for c in self._card_ints if c not in unavailable_cards]
         
-        n_river_centroids = len(self.centroids["river"])
+        n_river_centroids = len(river_centroids)
         distribution = np.zeros(n_river_centroids)
         
         if len(available_cards) == 0:
             return distribution
         
+        # Pre-compute hand and board for key generation (avoid repeated conversions)
+        sorted_hand = sorted(our_hand.tolist(), reverse=True)
+        sorted_board_prefix = sorted(board.tolist(), reverse=True)
+        
         # Enumerate all possible river cards
         for river_card in available_cards:
-            river_board = np.append(board, river_card)
+            # Create key efficiently: hand + board + river_card (all sorted)
+            sorted_board = sorted_board_prefix + [river_card]
+            sorted_board.sort(reverse=True)
+            key = tuple(sorted_hand + sorted_board)
             
-            # Look up pre-computed EHS from river chunks via memory-mapped access
-            key = self._make_lut_key(our_hand, river_board)
-            ehs = self._lookup_ehs_data("river", key, self._river_ehs_index)
+            # Lookup using process cache
+            ehs = None
+            if river_index is not None and river_memmap is not None:
+                row_idx = river_index.get(key)
+                if row_idx is not None:
+                    ehs = river_memmap[row_idx]
             
             if ehs is not None:
                 # Find closest centroid using the pre-computed EHS
-                min_idx = self._find_closest_centroid(ehs, self.centroids["river"])
+                min_idx = self._find_closest_centroid(ehs, river_centroids)
             else:
                 # Fallback: compute exact river EHS (shouldn't happen if all chunks complete)
+                # Need to construct river_board for fallback
+                river_board = np.append(board, river_card)
                 ehs = self.compute_exact_river_ehs(our_hand, river_board)
-                min_idx = self._find_closest_centroid(ehs, self.centroids["river"])
+                min_idx = self._find_closest_centroid(ehs, river_centroids)
             
             distribution[min_idx] += 1
         
@@ -393,6 +391,8 @@ class ExactHandStrengthBuilder(CardInfoLutBuilder):
         For each possible turn card, looks up the pre-computed turn EHS distribution
         from the chunks instead of recomputing.
         
+        Uses module-level cache for multiprocessing compatibility.
+        
         Parameters
         ----------
         our_hand : np.ndarray
@@ -405,40 +405,54 @@ class ExactHandStrengthBuilder(CardInfoLutBuilder):
         np.ndarray
             Distribution over turn clusters (normalized frequencies).
         """
-        # Ensure centroids are available (needed for determining n_clusters)
-        if "turn" not in self.centroids or self.centroids["turn"] is None:
-            self.centroids["turn"] = self.chunked_processor.load_centroids("turn")
+        # Get turn lookup data from process cache (multiprocessing-safe)
+        # This loads index, memmap, AND centroids to avoid repeated disk I/O
+        turn_index, turn_memmap, turn_centroids = _get_process_cache("turn", self._config["save_dir"])
         
-        # Build turn distribution index if not already loaded (lightweight, only stores row indices)
-        if self._turn_dist_index is None:
-            self._turn_dist_index = self._get_or_build_index("turn")
+        # Fallback to instance centroids if not in cache (shouldn't happen normally)
+        if turn_centroids is None:
+            if "turn" not in self.centroids or self.centroids["turn"] is None:
+                self.centroids["turn"] = self.chunked_processor.load_centroids("turn")
+            turn_centroids = self.centroids["turn"]
         
         # Cards not available for turn
         unavailable_cards = set(our_hand.tolist() + board.tolist())
         available_cards = [c for c in self._card_ints if c not in unavailable_cards]
         
-        n_turn_centroids = len(self.centroids["turn"])
+        n_turn_centroids = len(turn_centroids)
         distribution = np.zeros(n_turn_centroids)
         
         if len(available_cards) == 0:
             return distribution
         
+        # Pre-compute hand and board for key generation (avoid repeated conversions)
+        sorted_hand = sorted(our_hand.tolist(), reverse=True)
+        sorted_board_prefix = sorted(board.tolist(), reverse=True)
+        
         # Enumerate all possible turn cards
         for turn_card in available_cards:
-            turn_board = np.append(board, turn_card)
-            key = self._make_lut_key(our_hand, turn_board)
+            # Create key efficiently: hand + board + turn_card (all sorted)
+            sorted_board = sorted_board_prefix + [turn_card]
+            sorted_board.sort(reverse=True)
+            key = tuple(sorted_hand + sorted_board)
             
-            # Look up pre-computed turn EHS distribution via memory-mapped access
-            turn_ehs_dist = self._lookup_ehs_data("turn", key, self._turn_dist_index)
+            # Lookup using process cache
+            turn_ehs_dist = None
+            if turn_index is not None and turn_memmap is not None:
+                row_idx = turn_index.get(key)
+                if row_idx is not None:
+                    turn_ehs_dist = turn_memmap[row_idx]
             
             if turn_ehs_dist is not None:
                 # Find closest centroid for the distribution
-                min_idx = self._find_closest_centroid(turn_ehs_dist, self.centroids["turn"])
+                min_idx = self._find_closest_centroid(turn_ehs_dist, turn_centroids)
                 distribution[min_idx] += 1
             else:
                 # Fallback: compute if not found in chunks (shouldn't happen normally)
+                # Need to construct turn_board for fallback
+                turn_board = np.append(board, turn_card)
                 turn_ehs_dist = self.compute_exact_turn_ehs_distribution(our_hand, turn_board)
-                min_idx = self._find_closest_centroid(turn_ehs_dist, self.centroids["turn"])
+                min_idx = self._find_closest_centroid(turn_ehs_dist, turn_centroids)
                 distribution[min_idx] += 1
         
         # Normalize
