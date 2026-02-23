@@ -125,6 +125,7 @@ class CardInfoLutBuilder(CardCombos):
         self.chunked_processor = ChunkedProcessor(
             save_dir=self.save_dir,
             chunk_size=chunk_size,
+            use_compression=False,  # No compression - faster I/O with sufficient disk space
         )
         
         # Load existing results if available

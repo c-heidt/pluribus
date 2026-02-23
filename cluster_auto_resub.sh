@@ -22,7 +22,8 @@ set -euo pipefail
 CONDA_ENV=${CONDA_ENV:-pluribus}
 PROJECT_DIR=${PROJECT_DIR:-"$HOME/pluribus"}
 WORKERS=${WORKERS:-30}
-SAVE_DIR=${SAVE_DIR:-"$PROJECT_DIR/data/clustering/20cards_exact"}
+WORKSPACE=${WORKSPACE:-/pfs/work9/workspace/scratch/ka_gu4593-clustering_20}  # Workspace path!
+SAVE_DIR=${SAVE_DIR:-"$WORKSPACE/exact"}
 
 # Clustering parameters (adjust as needed)
 LOW_CARD_RANK=${LOW_CARD_RANK:-10}
@@ -33,7 +34,7 @@ N_FLOP_CLUSTERS=${N_FLOP_CLUSTERS:-50}
 N_SIMULATIONS_RIVER=${N_SIMULATIONS_RIVER:-100}
 N_SIMULATIONS_TURN=${N_SIMULATIONS_TURN:-200}
 N_SIMULATIONS_FLOP=${N_SIMULATIONS_FLOP:-1000}
-CHUNK_SIZE=${CHUNK_SIZE:-10000}
+CHUNK_SIZE=${CHUNK_SIZE:-20000}
 MAX_RESUBMISSIONS=${MAX_RESUBMISSIONS:-2}
 # Computation method: monte_carlo or exact 
 # If exact, N_SIMULATIONS_* parameters are ignored
@@ -134,6 +135,15 @@ except:
     sys.exit(1)
 " 2>/dev/null; then
     echo "✓ Clustering completed successfully!"
+    
+    # Copy final results to home directory for permanent storage
+    FINAL_DIR="$PROJECT_DIR/data/clustering/20cards_exact"
+    mkdir -p "$FINAL_DIR"
+    echo "Copying final results to home directory: $FINAL_DIR"
+    cp "$SAVE_DIR"/*.joblib "$FINAL_DIR/" 2>/dev/null || true
+    cp "$SAVE_DIR"/checkpoint.json "$FINAL_DIR/" 2>/dev/null || true
+    echo "✓ Results saved to permanent storage"
+    
     exit 0
   fi
 fi
