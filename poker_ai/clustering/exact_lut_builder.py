@@ -82,18 +82,18 @@ def _get_process_cache(street: str, save_dir: str):
     if _PROCESS_CACHE[index_key] is not None:
         return _PROCESS_CACHE[index_key], _PROCESS_CACHE[memmap_key], _PROCESS_CACHE[centroids_key]
     
-    # Load index
-    index_path = Path(save_dir) / "chunks" / street / "lookup_index.joblib"
+    # Load index (saved as .npy by chunked_processor)
+    index_path = Path(save_dir) / street / "lookup_index.npy"
     if not index_path.exists():
         log.warning(f"Index not found for {street} at {index_path}")
         return None, None, None
     
-    import joblib
-    index = joblib.load(index_path)
+    # Load index saved with np.save (dictionary stored with allow_pickle=True)
+    index = np.load(index_path, allow_pickle=True).item()
     _PROCESS_CACHE[index_key] = index
     
     # Load memmap
-    merged_path = Path(save_dir) / "chunks" / street / "merged_data.dat"
+    merged_path = Path(save_dir) / street / "merged_data.dat"
     if not merged_path.exists():
         log.warning(f"Merged data not found for {street} at {merged_path}")
         return index, None, None
@@ -102,7 +102,7 @@ def _get_process_cache(street: str, save_dir: str):
     _PROCESS_CACHE[memmap_key] = memmap
     
     # Load centroids
-    centroids_path = Path(save_dir) / "chunks" / street / "centroids.npy"
+    centroids_path = Path(save_dir) / street / "centroids.npy"
     if not centroids_path.exists():
         log.warning(f"Centroids not found for {street} at {centroids_path}")
         # Return what we have so far
@@ -113,6 +113,31 @@ def _get_process_cache(street: str, save_dir: str):
     
     log.debug(f"Loaded {street} lookup data in process (index: {len(index)}, centroids: {len(centroids)})")
     return index, memmap, centroids
+
+
+def _clear_process_cache_for_street(street: str):
+    """
+    Clear cached data for a specific street to free memory.
+    
+    Call this when a street's data is no longer needed:
+    - Clear river cache when turn completes (flop doesn't need river)
+    - Could clear turn cache when flop completes (nothing after flop)
+    
+    Parameters
+    ----------
+    street : str
+        The street name ("river" or "turn").
+    """
+    index_key = f"{street}_index"
+    memmap_key = f"{street}_memmap"
+    centroids_key = f"{street}_centroids"
+    
+    # Clear the cache entries
+    _PROCESS_CACHE[index_key] = None
+    _PROCESS_CACHE[memmap_key] = None
+    _PROCESS_CACHE[centroids_key] = None
+    
+    log.debug(f"Cleared process cache for {street}")
 
 
 class ExactHandStrengthBuilder(CardInfoLutBuilder):
@@ -392,6 +417,7 @@ class ExactHandStrengthBuilder(CardInfoLutBuilder):
         from the chunks instead of recomputing.
         
         Uses module-level cache for multiprocessing compatibility.
+        River cache is cleared on first call to free memory (flop doesn't need river data).
         
         Parameters
         ----------
@@ -405,6 +431,11 @@ class ExactHandStrengthBuilder(CardInfoLutBuilder):
         np.ndarray
             Distribution over turn clusters (normalized frequencies).
         """
+        # Clear river cache on first flop call in this process to save memory
+        # Flop only needs turn data, not river data
+        if _PROCESS_CACHE["river_index"] is not None:
+            _clear_process_cache_for_street("river")
+        
         # Get turn lookup data from process cache (multiprocessing-safe)
         # This loads index, memmap, AND centroids to avoid repeated disk I/O
         turn_index, turn_memmap, turn_centroids = _get_process_cache("turn", self._config["save_dir"])

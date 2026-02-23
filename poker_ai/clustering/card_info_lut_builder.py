@@ -710,36 +710,6 @@ class CardInfoLutBuilder(CardCombos):
         
         return centroids, y_km
 
-    # Keep the old cluster method for backward compatibility
-    @staticmethod
-    def cluster(num_clusters: int, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Legacy clustering method for backward compatibility.
-        
-        Parameters
-        ----------
-        num_clusters : int
-            Number of clusters.
-        X : np.ndarray
-            Data to cluster.
-            
-        Returns
-        -------
-        Tuple[np.ndarray, np.ndarray]
-            Tuple of (centroids, cluster_assignments).
-        """
-        km = KMeans(
-            n_clusters=num_clusters,
-            init="random",
-            n_init=10,
-            max_iter=300,
-            tol=1e-04,
-            random_state=0,
-        )
-        y_km = km.fit_predict(X)
-        centroids = km.cluster_centers_
-        return centroids, y_km
-
     def _find_closest_centroid(
         self,
         point: np.ndarray,
