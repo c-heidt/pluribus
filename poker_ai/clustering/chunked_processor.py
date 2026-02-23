@@ -91,9 +91,27 @@ class ChunkedProcessor:
         """Return an empty checkpoint structure."""
         return {
             "streets": {
-                "river": {"completed_chunks": [], "total_chunks": 0, "merge_done": False, "clustering_done": False},
-                "turn": {"completed_chunks": [], "total_chunks": 0, "merge_done": False, "clustering_done": False},
-                "flop": {"completed_chunks": [], "total_chunks": 0, "merge_done": False, "clustering_done": False},
+                "river": {
+                    "completed_chunks": [],
+                    "total_chunks": 0,
+                    "merge_done": False,
+                    "clustering_done": False,
+                    "feature_dim": None,
+                },
+                "turn": {
+                    "completed_chunks": [],
+                    "total_chunks": 0,
+                    "merge_done": False,
+                    "clustering_done": False,
+                    "feature_dim": None,
+                },
+                "flop": {
+                    "completed_chunks": [],
+                    "total_chunks": 0,
+                    "merge_done": False,
+                    "clustering_done": False,
+                    "feature_dim": None,
+                },
             },
             "config": {},
         }
@@ -185,6 +203,7 @@ class ChunkedProcessor:
                 "total_chunks": n_chunks,
                 "merge_done": False,
                 "clustering_done": False,
+                "feature_dim": None,
             }
             # Clear old chunk files if configuration changed
             self._clear_street_data(street)
@@ -401,6 +420,10 @@ class ChunkedProcessor:
         
         log.info(f"Total rows for {street}: {total_rows}, feature_dim: {feature_dim}")
         
+        # Store feature_dim in checkpoint for later use (after cleanup)
+        self._checkpoint["streets"][street]["feature_dim"] = int(feature_dim)
+        self._save_checkpoint()
+        
         # Create memory-mapped file for merged data
         merged_path = self.get_street_dir(street) / "merged_data.dat"
         merged_data = np.memmap(
@@ -479,19 +502,32 @@ class ChunkedProcessor:
         # Load combos to get shape
         all_combos = np.load(combos_path, allow_pickle=True)
         
-        # Determine feature dimension from first chunk
-        completed_chunks = sorted(self.get_completed_chunks(street))
-        if not completed_chunks:
-            raise ValueError(f"No completed chunks found for {street}")
-        first_chunk_data, _ = self.load_chunk(street, completed_chunks[0])
-        feature_dim = first_chunk_data.shape[1] if first_chunk_data.ndim > 1 else 1
+        # Get feature dimension from checkpoint (stored during merge)
+        feature_dim = self._checkpoint["streets"].get(street, {}).get("feature_dim")
+        
+        if feature_dim is None:
+            # Fallback: try to determine from first chunk if still available
+            completed_chunks = sorted(self.get_completed_chunks(street))
+            if not completed_chunks:
+                raise ValueError(f"No completed chunks found for {street}")
+            try:
+                first_chunk_data, _ = self.load_chunk(street, completed_chunks[0])
+                feature_dim = first_chunk_data.shape[1] if first_chunk_data.ndim > 1 else 1
+                # Store for next time
+                self._checkpoint["streets"][street]["feature_dim"] = int(feature_dim)
+                self._save_checkpoint()
+            except FileNotFoundError:
+                raise ValueError(
+                    f"Cannot determine feature dimension for {street}: "
+                    f"chunks cleaned up and feature_dim not in checkpoint"
+                )
         
         # Load memory-mapped file
         total_rows = len(all_combos)
         merged_data = np.memmap(
             merged_path,
             dtype=dtype,
-            mode='r+',
+            mode='r',
             shape=(total_rows, feature_dim),
         )
         
@@ -676,10 +712,6 @@ class ChunkedProcessor:
         """Get the path for the lookup index file."""
         return self.get_street_dir(street) / "lookup_index.npy"
     
-    def get_merged_path(self, street: str) -> Path:
-        """Get the path for the merged data file."""
-        return self.get_street_dir(street) / "merged_data.dat"
-    
     def build_lookup_index(
         self,
         street: str,
@@ -739,7 +771,7 @@ class ChunkedProcessor:
             The lookup index to save.
         """
         index_path = self.get_lookup_index_path(street)
-        temp_path = index_path.with_suffix(".tmp.npy")
+        temp_path = index_path.parent / f"{index_path.stem}.tmp{index_path.suffix}"
         
         try:
             np.save(temp_path, index, allow_pickle=True)
@@ -770,52 +802,6 @@ class ChunkedProcessor:
         if index_path.exists():
             return np.load(index_path, allow_pickle=True).item()
         return None
-    
-    def lookup_data_by_index(
-        self,
-        street: str,
-        combo_key: Tuple[int, ...],
-        index: Dict[Tuple[int, ...], int],
-        merged_data_cache: Optional[np.memmap] = None,
-    ) -> Optional[np.ndarray]:
-        """
-        Look up data for a specific card combo using memory-mapped merged data.
-        
-        Thread-safe: uses read-only memory mapping for merged data file.
-        
-        Parameters
-        ----------
-        street : str
-            The street name.
-        combo_key : Tuple[int, ...]
-            The card combo key to look up.
-        index : Dict[Tuple[int, ...], int]
-            The lookup index mapping keys to row indices.
-        merged_data_cache : Optional[np.memmap]
-            Optional cached reference to the memory-mapped merged data.
-            If None, opens the file on each call (still efficient due to OS caching).
-            
-        Returns
-        -------
-        Optional[np.ndarray]
-            The data for the combo, or None if not found.
-        """
-        row_idx = index.get(combo_key)
-        if row_idx is None:
-            return None
-        
-        # Use cached memmap if provided, otherwise open file
-        if merged_data_cache is not None:
-            return merged_data_cache[row_idx].copy()
-        
-        # Memory-map the merged data file for thread-safe read access
-        merged_path = self.get_merged_path(street)
-        if not merged_path.exists():
-            log.warning(f"Merged data file not found for {street}: {merged_path}")
-            return None
-        
-        merged_data = np.load(merged_path, mmap_mode='r')
-        return merged_data[row_idx].copy()
     
     def get_or_build_index(
         self,
