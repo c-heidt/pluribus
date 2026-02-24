@@ -4,18 +4,52 @@ Chunked processing with checkpointing for memory-efficient clustering.
 This module provides utilities for processing large datasets in chunks,
 saving intermediate results to disk, and resuming from checkpoints.
 """
+import concurrent.futures
 import fcntl
 import gzip
 import json
 import logging
 import os
 import shutil
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
 log = logging.getLogger("poker_ai.clustering.chunked_processor")
+
+
+def _process_single_chunk_worker(
+    chunk_idx: int,
+    chunk_combos: np.ndarray,
+    item_processor: Callable[[np.ndarray], np.ndarray],
+) -> Tuple[int, np.ndarray, np.ndarray]:
+    """
+    Worker function to process a single chunk.
+    
+    This is a module-level function so it can be pickled for multiprocessing.
+    Each worker processes ALL items in its assigned chunk sequentially.
+    
+    Parameters
+    ----------
+    chunk_idx : int
+        The chunk index being processed.
+    chunk_combos : np.ndarray
+        Array of card combinations for this chunk.
+    item_processor : Callable
+        Function to process a single card combo, returns feature array.
+        
+    Returns
+    -------
+    Tuple[int, np.ndarray, np.ndarray]
+        Tuple of (chunk_idx, results_array, chunk_combos).
+    """
+    results = []
+    for combo in chunk_combos:
+        result = item_processor(combo)
+        results.append(result)
+    return chunk_idx, np.array(results, dtype=np.float32), chunk_combos
 
 
 class ChunkedProcessor:
@@ -348,6 +382,93 @@ class ChunkedProcessor:
         """Mark clustering as complete for a street."""
         self._checkpoint["streets"][street]["clustering_done"] = True
         self._save_checkpoint()
+    
+    def process_chunks_parallel(
+        self,
+        street: str,
+        chunk_indices: List[int],
+        all_combos: np.ndarray,
+        item_processor: Callable[[np.ndarray], np.ndarray],
+        workers: int,
+    ):
+        """
+        Process multiple chunks in parallel, one chunk per worker.
+        
+        Each worker processes all items in its assigned chunk sequentially.
+        This approach minimizes pickling overhead (each chunk's combos are sent
+        once per worker) and allows workers to maintain local caches efficiently.
+        
+        Results are saved to disk as each chunk completes, enabling resumability.
+        
+        Parameters
+        ----------
+        street : str
+            The street name (river, turn, flop).
+        chunk_indices : List[int]
+            List of chunk indices to process.
+        all_combos : np.ndarray
+            Full array of all card combinations for this street.
+        item_processor : Callable
+            Function to process a single card combo. Must be picklable.
+            Signature: (combo: np.ndarray) -> np.ndarray
+        workers : int
+            Number of worker processes to use.
+        """
+        if not chunk_indices:
+            log.info(f"No chunks to process for {street}")
+            return
+        
+        chunk_specs = self.get_chunk_indices(len(all_combos))
+        total_chunks = len(chunk_specs)
+        
+        log.info(f"Processing {len(chunk_indices)} chunks with {workers} workers (1 chunk per worker)...")
+        start_time = time.time()
+        
+        # Track completed count for progress updates
+        completed_count = len(self.get_completed_chunks(street))
+        
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+            # Submit all chunks - each worker gets one chunk
+            futures = {}
+            for chunk_idx in chunk_indices:
+                _, start_idx, end_idx = chunk_specs[chunk_idx]
+                chunk_combos = all_combos[start_idx:end_idx]
+                
+                future = executor.submit(
+                    _process_single_chunk_worker,
+                    chunk_idx,
+                    chunk_combos,
+                    item_processor,
+                )
+                futures[future] = chunk_idx
+            
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(futures):
+                chunk_idx = futures[future]
+                try:
+                    result_idx, results, combos = future.result()
+                    
+                    # Save chunk to disk
+                    self.save_chunk(street, result_idx, results, combos)
+                    self.mark_chunk_complete(street, result_idx)
+                    completed_count += 1
+                    
+                    # Progress update every 20 chunks (or on first and last)
+                    is_last = completed_count == total_chunks
+                    if completed_count % 20 == 0 or completed_count == 1 or is_last:
+                        elapsed = time.time() - start_time
+                        rate = completed_count / elapsed if elapsed > 0 else 0
+                        remaining = (total_chunks - completed_count) / rate if rate > 0 else 0
+                        log.info(
+                            f"[{street.upper()}] Chunk {completed_count}/{total_chunks} | "
+                            f"Elapsed: {elapsed/60:.1f}m | "
+                            f"ETA: {remaining/60:.1f}m | "
+                            f"Rate: {rate*60:.1f} chunks/min"
+                        )
+                    
+                except Exception as e:
+                    log.error(f"Chunk {chunk_idx} failed: {e}")
+                    raise
     
     def load_chunk(self, street: str, chunk_idx: int) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -704,138 +825,4 @@ class ChunkedProcessor:
         if total_freed > 0:
             log.info(f"Total disk space freed: {total_freed / (1024**2):.1f} MB")
 
-    # =========================================================================
-    # Index-based lookup methods for memory-efficient data access
-    # =========================================================================
-    
-    def get_lookup_index_path(self, street: str) -> Path:
-        """Get the path for the lookup index file."""
-        return self.get_street_dir(street) / "lookup_index.npy"
-    
-    def build_lookup_index(
-        self,
-        street: str,
-        all_combos: np.ndarray,
-        key_builder: callable = None,
-    ) -> Dict[Tuple[int, ...], int]:
-        """
-        Build a lightweight index mapping card combos to their row in merged data.
-        
-        This index stores only row indices (single integer), not the actual data,
-        making it much more memory-efficient than loading all data.
-        
-        Thread-safe: only reads from completed merge.
-        
-        Parameters
-        ----------
-        street : str
-            The street name (river, turn, flop).
-        all_combos : np.ndarray
-            All card combos in order (from merge_chunks_to_memmap).
-        key_builder : callable, optional
-            Function that takes a combo array and returns a tuple key.
-            If None, uses tuple(combo) directly.
-            
-        Returns
-        -------
-        Dict[Tuple[int, ...], int]
-            Maps combo key to row index in merged_data.dat.
-        """
-        log.info(f"Building lookup index for {street}...")
-        
-        index: Dict[Tuple[int, ...], int] = {}
-        
-        for row_idx, combo in enumerate(all_combos):
-            if key_builder is not None:
-                key = key_builder(combo)
-            else:
-                key = tuple(combo)
-            index[key] = row_idx
-        
-        log.info(f"Built {street} lookup index with {len(index):,} entries")
-        return index
-    
-    def save_lookup_index(
-        self,
-        street: str,
-        index: Dict[Tuple[int, ...], int],
-    ):
-        """
-        Save a lookup index to disk for later reuse.
-        
-        Parameters
-        ----------
-        street : str
-            The street name.
-        index : Dict[Tuple[int, ...], int]
-            The lookup index to save.
-        """
-        index_path = self.get_lookup_index_path(street)
-        temp_path = index_path.parent / f"{index_path.stem}.tmp{index_path.suffix}"
-        
-        try:
-            np.save(temp_path, index, allow_pickle=True)
-            shutil.move(str(temp_path), str(index_path))
-        except Exception as e:
-            if temp_path.exists():
-                temp_path.unlink()
-            raise RuntimeError(f"Failed to save lookup index: {e}")
-    
-    def load_lookup_index(
-        self,
-        street: str,
-    ) -> Optional[Dict[Tuple[int, ...], int]]:
-        """
-        Load a previously saved lookup index from disk.
-        
-        Parameters
-        ----------
-        street : str
-            The street name.
-            
-        Returns
-        -------
-        Optional[Dict[Tuple[int, ...], int]]
-            The lookup index, or None if not found.
-        """
-        index_path = self.get_lookup_index_path(street)
-        if index_path.exists():
-            return np.load(index_path, allow_pickle=True).item()
-        return None
-    
-    def get_or_build_index(
-        self,
-        street: str,
-        all_combos: np.ndarray,
-        key_builder: callable = None,
-    ) -> Dict[Tuple[int, ...], int]:
-        """
-        Get existing lookup index or build and save a new one.
-        
-        Thread-safe: builds index from read-only merged data.
-        
-        Parameters
-        ----------
-        street : str
-            The street name.
-        all_combos : np.ndarray
-            All card combos in order (from merge_chunks_to_memmap).
-        key_builder : callable, optional
-            Function to build keys from combos. Must be consistent
-            across all uses of this index.
-            
-        Returns
-        -------
-        Dict[Tuple[int, ...], int]
-            The lookup index.
-        """
-        # Try to load existing index
-        index = self.load_lookup_index(street)
-        if index is not None:
-            log.info(f"Loaded existing {street} lookup index with {len(index):,} entries")
-            return index
-        
-        # Build new index from merged data combos
-        index = self.build_lookup_index(street, all_combos, key_builder)
-        self.save_lookup_index(street, index)
-        return index
+   

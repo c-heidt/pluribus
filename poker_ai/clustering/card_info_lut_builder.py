@@ -14,7 +14,6 @@ import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-import concurrent.futures
 import os
 
 import joblib
@@ -144,7 +143,31 @@ class CardInfoLutBuilder(CardCombos):
             "low_card_rank": low_card_rank,
             "high_card_rank": high_card_rank,
             "chunk_size": chunk_size,
+            "save_dir": str(self.save_dir),  # Store as string for serialization
         }
+
+    def __getstate__(self):
+        """
+        Custom pickle state to reduce serialization size for multiprocessing.
+        
+        Excludes card_info_lut since worker processes use
+        module-level cache (_get_process_cache) to load data from disk instead.
+        Also excludes chunked_processor which contains file handles.
+        """
+        state = self.__dict__.copy()
+        # Exclude large data structures that workers don't need
+        # Workers use module-level cache loaded from disk files
+        state['card_info_lut'] = {}
+        state['centroids'] = {}
+        # Exclude non-picklable or unnecessary objects
+        state['chunked_processor'] = None
+        return state
+
+    def __setstate__(self, state):
+        """Restore state after unpickling in worker process."""
+        self.__dict__.update(state)
+        # Workers will use module-level cache, so empty dicts are fine
+        # chunked_processor is not needed in workers
 
     def _get_worker_count(self) -> int:
         """Get the number of worker processes to use."""
@@ -256,10 +279,6 @@ class CardInfoLutBuilder(CardCombos):
             # Merge (or load if already merged) and cluster
             merged_data, all_combos = self.chunked_processor.get_or_merge_data(street)
             
-            # Build lookup index for later use (e.g., by turn stage)
-            log.info(f"Building lookup index for {street}...")
-            self.chunked_processor.get_or_build_index(street, all_combos)
-            
             self.centroids["river"], clusters = self._cluster(
                 num_clusters=n_river_clusters,
                 X=merged_data,
@@ -282,56 +301,15 @@ class CardInfoLutBuilder(CardCombos):
         return self.create_card_lookup(clusters, all_combos)
 
     def _process_river_chunks(self, chunk_indices: List[int]):
-        """Process river chunks in parallel (2 chunks simultaneously)."""
+        """Process river chunks in parallel (one chunk per worker)."""
         workers = self._get_worker_count()
-        chunk_specs = self.chunked_processor.get_chunk_indices(len(self.river))
-        parallel_chunks = 2  # Process 2 chunks at a time
-        total_chunks = len(self.chunked_processor.get_chunk_indices(len(self.river)))
-        
-        log.info(f"Processing {len(chunk_indices)} chunks with {workers} workers...")
-        start_time = time.time()
-        
-        # Reuse single executor for all chunks
-        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-            # Process parallel_chunks at a time
-            for batch_idx, batch_start in enumerate(range(0, len(chunk_indices), parallel_chunks)):
-                chunk_batch = chunk_indices[batch_start:batch_start + parallel_chunks]
-                futures = {}
-                
-                # Submit all chunks in this batch
-                for chunk_idx in chunk_batch:
-                    _, start_idx, end_idx = chunk_specs[chunk_idx]
-                    chunk_combos = self.river[start_idx:end_idx]
-                    chunksize = max(1, len(chunk_combos) // (workers * 4))
-                    
-                    future = executor.map(
-                        self.process_river_ehs,
-                        chunk_combos,
-                        chunksize=chunksize,
-                    )
-                    futures[chunk_idx] = (future, chunk_combos)
-                
-                # Collect results and save
-                for chunk_idx, (future, chunk_combos) in futures.items():
-                    chunk_results = list(future)
-                    self.chunked_processor.save_chunk(
-                        "river",
-                        chunk_idx,
-                        np.array(chunk_results, dtype=np.float32),
-                        chunk_combos,
-                    )
-                    self.chunked_processor.mark_chunk_complete("river", chunk_idx)
-                
-                # Progress update every few batches
-                if (batch_idx + 1) % 10 == 0 or batch_idx == 0:
-                    completed = len(chunk_indices) - len(self.chunked_processor.get_incomplete_chunks("river"))
-                    elapsed = time.time() - start_time
-                    rate = completed / elapsed if elapsed > 0 else 0
-                    remaining = (total_chunks - completed) / rate if rate > 0 else 0
-                    log.info(f"[RIVER] Chunk {completed}/{total_chunks} | "
-                            f"Elapsed: {elapsed/3600:.1f}h | "
-                            f"ETA: {remaining/3600:.1f}h | "
-                            f"Rate: {rate*3600:.1f} chunks/hr")
+        self.chunked_processor.process_chunks_parallel(
+            street="river",
+            chunk_indices=chunk_indices,
+            all_combos=self.river,
+            item_processor=self.process_river_ehs,
+            workers=workers,
+        )
 
     def _compute_turn_clusters(self, n_turn_clusters: int) -> Dict:
         """
@@ -375,10 +353,6 @@ class CardInfoLutBuilder(CardCombos):
             # Merge (or load if already merged) and cluster
             merged_data, all_combos = self.chunked_processor.get_or_merge_data(street)
             
-            # Build lookup index for later use (e.g., by flop stage)
-            log.info(f"Building lookup index for {street}...")
-            self.chunked_processor.get_or_build_index(street, all_combos)
-            
             self.centroids["turn"], clusters = self._cluster(
                 num_clusters=n_turn_clusters,
                 X=merged_data,
@@ -401,56 +375,15 @@ class CardInfoLutBuilder(CardCombos):
         return self.create_card_lookup(clusters, all_combos)
 
     def _process_turn_chunks(self, chunk_indices: List[int]):
-        """Process turn chunks in parallel (2 chunks simultaneously)."""
+        """Process turn chunks in parallel (one chunk per worker)."""
         workers = self._get_worker_count()
-        chunk_specs = self.chunked_processor.get_chunk_indices(len(self.turn))
-        parallel_chunks = 2  # Process 2 chunks at a time
-        total_chunks = len(self.chunked_processor.get_chunk_indices(len(self.turn)))
-        
-        log.info(f"Processing {len(chunk_indices)} chunks with {workers} workers...")
-        start_time = time.time()
-        
-        # Reuse single executor for all chunks
-        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-            # Process parallel_chunks at a time
-            for batch_idx, batch_start in enumerate(range(0, len(chunk_indices), parallel_chunks)):
-                chunk_batch = chunk_indices[batch_start:batch_start + parallel_chunks]
-                futures = {}
-                
-                # Submit all chunks in this batch
-                for chunk_idx in chunk_batch:
-                    _, start_idx, end_idx = chunk_specs[chunk_idx]
-                    chunk_combos = self.turn[start_idx:end_idx]
-                    chunksize = max(1, len(chunk_combos) // (workers * 4))
-                    
-                    future = executor.map(
-                        self.process_turn_ehs_distributions,
-                        chunk_combos,
-                        chunksize=chunksize,
-                    )
-                    futures[chunk_idx] = (future, chunk_combos)
-                
-                # Collect results and save
-                for chunk_idx, (future, chunk_combos) in futures.items():
-                    chunk_results = list(future)
-                    self.chunked_processor.save_chunk(
-                        "turn",
-                        chunk_idx,
-                        np.array(chunk_results, dtype=np.float32),
-                        chunk_combos,
-                    )
-                    self.chunked_processor.mark_chunk_complete("turn", chunk_idx)
-                
-                # Progress update every few batches
-                if (batch_idx + 1) % 10 == 0 or batch_idx == 0:
-                    completed = len(chunk_indices) - len(self.chunked_processor.get_incomplete_chunks("turn"))
-                    elapsed = time.time() - start_time
-                    rate = completed / elapsed if elapsed > 0 else 0
-                    remaining = (total_chunks - completed) / rate if rate > 0 else 0
-                    log.info(f"[TURN] Chunk {completed}/{total_chunks} | "
-                            f"Elapsed: {elapsed/3600:.1f}h | "
-                            f"ETA: {remaining/3600:.1f}h | "
-                            f"Rate: {rate*3600:.1f} chunks/hr")
+        self.chunked_processor.process_chunks_parallel(
+            street="turn",
+            chunk_indices=chunk_indices,
+            all_combos=self.turn,
+            item_processor=self.process_turn_ehs_distributions,
+            workers=workers,
+        )
 
     def _compute_flop_clusters(self, n_flop_clusters: int) -> Dict:
         """
@@ -494,10 +427,6 @@ class CardInfoLutBuilder(CardCombos):
             # Merge (or load if already merged) and cluster
             merged_data, all_combos = self.chunked_processor.get_or_merge_data(street)
             
-            # Build lookup index (though flop is final stage)
-            log.info(f"Building lookup index for {street}...")
-            self.chunked_processor.get_or_build_index(street, all_combos)
-            
             self.centroids["flop"], clusters = self._cluster(
                 num_clusters=n_flop_clusters,
                 X=merged_data,
@@ -520,56 +449,15 @@ class CardInfoLutBuilder(CardCombos):
         return self.create_card_lookup(clusters, all_combos)
 
     def _process_flop_chunks(self, chunk_indices: List[int]):
-        """Process flop chunks in parallel (2 chunks simultaneously)."""
+        """Process flop chunks in parallel (one chunk per worker)."""
         workers = self._get_worker_count()
-        chunk_specs = self.chunked_processor.get_chunk_indices(len(self.flop))
-        parallel_chunks = 2  # Process 2 chunks at a time
-        total_chunks = len(self.chunked_processor.get_chunk_indices(len(self.flop)))
-        
-        log.info(f"Processing {len(chunk_indices)} chunks with {workers} workers...")
-        start_time = time.time()
-        
-        # Reuse single executor for all chunks
-        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-            # Process parallel_chunks at a time
-            for batch_idx, batch_start in enumerate(range(0, len(chunk_indices), parallel_chunks)):
-                chunk_batch = chunk_indices[batch_start:batch_start + parallel_chunks]
-                futures = {}
-                
-                # Submit all chunks in this batch
-                for chunk_idx in chunk_batch:
-                    _, start_idx, end_idx = chunk_specs[chunk_idx]
-                    chunk_combos = self.flop[start_idx:end_idx]
-                    chunksize = max(1, len(chunk_combos) // (workers * 4))
-                    
-                    future = executor.map(
-                        self.process_flop_potential_aware_distributions,
-                        chunk_combos,
-                        chunksize=chunksize,
-                    )
-                    futures[chunk_idx] = (future, chunk_combos)
-                
-                # Collect results and save
-                for chunk_idx, (future, chunk_combos) in futures.items():
-                    chunk_results = list(future)
-                    self.chunked_processor.save_chunk(
-                        "flop",
-                        chunk_idx,
-                        np.array(chunk_results, dtype=np.float32),
-                        chunk_combos,
-                    )
-                    self.chunked_processor.mark_chunk_complete("flop", chunk_idx)
-                
-                # Progress update every few batches
-                if (batch_idx + 1) % 10 == 0 or batch_idx == 0:
-                    completed = len(chunk_indices) - len(self.chunked_processor.get_incomplete_chunks("flop"))
-                    elapsed = time.time() - start_time
-                    rate = completed / elapsed if elapsed > 0 else 0
-                    remaining = (total_chunks - completed) / rate if rate > 0 else 0
-                    log.info(f"[FLOP] Chunk {completed}/{total_chunks} | "
-                            f"Elapsed: {elapsed/3600:.1f}h | "
-                            f"ETA: {remaining/3600:.1f}h | "
-                            f"Rate: {rate*3600:.1f} chunks/hr")
+        self.chunked_processor.process_chunks_parallel(
+            street="flop",
+            chunk_indices=chunk_indices,
+            all_combos=self.flop,
+            item_processor=self.process_flop_potential_aware_distributions,
+            workers=workers,
+        )
 
     def _cluster(
         self,
