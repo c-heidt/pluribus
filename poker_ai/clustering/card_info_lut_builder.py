@@ -71,6 +71,7 @@ class CardInfoLutBuilder(CardCombos):
         workers: Optional[int] = None,
         chunk_size: int = 10000,
         use_mini_batch: bool = True,
+        parallel_combos: bool = True,
     ):
         """
         Initialize the CardInfoLutBuilder.
@@ -95,6 +96,9 @@ class CardInfoLutBuilder(CardCombos):
             Number of combinations per chunk. Default 10000.
         use_mini_batch : bool
             Whether to use MiniBatchKMeans for large datasets. Default True.
+        parallel_combos : bool
+            Whether to use parallel processing for combo generation.
+            Recommended for decks with >15 cards. Default False.
         """
         self.n_simulations_river = n_simulations_river
         self.n_simulations_turn = n_simulations_turn
@@ -103,7 +107,7 @@ class CardInfoLutBuilder(CardCombos):
         self.chunk_size = chunk_size
         self.use_mini_batch = use_mini_batch
         
-        super().__init__(low_card_rank, high_card_rank)
+        super().__init__(low_card_rank, high_card_rank, parallel=parallel_combos, n_workers=workers)
         
         # Select appropriate evaluator based on deck size
         n_ranks = high_card_rank - low_card_rank + 1
