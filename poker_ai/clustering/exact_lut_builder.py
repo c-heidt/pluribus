@@ -284,6 +284,33 @@ class ExactHandStrengthBuilder(CardInfoLutBuilder):
         log.info("Starting computation of clusters using EXACT hand strength.")
         super().compute(n_river_clusters, n_turn_clusters, n_flop_clusters)
 
+    def _on_street_clustering_complete(
+        self,
+        street: str,
+        merged_data: np.ndarray,
+        all_combos: np.ndarray,
+    ):
+        """
+        Pre-populate the module-level process cache after clustering completes.
+        
+        When workers are forked via ProcessPoolExecutor, they inherit
+        this cache directly and skip the expensive disk reload that
+        ``_get_process_cache`` would otherwise perform.
+        
+        On restart (process failed and restarted), the cache is empty so
+        workers fall back to loading from disk automatically.
+        """
+        _PROCESS_CACHE["save_dir"] = self._config["save_dir"]
+        _PROCESS_CACHE[f"{street}_combos"] = all_combos
+        _PROCESS_CACHE[f"{street}_memmap"] = merged_data
+        _PROCESS_CACHE[f"{street}_centroids"] = self.centroids.get(street)
+
+        log.info(
+            f"Pre-populated process cache for {street} "
+            f"(combos: {len(all_combos):,}, "
+            f"centroids: {len(self.centroids.get(street, []))})"
+        )
+
     # =========================================================================
     # River: Override to use exact EHS computation
     # =========================================================================

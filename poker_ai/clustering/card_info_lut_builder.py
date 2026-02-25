@@ -274,7 +274,7 @@ class CardInfoLutBuilder(CardCombos):
             log.info(f"Loading existing clustering results for {street}")
             self.centroids["river"] = self.chunked_processor.load_centroids(street)
             clusters = self.chunked_processor.load_clusters(street)
-            _, all_combos = self.chunked_processor.get_or_merge_data(street)
+            merged_data, all_combos = self.chunked_processor.get_or_merge_data(street)
         else:
             # Merge (or load if already merged) and cluster
             merged_data, all_combos = self.chunked_processor.get_or_merge_data(street)
@@ -294,6 +294,11 @@ class CardInfoLutBuilder(CardCombos):
             log.info(f"Cleaning up intermediate chunk files for {street}...")
             self.chunked_processor.cleanup_chunks(street)
             self.chunked_processor.cleanup_partial_clustering(street)
+        
+        # Notify subclasses (e.g. ExactHandStrengthBuilder) so they can
+        # pre-populate the worker process cache from in-memory data,
+        # avoiding an expensive disk reload in the next stage.
+        self._on_street_clustering_complete(street, merged_data, all_combos)
         
         end = time.time()
         log.info(f"Finished computation of {street} clusters - took {end - start:.2f} seconds.")
@@ -348,7 +353,7 @@ class CardInfoLutBuilder(CardCombos):
             log.info(f"Loading existing clustering results for {street}")
             self.centroids["turn"] = self.chunked_processor.load_centroids(street)
             clusters = self.chunked_processor.load_clusters(street)
-            _, all_combos = self.chunked_processor.get_or_merge_data(street)
+            merged_data, all_combos = self.chunked_processor.get_or_merge_data(street)
         else:
             # Merge (or load if already merged) and cluster
             merged_data, all_combos = self.chunked_processor.get_or_merge_data(street)
@@ -368,6 +373,11 @@ class CardInfoLutBuilder(CardCombos):
             log.info(f"Cleaning up intermediate chunk files for {street}...")
             self.chunked_processor.cleanup_chunks(street)
             self.chunked_processor.cleanup_partial_clustering(street)
+        
+        # Notify subclasses (e.g. ExactHandStrengthBuilder) so they can
+        # pre-populate the worker process cache from in-memory data,
+        # avoiding an expensive disk reload in the next stage.
+        self._on_street_clustering_complete(street, merged_data, all_combos)
         
         end = time.time()
         log.info(f"Finished computation of {street} clusters - took {end - start:.2f} seconds.")
@@ -422,7 +432,7 @@ class CardInfoLutBuilder(CardCombos):
             log.info(f"Loading existing clustering results for {street}")
             self.centroids["flop"] = self.chunked_processor.load_centroids(street)
             clusters = self.chunked_processor.load_clusters(street)
-            _, all_combos = self.chunked_processor.get_or_merge_data(street)
+            merged_data, all_combos = self.chunked_processor.get_or_merge_data(street)
         else:
             # Merge (or load if already merged) and cluster
             merged_data, all_combos = self.chunked_processor.get_or_merge_data(street)
@@ -443,6 +453,11 @@ class CardInfoLutBuilder(CardCombos):
             self.chunked_processor.cleanup_chunks(street)
             self.chunked_processor.cleanup_partial_clustering(street)
         
+        # Notify subclasses (e.g. ExactHandStrengthBuilder) so they can
+        # pre-populate the worker process cache from in-memory data,
+        # avoiding an expensive disk reload in the next stage.
+        self._on_street_clustering_complete(street, merged_data, all_combos)
+        
         end = time.time()
         log.info(f"Finished computation of {street} clusters - took {end - start:.2f} seconds.")
         
@@ -458,6 +473,30 @@ class CardInfoLutBuilder(CardCombos):
             item_processor=self.process_flop_potential_aware_distributions,
             workers=workers,
         )
+
+    def _on_street_clustering_complete(
+        self,
+        street: str,
+        merged_data: np.ndarray,
+        all_combos: np.ndarray,
+    ):
+        """
+        Hook called after a street's clustering is complete.
+        
+        Override in subclasses to perform additional actions such as
+        pre-populating worker process caches with the merged data,
+        avoiding expensive disk reloads in the next stage.
+        
+        Parameters
+        ----------
+        street : str
+            The street name (river, turn, flop).
+        merged_data : np.ndarray
+            Memory-mapped merged data array.
+        all_combos : np.ndarray
+            Array of all card combinations.
+        """
+        pass
 
     def _cluster(
         self,
