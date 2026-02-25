@@ -21,7 +21,7 @@ set -euo pipefail
 # User-configurable
 CONDA_ENV=${CONDA_ENV:-pluribus}
 PROJECT_DIR=${PROJECT_DIR:-"$HOME/pluribus"}
-WORKERS=${WORKERS:-30}
+WORKERS=${WORKERS:-60}
 WORKSPACE=${WORKSPACE:-/pfs/work9/workspace/scratch/ka_gu4593-clustering_52}  # Workspace path!
 SAVE_DIR=${SAVE_DIR:-"$WORKSPACE/exact"}
 
