@@ -453,9 +453,9 @@ class ChunkedProcessor:
                     self.mark_chunk_complete(street, result_idx)
                     completed_count += 1
                     
-                    # Progress update every 20 chunks (or on first and last)
+                    # Progress update every 60 chunks (or on first and last)
                     is_last = completed_count == total_chunks
-                    if completed_count % 20 == 0 or completed_count == 1 or is_last:
+                    if completed_count % 60 == 0 or completed_count == 1 or is_last:
                         elapsed = time.time() - start_time
                         rate = completed_count / elapsed if elapsed > 0 else 0
                         remaining = (total_chunks - completed_count) / rate if rate > 0 else 0

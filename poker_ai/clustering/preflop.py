@@ -104,11 +104,10 @@ def compute_preflop_lossless_abstraction(builder) -> Dict[Tuple[Card, Card], int
     for starting_hand_ints in builder.starting_hands:
         # Convert integer array to Card objects
         starting_hand_cards = builder.int_to_cards(starting_hand_ints)
-        # Sort by eval_card descending
+        # Sort by eval_card ascending to match combo ordering
         starting_hand_cards = sorted(
             starting_hand_cards,
             key=operator.attrgetter("eval_card"),
-            reverse=True
         )
         bucket = make_starting_hand_bucket(starting_hand_cards, rank_to_index)
         preflop_lossless[tuple(starting_hand_cards)] = bucket

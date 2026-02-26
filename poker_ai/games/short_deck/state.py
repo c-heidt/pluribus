@@ -183,12 +183,10 @@ class ShortDeckPokerState(PokerState):
         cards = sorted(
             self.current_player.cards,
             key=operator.attrgetter("eval_card"),
-            reverse=True,
         )
         cards += sorted(
             self._table.community_cards,
             key=operator.attrgetter("eval_card"),
-            reverse=True,
         )
         if self._pickle_dir:
             lookup_cards = tuple([card.eval_card for card in cards])

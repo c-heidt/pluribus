@@ -1,5 +1,11 @@
 import logging
 import multiprocessing as mp
+try:
+    from math import comb
+except ImportError:
+    from scipy.special import comb as _comb
+    def comb(n, k):
+        return int(_comb(n, k, exact=True))
 from typing import Dict, List, Optional, Tuple
 from itertools import combinations
 import operator
@@ -14,12 +20,46 @@ from poker_ai.poker.deck import get_all_suits
 log = logging.getLogger("poker_ai.clustering.runner")
 
 
+def _lex_rank(combo: Tuple[int, ...], n: int) -> int:
+    """
+    Compute the lexicographic rank of a combination in O(k) time.
+    
+    Given a k-combination (c_0, c_1, ..., c_{k-1}) with c_0 < c_1 < ... < c_{k-1}
+    chosen from {0, 1, ..., n-1}, compute its position in lexicographic order
+    among all C(n, k) combinations.
+    
+    Uses the identity: sum_{j=a}^{b-1} C(n-j-1, r) = C(n-a, r+1) - C(n-b, r+1)
+    to avoid inner loops.
+    
+    Parameters
+    ----------
+    combo : Tuple[int, ...]
+        Combination of indices in ascending order.
+    n : int
+        Size of the universe {0, ..., n-1}.
+        
+    Returns
+    -------
+    int
+        Lexicographic rank (0-based).
+    """
+    k = len(combo)
+    rank = 0
+    prev = -1
+    for i in range(k):
+        start = prev + 1
+        remaining_positions = k - i
+        rank += comb(n - start, remaining_positions) - comb(n - combo[i], remaining_positions)
+        prev = combo[i]
+    return rank
+
+
 def _process_hole_combo_batch(args):
     """
     Worker function for parallel combo generation.
     
-    CRITICAL: Processes batches of HOLE COMBOS (not public combos)
-    to maintain ordering for binary search compatibility.
+    Processes batches of HOLE COMBOS to maintain ordering
+    for direct combinadic indexing.
     
     Parameters
     ----------
@@ -114,9 +154,16 @@ class CardCombos:
         )
         
         # Create integer representation (eval_card values) - 18x more memory efficient
-        self._card_ints = np.array(
+        # SORTED ASCENDING: required for deterministic combinadic indexing (O(1) lookup)
+        self._card_ints = np.sort(np.array(
             [c.eval_card for c in self._cards], dtype=np.int32
-        )
+        ))
+        
+        # Card-to-index mapping for O(1) combinadic rank computation
+        self._card_to_idx: Dict[int, int] = {
+            int(c): i for i, c in enumerate(self._card_ints)
+        }
+        self._n_cards: int = len(self._card_ints)
         
         # Mapping from integer back to Card object
         self._int_to_card: Dict[int, Card] = {
@@ -170,7 +217,7 @@ class CardCombos:
         Combinations of private info (hole cards) and public info (board).
         
         Uses integer card representation for memory efficiency.
-        Cards are sorted by value (descending) for canonical representation.
+        Cards are sorted ascending for deterministic combinadic indexing.
         
         OPTIMIZED: Uses vectorized operations over NumPy arrays for ~10-100x speedup.
 
@@ -192,11 +239,9 @@ class CardCombos:
         num_public = publics.shape[1]
         total_cards = num_hole + num_public
         
-        # Pre-sort all starting hands once (descending)
-        sorted_holes = np.sort(start_combos, axis=1)[:, ::-1]
-        
-        # Pre-sort all public combos once (descending)
-        sorted_publics = np.sort(publics, axis=1)[:, ::-1]
+        # Sort ascending for deterministic combinadic indexing (O(1) lookup)
+        sorted_holes = np.sort(start_combos, axis=1)
+        sorted_publics = np.sort(publics, axis=1)
         
         # Choose between parallel and sequential processing
         n_holes = len(sorted_holes)
@@ -378,3 +423,57 @@ class CardCombos:
             Tuple of Card objects.
         """
         return tuple(self._int_to_card[int(c)] for c in int_combo)
+
+    def get_row_index(self, hole_ints, public_ints) -> int:
+        """
+        Compute the exact row index for a card combo in O(1) time.
+        
+        Uses the combinatorial number system (combinadic) to compute the
+        position of a combo in the array, eliminating any need for search.
+        
+        The combo array is structured as:
+            for each hole_combo (in lex order):
+                for each valid_public_combo (in lex order of remaining cards):
+                    row_index += 1
+        
+        Since every hole combo has exactly C(N-2, k_public) valid public
+        combos, the row index is:
+            row = hole_rank * C(N-2, k_public) + public_rank_in_remaining
+            
+        Complexity: O(k) where k = number of public cards (≤5), effectively O(1).
+        Memory: Zero extra memory.
+        
+        Parameters
+        ----------
+        hole_ints : array-like
+            Two hole card eval_card integers.
+        public_ints : array-like
+            Public card eval_card integers (3 for flop, 4 for turn, 5 for river).
+            
+        Returns
+        -------
+        int
+            Row index in the combo/data array.
+        """
+        card_to_idx = self._card_to_idx
+        n = self._n_cards
+        
+        # Convert eval_card ints to sorted dense indices
+        h_idx = sorted(card_to_idx[int(c)] for c in hole_ints)
+        p_idx = sorted(card_to_idx[int(c)] for c in public_ints)
+        
+        # Hole rank in C(N, 2) combinations
+        hole_rank = _lex_rank(tuple(h_idx), n)
+        
+        # Re-index public cards into {0..N-3} by excluding hole card indices
+        h0, h1 = h_idx[0], h_idx[1]
+        p_reindexed = tuple(
+            p - (h0 < p) - (h1 < p) for p in p_idx
+        )
+        
+        # Public rank among C(N-2, k_public) combinations
+        n_remaining = n - 2
+        k_public = len(p_idx)
+        public_rank = _lex_rank(p_reindexed, n_remaining)
+        
+        return hole_rank * comb(n_remaining, k_public) + public_rank
