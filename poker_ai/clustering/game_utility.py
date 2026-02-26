@@ -54,6 +54,8 @@ class GameUtility:
         )
         self.our_hand = np.asarray(our_hand, dtype=np.int32)
         self.board = np.asarray(board, dtype=np.int32)
+        # Pre-compute our rank once — avoid re-evaluating it on every get_winner() call
+        self.our_hand_rank = self.evaluate_hand(self.our_hand)
 
     def evaluate_hand(self, hand: np.ndarray) -> int:
         """
@@ -81,11 +83,10 @@ class GameUtility:
             int of win (0), lose (1) or tie (2) - this is an index in the
             expected hand strength array
         """
-        our_hand_rank = self.evaluate_hand(self.our_hand)
         opp_hand_rank = self.evaluate_hand(self.opp_hand)
-        if our_hand_rank > opp_hand_rank:
+        if self.our_hand_rank > opp_hand_rank:
             return 0
-        elif our_hand_rank < opp_hand_rank:
+        elif self.our_hand_rank < opp_hand_rank:
             return 1
         else:
             return 2

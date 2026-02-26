@@ -22,12 +22,6 @@ Options:
   --n_simulations_river INTEGER  The number of opponent hand simulations we
                                  would like to run on the river. We recommend
                                  to start small. (Ignored if --method exact)
-  --n_simulations_turn INTEGER   The number of river card hand simulations we
-                                 would like to run on the turn. We recommend
-                                 to start small. (Ignored if --method exact)
-  --n_simulations_flop INTEGER   The number of turn card hand simulations we
-                                 would like to run on the flop. We recommend
-                                 to start small. (Ignored if --method exact)
   --save_dir TEXT                Path to directory to save card info lookup
                                  table, betting stage centroids, and checkpoints.
   --workers INTEGER              Number of worker processes to use for clustering.
@@ -46,8 +40,7 @@ Options:
 import click
 from typing import Optional
 
-from poker_ai.clustering.card_info_lut_builder import CardInfoLutBuilder
-from poker_ai.clustering.exact_lut_builder import ExactHandStrengthBuilder
+from poker_ai.clustering.unified_lut_builder import UnifiedLutBuilder
 
 
 @click.command()
@@ -96,23 +89,7 @@ from poker_ai.clustering.exact_lut_builder import ExactHandStrengthBuilder
     default=6,
     help=(
         "The number of opponent hand simulations we would like to run on the "
-        "river. We recommend to start small."
-    )
-)
-@click.option(
-    "--n_simulations_turn",
-    default=6,
-    help=(
-        "The number of river card hand simulations we would like to run on the "
-        "turn. We recommend to start small."
-    )
-)
-@click.option(
-    "--n_simulations_flop",
-    default=6,
-    help=(
-        "The number of turn card hand simulations we would like to run on the "
-        "flop. We recommend to start small."
+        "river. We recommend to start small. (Ignored if --method exact)"
     )
 )
 @click.option(
@@ -167,8 +144,6 @@ def cluster(
     n_turn_clusters: int,
     n_flop_clusters: int,
     n_simulations_river: int,
-    n_simulations_turn: int,
-    n_simulations_flop: int,
     save_dir: str,
     workers: Optional[int],
     chunk_size: int,
@@ -177,30 +152,16 @@ def cluster(
 ):
     """Run clustering with memory-efficient chunked processing and checkpointing."""
     
-    # Choose builder based on method
-    if method.lower() == "exact":
-        # Exact computation doesn't use simulation parameters
-        builder = ExactHandStrengthBuilder(
-            low_card_rank=low_card_rank,
-            high_card_rank=high_card_rank,
-            save_dir=save_dir,
-            workers=workers,
-            chunk_size=chunk_size,
-            use_mini_batch=use_mini_batch,
-        )
-    else:
-        # Monte Carlo computation (default)
-        builder = CardInfoLutBuilder(
-            n_simulations_river,
-            n_simulations_turn,
-            n_simulations_flop,
-            low_card_rank,
-            high_card_rank,
-            save_dir,
-            workers=workers,
-            chunk_size=chunk_size,
-            use_mini_batch=use_mini_batch,
-        )
+    builder = UnifiedLutBuilder(
+        method=method,
+        n_simulations_river=n_simulations_river,
+        low_card_rank=low_card_rank,
+        high_card_rank=high_card_rank,
+        save_dir=save_dir,
+        workers=workers,
+        chunk_size=chunk_size,
+        use_mini_batch=use_mini_batch,
+    )
     
     builder.compute(
         n_river_clusters,
