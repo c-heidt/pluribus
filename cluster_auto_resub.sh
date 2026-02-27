@@ -9,7 +9,7 @@
 #SBATCH --partition=highmem
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=600000mb
 #SBATCH --mail-type=ALL
