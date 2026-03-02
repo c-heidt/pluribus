@@ -11,7 +11,7 @@
 #SBATCH --ntasks=1
 #SBATCH --time=72:00:00
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=600000mb
+#SBATCH --mem=2300000mb
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=uvizo@student.kit.edu
 
@@ -97,7 +97,7 @@ echo "  Method: $METHOD"
 echo "  Cards: $LOW_CARD_RANK-$HIGH_CARD_RANK"
 echo "  Clusters: River=$N_RIVER_CLUSTERS, Turn=$N_TURN_CLUSTERS, Flop=$N_FLOP_CLUSTERS"
 if [ "$METHOD" = "monte_carlo" ]; then
-  echo "  Simulations: River=$N_SIMULATIONS_RIVER, Turn=$N_SIMULATIONS_TURN, Flop=$N_SIMULATIONS_FLOP"
+  echo "  Simulations: River=$N_SIMULATIONS_RIVER"
 fi
 echo "  Chunk size: $CHUNK_SIZE"
 echo "  Save directory: $SAVE_DIR"
