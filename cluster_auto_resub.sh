@@ -1,6 +1,6 @@
 #!/bin/bash -l
 # Auto-resubmitting Slurm script for long-running clustering jobs.
-# The job will automatically resubmit itself every 24 hours until clustering is complete.
+# The job will automatically resubmit itself every 72 hours until clustering is complete.
 # Usage:
 #   sbatch cluster_auto_resub.sh
 #SBATCH --job-name=pluribus-cluster
@@ -10,6 +10,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=72:00:00
+#SBATCH --signal=B:USR1@300
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=2300000mb
 #SBATCH --mail-type=ALL
@@ -43,6 +44,29 @@ mkdir -p "$SAVE_DIR"
 
 # Counter file to track resubmissions
 COUNTER_FILE="$SAVE_DIR/.resubmit_counter"
+
+# Handler called by Slurm ~5 min before the wall-time limit via SIGUSR1.
+# Resubmits the job so the next run resumes from the checkpoint.
+resubmit_on_timeout() {
+  echo "⟳ Received pre-timeout signal from Slurm."
+  if [ -f "$COUNTER_FILE" ]; then
+    RESUBMIT_COUNT=$(cat "$COUNTER_FILE")
+  else
+    RESUBMIT_COUNT=0
+  fi
+  if [ "$RESUBMIT_COUNT" -lt "$MAX_RESUBMISSIONS" ]; then
+    NEW_COUNT=$((RESUBMIT_COUNT + 1))
+    echo "$NEW_COUNT" > "$COUNTER_FILE"
+    echo "⟳ Resubmitting job ($NEW_COUNT/$MAX_RESUBMISSIONS)..."
+    sbatch "$PROJECT_DIR/cluster_auto_resub.sh"
+  else
+    echo "⊗ Maximum resubmissions ($MAX_RESUBMISSIONS) reached. Not resubmitting."
+  fi
+  # Gracefully stop the background clustering process before Slurm kills everything
+  [ -n "${CLUSTER_PID:-}" ] && kill "$CLUSTER_PID" 2>/dev/null || true
+  exit 0
+}
+trap 'resubmit_on_timeout' USR1
 
 # Activate conda
 if command -v conda >/dev/null 2>&1; then
@@ -102,7 +126,7 @@ fi
 echo "  Chunk size: $CHUNK_SIZE"
 echo "  Save directory: $SAVE_DIR"
 
-# Run clustering (will resume from checkpoint automatically)
+# Run clustering in background so the USR1 trap can fire while it is running.
 poker_ai cluster \
   --save_dir "$SAVE_DIR" \
   --workers "$WORKERS" \
@@ -112,10 +136,10 @@ poker_ai cluster \
   --n_turn_clusters "$N_TURN_CLUSTERS" \
   --n_flop_clusters "$N_FLOP_CLUSTERS" \
   --n_simulations_river "$N_SIMULATIONS_RIVER" \
-  --n_simulations_turn "$N_SIMULATIONS_TURN" \
-  --n_simulations_flop "$N_SIMULATIONS_FLOP" \
   --chunk_size "$CHUNK_SIZE" \
-  --method "$METHOD"
+  --method "$METHOD" &
+CLUSTER_PID=$!
+wait "$CLUSTER_PID" || true  # 'true' so set -e doesn't fire if we killed it
 
 # Check if clustering completed
 if [ -f "$CARD_INFO_LUT" ]; then
@@ -157,7 +181,7 @@ fi
 if [ "$RESUBMIT_COUNT" -lt "$MAX_RESUBMISSIONS" ]; then
   NEW_COUNT=$((RESUBMIT_COUNT + 1))
   echo "$NEW_COUNT" > "$COUNTER_FILE"
-  echo "⟳ 24-hour time limit reached. Resubmitting job ($NEW_COUNT/$MAX_RESUBMISSIONS)..."
+  echo "⟳ Clustering not complete after run. Resubmitting job ($NEW_COUNT/$MAX_RESUBMISSIONS)..."
   sbatch "$PROJECT_DIR/cluster_auto_resub.sh"
 else
   echo "⊗ Maximum resubmissions ($MAX_RESUBMISSIONS) reached."
