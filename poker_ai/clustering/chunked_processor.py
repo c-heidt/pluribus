@@ -24,7 +24,7 @@ def _process_single_chunk_worker(
     chunk_idx: int,
     chunk_combos: np.ndarray,
     item_processor: Callable[[np.ndarray], np.ndarray],
-) -> Tuple[int, np.ndarray, np.ndarray]:
+) -> Tuple[int, np.ndarray]:
     """
     Worker function to process a single chunk.
     
@@ -42,14 +42,18 @@ def _process_single_chunk_worker(
         
     Returns
     -------
-    Tuple[int, np.ndarray, np.ndarray]
-        Tuple of (chunk_idx, results_array, chunk_combos).
+    Tuple[int, np.ndarray]
+        Tuple of (chunk_idx, results_array).  chunk_combos is NOT returned;
+        the main process reconstructs it from all_combos to avoid sending
+        ~700 KB of redundant data back through IPC on every chunk.
     """
-    results = []
-    for combo in chunk_combos:
-        result = item_processor(combo)
-        results.append(result)
-    return chunk_idx, np.array(results, dtype=np.float32), chunk_combos
+    # Process first combo to determine output dimension, then pre-allocate.
+    first = item_processor(chunk_combos[0])
+    results = np.empty((len(chunk_combos), len(first)), dtype=np.float32)
+    results[0] = first
+    for i in range(1, len(chunk_combos)):
+        results[i] = item_processor(chunk_combos[i])
+    return chunk_idx, results
 
 
 class ChunkedProcessor:
@@ -235,12 +239,16 @@ class ChunkedProcessor:
             self._checkpoint["streets"][street] = {
                 "completed_chunks": [],
                 "total_chunks": n_chunks,
+                "total_combos": total_combos,
                 "merge_done": False,
                 "clustering_done": False,
                 "feature_dim": None,
             }
             # Clear old chunk files if configuration changed
             self._clear_street_data(street)
+        else:
+            # Always keep total_combos up to date (may be absent in old checkpoints)
+            self._checkpoint["streets"][street]["total_combos"] = total_combos
         
         if config:
             self._checkpoint["config"] = config
@@ -443,11 +451,17 @@ class ChunkedProcessor:
                 futures[future] = chunk_idx
             
             # Process results as they complete
+            failed_chunks = []
             for future in concurrent.futures.as_completed(futures):
                 chunk_idx = futures[future]
                 try:
-                    result_idx, results, combos = future.result()
+                    result_idx, results = future.result()
                     
+                    # Reconstruct combos from all_combos — avoids shipping
+                    # ~700 KB back from the worker on every chunk.
+                    _, start_idx, end_idx = chunk_specs[result_idx]
+                    combos = all_combos[start_idx:end_idx]
+
                     # Save chunk to disk
                     self.save_chunk(street, result_idx, results, combos)
                     self.mark_chunk_complete(street, result_idx)
@@ -468,7 +482,17 @@ class ChunkedProcessor:
                     
                 except Exception as e:
                     log.error(f"Chunk {chunk_idx} failed: {e}")
-                    raise
+                    failed_chunks.append(chunk_idx)
+                    # Continue processing remaining futures — do NOT raise here.
+                    # Failed chunks stay absent from the checkpoint so they are
+                    # automatically retried on the next run.
+
+        if failed_chunks:
+            log.warning(
+                f"{len(failed_chunks)} chunk(s) failed for {street} and will be "
+                f"retried on the next run: {failed_chunks[:20]}"
+                + (" ..." if len(failed_chunks) > 20 else "")
+            )
     
     def load_chunk(self, street: str, chunk_idx: int) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -527,17 +551,42 @@ class ChunkedProcessor:
         completed_chunks = sorted(self.get_completed_chunks(street))
         if not completed_chunks:
             raise ValueError(f"No completed chunks found for {street}")
-        
-        # First pass: determine total size and feature dimension
-        # Load first chunk to get feature dimension
-        first_chunk_data, first_chunk_combos = self.load_chunk(street, completed_chunks[0])
-        feature_dim = first_chunk_data.shape[1] if first_chunk_data.ndim > 1 else 1
-        
-        # Count total rows by loading each chunk (required for compressed files)
-        total_rows = 0
-        for chunk_idx in completed_chunks:
-            chunk_data, _ = self.load_chunk(street, chunk_idx)
-            total_rows += chunk_data.shape[0]
+
+        # Verify all chunks are present before merging — merging partial data
+        # would silently produce a card_info_lut with missing entries.
+        total_chunks = self._checkpoint["streets"][street]["total_chunks"]
+        if len(completed_chunks) != total_chunks:
+            missing = sorted(set(range(total_chunks)) - set(completed_chunks))
+            raise ValueError(
+                f"Cannot merge {street}: {len(missing)} chunk(s) still incomplete "
+                f"(indices {missing[:20]}{' ...' if len(missing) > 20 else ''}). "
+                f"Re-run to process missing chunks."
+            )
+
+        # Compute total_rows and feature_dim without loading any files.
+        # total_combos is stored in the checkpoint during initialize_street.
+        total_combos = self._checkpoint["streets"][street].get("total_combos")
+        if total_combos is not None:
+            # Each chunk i covers rows [i*chunk_size, min((i+1)*chunk_size, total_combos))
+            total_rows = sum(
+                min((idx + 1) * self.chunk_size, total_combos) - idx * self.chunk_size
+                for idx in completed_chunks
+            )
+            # Load only the first chunk to determine feature_dim
+            first_chunk_data, _ = self.load_chunk(street, completed_chunks[0])
+            feature_dim = first_chunk_data.shape[1] if first_chunk_data.ndim > 1 else 1
+        else:
+            # Fallback for old checkpoints: load every chunk once to measure sizes
+            log.warning(
+                f"total_combos not in checkpoint for {street}; "
+                "falling back to full-scan for row count (slower)."
+            )
+            first_chunk_data, _ = self.load_chunk(street, completed_chunks[0])
+            feature_dim = first_chunk_data.shape[1] if first_chunk_data.ndim > 1 else 1
+            total_rows = first_chunk_data.shape[0]
+            for chunk_idx in completed_chunks[1:]:
+                chunk_data, _ = self.load_chunk(street, chunk_idx)
+                total_rows += chunk_data.shape[0]
         
         log.info(f"Total rows for {street}: {total_rows}, feature_dim: {feature_dim}")
         

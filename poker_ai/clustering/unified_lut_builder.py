@@ -265,11 +265,24 @@ class UnifiedLutBuilder(CardCombos):
     # ------------------------------------------------------------------
 
     def __getstate__(self):
-        """Reduce pickle size — workers use module-level cache instead."""
+        """Reduce pickle size — workers use module-level cache instead.
+
+        Large combo arrays (river, turn, flop, starting_hands) are excluded
+        because worker functions only use _card_ints, _card_to_idx, _n_cards,
+        _evaluator, _config, method, and n_simulations_river.  For a 52-card
+        deck self.river alone is ~78 GB, which exceeds the pickle 4 GiB limit
+        and causes every chunk submission to fail.
+        """
         state = self.__dict__.copy()
         state["card_info_lut"] = {}
         state["centroids"] = {}
         state["chunked_processor"] = None
+        # Exclude large CardCombos arrays — workers don't need them.
+        # These are the backing attributes for the lazy river/turn/flop properties.
+        state["_river"] = None
+        state["_turn"] = None
+        state["_flop"] = None
+        state["starting_hands"] = None
         return state
 
     def __setstate__(self, state):
@@ -320,6 +333,8 @@ class UnifiedLutBuilder(CardCombos):
             "n_flop_clusters": n_flop_clusters,
         })
 
+        n = self._n_cards
+
         # -- Preflop (lossless) -----------------------------------------------
         if "pre_flop" not in self.card_info_lut:
             log.info("Computing pre-flop abstraction...")
@@ -329,40 +344,45 @@ class UnifiedLutBuilder(CardCombos):
             atomic_joblib_dump(self.card_info_lut, self.card_info_lut_path)
 
         # -- River -------------------------------------------------------------
+        n_river_rows = comb(n, 2) * comb(n - 2, 5)
         if "river" not in self.card_info_lut:
             self.card_info_lut["river"] = self._compute_street_clusters(
-                "river", n_river_clusters, self.river,
+                "river", n_river_clusters, self.river,  # lazy-built here
                 self._process_river_chunks,
             )
+            self.river = None  # free memory before next stage
             atomic_joblib_dump(self.card_info_lut, self.card_info_lut_path)
             atomic_joblib_dump(self.centroids, self.centroid_path)
         else:
             # Resume: pre-populate cache so turn workers inherit it via fork
             # and never need to load from disk themselves.
             _get_cluster_id_cache(
-                "river", self._config["save_dir"], len(self.river),
+                "river", self._config["save_dir"], n_river_rows,
             )
 
         # -- Turn --------------------------------------------------------------
+        n_turn_rows = comb(n, 2) * comb(n - 2, 4)
         if "turn" not in self.card_info_lut:
             self.card_info_lut["turn"] = self._compute_street_clusters(
-                "turn", n_turn_clusters, self.turn,
+                "turn", n_turn_clusters, self.turn,  # lazy-built here
                 self._process_turn_chunks,
             )
+            self.turn = None  # free memory before next stage
             atomic_joblib_dump(self.card_info_lut, self.card_info_lut_path)
             atomic_joblib_dump(self.centroids, self.centroid_path)
         else:
             # Resume: pre-populate cache so flop workers inherit it via fork.
             _get_cluster_id_cache(
-                "turn", self._config["save_dir"], len(self.turn),
+                "turn", self._config["save_dir"], n_turn_rows,
             )
 
         # -- Flop --------------------------------------------------------------
         if "flop" not in self.card_info_lut:
             self.card_info_lut["flop"] = self._compute_street_clusters(
-                "flop", n_flop_clusters, self.flop,
+                "flop", n_flop_clusters, self.flop,  # lazy-built here
                 self._process_flop_chunks,
             )
+            self.flop = None  # free memory
             atomic_joblib_dump(self.card_info_lut, self.card_info_lut_path)
             atomic_joblib_dump(self.centroids, self.centroid_path)
 
@@ -425,6 +445,16 @@ class UnifiedLutBuilder(CardCombos):
                 f"for {street}"
             )
             chunk_processor_fn(incomplete_chunks)
+
+        # Guard: refuse to merge if any chunks are still missing.  Merging
+        # partial data would silently produce a card_info_lut with gaps.
+        still_incomplete = self.chunked_processor.get_incomplete_chunks(street)
+        if still_incomplete:
+            raise RuntimeError(
+                f"{len(still_incomplete)} chunk(s) failed for {street} and must be "
+                f"retried before clustering can proceed. "
+                f"Re-run the script to retry them automatically."
+            )
 
         # Cluster (or load existing clustering results)
         if self.chunked_processor.is_clustering_done(street):
