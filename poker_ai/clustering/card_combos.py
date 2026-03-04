@@ -170,25 +170,73 @@ class CardCombos:
             c.eval_card: c for c in self._cards
         }
         
-        # Generate combos using integers
-        log.info(f"Generating card combos for {len(self._cards)} cards...")
+        # Generate only starting_hands upfront (small, needed for preflop
+        # and as the hole-card input when building larger combo arrays).
+        # river, turn, and flop are generated on demand in compute() so that
+        # each large array can be freed immediately after its street is done.
+        log.info(f"Generating starting hands for {len(self._cards)} cards...")
         self.starting_hands = self._get_int_combos(2)
         log.info(f"Starting hands: {len(self.starting_hands):,}")
-        
-        self.flop = self._create_int_info_combos(
-            self.starting_hands, self._get_int_combos(3), "flop"
+
+        # Deferred: built lazily on first access via properties.
+        self._flop: Optional[np.ndarray] = None
+        self._turn: Optional[np.ndarray] = None
+        self._river: Optional[np.ndarray] = None
+
+    # ------------------------------------------------------------------
+    # Lazy combo properties — build on first access, free by setting None
+    # ------------------------------------------------------------------
+
+    @property
+    def river(self) -> np.ndarray:
+        if self._river is None:
+            self._river = self.build_street_combos("river")
+        return self._river
+
+    @river.setter
+    def river(self, value: Optional[np.ndarray]):
+        self._river = value
+
+    @property
+    def turn(self) -> np.ndarray:
+        if self._turn is None:
+            self._turn = self.build_street_combos("turn")
+        return self._turn
+
+    @turn.setter
+    def turn(self, value: Optional[np.ndarray]):
+        self._turn = value
+
+    @property
+    def flop(self) -> np.ndarray:
+        if self._flop is None:
+            self._flop = self.build_street_combos("flop")
+        return self._flop
+
+    @flop.setter
+    def flop(self, value: Optional[np.ndarray]):
+        self._flop = value
+
+    def build_street_combos(self, street: str) -> np.ndarray:
+        """
+        Generate (or return cached) combo array for *street* on demand.
+
+        Parameters
+        ----------
+        street : str
+            One of ``"flop"``, ``"turn"``, or ``"river"``.
+
+        Returns
+        -------
+        np.ndarray
+            2D array of (hole1, hole2, board...) integer combos.
+        """
+        n_public = {"flop": 3, "turn": 4, "river": 5}[street]
+        combos = self._create_int_info_combos(
+            self.starting_hands, self._get_int_combos(n_public), street
         )
-        log.info(f"Created flop: {len(self.flop):,} combos")
-        
-        self.turn = self._create_int_info_combos(
-            self.starting_hands, self._get_int_combos(4), "turn"
-        )
-        log.info(f"Created turn: {len(self.turn):,} combos")
-        
-        self.river = self._create_int_info_combos(
-            self.starting_hands, self._get_int_combos(5), "river"
-        )
-        log.info(f"Created river: {len(self.river):,} combos")
+        log.info(f"Built {street}: {len(combos):,} combos")
+        return combos
 
     def _get_int_combos(self, num_cards: int) -> np.ndarray:
         """
