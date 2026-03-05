@@ -20,12 +20,13 @@ set -euo pipefail
 # User-configurable
 CONDA_ENV=${CONDA_ENV:-pluribus}
 PROJECT_DIR=${PROJECT_DIR:-"$HOME/pluribus"}
+WORKSPACE=${WORKSPACE:-/pfs/work9/workspace/scratch/ka_gu4593-clustering_20}
 N_PLAYERS=${N_PLAYERS:-2}
 UPDATE_THRESHOLD=${UPDATE_THRESHOLD:-50}
 N_ITERATIONS=${N_ITERATIONS:-1000}
 DUMP_ITERATION=${DUMP_ITERATION:-10}
-LUT_PATH=${LUT_PATH:-"$PROJECT_DIR/data/clustering"}
-NICKNAME=${NICKNAME:-"models/6player"}
+LUT_PATH=${LUT_PATH:-"$WORKSPACE/exact"}
+NICKNAME=${NICKNAME:-"models/2player_20cards"}
 
 mkdir -p "$PROJECT_DIR/logs"
 mkdir -p "$PROJECT_DIR/models"
