@@ -150,8 +150,10 @@ def cfr(
     log.debug(f"P(h) Updating Regret? {state.player_i == i}")
     log.debug(f"Betting Round {state._betting_stage}")
     log.debug(f"Community Cards {state._table.community_cards}")
-    for i, player in enumerate(state.players):
-        log.debug(f"Player {i} hole cards: {player.cards}")
+    # NOTE: loop variable intentionally renamed to avoid shadowing parameter `i`
+    # (Bug: previously `for i, player in ...` overwrote the player-index argument)
+    for player_idx, player in enumerate(state.players):
+        log.debug(f"Player {player_idx} hole cards: {player.cards}")
     try:
         log.debug(f"I(h): {state.info_set}")
     except KeyError:

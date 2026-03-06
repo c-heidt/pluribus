@@ -26,20 +26,9 @@ from poker_ai.clustering.card_combos import CardCombos
 from poker_ai.clustering.chunked_processor import ChunkedProcessor
 from poker_ai.clustering.game_utility import GameUtility
 from poker_ai.clustering.preflop import compute_preflop_lossless_abstraction
+from poker_ai.utils.io import atomic_joblib_dump
 
 log = logging.getLogger("poker_ai.clustering.card_info_lut_builder")
-
-
-def atomic_joblib_dump(obj: Any, path: Path):
-    """Save an object with joblib atomically using temp file."""
-    temp_path = path.with_suffix(".tmp.joblib")
-    try:
-        joblib.dump(obj, temp_path)
-        shutil.move(str(temp_path), str(path))
-    except Exception as e:
-        if temp_path.exists():
-            temp_path.unlink()
-        raise RuntimeError(f"Failed to save {path}: {e}")
 
 
 class CardInfoLutBuilder(CardCombos):

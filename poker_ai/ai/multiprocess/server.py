@@ -116,7 +116,9 @@ class Server:
                         i=i,
                     )
                 self.job("cfr", sync_workers=self._sync_cfr, t=t, i=i)
-            if t < self._lcfr_threshold & t % self._discount_interval == 0:
+            # Bug 1 fix: `&` had higher precedence than `<` and `==`, causing
+            # the discount condition to never fire.  Use `and` instead.
+            if t < self._lcfr_threshold and t % self._discount_interval == 0:
                 self.job("discount", sync_workers=self._sync_discount, t=t)
             if t > self._update_threshold and t % self._dump_iteration == 0:
                 self.job(
