@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import random
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Union
 
 import click
 import joblib
@@ -105,13 +105,16 @@ def simple_search(
                     ai.cfrp(agent=agent, state=state, i=i, t=t, c=c)
             else:
                 ai.cfr(agent=agent, state=state, i=i, t=t)
-        if t < lcfr_threshold & t % discount_interval == 0:
+        # Bug 1 fix: `&` had higher precedence than `<` and `==`, so the
+        # condition was never True.  Use `and` for correct boolean short-circuit.
+        if t < lcfr_threshold and t % discount_interval == 0:
             d = (t / discount_interval) / ((t / discount_interval) + 1)
             for I in agent.regret.keys():
                 for a in agent.regret[I].keys():
+                    # Bug 2 fix: per Pluribus paper only regret is discounted;
+                    # discounting strategy degrades convergence.
                     agent.regret[I][a] *= d
-                    agent.strategy[I][a] *= d
-        if (t > update_threshold) & (t % dump_iteration == 0):
+        if t > update_threshold and t % dump_iteration == 0:
             # dump the current strategy (sigma) throughout training and then
             # take an average. This allows for estimation of expected value in
             # leaf nodes later on using modified versions of the blueprint
