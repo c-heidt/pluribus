@@ -92,12 +92,19 @@ class Worker(mp.Process):
     def _cfr(self, t, i):
         """Search over random game and calculate the strategy."""
         self._setup_new_game()
+        local_delta: Dict[str, Dict[str, float]] = {}
         use_pruning: bool = np.random.uniform() < 0.95
         pruning_allowed: bool = t > self._prune_threshold
         if pruning_allowed and use_pruning:
-            ai.cfrp(self._agent, self._state, i, t, self._c, self._locks)
+            ai.cfrp(self._agent, self._state, i, t, self._c, local_delta)
         else:
-            ai.cfr(self._agent, self._state, i, t, self._locks)
+            ai.cfr(self._agent, self._state, i, t, local_delta)
+        # Merge the local regret delta into the shared regret table under lock.
+        # One lock acquisition per cfr() call replaces the old per-infoset
+        # lock pattern, keeping cfr() traversal completely lock-free.
+        self._locks["regret"].acquire()
+        ai.merge_local_delta(self._agent, local_delta)
+        self._locks["regret"].release()
 
     def _discount(self, t):
         """Discount previous regrets and strategy."""
@@ -113,20 +120,17 @@ class Worker(mp.Process):
             f"[t={t}] Discounting regrets and strategy (factor={discount_factor:.4f})",
             block=True,
         )
+        # Per Pluribus paper only regret is discounted (Bug 2 fix).
+        # Discounting strategy degrades convergence and is incorrect.
         self._locks["regret"].acquire()
         for info_set in self._agent.regret.keys():
             for action in self._agent.regret[info_set].keys():
                 self._agent.regret[info_set][action] *= discount_factor
         self._locks["regret"].release()
-        self._locks["strategy"].acquire()
-        for info_set in self._agent.strategy.keys():
-            for action in self._agent.strategy[info_set].keys():
-                self._agent.strategy[info_set][action] *= discount_factor
-        self._locks["strategy"].release()
 
     def _update_strategy(self, t, i):
         """Update the strategy."""
-        ai.update_strategy(self._agent, self._state, i, t, self._locks)
+        ai.update_strategy(self._agent, self._state, i, t)
 
     def _serialise(self, t: int, server_state: Dict[str, Union[str, float, int, None]]):
         """Write progress of optimising agent (and server state) to file."""

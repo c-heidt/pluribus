@@ -6,7 +6,6 @@ import logging
 import random
 from pathlib import Path
 from typing import Dict, Union
-from typing import Dict, Union
 
 import click
 import joblib
@@ -99,25 +98,24 @@ def simple_search(
             card_info_lut = state.card_info_lut
             if t > update_threshold and t % strategy_interval == 0:
                 ai.update_strategy(agent=agent, state=state, i=i, t=t)
+            local_delta: Dict[str, Dict[str, float]] = {}
             if t > prune_threshold:
                 if random.uniform(0, 1) < 0.05:
-                    ai.cfr(agent=agent, state=state, i=i, t=t)
+                    ai.cfr(agent=agent, state=state, i=i, t=t, local_delta=local_delta)
                 else:
-                    ai.cfrp(agent=agent, state=state, i=i, t=t, c=c)
+                    ai.cfrp(agent=agent, state=state, i=i, t=t, c=c, local_delta=local_delta)
             else:
-                ai.cfr(agent=agent, state=state, i=i, t=t)
+                ai.cfr(agent=agent, state=state, i=i, t=t, local_delta=local_delta)
+            ai.merge_local_delta(agent=agent, local_delta=local_delta)
         # Bug 1 fix: `&` had higher precedence than `<` and `==`, so the
         # condition was never True.  Use `and` for correct boolean short-circuit.
         if t < lcfr_threshold and t % discount_interval == 0:
             d = (t / discount_interval) / ((t / discount_interval) + 1)
+            # Per Pluribus paper only regret is discounted (Bug 2 fix).
+            # Discounting strategy degrades convergence and is incorrect.
             for I in agent.regret.keys():
                 for a in agent.regret[I].keys():
-                    # Bug 2 fix: per Pluribus paper only regret is discounted;
-                    # discounting strategy degrades convergence.
                     agent.regret[I][a] *= d
-            for I in agent.strategy.keys():
-                for a in agent.strategy[I].keys():
-                    agent.strategy[I][a] *= d
         if (t > update_threshold) and (t % dump_iteration == 0):
             # dump the current strategy (sigma) throughout training and then
             # take an average. This allows for estimation of expected value in
