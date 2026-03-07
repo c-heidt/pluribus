@@ -181,6 +181,16 @@ def run_terminal_app(
                     this_state_strategy = offline_strategy.get(
                         state.info_set, default_strategy
                     )
+                    # Filter to only legal actions in the current state, then
+                    # renormalize so stored actions from different pot sizes
+                    # (e.g. 'raise:2.5' when only 'raise:1.5' is legal) don't
+                    # cause invalid-action warnings.
+                    legal = set(state.legal_actions)
+                    this_state_strategy = {
+                        k: v for k, v in this_state_strategy.items() if k in legal
+                    }
+                    if not this_state_strategy:
+                        this_state_strategy = default_strategy
                     # Normalizing strategy.
                     total = sum(this_state_strategy.values())
                     this_state_strategy = {

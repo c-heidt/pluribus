@@ -401,7 +401,7 @@ class PokerState(ABC):
         # Update the new state.
         skip_actions = ["skip" for _ in range(new_state._skip_counter)]
         new_state._history[new_state.betting_stage] += skip_actions
-        new_state._history[new_state.betting_stage].append(str(action))
+        new_state._history[new_state.betting_stage].append(action_str)
         new_state._n_actions += 1
         new_state._skip_counter = 0
         # Player has made move, increment the player that is next.
