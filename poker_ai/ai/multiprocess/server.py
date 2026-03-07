@@ -142,8 +142,23 @@ class Server:
             kwargs = dict()
             self._job_queue.put((name, kwargs), block=True)
             log.info("sending sentinel to worker")
+        # Join each worker while continuously draining the status and logging
+        # queues. Without this, the OS pipe backing those queues fills up,
+        # the workers' background feeder threads block on pipe writes, and the
+        # worker processes can never exit — causing worker.join() to hang.
         for name, worker in self._workers.items():
-            worker.join()
+            while worker.is_alive():
+                while not self._status_queue.empty():
+                    try:
+                        self._status_queue.get_nowait()
+                    except Exception:
+                        pass
+                while not self._logging_queue.empty():
+                    try:
+                        log.info(self._logging_queue.get_nowait())
+                    except Exception:
+                        pass
+                worker.join(timeout=0.5)
             log.info(f"worker {name} joined.")
 
     def to_dict(self) -> Dict[str, Union[str, float, int, None]]:
