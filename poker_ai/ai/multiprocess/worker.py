@@ -1,4 +1,5 @@
 import copy
+import logging
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -11,6 +12,8 @@ from poker_ai.ai import ai
 from poker_ai.ai.agent import Agent
 from poker_ai import utils
 from poker_ai.games.short_deck import state
+
+log = logging.getLogger("sync.worker")
 
 
 class Worker(mp.Process):
@@ -106,6 +109,10 @@ class Worker(mp.Process):
         discount_factor = (t / self._discount_interval) / (
             (t / self._discount_interval) + 1
         )
+        self._logging_queue.put(
+            f"[t={t}] Discounting regrets and strategy (factor={discount_factor:.4f})",
+            block=True,
+        )
         self._locks["regret"].acquire()
         for info_set in self._agent.regret.keys():
             for action in self._agent.regret[info_set].keys():
@@ -123,6 +130,9 @@ class Worker(mp.Process):
 
     def _serialise(self, t: int, server_state: Dict[str, Union[str, float, int, None]]):
         """Write progress of optimising agent (and server state) to file."""
+        self._logging_queue.put(
+            f"[t={t}] Saving checkpoint to {self._save_path}", block=True
+        )
         ai.serialise(
             agent=self._agent,
             save_path=self._save_path,
@@ -130,13 +140,14 @@ class Worker(mp.Process):
             server_state=server_state,
             locks=self._locks,
         )
+        n_info_sets = len(self._agent.regret)
+        self._logging_queue.put(
+            f"[t={t}] Checkpoint saved — {n_info_sets:,} info sets in regret table",
+            block=True,
+        )
 
-    def _update_status(self, status, log_status: bool = True):
+    def _update_status(self, status):
         """Update the status of this worker by posting it to the server."""
-        if log_status:
-            self._logging_queue.put(
-                f"{self.name} updating status to {status}", block=True
-            )
         self._status_queue.put((self.name, status), block=True)
 
     def _setup_new_game(self):

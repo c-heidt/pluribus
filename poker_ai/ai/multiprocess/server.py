@@ -207,7 +207,6 @@ class Server:
         # Wait for all workers to become idle.
         self._wait_until_all_workers_are_idle()
         log.info(f"Sending synchronised {job_name} to workers")
-        log.info(self._worker_status)
         # Send the job to a single worker.
         self._send_job(job_name, **kwargs)
         # Wait for the synchronised job to be completed.

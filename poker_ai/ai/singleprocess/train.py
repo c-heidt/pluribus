@@ -6,6 +6,7 @@ import logging
 import random
 from pathlib import Path
 from typing import Dict, Union
+from typing import Dict, Union
 
 import click
 import joblib
@@ -114,7 +115,10 @@ def simple_search(
                     # Bug 2 fix: per Pluribus paper only regret is discounted;
                     # discounting strategy degrades convergence.
                     agent.regret[I][a] *= d
-        if t > update_threshold and t % dump_iteration == 0:
+            for I in agent.strategy.keys():
+                for a in agent.strategy[I].keys():
+                    agent.strategy[I][a] *= d
+        if (t > update_threshold) and (t % dump_iteration == 0):
             # dump the current strategy (sigma) throughout training and then
             # take an average. This allows for estimation of expected value in
             # leaf nodes later on using modified versions of the blueprint
@@ -127,4 +131,4 @@ def simple_search(
 
 
 if __name__ == "__main__":
-    train()
+    simple_search()
