@@ -88,7 +88,7 @@ def update_strategy(
 
     elif ph == i:
         # calculate regret
-        this_info_sets_regret = agent.regret.get(state.info_set, state.initial_regret)
+        this_info_sets_regret = {**state.initial_regret, **agent.regret.get(state.info_set, {})}
         sigma = calculate_strategy(this_info_sets_regret)
         log.debug(f"Calculated Strategy for {state.info_set}: {sigma}")
         # choose an action based of sigma
@@ -99,9 +99,7 @@ def update_strategy(
         # Increment the action counter.
         if locks:
             locks["strategy"].acquire()
-        this_states_strategy = agent.strategy.get(
-            state.info_set, state.initial_strategy
-        )
+        this_states_strategy = {**state.initial_strategy, **agent.strategy.get(state.info_set, {})}
         this_states_strategy[action] += 1
         # Update the master strategy by assigning.
         agent.strategy[state.info_set] = this_states_strategy
@@ -183,7 +181,7 @@ def cfr(
 
     elif ph == i:
         # calculate strategy
-        this_info_sets_regret = agent.regret.get(state.info_set, state.initial_regret)
+        this_info_sets_regret = {**state.initial_regret, **agent.regret.get(state.info_set, {})}
         sigma = calculate_strategy(this_info_sets_regret)
         log.debug(f"Calculated Strategy for {state.info_set}: {sigma}")
 
@@ -204,7 +202,7 @@ def cfr(
         log.debug(f"Updated EV at {state.info_set}: {vo}")
         if locks:
             locks["regret"].acquire()
-        this_info_sets_regret = agent.regret.get(state.info_set, state.initial_regret)
+        this_info_sets_regret = {**state.initial_regret, **agent.regret.get(state.info_set, {})}
         for action in state.legal_actions:
             this_info_sets_regret[action] += voa[action] - vo
         # Assign regret back to the shared memory.
@@ -213,7 +211,7 @@ def cfr(
             locks["regret"].release()
         return vo
     else:
-        this_info_sets_regret = agent.regret.get(state.info_set, state.initial_regret)
+        this_info_sets_regret = {**state.initial_regret, **agent.regret.get(state.info_set, {})}
         sigma = calculate_strategy(this_info_sets_regret)
         log.debug(f"Calculated Strategy for {state.info_set}: {sigma}")
         available_actions: List[str] = list(sigma.keys())
@@ -271,7 +269,7 @@ def cfrp(
     #   cfr()
     elif ph == i:
         # calculate strategy
-        this_info_sets_regret = agent.regret.get(state.info_set, state.initial_regret)
+        this_info_sets_regret = {**state.initial_regret, **agent.regret.get(state.info_set, {})}
         sigma = calculate_strategy(this_info_sets_regret)
         # TODO: Does updating sigma here (as opposed to after regret) miss out
         #       on any updates? If so, is there any benefit to having it up
@@ -282,7 +280,7 @@ def cfrp(
         # skipped.
         explored: Dict[str, bool] = {action: False for action in state.legal_actions}
         # Get the regret for this state.
-        this_info_sets_regret = agent.regret.get(state.info_set, state.initial_regret)
+        this_info_sets_regret = {**state.initial_regret, **agent.regret.get(state.info_set, {})}
         
         # Disable pruning in the last betting round (river)
         is_river = state._betting_stage == "river"
@@ -298,7 +296,7 @@ def cfrp(
             locks["regret"].acquire()
         # Get the regret for this state again, incase any other process updated
         # it whilst we were doing `cfrp`.
-        this_info_sets_regret = agent.regret.get(state.info_set, state.initial_regret)
+        this_info_sets_regret = {**state.initial_regret, **agent.regret.get(state.info_set, {})}
         for action in state.legal_actions:
             if explored[action]:
                 this_info_sets_regret[action] += voa[action] - vo
@@ -308,7 +306,7 @@ def cfrp(
             locks["regret"].release()
         return vo
     else:
-        this_info_sets_regret = agent.regret.get(state.info_set, state.initial_regret)
+        this_info_sets_regret = {**state.initial_regret, **agent.regret.get(state.info_set, {})}
         sigma = calculate_strategy(this_info_sets_regret)
         available_actions: List[str] = list(sigma.keys())
         action_probabilities: List[float] = list(sigma.values())
@@ -344,8 +342,17 @@ def serialise(
     """
     # Load the shared strategy that we accumulate into.
     agent_path = os.path.abspath(str(save_path / f"agent.joblib"))
+    agent_path_tmp = agent_path + ".tmp"
     if os.path.isfile(agent_path):
-        offline_agent = joblib.load(agent_path)
+        try:
+            offline_agent = joblib.load(agent_path)
+        except (EOFError, Exception):
+            offline_agent = {
+                "regret": {},
+                "timestep": t,
+                "strategy": {},
+                "pre_flop_strategy": {}
+            }
     else:
         offline_agent = {
             "regret": {},
@@ -355,21 +362,26 @@ def serialise(
         }
     # Lock shared dicts so no other process modifies it whilst writing to
     # file.
+    # Take a snapshot of regret under the lock so we compute strategy from a
+    # consistent view, then release before the (potentially slow) processing.
+    if locks:
+        locks["regret"].acquire()
+    regret_snapshot = list(agent.regret.items())
+    if locks:
+        locks["regret"].release()
     # Calculate the strategy for each info sets regret, and accumulate in
     # the offline agent's strategy.
-    for info_set, this_info_sets_regret in sorted(agent.regret.items()):
-        if locks:
-            locks["regret"].acquire()
+    for info_set, this_info_sets_regret in sorted(regret_snapshot):
         strategy = calculate_strategy(this_info_sets_regret)
-        if locks:
-            locks["regret"].release()
         if info_set not in offline_agent["strategy"]:
             offline_agent["strategy"][info_set] = {
                 action: probability for action, probability in strategy.items()
             }
         else:
             for action, probability in strategy.items():
-                offline_agent["strategy"][info_set][action] += probability
+                offline_agent["strategy"][info_set][action] = (
+                    offline_agent["strategy"][info_set].get(action, 0) + probability
+                )
     if locks:
         locks["regret"].acquire()
     offline_agent["regret"] = copy.deepcopy(agent.regret)
@@ -380,11 +392,14 @@ def serialise(
     offline_agent["pre_flop_strategy"] = copy.deepcopy(agent.strategy)
     if locks:
         locks["pre_flop_strategy"].release()
-    joblib.dump(offline_agent, agent_path)
+    joblib.dump(offline_agent, agent_path_tmp)
+    os.replace(agent_path_tmp, agent_path)
     # Dump the server state to file too, but first update a few bits of the
     # state so when we load it next time, we start from the right place in
     # the optimisation process.
     server_path = save_path / f"server.gz"
+    server_path_tmp = str(server_path) + ".tmp"
     server_state["agent_path"] = agent_path
     server_state["start_timestep"] = t + 1
-    joblib.dump(server_state, server_path)
+    joblib.dump(server_state, server_path_tmp)
+    os.replace(server_path_tmp, str(server_path))
