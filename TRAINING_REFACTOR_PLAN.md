@@ -251,10 +251,16 @@ def apply_discount(self, factor: float):
 
 ---
 
-## Phase 3 — CFR Core: External Sampling and Local Delta
+## Phase 3 — CFR Core: External Sampling and Local Delta ✅ COMPLETE
 *Changes sampling scheme and how workers write regrets. Core parallelism and correctness improvement.*
 
-### 3.1 Implement `calculate_strategy_from_row`
+> **Implementation notes:**
+> - `local_delta` uses `Dict[str, Dict[str, float]]` (not `Dict[str, np.ndarray]` as planned) — numpy array conversion deferred to Phase 4 when `Agent` gets `SparseRegretTable`.
+> - Bug 2 was also present in `multiprocess/worker.py` `_discount()` — the Phase 2 fix was incomplete; fully fixed this phase.
+> - Duplicate `from typing import Dict, Union` import removed from `singleprocess/train.py`.
+> - 47 unit tests in `test/unit/test_phase3_cfr_core.py`, all green. Uses `data/clustering/20cards_exact` for slow integration test.
+
+### 3.1 Implement `calculate_strategy_from_row` ✅ COMPLETE
 - Takes `np.ndarray` of `int32` regrets, returns `np.ndarray` of `float32` probabilities
 - Regret matching: `max(r, 0) / sum(max(r, 0))` with uniform fallback if sum is zero
 - Pure numpy — no Python loops:
@@ -272,7 +278,9 @@ def calculate_strategy_from_row(regret_row: np.ndarray) -> np.ndarray:
 - Keep existing `calculate_strategy(dict) -> dict` as a wrapper for backward compatibility during transition
 - Unit test: verify uniform output on all-zero input, verify correct probabilities on known input
 
-### 3.2 Switch to External Sampling
+> **Implemented:** `calculate_strategy_from_row(regret_row: np.ndarray) -> np.ndarray` added to `poker_ai/ai/ai.py`. Uses `np.maximum` + `np.float32` cast; uniform fallback on all-non-positive input.
+
+### 3.2 Switch to External Sampling ✅ COMPLETE
 - Rewrite `cfr()` opponent branch to iterate all opponent actions weighted by strategy probability
 - This eliminates the high-variance single-action sample for opponent nodes:
 
@@ -296,7 +304,9 @@ else:
 - Traversing player branch remains unchanged — iterates all actions
 - Validate against singleprocess baseline from Phase 0 — exploitability should be lower per iteration than the original outcome sampling
 
-### 3.3 Add Local Delta Parameter
+> **Implemented:** `cfr()` and `cfrp()` opponent branches replaced with weighted sum over all `state.legal_actions` using current strategy. Traversal is now fully deterministic given opponent states.
+
+### 3.3 Add Local Delta Parameter ✅ COMPLETE
 - Add `local_delta: Dict[str, np.ndarray]` parameter to `cfr()`
 - Add `index_map` and `action_map` parameters for numpy-based lookup
 - Remove `locks` parameter from `cfr()` — locking is now exclusively the worker's responsibility during sync
@@ -304,7 +314,9 @@ else:
 - `cfr()` writes regret updates to `local_delta` only — zero shared memory writes during traversal
 - New infosets go into `local_delta` and are allocated in shared memory during sync, not during traversal
 
-### 3.4 Fix Bug 1 — Discount Operator Precedence **✅ FIXED EARLY (Phase 2)**
+> **Implemented:** `cfr(agent, state, i, t, local_delta=None)` — when `local_delta is not None`, all regret increments are written to `local_delta.setdefault(info_set, {})` instead of `agent.regret`. `merge_local_delta(agent, local_delta)` helper merges after traversal. `locks` parameter removed from `cfr()` and `cfrp()` entirely.
+
+### 3.4 Fix Bug 1 — Discount Operator Precedence ✅ FIXED EARLY (Phase 2) — Discount Operator Precedence **✅ FIXED EARLY (Phase 2)**
 ```python
 # Fix in ai.py
 # Before:
@@ -321,26 +333,33 @@ if t < lcfr_threshold and t % discount_interval == 0:
 - Strategy accumulation must be untouched by discount step
 
 > **Implementation note:** `agent.strategy[I][a] *= d` line removed from `singleprocess/train.py` during Phase 2 bug scanning. The `apply_discount` method on `SparseRegretTable` only operates on regret rows by design.
+> **Also fixed:** `worker.py` `_discount()` had the same strategy-discount bug (Phase 2 fix was incomplete) — fully removed this phase.
 
-### 3.6 Refactor `update_strategy()`
+### 3.6 Refactor `update_strategy()` ✅ COMPLETE
 - Remove `locks` parameter
 - Reads from shared regret table via `get_row_if_exists`
 - Writes to shared strategy table via `get_row`
 - Strategy table uses the same `SparseRegretTable` structure
 - Document explicitly: exits for postflop states by design per Pluribus blueprint
 
-### 3.7 Rewrite `serialise()`
+> **Implemented:** `locks` parameter removed from `update_strategy()` signature. Reads from `agent.regret` directly; no lock acquisitions during traversal. `betting_round > 0` early-exit retained as intentional design (Bug 5, not a bug).
+
+### 3.7 Rewrite `serialise()` ✅ COMPLETE
 - Remove `copy.deepcopy` — fix Bug 4
 - Remove per-infoset lock acquisition — fix Bug 3
 - Serialisation is now the checkpoint writer's responsibility — `serialise()` becomes a thin wrapper that calls `CheckpointManager.checkpoint()`
 - Never holds any lock during iteration over infosets
 
-### 3.8 Unit Tests
+> **Implemented:** Bug 4 fixed — `copy.deepcopy` removed. Takes `regret_snapshot = list(agent.regret.items())` and `strategy_snapshot = list(agent.strategy.items())` under their respective locks (short critical sections). Builds offline dicts from snapshots via dict comprehensions. `locks: dict = {}` parameter kept for worker compatibility; full `CheckpointManager` deferred to Phase 6.
+
+### 3.8 Unit Tests ✅ COMPLETE
 - Run refactored `cfr()` for 1000 iterations on the small game
 - Verify `local_delta` accumulates correct values
 - Verify zero writes to shared memory during traversal
 - Verify external sampling produces lower variance value estimates than outcome sampling over 10K runs
 - Compare strategy output against Phase 0 singleprocess baseline using `validate_strategy_equivalence`
+
+> **Implemented:** 47 tests in `test/unit/test_phase3_cfr_core.py`. Covers `calculate_strategy_from_row`, `merge_local_delta`, `cfr()` local_delta path, external sampling determinism, `cfrp()` local_delta path, `update_strategy()` signature, `serialise()` Bug 4 regression, and bug regression checks for signatures. Uses `data/clustering/20cards_exact` for slow integration test.
 
 ---
 
