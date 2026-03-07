@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import random
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Union
 
 import click
 import joblib
@@ -105,13 +105,15 @@ def simple_search(
                     ai.cfrp(agent=agent, state=state, i=i, t=t, c=c)
             else:
                 ai.cfr(agent=agent, state=state, i=i, t=t)
-        if t < lcfr_threshold & t % discount_interval == 0:
+        if t < lcfr_threshold and t % discount_interval == 0:
             d = (t / discount_interval) / ((t / discount_interval) + 1)
             for I in agent.regret.keys():
                 for a in agent.regret[I].keys():
                     agent.regret[I][a] *= d
+            for I in agent.strategy.keys():
+                for a in agent.strategy[I].keys():
                     agent.strategy[I][a] *= d
-        if (t > update_threshold) & (t % dump_iteration == 0):
+        if (t > update_threshold) and (t % dump_iteration == 0):
             # dump the current strategy (sigma) throughout training and then
             # take an average. This allows for estimation of expected value in
             # leaf nodes later on using modified versions of the blueprint
@@ -124,4 +126,4 @@ def simple_search(
 
 
 if __name__ == "__main__":
-    train()
+    simple_search()

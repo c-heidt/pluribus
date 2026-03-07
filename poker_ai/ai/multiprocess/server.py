@@ -116,7 +116,7 @@ class Server:
                         i=i,
                     )
                 self.job("cfr", sync_workers=self._sync_cfr, t=t, i=i)
-            if t < self._lcfr_threshold & t % self._discount_interval == 0:
+            if t < self._lcfr_threshold and t % self._discount_interval == 0:
                 self.job("discount", sync_workers=self._sync_discount, t=t)
             if t > self._update_threshold and t % self._dump_iteration == 0:
                 self.job(
@@ -205,7 +205,6 @@ class Server:
         # Wait for all workers to become idle.
         self._wait_until_all_workers_are_idle()
         log.info(f"Sending synchronised {job_name} to workers")
-        log.info(self._worker_status)
         # Send the job to a single worker.
         self._send_job(job_name, **kwargs)
         # Wait for the synchronised job to be completed.
