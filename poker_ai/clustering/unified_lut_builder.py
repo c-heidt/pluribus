@@ -43,12 +43,107 @@ import numpy as np
 from sklearn.cluster import KMeans, MiniBatchKMeans
 from tqdm import tqdm
 
-from poker_ai.clustering.card_combos import CardCombos
+from poker_ai.clustering.card_combos import CardCombos, _lex_rank
 from poker_ai.clustering.chunked_processor import ChunkedProcessor
 from poker_ai.clustering.preflop import compute_preflop_lossless_abstraction
 from poker_ai.utils.io import atomic_joblib_dump
 
 log = logging.getLogger("poker_ai.clustering.unified_lut_builder")
+
+
+# ---------------------------------------------------------------------------
+# Memory-efficient street lookup (replaces the per-street Python dict)
+# ---------------------------------------------------------------------------
+
+class MemmapLookup:
+    """
+    Drop-in replacement for the ``{tuple: cluster_id}`` dict that
+    ``create_card_lookup`` used to build for each street.
+
+    For a 52-card deck the river has ~2.8 billion combos.  A Python dict for
+    that many entries requires ~840 GB of RAM and makes ``joblib.dump`` hang
+    for hours.  This class reads cluster IDs directly from the compact uint16
+    ``cluster_ids.dat`` memmap (already written by
+    ``_on_street_clustering_complete``) using the same O(1) combinadic
+    ``get_row_index`` logic — consuming only a few KB when pickled.
+
+    Call ``rebind(new_ids_path)`` after moving ``cluster_ids.dat`` to a new
+    location (e.g. when copying results from a scratch workspace to permanent
+    storage).
+    """
+
+    def __init__(
+        self,
+        ids_path: str,
+        card_to_idx: Dict[int, int],
+        n_cards: int,
+        n_rows: int,
+    ):
+        self._ids_path = str(ids_path)
+        self._card_to_idx = card_to_idx
+        self._n_cards = n_cards
+        self._n_rows = n_rows
+        self._mm: Optional[np.memmap] = None
+
+    # ------------------------------------------------------------------
+    # Lazy memmap loading
+    # ------------------------------------------------------------------
+
+    def _load(self):
+        if self._mm is None:
+            self._mm = np.memmap(
+                self._ids_path, dtype=np.uint16, mode="r",
+                shape=(self._n_rows,)
+            )
+
+    # ------------------------------------------------------------------
+    # Dict-like interface expected by the game state
+    # ------------------------------------------------------------------
+
+    def __getitem__(self, combo):
+        """Return the cluster ID for *combo* (tuple of Card objects or ints)."""
+        self._load()
+        ints = [int(c) for c in combo]
+        row = self._get_row_index(ints[:2], ints[2:])
+        return int(self._mm[row])
+
+    # ------------------------------------------------------------------
+    # O(1) combinadic row index (mirrors CardCombos.get_row_index)
+    # ------------------------------------------------------------------
+
+    def _get_row_index(self, hole_ints, public_ints) -> int:
+        card_to_idx = self._card_to_idx
+        n = self._n_cards
+        h_idx = sorted(card_to_idx[int(c)] for c in hole_ints)
+        p_idx = sorted(card_to_idx[int(c)] for c in public_ints)
+        hole_rank = _lex_rank(tuple(h_idx), n)
+        h0, h1 = h_idx[0], h_idx[1]
+        p_reindexed = tuple(p - (h0 < p) - (h1 < p) for p in p_idx)
+        n_remaining = n - 2
+        k_public = len(p_idx)
+        public_rank = _lex_rank(p_reindexed, n_remaining)
+        return hole_rank * comb(n_remaining, k_public) + public_rank
+
+    # ------------------------------------------------------------------
+    # Path update after copying files to a new location
+    # ------------------------------------------------------------------
+
+    def rebind(self, new_ids_path: str):
+        """Point this lookup at a new ``cluster_ids.dat`` path and reset the memmap."""
+        self._ids_path = str(new_ids_path)
+        self._mm = None
+
+    # ------------------------------------------------------------------
+    # Pickle support — do not serialise the memmap handle
+    # ------------------------------------------------------------------
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_mm"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
 
 
 # ---------------------------------------------------------------------------
@@ -449,11 +544,11 @@ class UnifiedLutBuilder(CardCombos):
             )
             clusters = self.chunked_processor.load_clusters(street)
             merged_data, all_combos = (
-                self.chunked_processor.get_or_merge_data(street)
+                self.chunked_processor.get_or_merge_data(street, all_combos_full=combos)
             )
         else:
             merged_data, all_combos = (
-                self.chunked_processor.get_or_merge_data(street)
+                self.chunked_processor.get_or_merge_data(street, all_combos_full=combos)
             )
             self.centroids[street], clusters = self._cluster(
                 num_clusters=n_clusters, X=merged_data, street=street,
@@ -476,7 +571,22 @@ class UnifiedLutBuilder(CardCombos):
 
         end = time.time()
         log.info(f"Finished {street} clusters — {end - start:.2f}s.")
-        return self.create_card_lookup(clusters, all_combos)
+
+        # Return a MemmapLookup instead of a full Python dict.
+        # For a 52-card deck the river has ~2.8 billion combos; building a
+        # Python dict for that requires ~840 GB RAM and makes joblib.dump
+        # hang for hours.  MemmapLookup reads directly from the compact
+        # cluster_ids.dat memmap that _on_street_clustering_complete already
+        # wrote, serialising to only a few KB.
+        ids_path = (
+            Path(self._config["save_dir"]) / street / "cluster_ids.dat"
+        )
+        return MemmapLookup(
+            ids_path=ids_path,
+            card_to_idx=self._card_to_idx,
+            n_cards=self._n_cards,
+            n_rows=len(all_combos),
+        )
 
     # ------------------------------------------------------------------
     # Chunk dispatch
@@ -948,8 +1058,10 @@ class UnifiedLutBuilder(CardCombos):
         available = [c for c in self._card_ints if c not in unavailable]
         dist = np.zeros(n_river_clusters)
 
+        river_board = np.empty(5, dtype=np.int32)
+        river_board[:4] = board
         for river_card in available:
-            river_board = np.append(board, river_card)
+            river_board[4] = river_card
             dist[int(river_cluster_ids[self.get_row_index(our_hand, river_board)])] += 1
 
         total = dist.sum()
@@ -1007,8 +1119,10 @@ class UnifiedLutBuilder(CardCombos):
         available = [c for c in self._card_ints if c not in unavailable]
         dist = np.zeros(n_turn_clusters)
 
+        turn_board = np.empty(4, dtype=np.int32)
+        turn_board[:3] = board
         for turn_card in available:
-            turn_board = np.append(board, turn_card)
+            turn_board[3] = turn_card
             dist[int(turn_cluster_ids[self.get_row_index(our_hand, turn_board)])] += 1
 
         total = dist.sum()
