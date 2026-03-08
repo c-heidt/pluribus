@@ -122,15 +122,35 @@ class Worker(mp.Process):
         )
         # Per Pluribus paper only regret is discounted (Bug 2 fix).
         # Discounting strategy degrades convergence and is incorrect.
+        #
+        # IMPORTANT: agent.regret is a manager.dict() proxy.  Accessing
+        # agent.regret[info_set] returns a *copy* of the nested dict, not a
+        # proxy into it.  Mutating that copy in-place (e.g.
+        # regret[info_set][action] *= d) is a silent lost update — the change
+        # is never written back to the shared manager process.  We must
+        # explicitly read the row, mutate a local copy, then write it back.
         self._locks["regret"].acquire()
-        for info_set in self._agent.regret.keys():
-            for action in self._agent.regret[info_set].keys():
-                self._agent.regret[info_set][action] *= discount_factor
+        for info_set in list(self._agent.regret.keys()):
+            row = dict(self._agent.regret[info_set])
+            for action in row:
+                row[action] *= discount_factor
+            self._agent.regret[info_set] = row
         self._locks["regret"].release()
 
     def _update_strategy(self, t, i):
         """Update the strategy."""
+        # Deal a fresh hand so each strategy update traverses a different game
+        # path, giving more diverse strategy samples.
+        self._setup_new_game()
+        # Acquire the pre_flop_strategy lock for the full traversal so that
+        # concurrent workers performing strategy updates don't race on the
+        # same infoset's read-modify-write.  The lock is *not* acquired inside
+        # ai.update_strategy() (that function is recursive and must not try to
+        # re-acquire a non-reentrant lock); it is acquired here at the single
+        # entry point for the whole traversal.
+        self._locks["pre_flop_strategy"].acquire()
         ai.update_strategy(self._agent, self._state, i, t)
+        self._locks["pre_flop_strategy"].release()
 
     def _serialise(self, t: int, server_state: Dict[str, Union[str, float, int, None]]):
         """Write progress of optimising agent (and server state) to file."""

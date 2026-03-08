@@ -311,12 +311,18 @@ class TestCfrLocalDelta:
         assert "root" in agent.regret
 
     def test_merge_after_cfr_equals_direct_mode(self):
-        """local_delta path + merge must give identical regrets to direct path."""
+        """local_delta path + merge must give identical regrets to direct path.
+
+        Both calls use the same numpy seed so the opponent's sampled action
+        is identical, making the two paths produce the exact same regrets.
+        """
         root, _ = _make_two_node_game()
 
+        np.random.seed(7)
         agent_direct = _fresh_agent()
         cfr(agent_direct, root, i=0, t=1, local_delta=None)
 
+        np.random.seed(7)
         agent_delta = _fresh_agent()
         local_delta: Dict = {}
         cfr(agent_delta, root, i=0, t=1, local_delta=local_delta)
@@ -361,13 +367,13 @@ class TestCfrLocalDelta:
 
 
 class TestExternalSampling:
-    def test_opponent_branch_visits_all_actions(self):
+    def test_opponent_samples_single_action_per_call(self):
         """
-        In external sampling, every legal action at an opponent node must
-        be visited on every cfr() call.  Confirm this by tracking which child
-        states are reached from an opponent node.
+        In external sampling each cfr() call samples exactly ONE opponent
+        action per opponent node — not all of them.  Over many calls (with
+        uniform strategy) all actions should eventually be sampled.
         """
-        visited = set()
+        sampled_per_call = []
 
         class TrackingTerminal(MockTerminal):
             def __init__(self, action_name, payout, n_players=2):
@@ -376,7 +382,7 @@ class TestExternalSampling:
 
             @property
             def payout(self):
-                visited.add(self._action_name)
+                sampled_per_call[-1].add(self._action_name)
                 return self._payout
 
         opp_node = MockState(
@@ -389,8 +395,9 @@ class TestExternalSampling:
                 "raise": TrackingTerminal("raise", {0: -100, 1: 100}),
             },
         )
+        # Root is also the opponent's turn (i=0 traversing, ph=1)
         root = MockState(
-            player_i=1,   # root is also opponent's turn (i=0 traversing)
+            player_i=1,
             info_set="root_ext",
             actions=["fold", "call", "raise"],
             children={
@@ -400,16 +407,53 @@ class TestExternalSampling:
             },
         )
         agent = _fresh_agent()
-        visited.clear()
+        np.random.seed(0)
+        for _ in range(30):
+            sampled_per_call.append(set())
+            cfr(agent, root, i=0, t=1)
+
+        # Each individual call must reach exactly one terminal (one sampled path)
+        for run_idx, visited in enumerate(sampled_per_call):
+            assert len(visited) == 1, (
+                f"Run {run_idx}: expected 1 action sampled, got {visited}"
+            )
+
+        # Over 30 runs, more than one distinct action should appear
+        all_visited = set().union(*sampled_per_call)
+        assert len(all_visited) > 1, "Strategy is uniform — multiple actions should be sampled across runs"
+
+    def test_traversing_player_visits_all_actions(self):
+        """The traversing player (ph == i) must still explore all its own actions."""
+        visited = set()
+
+        class TrackingTerminal(MockTerminal):
+            def __init__(self, action_name, payout, n_players=2):
+                super().__init__(payout, n_players)
+                self._action_name = action_name
+
+            @property
+            def payout(self):
+                visited.add(self._action_name)
+                return self._payout
+
+        root = MockState(
+            player_i=0,  # traversing player (i=0)
+            info_set="root_traversing",
+            actions=["fold", "call", "raise"],
+            children={
+                "fold": TrackingTerminal("fold", {0: -50, 1: 50}),
+                "call": TrackingTerminal("call", {0: 0, 1: 0}),
+                "raise": TrackingTerminal("raise", {0: 100, 1: -100}),
+            },
+        )
+        agent = _fresh_agent()
         cfr(agent, root, i=0, t=1)
-        # External sampling must have visited all 3 opponent actions
         assert visited == {"fold", "call", "raise"}, (
-            f"Expected all 3 actions visited, got: {visited}"
+            f"Traversing player must visit ALL actions, got: {visited}"
         )
 
-    def test_external_sampling_is_deterministic_given_seed(self):
-        """External sampling should produce the same result regardless of random
-        state because it visits all actions (no sampling)."""
+    def test_same_seed_produces_same_result(self):
+        """With the same numpy seed, cfr() must produce identical results."""
         root, _ = _make_two_node_game()
         agent1 = _fresh_agent()
         agent2 = _fresh_agent()
@@ -418,17 +462,11 @@ class TestExternalSampling:
         local_delta1: Dict = {}
         cfr(agent1, root, i=0, t=1, local_delta=local_delta1)
 
-        np.random.seed(99)
+        np.random.seed(42)
         local_delta2: Dict = {}
         cfr(agent2, root, i=0, t=1, local_delta=local_delta2)
 
-        # Because external sampling visits all opponent actions deterministically,
-        # both runs must produce identical local_delta values.
-        for info_set in local_delta1:
-            for action in local_delta1[info_set]:
-                assert local_delta1[info_set][action] == pytest.approx(
-                    local_delta2[info_set][action], abs=1e-9
-                ), f"Mismatch at {info_set}/{action}"
+        assert local_delta1 == local_delta2
 
 
 # ---------------------------------------------------------------------------
@@ -455,9 +493,11 @@ class TestCfrpLocalDelta:
         root, _ = _make_two_node_game()
         c = -1_000_000_000
 
+        np.random.seed(7)
         agent_direct = _fresh_agent()
         cfrp(agent_direct, root, i=0, t=1, c=c, local_delta=None)
 
+        np.random.seed(7)
         agent_delta = _fresh_agent()
         local_delta: Dict = {}
         cfrp(agent_delta, root, i=0, t=1, c=c, local_delta=local_delta)
