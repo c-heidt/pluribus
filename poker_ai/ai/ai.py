@@ -161,9 +161,10 @@ def cfr(
     """
     Regular counter factual regret minimization algorithm.
 
-    Uses **external sampling** for opponent nodes — iterates all opponent
-    actions weighted by current strategy, eliminating the high-variance
-    single-sample used by the previous outcome-sampling scheme.
+    Uses **external sampling** for opponent nodes: the traversing player
+    explores all its own actions while each opponent node samples a single
+    action from its current strategy.  This gives O(B^{depth/2}) cost per
+    traversal vs. O(B^depth) for vanilla CFR.
 
     Parameters
     ----------
@@ -241,18 +242,19 @@ def cfr(
             agent.regret[state.info_set] = this_info_sets_regret
         return vo
     else:
-        # External sampling: iterate all opponent actions weighted by their
-        # current strategy probability, replacing the old outcome-sampling
-        # single-action sample and dramatically reducing per-iteration variance.
+        # External sampling: sample ONE opponent action from current strategy.
+        # The traversing player (ph == i) already explores all its own actions
+        # above.  Iterating all opponent actions here would be vanilla/tree CFR,
+        # which is exponentially expensive for real poker game trees.
         this_info_sets_regret = {**state.initial_regret, **agent.regret.get(state.info_set, {})}
         sigma = calculate_strategy(this_info_sets_regret)
         log.debug(f"Calculated Strategy for {state.info_set}: {sigma}")
-        vo = 0.0
-        for action in state.legal_actions:
-            log.debug(f"EXTERNAL SAMPLE: opponent ph {state.player_i} ACTION: {action}")
-            new_state: ShortDeckPokerState = state.apply_action(action)
-            vo += sigma[action] * cfr(agent, new_state, i, t, local_delta)
-        return vo
+        available_actions: List[str] = list(sigma.keys())
+        action_probs: np.ndarray = np.array(list(sigma.values()))
+        action: str = np.random.choice(available_actions, p=action_probs)
+        log.debug(f"EXTERNAL SAMPLE: opponent ph {state.player_i} sampled ACTION: {action}")
+        new_state: ShortDeckPokerState = state.apply_action(action)
+        return cfr(agent, new_state, i, t, local_delta)
 
 
 def cfrp(
@@ -320,14 +322,14 @@ def cfrp(
             agent.regret[state.info_set] = this_info_sets_regret
         return vo
     else:
-        # External sampling: iterate all opponent actions weighted by strategy.
+        # External sampling: sample ONE opponent action from current strategy.
         this_info_sets_regret = {**state.initial_regret, **agent.regret.get(state.info_set, {})}
         sigma = calculate_strategy(this_info_sets_regret)
-        vo = 0.0
-        for action in state.legal_actions:
-            new_state: ShortDeckPokerState = state.apply_action(action)
-            vo += sigma[action] * cfrp(agent, new_state, i, t, c, local_delta)
-        return vo
+        available_actions: List[str] = list(sigma.keys())
+        action_probs: np.ndarray = np.array(list(sigma.values()))
+        action: str = np.random.choice(available_actions, p=action_probs)
+        new_state: ShortDeckPokerState = state.apply_action(action)
+        return cfrp(agent, new_state, i, t, c, local_delta)
 
 
 def serialise(

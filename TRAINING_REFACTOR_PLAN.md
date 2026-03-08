@@ -304,7 +304,7 @@ else:
 - Traversing player branch remains unchanged — iterates all actions
 - Validate against singleprocess baseline from Phase 0 — exploitability should be lower per iteration than the original outcome sampling
 
-> **Implemented:** `cfr()` and `cfrp()` opponent branches replaced with weighted sum over all `state.legal_actions` using current strategy. Traversal is now fully deterministic given opponent states.
+> **Implemented (corrected):** The plan pseudocode above shows vanilla/tree CFR (iterate all opponent actions), which caused an exponential game-tree traversal and hung on real 20-card games. Correct external sampling MCCFR samples **one opponent action** per node according to the current strategy while the traversing player still explores all its own actions. Both `cfr()` and `cfrp()` opponent branches now use `np.random.choice(actions, p=probs)` to sample a single action. 48 unit tests green.
 
 ### 3.3 Add Local Delta Parameter ✅ COMPLETE
 - Add `local_delta: Dict[str, np.ndarray]` parameter to `cfr()`
