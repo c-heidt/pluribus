@@ -157,14 +157,7 @@ except:
     sys.exit(1)
 " 2>/dev/null; then
     echo "✓ Clustering completed successfully!"
-    
-    # Copy final results to home directory for permanent storage
-    FINAL_DIR="$PROJECT_DIR/data/clustering/20cards_exact"
-    mkdir -p "$FINAL_DIR"
-    echo "Copying final results to home directory: $FINAL_DIR"
-    cp "$SAVE_DIR"/*.joblib "$FINAL_DIR/" 2>/dev/null || true
-    cp "$SAVE_DIR"/checkpoint.json "$FINAL_DIR/" 2>/dev/null || true
-    echo "✓ Results saved to permanent storage"
+    echo "Results are in: $SAVE_DIR"
     
     exit 0
   fi
