@@ -1073,8 +1073,10 @@ class UnifiedLutBuilder(CardCombos):
         available = [c for c in self._card_ints if c not in unavailable]
         dist = np.zeros(n_river_clusters)
 
+        river_board = np.empty(5, dtype=np.int32)
+        river_board[:4] = board
         for river_card in available:
-            river_board = np.append(board, river_card)
+            river_board[4] = river_card
             dist[int(river_cluster_ids[self.get_row_index(our_hand, river_board)])] += 1
 
         total = dist.sum()
@@ -1132,8 +1134,10 @@ class UnifiedLutBuilder(CardCombos):
         available = [c for c in self._card_ints if c not in unavailable]
         dist = np.zeros(n_turn_clusters)
 
+        turn_board = np.empty(4, dtype=np.int32)
+        turn_board[:3] = board
         for turn_card in available:
-            turn_board = np.append(board, turn_card)
+            turn_board[3] = turn_card
             dist[int(turn_cluster_ids[self.get_row_index(our_hand, turn_board)])] += 1
 
         total = dist.sum()
