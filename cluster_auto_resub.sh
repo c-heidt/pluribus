@@ -24,7 +24,7 @@ CONDA_ENV=${CONDA_ENV:-pluribus}
 PROJECT_DIR=${PROJECT_DIR:-"$HOME/pluribus"}
 WORKERS=${WORKERS:-60}
 WORKSPACE=${WORKSPACE:-/pfs/work9/workspace/scratch/ka_gu4593-clustering_52}  # Workspace path!
-SAVE_DIR=${SAVE_DIR:-"$WORKSPACE/monte_carlo"}
+SAVE_DIR=${SAVE_DIR:-"$WORKSPACE/exact"}
 
 # Clustering parameters (adjust as needed)
 LOW_CARD_RANK=${LOW_CARD_RANK:-2}
@@ -33,11 +33,11 @@ N_RIVER_CLUSTERS=${N_RIVER_CLUSTERS:-200}
 N_TURN_CLUSTERS=${N_TURN_CLUSTERS:-200}
 N_FLOP_CLUSTERS=${N_FLOP_CLUSTERS:-200}
 N_SIMULATIONS_RIVER=${N_SIMULATIONS_RIVER:-200}
-CHUNK_SIZE=${CHUNK_SIZE:-25000}
+CHUNK_SIZE=${CHUNK_SIZE:-100000}
 MAX_RESUBMISSIONS=${MAX_RESUBMISSIONS:-2}
 # Computation method: monte_carlo or exact 
 # If exact, N_SIMULATIONS_* parameters are ignored
-METHOD=${METHOD:-monte_carlo}
+METHOD=${METHOD:-exact}
 
 mkdir -p "$PROJECT_DIR/logs"
 mkdir -p "$SAVE_DIR"

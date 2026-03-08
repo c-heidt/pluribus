@@ -320,11 +320,14 @@ class ChunkedProcessor:
         street: str,
         chunk_idx: int,
         data: np.ndarray,
-        combos: np.ndarray,
     ):
         """
-        Save a processed chunk to disk.
-        
+        Save a processed chunk's EHS data to disk.
+
+        Combo files are NOT saved here — combos are always reconstructible
+        from ``all_combos[chunk_idx * chunk_size : end]`` and saving them
+        would write 78.7 GB of redundant data for a 52-card river.
+
         Parameters
         ----------
         street : str
@@ -333,40 +336,21 @@ class ChunkedProcessor:
             The chunk index.
         data : np.ndarray
             The computed EHS/distribution data for this chunk.
-        combos : np.ndarray
-            The card combinations for this chunk.
         """
-        # Save data atomically using temp files
         chunk_path = self.get_chunk_path(street, chunk_idx)
-        combos_path = self.get_combos_path(street, chunk_idx)
-        
-        # Determine temp file extensions
         temp_ext = ".tmp.npy.gz" if self.use_compression else ".tmp.npy"
         temp_chunk = chunk_path.parent / f"chunk_{chunk_idx:06d}{temp_ext}"
-        temp_combos = combos_path.with_suffix(".tmp.npy")
-        
         try:
-            # Convert to storage dtype (float16 saves 50% disk space)
             data_to_save = data.astype(self.storage_dtype)
-            
             if self.use_compression:
-                # Save with gzip compression (saves additional 60-80%)
                 with gzip.open(temp_chunk, 'wb', compresslevel=4) as f:
                     np.save(f, data_to_save)
             else:
                 np.save(temp_chunk, data_to_save)
-            
-            # Combos are small integers, no need to compress
-            np.save(temp_combos, combos)
-            
-            # Atomic rename
             shutil.move(str(temp_chunk), str(chunk_path))
-            shutil.move(str(temp_combos), str(combos_path))
         except Exception as e:
-            # Clean up temp files on failure
-            for f in [temp_chunk, temp_combos]:
-                if f.exists():
-                    f.unlink()
+            if temp_chunk.exists():
+                temp_chunk.unlink()
             raise RuntimeError(f"Failed to save chunk {chunk_idx}: {e}")
     
     def mark_chunk_complete(self, street: str, chunk_idx: int):
@@ -434,14 +418,22 @@ class ChunkedProcessor:
         
         # Track completed count for progress updates
         completed_count = len(self.get_completed_chunks(street))
-        
+
+        # Keep in-memory set for O(1) duplicate detection; flush to disk
+        # every checkpoint_flush_interval completions instead of every chunk.
+        # Writing a growing JSON on every chunk is O(n²) total I/O.
+        completed_set = set(self._checkpoint["streets"][street]["completed_chunks"])
+        pending_flush = 0
+        checkpoint_flush_interval = max(100, workers * 2)
+        failed_chunks = []
+
         with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
             # Submit all chunks - each worker gets one chunk
             futures = {}
             for chunk_idx in chunk_indices:
                 _, start_idx, end_idx = chunk_specs[chunk_idx]
                 chunk_combos = all_combos[start_idx:end_idx]
-                
+
                 future = executor.submit(
                     _process_single_chunk_worker,
                     chunk_idx,
@@ -449,24 +441,28 @@ class ChunkedProcessor:
                     item_processor,
                 )
                 futures[future] = chunk_idx
-            
+
             # Process results as they complete
-            failed_chunks = []
             for future in concurrent.futures.as_completed(futures):
                 chunk_idx = futures[future]
                 try:
                     result_idx, results = future.result()
-                    
-                    # Reconstruct combos from all_combos — avoids shipping
-                    # ~700 KB back from the worker on every chunk.
-                    _, start_idx, end_idx = chunk_specs[result_idx]
-                    combos = all_combos[start_idx:end_idx]
 
-                    # Save chunk to disk
-                    self.save_chunk(street, result_idx, results, combos)
-                    self.mark_chunk_complete(street, result_idx)
+                    # Save EHS data only — combos are reconstructed from
+                    # all_combos during merge, eliminating 78.7 GB of file I/O.
+                    self.save_chunk(street, result_idx, results)
+
+                    # Buffer completion; avoid one growing-JSON write per chunk.
+                    if result_idx not in completed_set:
+                        completed_set.add(result_idx)
+                        pending_flush += 1
                     completed_count += 1
-                    
+
+                    if pending_flush >= checkpoint_flush_interval:
+                        self._checkpoint["streets"][street]["completed_chunks"] = sorted(completed_set)
+                        self._save_checkpoint(merge_with_disk=False)
+                        pending_flush = 0
+
                     # Progress update every 60 chunks (or on first and last)
                     is_last = completed_count == total_chunks
                     if completed_count % 60 == 0 or completed_count == 1 or is_last:
@@ -479,13 +475,18 @@ class ChunkedProcessor:
                             f"ETA: {remaining/60:.1f}m | "
                             f"Rate: {rate*60:.1f} chunks/min"
                         )
-                    
+
                 except Exception as e:
                     log.error(f"Chunk {chunk_idx} failed: {e}")
                     failed_chunks.append(chunk_idx)
                     # Continue processing remaining futures — do NOT raise here.
                     # Failed chunks stay absent from the checkpoint so they are
                     # automatically retried on the next run.
+
+        # Final flush to persist any completions not yet written to disk
+        if pending_flush > 0:
+            self._checkpoint["streets"][street]["completed_chunks"] = sorted(completed_set)
+            self._save_checkpoint(merge_with_disk=False)
 
         if failed_chunks:
             log.warning(
@@ -522,14 +523,17 @@ class ChunkedProcessor:
         
         # Convert back to float32 for computation accuracy
         data = data.astype(np.float32)
-        
-        combos = np.load(combos_path, allow_pickle=True)
+
+        # Combo file is optional — new runs don't write it (combos are
+        # reconstructed from all_combos_full during merge instead).
+        combos = np.load(combos_path, allow_pickle=True) if combos_path.exists() else None
         return data, combos
     
     def merge_chunks_to_memmap(
         self,
         street: str,
         dtype: np.dtype = np.float32,
+        all_combos_full: Optional[np.ndarray] = None,
     ) -> Tuple[np.memmap, np.ndarray]:
         """
         Merge all chunk files into a single memory-mapped array.
@@ -603,23 +607,35 @@ class ChunkedProcessor:
             shape=(total_rows, feature_dim),
         )
         
-        # Collect all combos (these are smaller, can fit in memory)
+        # Collect all combos
         all_combos = []
-        
+
         # Second pass: copy data to memory-mapped file
         current_row = 0
         flush_interval = 10  # Flush every 10 chunks for safety
         for i, chunk_idx in enumerate(completed_chunks):
-            chunk_data, chunk_combos = self.load_chunk(street, chunk_idx)
+            chunk_data, chunk_combos_file = self.load_chunk(street, chunk_idx)
             n_rows = chunk_data.shape[0]
-            
+
             if chunk_data.ndim == 1:
                 chunk_data = chunk_data.reshape(-1, 1)
-            
+
             merged_data[current_row:current_row + n_rows] = chunk_data
-            all_combos.append(chunk_combos)
+
+            if all_combos_full is not None:
+                # Reconstruct combos from index — no combo file I/O needed
+                start_idx = chunk_idx * self.chunk_size
+                end_idx = min(
+                    start_idx + self.chunk_size,
+                    total_combos if total_combos is not None else start_idx + n_rows,
+                )
+                all_combos.append(all_combos_full[start_idx:end_idx])
+            elif chunk_combos_file is not None:
+                # Fall back to file-based combos (backward compatibility)
+                all_combos.append(chunk_combos_file)
+
             current_row += n_rows
-            
+
             # Periodic flush to ensure progress is saved to disk
             if (i + 1) % flush_interval == 0:
                 merged_data.flush()
@@ -708,20 +724,26 @@ class ChunkedProcessor:
         self,
         street: str,
         dtype: np.dtype = np.float32,
+        all_combos_full: Optional[np.ndarray] = None,
     ) -> Tuple[np.memmap, np.ndarray]:
         """
         Get merged data, either by loading from disk or merging chunks.
-        
+
         This method checks if merge is complete. If yes, loads existing data.
         If no, merges chunks and marks merge as complete.
-        
+
         Parameters
         ----------
         street : str
             The street name.
         dtype : np.dtype
             Data type for the memory-mapped file.
-            
+        all_combos_full : Optional[np.ndarray]
+            Full combo array for this street.  When provided, combo data is
+            reconstructed from the chunk index instead of loaded from per-chunk
+            combo files, eliminating ~78.7 GB of redundant file I/O for the
+            52-card river.
+
         Returns
         -------
         Tuple[np.memmap, np.ndarray]
@@ -734,9 +756,11 @@ class ChunkedProcessor:
             except (FileNotFoundError, ValueError) as e:
                 log.warning(f"Failed to load merged data: {e}. Re-merging from chunks...")
                 # Fall through to merge
-        
+
         # Merge from chunks
-        merged_data, all_combos = self.merge_chunks_to_memmap(street, dtype)
+        merged_data, all_combos = self.merge_chunks_to_memmap(
+            street, dtype, all_combos_full=all_combos_full
+        )
         self.mark_merge_done(street)
         return merged_data, all_combos
     

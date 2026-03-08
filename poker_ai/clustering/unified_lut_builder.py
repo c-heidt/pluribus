@@ -559,11 +559,11 @@ class UnifiedLutBuilder(CardCombos):
             )
             clusters = self.chunked_processor.load_clusters(street)
             merged_data, all_combos = (
-                self.chunked_processor.get_or_merge_data(street)
+                self.chunked_processor.get_or_merge_data(street, all_combos_full=combos)
             )
         else:
             merged_data, all_combos = (
-                self.chunked_processor.get_or_merge_data(street)
+                self.chunked_processor.get_or_merge_data(street, all_combos_full=combos)
             )
             self.centroids[street], clusters = self._cluster(
                 num_clusters=n_clusters, X=merged_data, street=street,
