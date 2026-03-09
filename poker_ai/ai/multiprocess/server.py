@@ -245,14 +245,13 @@ class Server:
                 logging_queue=self._logging_queue,
                 locks=self._locks,
                 agent=self._agent,
+                lut_path=self._lut_path,
+                pickle_dir=self._pickle_dir,
                 info_set_lut=self._info_set_lut,
                 n_players=self._n_players,
                 prune_threshold=self._prune_threshold,
                 c=self._c,
-                lcfr_threshold=self._lcfr_threshold,
                 discount_interval=self._discount_interval,
-                update_threshold=self._update_threshold,
-                dump_iteration=self._dump_iteration,
                 save_path=self._save_path,
             )
             workers[worker.name] = worker

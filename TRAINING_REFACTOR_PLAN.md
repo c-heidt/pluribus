@@ -366,13 +366,23 @@ if t < lcfr_threshold and t % discount_interval == 0:
 ## Phase 4 — Worker: Local Delta Sync Protocol
 *Implements the worker process with local accumulation and periodic sync.*
 
-### 4.1 Refactor `Worker.__init__`
+### 4.1 Refactor `Worker.__init__` ✅ COMPLETE
 - Remove all `manager.dict` references
 - Parameters: `job_queue`, `locks` (stripe locks only), `agent`, `lut_mmap_path`, `sync_interval`, `n_players`, `n_actions`
 - No shared state beyond the job queue and the `SparseRegretTable` via `agent`
 - `_local_delta: Dict[str, np.ndarray]` initialised as empty dict — allocated fresh after each sync
 
-### 4.2 Implement `Worker.run()`
+> **Implementation notes:**
+> - `info_set_lut` parameter replaced with `lut_path: Union[str, Path]` and `pickle_dir: bool` — the LUT object is not passed to the worker; only the path is stored and the dict is loaded after fork in `run()`.
+> - `_local_delta` initialised as `Dict[str, Dict[str, float]]` (not `Dict[str, np.ndarray]` as planned) — numpy conversion deferred to Phase 5 when `Agent` gets `SparseRegretTable`.
+> - `_setup_new_game()` removed from `__init__` — it requires the LUT which is only loaded after fork; moved to `run()`.
+> - Three parameters removed as redundant — the server already gates dispatch before enqueuing these jobs, so the worker never needs to re-check:
+>   - `lcfr_threshold` — server checks `t < lcfr_threshold` before sending `discount`
+>   - `update_threshold` — server checks `t > update_threshold` before sending `update_strategy`
+>   - `dump_iteration` — server checks `t % dump_iteration == 0` before sending `serialise`
+> - Server `_start_workers()` updated to pass `lut_path` and `pickle_dir` instead of `info_set_lut`.
+
+### 4.2 Implement `Worker.run()` ✅ COMPLETE
 - Attach to shared memory blocks **after fork** — never before
 - Open LUT as read-only `mmap` after fork:
 
@@ -388,7 +398,13 @@ self._lut_mmap.madvise(mmap.MADV_RANDOM)
 - Set worker-specific random seed for reproducibility
 - Main loop: get job from queue, dispatch to handler, call `task_done()`
 
-### 4.3 Implement `_sync_to_master()`
+> **Implementation notes:**
+> - LUT loaded after fork via `_mmap.mmap(lut_file.fileno(), 0, access=_mmap.ACCESS_READ)` + `joblib.load(lut_mmap)`. All workers mapping the same file share the same physical OS page-cache pages.
+> - `mmap.madvise(mmap.MADV_RANDOM)` skipped — only available from Python 3.8; project runs Python 3.7.12.
+> - For the deprecated `pickle_dir` format, falls back to `utils.io.load_info_set_lut()`.
+> - Startup sequence after fork: load LUT → `_set_seed()` → `_setup_new_game()` → dispatch loop.
+
+### 4.3 Implement `_sync_to_master()` ✅ COMPLETE
 - Iterate over `_local_delta` entries
 - For each infoset:
   - Call `agent.regret_table.get_row(info_set)` — allocates if new
@@ -400,14 +416,25 @@ self._lut_mmap.madvise(mmap.MADV_RANDOM)
 - After all entries flushed: `_local_delta.clear()`
 - Log count of infosets synced and elapsed time
 
-### 4.4 Implement Worker Job Handlers
+> **Implementation notes:**
+> - `agent.regret_table` (SparseRegretTable) does not exist yet — that is Phase 5.1. For now `_sync_to_master()` acquires the `regret` lock once and calls `ai.merge_local_delta(agent, _local_delta)`, which does the dict-based read-modify-write. The stripe lock / `np.add` / dirty-marking path will be wired in when Phase 5.1 refactors `Agent`.
+> - Returns immediately without locking when `_local_delta` is empty.
+> - Logs a single message per flush containing the infoset count.
+
+### 4.4 Implement Worker Job Handlers ✅ COMPLETE
 - `cfr` job: calls `cfr()` with `_local_delta`, increments local iteration counter
 - `sync` job: calls `_sync_to_master()`
 - `update_strategy` job: only dispatched after sync boundary — reads shared regret table, writes shared strategy table
 - `discount` job: only dispatched after sync — calls `regret_table.apply_discount(factor)` — never touches strategy table
 - `terminate` job: calls `_sync_to_master()` one final time, closes mmap, exits cleanly
 
-### 4.5 NUMA Pinning
+> **Implementation notes:**
+> - `_cfr()` now accumulates into `self._local_delta` (instance variable, not a local) and calls `self._sync_to_master()` after each traversal. This keeps behaviour identical to Phase 3 while introducing the infrastructure for Phase 5, which will decouple flush frequency from traversal frequency via explicit server-dispatched `sync` jobs.
+> - `terminate` calls `self._sync_to_master()` and `self._job_queue.task_done()` before breaking — no regret increments are lost on shutdown.
+> - `sync` job handler added to the dispatch loop — currently only triggered by Phase 5's server loop, but the worker handles it today.
+> - `self._local_iteration_count` incremented in `_cfr()` for future per-worker throughput metrics.
+
+### 4.5 NUMA Pinning ✅ COMPLETE
 - Detect NUMA topology on startup using `numactl --hardware`
 - Assign workers evenly across NUMA nodes
 - Pin each worker to its assigned NUMA node after fork:
@@ -419,12 +446,21 @@ def _pin_to_numa_node(self, node: int):
         os.sched_setaffinity(0, cores)
 ```
 
-### 4.6 Unit Tests
+> **Implementation notes:**
+> - NUMA topology read from `/sys/devices/system/node/node{N}/cpulist` — no dependency on `numactl` binary.
+> - Worker index derived from `self.name` (e.g. `Process-3` → index 2); node assigned as `nodes[index % len(nodes)]`.
+> - All errors (missing `/sys` path, unreadable files, `OSError` from `sched_setaffinity`, unparseable process name) are silently swallowed — NUMA pinning is a performance hint, not a correctness requirement.
+> - `_parse_cpulist(cpulist: str)` is a `@staticmethod` that handles ranges (`0-3`), single cores (`7`), and comma-separated combinations.
+> - `_try_numa_pin()` called in `run()` immediately after post-fork LUT load.
+
+### 4.6 Unit Tests ✅ COMPLETE
 - Verify `_sync_to_master()` correctly flushes all local delta entries
 - Verify dirty flags are set after sync
 - Verify `local_delta` is empty after sync
 - Verify terminate job flushes before exiting
 - Verify LUT mmap is opened after fork, not before
+
+> **Implemented:** 22 tests in `test/refactoring_training/test_phase4_worker.py` across 7 classes: `TestSyncToMaster` (6), `TestLocalDeltaState` (3), `TestLutLoadedAfterFork` (1), `TestParseCpulist` (6), `TestGetNumaNodes` (3), `TestTryNumaPin` (3), plus one `@pytest.mark.slow` integration test. All 22 non-slow tests pass.
 
 ---
 
@@ -437,6 +473,35 @@ def _pin_to_numa_node(self, node: int):
 - No locks inside `Agent` — locking is exclusively worker and server responsibility
 - Constructor: takes `info_set_lut`, `n_actions`, optional `checkpoint_path`
 - If `checkpoint_path` provided: load regret and strategy tables from checkpoint files
+
+> **Deferred from Phase 4.1:** Once `Agent` holds a `SparseRegretTable`, convert `Worker._local_delta` from `Dict[str, Dict[str, float]]` to `Dict[str, np.ndarray]` so that `_sync_to_master()` (Phase 4.3) can use `np.add` directly without a dict-to-array conversion step.
+
+> **Full checklist for 5.1 — do not skip any of these:**
+>
+> **`agent.py`:**
+> - Remove module-level `manager = mp.Manager()` and the `manager` import — this is the manager process that currently mediates all `agent.regret` and `agent.strategy` accesses
+> - Remove `use_manager: bool` parameter and the `TESTING_SUITE` environment variable workaround — they only exist to switch away from `manager.dict()` in tests
+> - Replace `self.regret = dict_constructor()` with `self.regret_table = SparseRegretTable(...)`
+> - Replace `self.strategy = dict_constructor()` with `self.strategy_table = SparseRegretTable(...)`
+> - Remove `agent_path` / `joblib.load` checkpoint loading from `__init__` — checkpoint resume moves to `CheckpointManager._restore_from_checkpoint()` in Phase 6
+>
+> **`server.py`:**
+> - Remove module-level `manager = mp.Manager()` — no longer needed once `Agent` no longer uses it
+> - Remove `regret` and `strategy` from `self._locks` — replaced by `SparseRegretTable` stripe locks (256 per table)
+> - Keep `pre_flop_strategy` lock — `update_strategy()` traversal still needs it until a finer-grained solution is designed
+>
+> **`ai.py`:**
+> - `cfr()` and `cfrp()`: reads against `agent.regret_table.get_row_if_exists(info_set)` instead of `agent.regret.get(info_set, {})` — returns a numpy row or `None`; `local_delta` values become `np.ndarray` (see Phase 4.1 deferred item)
+> - `merge_local_delta()`: replaced by the stripe-lock path in `Worker._sync_to_master()` — remove the function or keep as singleprocess-only utility
+> - `update_strategy()`: reads from `agent.regret_table.get_row_if_exists()`, writes to `agent.strategy_table.get_row()`
+> - `serialise()`: snapshot iteration changes from `agent.regret.items()` to iterating allocated chunks via `agent.regret_table`
+>
+> **`worker.py`:**
+> - `_discount()`: remove entire dict iteration loop; replace with `self._agent.regret_table.apply_discount(discount_factor)` — the table method handles all allocated chunks atomically
+> - `_sync_to_master()`: replace `ai.merge_local_delta` + single regret lock with stripe-lock + `np.add` pattern as documented in Phase 4.3
+>
+> **`singleprocess/train.py`:**
+> - Also uses `agent.regret` as a dict — update to use `SparseRegretTable` API; or keep singleprocess using a plain-dict `Agent` and document the divergence explicitly
 
 ### 5.2 Implement LUT Loading and Prefaulting
 - Server loads LUT via read-only `mmap` before spawning workers
@@ -455,12 +520,41 @@ log.info("LUT fully resident in page cache")
 - Workers fork after prefault — they inherit the warm page cache
 - Pass only the file path to workers — never the mmap object itself
 
+> **Implementation notes:**
+> - `self._info_set_lut` in `server.py` is now **unused** — workers load their own copy after fork (Phase 4.1/4.2). Remove the `utils.io.load_info_set_lut()` call and `self._info_set_lut` attribute entirely.
+> - Python 3.7: `mmap.madvise` is not available. The prefault must be done via the manual page-touch loop (`for offset in range(0, size, 4096): _ = lut_mmap[offset]`) rather than the `madvise(MADV_WILLNEED)` hint — the hint line should be skipped. The loop achieves the same effect by forcing page faults before fork.
+> - For `pickle_dir` format (no single joblib file) prefaulting is not applicable — skip the mmap step and go straight to spawning workers.
+
 ### 5.3 Refactor Server `__init__`
 - Remove all `mp.Manager()` references
 - Job queue `maxsize = n_workers * n_players * 2`
 - Initialise `CheckpointManager` before spawning workers — signal handlers must be registered first
 - Spawn workers only after LUT is prefaulted and signal handlers are registered
 - Store `session_id` generated at startup for shared memory naming
+
+> **Full checklist for 5.3 — do not skip any of these:**
+>
+> **Parameters to remove:**
+> - `sync_update_strategy`, `sync_cfr`, `sync_discount`, `sync_serialise` — these controlled the old `_syncronised_job` single-worker execution path; the new loop uses `_broadcast_job` + `job_queue.join()` instead
+> - `dump_iteration` — replaced by `checkpoint_interval` (explicit checkpoint cadence)
+>
+> **Parameters to add:**
+> - `sync_interval: int` — how many CFR iterations between explicit `sync` broadcasts (decouples flush frequency from traversal frequency)
+> - `checkpoint_interval: int` — how many iterations between `CheckpointManager.checkpoint()` calls
+>
+> **Parameters to rename / keep:**
+> - `start_timestep` → `start_t` (or keep as-is; align with the loop variable `t`)
+> - Retain: `strategy_interval`, `n_iterations`, `lcfr_threshold`, `discount_interval`, `prune_threshold`, `c`, `n_players`, `update_threshold`, `save_path`, `lut_path`, `pickle_dir`, `n_processes`
+> - Retain SLURM `SLURM_CPUS_PER_TASK` detection for `n_processes`
+>
+> **Methods / attributes to remove:**
+> - `_status_queue` and `_worker_status` — only used by `_wait_until_all_workers_are_idle`
+> - `_syncronised_job()` — replaced by `_broadcast_job()` + `job_queue.join()`
+> - `_wait_until_all_workers_are_idle()` — no longer needed; explicit `job_queue.join()` is sufficient
+> - `job()` wrapper method — only existed to dispatch to `_syncronised_job` vs `_send_job`
+>
+> **`to_dict()` / `from_dict()`:**
+> - Must be updated to reflect the new parameter set — remove `sync_*` and `dump_iteration`; add `sync_interval` and `checkpoint_interval`; add `session_id`
 
 ### 5.4 Implement Simplified Server Loop
 
@@ -495,12 +589,43 @@ def search(self):
             self._checkpoint_manager.checkpoint()
 ```
 
+> **Stubs pending other phases:**
+> - `_discount_window_active(t)` does not exist yet — implement as a stub returning `False` until Phase 7 is complete. This means the discount block is dead code until Phase 7.
+> - `self._checkpoint_manager.checkpoint()` does not exist yet — implement as a stub that calls the existing `ai.serialise()` until Phase 6 is complete.
+> - Retain the `enlighten` progress bar from the current `search()`.
+> - Remove the four `log.info(f"synchronising ... - {self._sync_*}")` lines at the top of `search()` — those flags no longer exist.
+
 ### 5.5 Implement `_send_job` and `_broadcast_job`
 - `_send_job(name, **kwargs)`: puts one job on queue, non-blocking
 - `_broadcast_job(name, **kwargs)`: puts one job per worker on queue, ensures all workers execute it
 
+> **`_send_job`** already exists. Keep as-is.
+>
+> **`_broadcast_job`** is new — puts exactly `len(self._workers)` copies of the job on the queue:
+> ```python
+> def _broadcast_job(self, job_name: str, **kwargs):
+>     for _ in self._workers:
+>         self._job_queue.put((job_name, kwargs), block=True)
+> ```
+>
+> **Remove:** `_syncronised_job()`, `_wait_until_all_workers_are_idle()`, and the `job()` wrapper (see 5.3).
+
 ### 5.6 Implement Clean Shutdown
 - `terminate(safe=True)`: broadcasts terminate job, joins queue, closes all shared memory blocks, unlinks all blocks, closes LMDB index
+
+> **Full checklist for 5.6:**
+> - Broadcast `terminate` to all workers via `_broadcast_job("terminate")` (not a loop of individual puts)
+> - Call `self._job_queue.join()` after broadcast to wait for all workers to process the sentinel
+> - Join each worker process — retain the queue-draining loop during join to prevent OS pipe bloat (the `logging_queue` can fill up if not drained; without draining the workers' feeder threads block and `worker.join()` hangs):
+>   ```python
+>   while worker.is_alive():
+>       while not self._logging_queue.empty(): ...
+>       worker.join(timeout=0.5)
+>   ```
+> - After all workers joined: call `self._agent.regret_table.close()` and `self._agent.strategy_table.close()` — this closes mmap file handles
+> - Call `self._agent.regret_table.unlink_all()` and `self._agent.strategy_table.unlink_all()` — this deletes the shm files from `/dev/shm`
+> - Call `self._agent.regret_table._index.close()` to close the LMDB environment cleanly
+> - `status_queue` is removed in 5.3, so no `status_queue` draining needed here
 
 ---
 
