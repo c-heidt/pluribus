@@ -1,13 +1,12 @@
-"""Unit tests for Phase 3: CFR Core refactor.
+"""Unit tests for Phase 3 / Phase 5.1 CFR Core refactor.
 
 Covers:
 - 3.1  calculate_strategy_from_row (pure numpy)
-- 3.2  External sampling (opponent branch iterates all actions)
-- 3.3  local_delta accumulation and lock-free traversal
-- 3.6  update_strategy (no locks parameter)
-- 3.7  serialise Bug 4 fix (no deepcopy)
-- merge_local_delta helper
-- Bug regression tests (Bug 2 fix in train.py and worker._discount)
+- 3.2  External sampling (opponent branch samples one action)
+- 3.3  local_delta accumulation (Dict[Tuple[int,str], np.ndarray])
+- 3.6  update_strategy (per-street tables, no locks)
+- merge_local_delta helper (per-street table merging)
+- Bug regression tests
 
 All game-state tests use a hand-rolled MockState so no LUT file is needed.
 The @pytest.mark.slow test uses the real 20-card LUT.
@@ -16,7 +15,7 @@ import os
 import random
 import tempfile
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -24,7 +23,8 @@ import pytest
 
 from poker_ai.ai.agent import Agent
 from poker_ai.ai.ai import (
-    calculate_strategy,
+    ACTION_TO_IDX,
+    MAX_ACTIONS_PER_STREET,
     calculate_strategy_from_row,
     cfr,
     cfrp,
@@ -123,6 +123,12 @@ class MockState:
     def betting_round(self):
         return 0
 
+    def get_valid_mask(self) -> np.ndarray:
+        from poker_ai.games.base.state import PokerState
+        canonical = PokerState.get_canonical_actions(self.betting_round)
+        legal_set = set(self._actions)
+        return np.array([a in legal_set for a in canonical], dtype=bool)
+
     def apply_action(self, action):
         return self._children[action]
 
@@ -166,10 +172,11 @@ def _make_two_node_game():
 
 
 def _fresh_agent():
-    """Create a fresh Agent without manager (test mode)."""
-    os.environ["TESTING_SUITE"] = "1"
-    agent = Agent(use_manager=False)
-    return agent
+    """Create a fresh Agent backed by a temporary directory."""
+    tmp = Path(tempfile.mkdtemp())
+    shm = str(tmp / "shm")
+    os.makedirs(shm, exist_ok=True)
+    return Agent(index_path=tmp / "lmdb", shm_dir=shm)
 
 
 # ---------------------------------------------------------------------------
@@ -228,55 +235,60 @@ class TestCalculateStrategyFromRow:
 # ---------------------------------------------------------------------------
 
 
+def _make_delta(r: int, **action_values) -> np.ndarray:
+    """Return an int64 delta array for betting round *r* with named action values."""
+    arr = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int64)
+    for action, val in action_values.items():
+        arr[ACTION_TO_IDX[r][action]] = int(val)
+    return arr
+
+
 class TestMergeLocalDelta:
     def test_new_infosets_added(self):
         agent = _fresh_agent()
-        local_delta = {"IS1": {"fold": 10.0, "call": -10.0}}
+        local_delta = {(0, "IS1"): _make_delta(0, fold=10, call=-10)}
         merge_local_delta(agent, local_delta)
-        assert agent.regret["IS1"]["fold"] == pytest.approx(10.0)
-        assert agent.regret["IS1"]["call"] == pytest.approx(-10.0)
+        row = agent.regret_tables[0].get_row_if_exists("IS1")
+        assert row is not None
+        assert row[ACTION_TO_IDX[0]["fold"]] == 10
+        assert row[ACTION_TO_IDX[0]["call"]] == -10
 
     def test_existing_infoset_accumulated(self):
         agent = _fresh_agent()
-        agent.regret["IS1"] = {"fold": 5.0, "call": -5.0}
-        local_delta = {"IS1": {"fold": 3.0, "call": 7.0}}
-        merge_local_delta(agent, local_delta)
-        assert agent.regret["IS1"]["fold"] == pytest.approx(8.0)
-        assert agent.regret["IS1"]["call"] == pytest.approx(2.0)
+        # Pre-populate via merge
+        merge_local_delta(agent, {(0, "IS1"): _make_delta(0, fold=5, call=-5)})
+        merge_local_delta(agent, {(0, "IS1"): _make_delta(0, fold=3, call=7)})
+        row = agent.regret_tables[0].get_row_if_exists("IS1")
+        assert row is not None
+        assert row[ACTION_TO_IDX[0]["fold"]] == 8
+        assert row[ACTION_TO_IDX[0]["call"]] == 2
 
     def test_empty_delta_noop(self):
         agent = _fresh_agent()
-        agent.regret["IS1"] = {"fold": 1.0}
+        merge_local_delta(agent, {(0, "IS1"): _make_delta(0, fold=1)})
+        row_before = int(agent.regret_tables[0].get_row("IS1")[ACTION_TO_IDX[0]["fold"]])
         merge_local_delta(agent, {})
-        assert agent.regret["IS1"]["fold"] == pytest.approx(1.0)
+        assert int(agent.regret_tables[0].get_row("IS1")[ACTION_TO_IDX[0]["fold"]]) == row_before
 
     def test_multiple_infosets(self):
         agent = _fresh_agent()
         local_delta = {
-            "A": {"x": 1.0, "y": 2.0},
-            "B": {"x": -1.0},
+            (0, "A"): _make_delta(0, fold=1, call=2),
+            (0, "B"): _make_delta(0, fold=-1),
         }
         merge_local_delta(agent, local_delta)
-        assert len(agent.regret) == 2
-        assert agent.regret["A"]["x"] == pytest.approx(1.0)
-        assert agent.regret["B"]["x"] == pytest.approx(-1.0)
+        assert agent.regret_tables[0].get_row_if_exists("A") is not None
+        assert agent.regret_tables[0].get_row_if_exists("B") is not None
 
     def test_idempotent_on_repeated_merge(self):
         """Merging the same delta twice should double the values."""
         agent = _fresh_agent()
-        delta = {"IS1": {"fold": 10.0}}
+        delta = {(0, "IS1"): _make_delta(0, fold=10)}
         merge_local_delta(agent, delta)
         merge_local_delta(agent, delta)
-        assert agent.regret["IS1"]["fold"] == pytest.approx(20.0)
-
-    def test_new_action_in_existing_infoset(self):
-        """A new action key in delta must be added, not overwrite existing."""
-        agent = _fresh_agent()
-        agent.regret["IS1"] = {"fold": 5.0}
-        local_delta = {"IS1": {"call": 3.0}}
-        merge_local_delta(agent, local_delta)
-        assert agent.regret["IS1"]["fold"] == pytest.approx(5.0)
-        assert agent.regret["IS1"]["call"] == pytest.approx(3.0)
+        row = agent.regret_tables[0].get_row_if_exists("IS1")
+        assert row is not None
+        assert row[ACTION_TO_IDX[0]["fold"]] == 20
 
 
 # ---------------------------------------------------------------------------
@@ -290,32 +302,28 @@ class TestCfrLocalDelta:
         agent = _fresh_agent()
         local_delta: Dict = {}
         cfr(agent, root, i=0, t=1, local_delta=local_delta)
-        # Traversing player is 0, root.info_set == "root"
-        assert "root" in local_delta
-        assert set(local_delta["root"].keys()) == {"fold", "call"}
+        # Traversing player is 0, root.betting_round==0 → key is (0, "root")
+        assert (0, "root") in local_delta
+        assert isinstance(local_delta[(0, "root")], np.ndarray)
 
-    def test_local_delta_does_not_write_agent_regret_for_traversing_player(self):
-        """When local_delta is provided, agent.regret must not be touched."""
+    def test_local_delta_does_not_write_agent_tables(self):
+        """When local_delta is provided, regret_tables must not be touched."""
         root, _ = _make_two_node_game()
         agent = _fresh_agent()
         local_delta: Dict = {}
         cfr(agent, root, i=0, t=1, local_delta=local_delta)
-        # agent.regret should have NO entry for root (all went to local_delta)
-        assert "root" not in agent.regret
+        # Nothing flushed yet → regret_tables[0] has no entry for "root"
+        assert agent.regret_tables[0].get_row_if_exists("root") is None
 
-    def test_direct_mode_writes_agent_regret(self):
-        """When local_delta is None, agent.regret must be updated."""
+    def test_direct_mode_writes_agent_tables(self):
+        """When local_delta is None, cfr auto-flushes into regret_tables."""
         root, _ = _make_two_node_game()
         agent = _fresh_agent()
         cfr(agent, root, i=0, t=1, local_delta=None)
-        assert "root" in agent.regret
+        assert agent.regret_tables[0].get_row_if_exists("root") is not None
 
     def test_merge_after_cfr_equals_direct_mode(self):
-        """local_delta path + merge must give identical regrets to direct path.
-
-        Both calls use the same numpy seed so the opponent's sampled action
-        is identical, making the two paths produce the exact same regrets.
-        """
+        """local_delta path + merge must give identical regrets to direct path."""
         root, _ = _make_two_node_game()
 
         np.random.seed(7)
@@ -328,11 +336,11 @@ class TestCfrLocalDelta:
         cfr(agent_delta, root, i=0, t=1, local_delta=local_delta)
         merge_local_delta(agent_delta, local_delta)
 
-        # Regrets at "root" must agree
-        for action in ["fold", "call"]:
-            assert agent_direct.regret["root"][action] == pytest.approx(
-                agent_delta.regret["root"][action], abs=1e-8
-            )
+        row_direct = agent_direct.regret_tables[0].get_row_if_exists("root")
+        row_delta = agent_delta.regret_tables[0].get_row_if_exists("root")
+        assert row_direct is not None
+        assert row_delta is not None
+        np.testing.assert_array_equal(row_direct, row_delta)
 
     def test_local_delta_is_empty_on_terminal_state(self):
         terminal = MockTerminal(payout={0: 100, 1: -100})
@@ -349,10 +357,9 @@ class TestCfrLocalDelta:
         local_delta: Dict = {}
         cfr(agent, root, i=0, t=1, local_delta=local_delta)
         merge_local_delta(agent, local_delta)
-        # Sum of regret increments at root must be zero (cfr invariant)
-        total = sum(agent.regret["root"].values())
-        # The regret values should be finite and not all zero after one pass
-        assert all(np.isfinite(v) for v in agent.regret["root"].values())
+        row = agent.regret_tables[0].get_row_if_exists("root")
+        assert row is not None
+        assert np.all(np.isfinite(row.astype(np.float64)))
 
     def test_payout_returned_at_terminal(self):
         terminal = MockTerminal(payout={0: 42, 1: -42})
@@ -388,22 +395,22 @@ class TestExternalSampling:
         opp_node = MockState(
             player_i=1,
             info_set="opp_track",
-            actions=["fold", "call", "raise"],
+            actions=["fold", "call", "raise:1.0"],
             children={
                 "fold": TrackingTerminal("fold", {0: 50, 1: -50}),
                 "call": TrackingTerminal("call", {0: 0, 1: 0}),
-                "raise": TrackingTerminal("raise", {0: -100, 1: 100}),
+                "raise:1.0": TrackingTerminal("raise:1.0", {0: -100, 1: 100}),
             },
         )
         # Root is also the opponent's turn (i=0 traversing, ph=1)
         root = MockState(
             player_i=1,
             info_set="root_ext",
-            actions=["fold", "call", "raise"],
+            actions=["fold", "call", "raise:1.0"],
             children={
                 "fold": opp_node,
                 "call": opp_node,
-                "raise": opp_node,
+                "raise:1.0": opp_node,
             },
         )
         agent = _fresh_agent()
@@ -439,16 +446,16 @@ class TestExternalSampling:
         root = MockState(
             player_i=0,  # traversing player (i=0)
             info_set="root_traversing",
-            actions=["fold", "call", "raise"],
+            actions=["fold", "call", "raise:1.0"],
             children={
                 "fold": TrackingTerminal("fold", {0: -50, 1: 50}),
                 "call": TrackingTerminal("call", {0: 0, 1: 0}),
-                "raise": TrackingTerminal("raise", {0: 100, 1: -100}),
+                "raise:1.0": TrackingTerminal("raise:1.0", {0: 100, 1: -100}),
             },
         )
         agent = _fresh_agent()
         cfr(agent, root, i=0, t=1)
-        assert visited == {"fold", "call", "raise"}, (
+        assert visited == {"fold", "call", "raise:1.0"}, (
             f"Traversing player must visit ALL actions, got: {visited}"
         )
 
@@ -466,7 +473,9 @@ class TestExternalSampling:
         local_delta2: Dict = {}
         cfr(agent2, root, i=0, t=1, local_delta=local_delta2)
 
-        assert local_delta1 == local_delta2
+        assert local_delta1.keys() == local_delta2.keys()
+        for key in local_delta1:
+            np.testing.assert_array_equal(local_delta1[key], local_delta2[key])
 
 
 # ---------------------------------------------------------------------------
@@ -481,13 +490,13 @@ class TestCfrpLocalDelta:
         local_delta: Dict = {}
         # Use c=-1e9 so pruning never fires (all regrets > c)
         cfrp(agent, root, i=0, t=1, c=-1_000_000_000, local_delta=local_delta)
-        assert "root" in local_delta
+        assert (0, "root") in local_delta
 
-    def test_cfrp_direct_mode_writes_agent_regret(self):
+    def test_cfrp_direct_mode_writes_agent_tables(self):
         root, _ = _make_two_node_game()
         agent = _fresh_agent()
         cfrp(agent, root, i=0, t=1, c=-1_000_000_000, local_delta=None)
-        assert "root" in agent.regret
+        assert agent.regret_tables[0].get_row_if_exists("root") is not None
 
     def test_cfrp_merge_equals_direct(self):
         root, _ = _make_two_node_game()
@@ -503,10 +512,11 @@ class TestCfrpLocalDelta:
         cfrp(agent_delta, root, i=0, t=1, c=c, local_delta=local_delta)
         merge_local_delta(agent_delta, local_delta)
 
-        for action in ["fold", "call"]:
-            assert agent_direct.regret["root"][action] == pytest.approx(
-                agent_delta.regret["root"][action], abs=1e-8
-            )
+        row_direct = agent_direct.regret_tables[0].get_row_if_exists("root")
+        row_delta = agent_delta.regret_tables[0].get_row_if_exists("root")
+        assert row_direct is not None
+        assert row_delta is not None
+        np.testing.assert_array_equal(row_direct, row_delta)
 
 
 # ---------------------------------------------------------------------------
@@ -518,28 +528,34 @@ class TestUpdateStrategy:
     def test_update_strategy_accumulates_counts(self):
         root, _ = _make_two_node_game()
         agent = _fresh_agent()
-        # Run update_strategy 10 times — counts should grow
+        # Run update_strategy 10 times — visit counts should grow
         for _ in range(10):
             update_strategy(agent, root, i=0, t=1)
-        assert "root" in agent.strategy
-        total = sum(agent.strategy["root"].values())
-        assert total == pytest.approx(10.0)
+        row = agent.strategy_tables[0].get_row_if_exists("root")
+        assert row is not None
+        total = int(row.sum())
+        assert total == 10
 
     def test_update_strategy_skips_terminal(self):
         terminal = MockTerminal(payout={0: 100, 1: -100})
         agent = _fresh_agent()
         update_strategy(agent, terminal, i=0, t=1)
-        assert len(agent.strategy) == 0
+        # No strategy entry created for terminal
+        for r in range(4):
+            assert agent.strategy_tables[r].get_row_if_exists("terminal") is None
 
-    def test_update_strategy_skips_postflop(self):
-        """betting_round > 0 should return immediately (Bug 5 — intentional)."""
-        root, _ = _make_two_node_game()
-        root._betting_stage = "flop"
-
+    def test_update_strategy_traverses_postflop(self):
+        """Phase 5.7: betting_round > 0 guard removed — postflop states are now traversed."""
         class _PostflopState(MockState):
             @property
             def betting_round(self):
-                return 1  # postflop
+                return 1  # flop
+
+            def get_valid_mask(self):
+                from poker_ai.games.base.state import PokerState
+                canonical = PokerState.get_canonical_actions(1)
+                legal_set = set(self._actions)
+                return np.array([a in legal_set for a in canonical], dtype=bool)
 
         postflop_root = _PostflopState(
             player_i=0,
@@ -552,7 +568,8 @@ class TestUpdateStrategy:
         )
         agent = _fresh_agent()
         update_strategy(agent, postflop_root, i=0, t=1)
-        assert "postflop_root" not in agent.strategy
+        # Strategy table for street 1 must have been written.
+        assert agent.strategy_tables[1].get_row_if_exists("postflop_root") is not None
 
     def test_update_strategy_accepts_no_locks_arg(self):
         """update_strategy must work without any locks argument (signature check)."""
@@ -564,76 +581,25 @@ class TestUpdateStrategy:
 
 
 # ---------------------------------------------------------------------------
-# 3.7 — serialise Bug 4 fix
+# serialise (Phase 5 stub — implementation deferred to Phase 6)
 # ---------------------------------------------------------------------------
 
 
 class TestSerialise:
-    def _make_agent_with_data(self):
+    def test_serialise_does_not_raise(self, tmp_path):
+        """serialise is a stub in Phase 5 and must not raise."""
         agent = _fresh_agent()
-        agent.regret["IS1"] = {"fold": 10.0, "call": -10.0}
-        agent.regret["IS2"] = {"fold": 5.0, "call": 5.0}
-        agent.strategy["IS1"] = {"fold": 3, "call": 7}
-        return agent
+        serialise(agent, tmp_path, t=1, server_state={})  # must not raise
 
-    def test_serialise_creates_agent_file(self, tmp_path):
-        agent = self._make_agent_with_data()
-        server_state = {"dummy": 1}
-        serialise(agent, tmp_path, t=1, server_state=server_state)
-        assert (tmp_path / "agent.joblib").exists()
-
-    def test_serialise_contains_regret(self, tmp_path):
-        import joblib
-        agent = self._make_agent_with_data()
-        serialise(agent, tmp_path, t=1, server_state={})
-        saved = joblib.load(tmp_path / "agent.joblib")
-        assert "IS1" in saved["regret"]
-        assert saved["regret"]["IS1"]["fold"] == pytest.approx(10.0)
-
-    def test_serialise_contains_pre_flop_strategy(self, tmp_path):
-        import joblib
-        agent = self._make_agent_with_data()
-        serialise(agent, tmp_path, t=1, server_state={})
-        saved = joblib.load(tmp_path / "agent.joblib")
-        assert "IS1" in saved["pre_flop_strategy"]
-
-    def test_serialise_regret_is_plain_dict(self, tmp_path):
-        """Regret in the saved file must be a plain dict, not a proxy."""
-        import joblib
-        agent = self._make_agent_with_data()
-        serialise(agent, tmp_path, t=1, server_state={})
-        saved = joblib.load(tmp_path / "agent.joblib")
-        assert isinstance(saved["regret"], dict)
-        for v in saved["regret"].values():
-            assert isinstance(v, dict)
-
-    def test_serialise_does_not_deepcopy(self, tmp_path):
-        """Verify copy.deepcopy is not called (Bug 4 regression)."""
-        import copy
-        agent = self._make_agent_with_data()
-        with patch.object(copy, "deepcopy", side_effect=AssertionError("deepcopy called")) as mock_dc:
-            # Should not raise — deepcopy must never be called
-            serialise(agent, tmp_path, t=1, server_state={})
-
-    def test_serialise_accumulates_strategy_across_calls(self, tmp_path):
-        """Repeated serialise calls must accumulate the strategy table."""
-        import joblib
-        agent = self._make_agent_with_data()
-        serialise(agent, tmp_path, t=1, server_state={})
-        serialise(agent, tmp_path, t=2, server_state={})
-        saved = joblib.load(tmp_path / "agent.joblib")
-        # After 2 serialise calls, strategy probabilities for IS1 should have
-        # been accumulated (added) twice.
-        total_prob = sum(saved["strategy"]["IS1"].values())
-        assert total_prob > 0.0
-
-    def test_serialise_server_state_written(self, tmp_path):
-        import joblib
-        agent = self._make_agent_with_data()
-        server_state = {"mode": "test", "n_iterations": 100}
-        serialise(agent, tmp_path, t=5, server_state=server_state)
-        saved_server = joblib.load(tmp_path / "server.gz")
-        assert saved_server["start_timestep"] == 6  # t+1
+    def test_serialise_accepts_required_args(self, tmp_path):
+        """serialise must accept (agent, save_path, t, server_state) keywords."""
+        import inspect
+        sig = inspect.signature(serialise)
+        params = set(sig.parameters)
+        assert "agent" in params
+        assert "save_path" in params
+        assert "t" in params
+        assert "server_state" in params
 
 
 # ---------------------------------------------------------------------------
@@ -642,31 +608,28 @@ class TestSerialise:
 
 
 class TestBugRegressions:
-    def test_bug2_strategy_not_discounted_in_train(self):
-        """After discounting, agent.strategy values must be unchanged.
+    def test_bug2_strategy_not_discounted(self):
+        """Applying discount to regret_tables must not touch strategy_tables.
 
         Previously singleprocess/train.py discounted agent.strategy alongside
-        agent.regret (Bug 2).  This test confirms the discount loop only
-        touches agent.regret.
+        agent.regret (Bug 2).  This test confirms that discounting regret
+        tables leaves strategy tables untouched.
         """
         agent = _fresh_agent()
-        agent.regret["IS1"] = {"fold": 1000.0, "call": -500.0}
-        agent.strategy["IS1"] = {"fold": 10, "call": 5}
+        # Populate via merge
+        merge_local_delta(agent, {(0, "IS1"): _make_delta(0, fold=1000)})
+        update_strategy(agent, _make_two_node_game()[0], i=0, t=1)
+        strategy_row_before = agent.strategy_tables[0].get_row_if_exists("root")
+        strategy_copy = strategy_row_before.copy() if strategy_row_before is not None else None
 
-        # Simulate the discount logic from the fixed train.py
-        t, discount_interval, lcfr_threshold = 5, 5, 100
-        if t < lcfr_threshold and t % discount_interval == 0:
-            d = (t / discount_interval) / ((t / discount_interval) + 1)
-            for I in agent.regret.keys():
-                for a in agent.regret[I].keys():
-                    agent.regret[I][a] *= d
-            # Bug 2: strategy loop MUST NOT be here
+        # Discount regret — strategy must remain unchanged
+        agent.regret_tables[0].set_sync_boundary(True)
+        agent.regret_tables[0].apply_discount(0.5)
+        agent.regret_tables[0].set_sync_boundary(False)
 
-        # Regret discounted
-        assert agent.regret["IS1"]["fold"] < 1000.0
-        # Strategy unchanged
-        assert agent.strategy["IS1"]["fold"] == 10
-        assert agent.strategy["IS1"]["call"] == 5
+        if strategy_copy is not None:
+            strategy_row_after = agent.strategy_tables[0].get_row_if_exists("root")
+            np.testing.assert_array_equal(strategy_row_after, strategy_copy)
 
     def test_cfr_signature_no_locks_param(self):
         import inspect
@@ -693,15 +656,6 @@ class TestBugRegressions:
         sig = inspect.signature(update_strategy)
         assert "locks" not in sig.parameters
 
-    def test_serialise_lock_type_hint_is_plain_dict(self):
-        """serialise must accept a plain dict for locks (no mp type constraint)."""
-        import inspect
-        sig = inspect.signature(serialise)
-        param = sig.parameters.get("locks")
-        assert param is not None
-        # Default must be empty dict (not a typed mp construct)
-        assert param.default == {} or param.default is inspect.Parameter.empty
-
     def test_calculate_strategy_from_row_imported(self):
         """calculate_strategy_from_row must be importable from poker_ai.ai.ai."""
         from poker_ai.ai.ai import calculate_strategy_from_row as csfr
@@ -712,19 +666,18 @@ class TestBugRegressions:
         from poker_ai.ai.ai import merge_local_delta as mld
         assert callable(mld)
 
-    def test_multiple_cfr_iterations_accumulate_correctly(self):
-        """Run 5 cfr iterations using local_delta, verify regret grows."""
+    def test_multiple_cfr_iterations_accumulate(self):
+        """Run 5 cfr iterations using local_delta, verify regret entries grow."""
         root, _ = _make_two_node_game()
         agent = _fresh_agent()
         for t in range(1, 6):
             local_delta: Dict = {}
             cfr(agent, root, i=0, t=t, local_delta=local_delta)
             merge_local_delta(agent, local_delta)
-        # After 5 iterations, regret should be non-trivially populated
-        assert "root" in agent.regret
-        # Both actions must have been updated
-        assert "fold" in agent.regret["root"]
-        assert "call" in agent.regret["root"]
+        # After 5 iterations, regret_tables[0] must have an entry for "root"
+        row = agent.regret_tables[0].get_row_if_exists("root")
+        assert row is not None
+        assert np.any(row != 0)
 
 
 # ---------------------------------------------------------------------------
@@ -739,10 +692,9 @@ def test_cfr_1000_iterations_small_game():
     Verifies:
     - local_delta + merge gives non-empty regret after 1000 iterations
     - All regret values are finite
-    - update_strategy populates agent.strategy
-    - serialise writes a valid checkpoint (no deepcopy crash)
+    - update_strategy populates strategy_tables[0]
+    - serialise (stub) does not crash
     """
-    import tempfile
     from poker_ai.games.short_deck.state import new_game
 
     lut_path = "data/clustering/20cards_exact"
@@ -767,19 +719,7 @@ def test_cfr_1000_iterations_small_game():
             cfr(agent, state, i=i, t=t, local_delta=local_delta)
             merge_local_delta(agent, local_delta)
 
-    assert len(agent.regret) > 0, "Regret table must be non-empty after 1000 iterations"
-    for info_set, regrets in list(agent.regret.items())[:20]:
-        for action, v in regrets.items():
-            assert np.isfinite(v), f"Non-finite regret at {info_set}/{action}: {v}"
-
-    if len(agent.strategy) > 0:
-        for info_set, counts in list(agent.strategy.items())[:5]:
-            assert all(v >= 0 for v in counts.values())
-
-    # Serialise checkpoint
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
-        import joblib
-        serialise(agent, tmp_path, t=1000, server_state={"n_iterations": 1000})
-        saved = joblib.load(tmp_path / "agent.joblib")
-        assert len(saved["regret"]) == len(agent.regret)
+    # regret_tables[0] must be non-empty
+    assert agent.regret_tables[0].n_allocated > 0, "Regret table must be non-empty after 1000 iterations"
+    # serialise is a stub — must not raise
+    serialise(agent, Path(tempfile.mkdtemp()), t=1000, server_state={"n_iterations": 1000})

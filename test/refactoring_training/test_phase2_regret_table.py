@@ -24,7 +24,6 @@ from poker_ai.ai.regret_table import (
     N_STRIPE_LOCKS,
     REGRET_FLOOR,
     SparseRegretTable,
-    _CHUNK_PREFIX,
     _MAX_DIRTY_CHUNKS,
     list_orphaned_blocks,
 )
@@ -40,8 +39,8 @@ def n_actions():
 
 
 @pytest.fixture
-def session_id():
-    return "test_session"
+def table_name():
+    return "pluribus_test"
 
 
 @pytest.fixture
@@ -54,13 +53,13 @@ def tmp_lmdb(tmp_path):
 
 
 @pytest.fixture
-def table(tmp_path, tmp_lmdb, n_actions, session_id):
+def table(tmp_path, tmp_lmdb, n_actions, table_name):
     """Create a SparseRegretTable backed by tmp_path, unlink on teardown."""
     shm_dir = str(tmp_path / "shm")
     os.makedirs(shm_dir, exist_ok=True)
     tbl = SparseRegretTable(
         n_actions=n_actions,
-        session_id=session_id,
+        table_name=table_name,
         index=tmp_lmdb,
         shm_dir=shm_dir,
     )
@@ -78,29 +77,29 @@ class TestConstruction:
     def test_n_actions_stored(self, table, n_actions):
         assert table.n_actions == n_actions
 
-    def test_session_id_stored(self, table, session_id):
-        assert table.session_id == session_id
+    def test_table_name_stored(self, table, table_name):
+        assert table.table_name == table_name
 
     def test_zero_chunks_on_empty_index(self, table):
         assert table.n_chunks == 0
 
-    def test_invalid_n_actions_raises(self, tmp_path, n_actions, session_id):
+    def test_invalid_n_actions_raises(self, tmp_path, n_actions, table_name):
         idx = InfosetIndex(tmp_path / "idx_bad")
         with pytest.raises(ValueError, match="n_actions"):
             SparseRegretTable(
                 n_actions=0,
-                session_id=session_id,
+                table_name=table_name,
                 index=idx,
                 shm_dir=str(tmp_path / "shm2"),
             )
         idx.close()
 
-    def test_chunk_file_created_in_shm_dir(self, table, n_actions, session_id):
+    def test_chunk_file_created_in_shm_dir(self, table, n_actions, table_name):
         table.get_row("first_infoset")
         assert table.n_chunks == 1
         expected_path = os.path.join(
             str(Path(table._shm_paths[0]).parent),
-            f"{_CHUNK_PREFIX}_{session_id}_000000",
+            f"{table_name}_000000",
         )
         assert os.path.exists(expected_path), f"expected chunk at {expected_path}"
 
@@ -110,7 +109,7 @@ class TestConstruction:
         expected_bytes = CHUNK_SIZE * n_actions * 4  # int32
         assert os.path.getsize(path) == expected_bytes
 
-    def test_resume_restores_existing_chunks(self, tmp_path, n_actions, session_id):
+    def test_resume_restores_existing_chunks(self, tmp_path, n_actions, table_name):
         """Reopening the table with an existing index re-opens chunk files."""
         idx_path = tmp_path / "idx_resume"
         shm_dir = str(tmp_path / "shm_resume")
@@ -118,7 +117,7 @@ class TestConstruction:
 
         # First session: allocate some infosets
         idx1 = InfosetIndex(idx_path)
-        tbl1 = SparseRegretTable(n_actions, session_id, idx1, shm_dir)
+        tbl1 = SparseRegretTable(n_actions, table_name, idx1, shm_dir)
         n = 100
         for k in range(n):
             row = tbl1.get_row(f"resume_is_{k}")
@@ -128,7 +127,7 @@ class TestConstruction:
 
         # Second session: reopen
         idx2 = InfosetIndex(idx_path)
-        tbl2 = SparseRegretTable(n_actions, session_id, idx2, shm_dir)
+        tbl2 = SparseRegretTable(n_actions, table_name, idx2, shm_dir)
         assert tbl2.n_chunks == 1, "should have restored the existing chunk"
         for k in range(n):
             row = tbl2.get_row_if_exists(f"resume_is_{k}")
@@ -208,13 +207,13 @@ class TestCoreAccessMethods:
         assert loc[1] == 0
 
     @pytest.mark.slow
-    def test_500k_infosets_correct_retrieval(self, tmp_path, n_actions, session_id):
+    def test_500k_infosets_correct_retrieval(self, tmp_path, n_actions, table_name):
         """Allocate 500K infosets across 5+ chunks and verify retrieval."""
         n = 500_000
         idx = InfosetIndex(tmp_path / "big_idx")
         shm_dir = str(tmp_path / "big_shm")
         os.makedirs(shm_dir)
-        tbl = SparseRegretTable(n_actions, session_id, idx, shm_dir)
+        tbl = SparseRegretTable(n_actions, table_name, idx, shm_dir)
 
         # Write a unique fingerprint into each row
         for k in range(n):
@@ -447,20 +446,20 @@ class TestApplyDiscount:
 
 
 class TestNamingAndOrphanDetection:
-    def test_chunk_name_format(self, table, session_id):
+    def test_chunk_name_format(self, table, table_name):
         table.get_row("name_test")
         name = os.path.basename(table._shm_paths[0])
-        expected = f"{_CHUNK_PREFIX}_{session_id}_000000"
+        expected = f"{table_name}_000000"
         assert name == expected
 
-    def test_chunk_names_sequential(self, table, session_id):
+    def test_chunk_names_sequential(self, table, table_name):
         # Force two chunks
         for k in range(CHUNK_SIZE + 1):
             table.get_row(f"seq_is_{k}")
         assert table.n_chunks == 2
         for chunk_id in range(2):
             name = os.path.basename(table._shm_paths[chunk_id])
-            expected = f"{_CHUNK_PREFIX}_{session_id}_{chunk_id:06d}"
+            expected = f"{table_name}_{chunk_id:06d}"
             assert name == expected
 
     def test_list_own_blocks(self, table):
@@ -472,46 +471,43 @@ class TestNamingAndOrphanDetection:
     def test_list_orphaned_blocks_empty_dir(self, tmp_path):
         orphan_dir = str(tmp_path / "empty_shm")
         os.makedirs(orphan_dir)
-        assert list_orphaned_blocks("any_session", shm_dir=orphan_dir) == []
+        assert list_orphaned_blocks(shm_dir=orphan_dir) == []
 
-    def test_list_orphaned_blocks_finds_files(self, tmp_path, session_id):
+    def test_list_orphaned_blocks_finds_files(self, tmp_path):
         shm_dir = str(tmp_path / "orphan_shm")
         os.makedirs(shm_dir)
-        # Create fake orphan files
+        # Create fake orphan files (must start with "pluribus_")
         for i in range(3):
-            path = os.path.join(
-                shm_dir, f"{_CHUNK_PREFIX}_{session_id}_{i:06d}"
-            )
+            path = os.path.join(shm_dir, f"pluribus_regret_0_{i:06d}")
             open(path, "wb").close()
 
-        orphans = list_orphaned_blocks(session_id, shm_dir=shm_dir)
+        orphans = list_orphaned_blocks(shm_dir=shm_dir)
         assert len(orphans) == 3
         for path in orphans:
             assert os.path.exists(path)
 
-    def test_list_orphaned_blocks_ignores_other_sessions(self, tmp_path, session_id):
+    def test_list_orphaned_blocks_ignores_non_pluribus(self, tmp_path):
+        """Files not starting with 'pluribus_' must be ignored."""
         shm_dir = str(tmp_path / "mixed_shm")
         os.makedirs(shm_dir)
-        # Own session
-        path_own = os.path.join(shm_dir, f"{_CHUNK_PREFIX}_{session_id}_000000")
-        open(path_own, "wb").close()
-        # Other session
-        path_other = os.path.join(shm_dir, f"{_CHUNK_PREFIX}_other_session_000000")
+        path_pluribus = os.path.join(shm_dir, "pluribus_regret_0_000000")
+        open(path_pluribus, "wb").close()
+        path_other = os.path.join(shm_dir, "other_prefix_000000")
         open(path_other, "wb").close()
 
-        orphans = list_orphaned_blocks(session_id, shm_dir=shm_dir)
+        orphans = list_orphaned_blocks(shm_dir=shm_dir)
         assert len(orphans) == 1
-        assert path_own in orphans
+        assert path_pluribus in orphans
         assert path_other not in orphans
 
     def test_list_orphaned_blocks_nonexistent_dir(self):
-        assert list_orphaned_blocks("any", shm_dir="/nonexistent_dir_abc123") == []
+        assert list_orphaned_blocks(shm_dir="/nonexistent_dir_abc123") == []
 
-    def test_unlink_all_removes_files(self, tmp_path, n_actions, session_id):
+    def test_unlink_all_removes_files(self, tmp_path, n_actions, table_name):
         idx = InfosetIndex(tmp_path / "unlink_idx")
         shm_dir = str(tmp_path / "unlink_shm")
         os.makedirs(shm_dir)
-        tbl = SparseRegretTable(n_actions, session_id, idx, shm_dir)
+        tbl = SparseRegretTable(n_actions, table_name, idx, shm_dir)
         tbl.get_row("unlink_test")
         paths = tbl.list_own_blocks()
         assert all(os.path.exists(p) for p in paths)
@@ -520,11 +516,11 @@ class TestNamingAndOrphanDetection:
         assert all(not os.path.exists(p) for p in paths)
         idx.close()
 
-    def test_context_manager_unlinks(self, tmp_path, n_actions, session_id):
+    def test_context_manager_unlinks(self, tmp_path, n_actions, table_name):
         idx = InfosetIndex(tmp_path / "cm_unlink_idx")
         shm_dir = str(tmp_path / "cm_unlink_shm")
         os.makedirs(shm_dir)
-        with SparseRegretTable(n_actions, session_id, idx, shm_dir) as tbl:
+        with SparseRegretTable(n_actions, table_name, idx, shm_dir) as tbl:
             tbl.get_row("cm_unlink_test")
             paths = tbl.list_own_blocks()
         assert all(not os.path.exists(p) for p in paths)
@@ -537,15 +533,85 @@ class TestNamingAndOrphanDetection:
 
 
 class TestRepr:
-    def test_repr_is_informative(self, table, session_id):
+    def test_repr_is_informative(self, table, table_name):
         table.get_row("repr_test")
         r = repr(table)
-        assert session_id in r
+        assert table_name in r
         assert "SparseRegretTable" in r
 
 
 # ---------------------------------------------------------------------------
 # Bug regression tests (for bugs found during Phase 2 scan)
+# ---------------------------------------------------------------------------
+# Phase 5 additions: n_allocated, merge_delta_row, _restore_chunk
+# ---------------------------------------------------------------------------
+
+
+class TestNAllocated:
+    def test_zero_initially(self, table):
+        assert table.n_allocated == 0
+
+    def test_increments_on_new_row(self, table):
+        table.get_row("first")
+        assert table.n_allocated == 1
+        table.get_row("second")
+        assert table.n_allocated == 2
+
+    def test_stable_on_repeated_access(self, table):
+        table.get_row("repeat_me")
+        table.get_row("repeat_me")
+        assert table.n_allocated == 1
+
+    def test_increments_via_merge_delta_row(self, table, n_actions):
+        delta = np.zeros(n_actions, dtype=np.int64)
+        delta[0] = 1
+        table.merge_delta_row("new_via_merge", delta)
+        assert table.n_allocated == 1
+
+    def test_stable_on_repeated_merge(self, table, n_actions):
+        delta = np.zeros(n_actions, dtype=np.int64)
+        table.merge_delta_row("merge_repeat", delta)
+        table.merge_delta_row("merge_repeat", delta)
+        assert table.n_allocated == 1
+
+
+class TestMergeDeltaRow:
+    def test_creates_row_on_first_call(self, table, n_actions):
+        delta = np.full(n_actions, 7, dtype=np.int64)
+        table.merge_delta_row("new_infoset", delta)
+        row = table.get_row_if_exists("new_infoset")
+        assert row is not None
+        np.testing.assert_array_equal(row, np.full(n_actions, 7, dtype=np.int32))
+
+    def test_accumulates_on_repeated_calls(self, table, n_actions):
+        delta = np.ones(n_actions, dtype=np.int64) * 3
+        table.merge_delta_row("accum_is", delta)
+        table.merge_delta_row("accum_is", delta)
+        row = table.get_row_if_exists("accum_is")
+        assert row is not None
+        np.testing.assert_array_equal(row, np.full(n_actions, 6, dtype=np.int32))
+
+    def test_negative_delta_accumulates(self, table, n_actions):
+        delta = np.full(n_actions, -5, dtype=np.int64)
+        table.merge_delta_row("neg_is", delta)
+        row = table.get_row_if_exists("neg_is")
+        assert row is not None
+        np.testing.assert_array_equal(row, np.full(n_actions, -5, dtype=np.int32))
+
+
+class TestRestoreChunk:
+    def test_restore_creates_chunk_and_reads_data(self, table, n_actions):
+        """_restore_chunk must make chunk 0 accessible with pre-set values."""
+        from poker_ai.ai.index import CHUNK_SIZE
+        arr = np.zeros((CHUNK_SIZE, n_actions), dtype=np.int32)
+        arr[0, :] = 42
+        table._restore_chunk(0, arr)
+        assert table.n_chunks >= 1
+        # Chunk 0 must have the restored values at row 0
+        restored_row = table.get_row_by_location(0, 0)
+        np.testing.assert_array_equal(restored_row, np.full(n_actions, 42))
+
+
 # ---------------------------------------------------------------------------
 
 

@@ -16,6 +16,8 @@ import operator
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+
 from poker_ai import utils
 from poker_ai.poker.card import Card
 from poker_ai.poker.engine import PokerEngine
@@ -765,3 +767,51 @@ class PokerState(ABC):
         else:
             actions += [None]
         return actions
+
+    @staticmethod
+    def get_canonical_actions(betting_round: int) -> List[str]:
+        """Return the full abstract action set for *betting_round* in stable order.
+
+        This is the superset of every possible element of ``legal_actions`` at
+        any node in the given street.  Used at startup to build
+        ``action_to_idx`` mappings and to determine row widths for
+        ``SparseRegretTable``; never called on the hot path.
+
+        Parameters
+        ----------
+        betting_round:
+            0 = pre_flop, 1 = flop, 2 = turn, 3 = river.
+
+        Returns
+        -------
+        List[str]
+            Actions in stable order: ``fold``, ``call``, ``all_in``,
+            then ``raise:<fraction>`` entries sorted by fraction value.
+        """
+        stage_names = {0: "pre_flop", 1: "flop", 2: "turn", 3: "river"}
+        stage = stage_names.get(betting_round)
+        if stage is None:
+            raise ValueError(f"betting_round must be 0-3, got {betting_round}")
+        stage_config = RAISE_SIZES_BY_STAGE[stage]
+        first_fracs = stage_config.get("first_raise", [])
+        subseq_fracs = stage_config.get("subsequent_raise", [])
+        all_fracs = sorted(set(first_fracs) | set(subseq_fracs))
+        return ["fold", "call", "all_in"] + [f"raise:{f}" for f in all_fracs]
+
+    def get_valid_mask(self) -> np.ndarray:
+        """Return a boolean mask over the canonical action set for this state.
+
+        The mask has one entry per canonical action at ``self.betting_round``.
+        An entry is ``True`` iff the corresponding action appears in
+        ``self.legal_actions``.  Used by ``calculate_strategy_from_row`` to
+        zero invalid slots before regret matching.
+
+        Returns
+        -------
+        np.ndarray
+            Boolean array of shape ``(max_actions_for_street,)``.
+        """
+        r = self.betting_round
+        canonical = PokerState.get_canonical_actions(r)
+        legal_set = {a for a in self.legal_actions if a is not None}
+        return np.array([a in legal_set for a in canonical], dtype=bool)

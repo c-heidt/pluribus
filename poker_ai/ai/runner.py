@@ -199,22 +199,30 @@ def resume(server_config_path: str):
     help="Either use or don't use multiple processes.",
 )
 @click.option(
-    "--sync_update_strategy/--async_update_strategy",
-    default=False,
-    help="Do or don't synchronise update_strategy.",
+    "--sync_interval",
+    default=50,
+    help=(
+        "How many iterations between worker sync barriers. Higher values keep "
+        "workers busier but delay delta merges. Recommended: 50 for small tests, "
+        "100–1000 for large runs."
+    ),
 )
 @click.option(
-    "--sync_cfr/--async_cfr", default=False, help="Do or don't synchronuse CFR."
+    "--checkpoint_interval",
+    default=1000,
+    help=(
+        "Write a training checkpoint every N iterations. Used by Phase 6 "
+        "resume logic; Phase 5 logs only."
+    ),
 )
 @click.option(
-    "--sync_discount/--async_discount",
-    default=False,
-    help="Do or don't synchronise the discounting.",
-)
-@click.option(
-    "--sync_serialise/--async_serialise",
-    default=False,
-    help="Do or don't synchronise the serialisation.",
+    "--n_processes",
+    default=None,
+    type=int,
+    help=(
+        "Number of worker processes to spawn. Defaults to cpu_count-1 "
+        "(or SLURM_CPUS_PER_TASK-1 when running under Slurm)."
+    ),
 )
 @click.option("--nickname", default="", help="The nickname of the study.")
 def start(
@@ -230,10 +238,9 @@ def start(
     lut_path: str,
     pickle_dir: bool,
     single_process: bool,
-    sync_update_strategy: bool,
-    sync_cfr: bool,
-    sync_discount: bool,
-    sync_serialise: bool,
+    sync_interval: int,
+    checkpoint_interval: int,
+    n_processes,
     nickname: str,
 ):
     """Train agent from scratch."""
@@ -276,15 +283,13 @@ def start(
             prune_threshold=prune_threshold,
             c=c,
             n_players=n_players,
-            dump_iteration=dump_iteration,
             update_threshold=update_threshold,
             save_path=save_path,
             lut_path=lut_path,
             pickle_dir=pickle_dir,
-            sync_update_strategy=sync_update_strategy,
-            sync_cfr=sync_cfr,
-            sync_discount=sync_discount,
-            sync_serialise=sync_serialise,
+            sync_interval=sync_interval,
+            checkpoint_interval=checkpoint_interval,
+            n_processes=n_processes,
         )
         _safe_search(server)
 
