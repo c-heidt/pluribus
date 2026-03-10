@@ -5,10 +5,11 @@ from __future__ import annotations
 import logging
 import random
 from pathlib import Path
-from typing import Dict, Union
+from typing import Dict, Tuple, Union
 
 import click
 import joblib
+import numpy as np
 import yaml
 from tqdm import tqdm, trange
 
@@ -82,7 +83,7 @@ def simple_search(
         Iteration at which we begin updating strategy.
     """
     utils.random.seed(42)
-    agent = Agent(use_manager=False)
+    agent = Agent(index_path=save_path / "lmdb_index")
     card_info_lut = {}
     for t in trange(1, n_iterations + 1, desc="train iter"):
         if t == 2:
@@ -98,7 +99,7 @@ def simple_search(
             card_info_lut = state.card_info_lut
             if t > update_threshold and t % strategy_interval == 0:
                 ai.update_strategy(agent=agent, state=state, i=i, t=t)
-            local_delta: Dict[str, Dict[str, float]] = {}
+            local_delta: Dict[Tuple[int, str], np.ndarray] = {}
             if t > prune_threshold:
                 if random.uniform(0, 1) < 0.05:
                     ai.cfr(agent=agent, state=state, i=i, t=t, local_delta=local_delta)
@@ -112,10 +113,9 @@ def simple_search(
         if t < lcfr_threshold and t % discount_interval == 0:
             d = (t / discount_interval) / ((t / discount_interval) + 1)
             # Per Pluribus paper only regret is discounted (Bug 2 fix).
-            # Discounting strategy degrades convergence and is incorrect.
-            for I in agent.regret.keys():
-                for a in agent.regret[I].keys():
-                    agent.regret[I][a] *= d
+            # Strategy tables must never be discounted.
+            for r in range(4):
+                agent.regret_tables[r].apply_discount(d)
         if (t > update_threshold) and (t % dump_iteration == 0):
             # dump the current strategy (sigma) throughout training and then
             # take an average. This allows for estimation of expected value in
@@ -124,8 +124,6 @@ def simple_search(
             ai.serialise(
                 agent=agent, save_path=save_path, t=t, server_state=config,
             )
-
-    print_strategy(agent.strategy)
 
 
 if __name__ == "__main__":

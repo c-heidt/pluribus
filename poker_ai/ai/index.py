@@ -215,6 +215,31 @@ class InfosetIndex:
             if global_row >= current:
                 txn.put(_NEXT_ROW_KEY, struct.pack("<Q", global_row + 1))
 
+    def reopen_after_fork(self) -> None:
+        """Reopen the LMDB environment in a forked child process.
+
+        LMDB registers reader lock-table slots per-PID.  When the parent opens
+        the environment and then forks workers, the children inherit the
+        file descriptor with a slot tied to the *parent's* PID.  Any
+        transaction attempt in the child raises ``MDB_BAD_RSLOT``.
+
+        Call this method at the very beginning of ``Worker.run()`` (before any
+        LMDB transaction) to close the inherited handle and open a fresh one
+        for the child's PID.
+        """
+        try:
+            self._env.close()
+        except Exception:
+            pass
+        self._env = lmdb.open(
+            str(self._path),
+            map_size=_MAP_SIZE,
+            writemap=True,
+            map_async=True,
+            max_readers=256,
+        )
+        log.debug("InfosetIndex reopened after fork (pid=%d)", os.getpid())
+
     def flush(self) -> None:
         """Force all pending writes to disk.
 

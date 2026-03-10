@@ -75,9 +75,6 @@ N_STRIPE_LOCKS: int = 256
 """Number of stripe locks.  With 64 workers the expected per-stripe contention
 ratio is 64/256 = 0.25 — contention is low after the initial warm-up phase."""
 
-_CHUNK_PREFIX: str = "pluribus_regret"
-"""File name prefix for shared memory chunks."""
-
 _MAX_DIRTY_CHUNKS: int = 2048
 """Maximum number of chunks tracked for dirty-flag purposes.  At
 CHUNK_SIZE=100_000 this covers up to 204.8M infosets — more than enough for
@@ -88,25 +85,22 @@ any realistic poker abstraction."""
 # Helper — orphan detection (Section 2.6)
 # ----------------------------------------------------------------------------
 
-def list_orphaned_blocks(session_id: str, shm_dir: str = "/dev/shm") -> List[str]:
-    """Return paths of any leftover shared memory files for *session_id*.
+def list_orphaned_blocks(shm_dir: str = "/dev/shm") -> List[str]:
+    """Return paths of any leftover ``pluribus_*`` shared memory files.
 
     Orphaned blocks are created when a training run is killed without a clean
     shutdown.  Call this on startup and optionally unlink them before creating
-    a fresh session.
+    a new run.
 
     Parameters
     ----------
-    session_id:
-        Session identifier whose blocks to search for.
     shm_dir:
         Directory to scan (typically ``/dev/shm``).
 
     Returns
     -------
-    List of absolute file paths matching the session's naming pattern.
+    List of absolute file paths whose basename starts with ``pluribus_``.
     """
-    prefix = f"{_CHUNK_PREFIX}_{session_id}_"
     try:
         names = os.listdir(shm_dir)
     except FileNotFoundError:
@@ -114,7 +108,7 @@ def list_orphaned_blocks(session_id: str, shm_dir: str = "/dev/shm") -> List[str
     return [
         os.path.join(shm_dir, name)
         for name in names
-        if name.startswith(prefix)
+        if name.startswith("pluribus_")
     ]
 
 
@@ -139,11 +133,14 @@ class SparseRegretTable:
     n_actions:
         Number of actions at every infoset.  Must match the action abstraction
         used during training.
-    session_id:
-        Unique identifier for this training session.  Used to name the shared
-        memory files so they can be detected and cleaned up on restart.
+    table_name:
+        Unique name used to form shared memory file names
+        (``{table_name}_{chunk_id:06d}``).  Conventionally
+        ``pluribus_regret_{street}`` or ``pluribus_strategy_{street}``.
     index:
         ``InfosetIndex`` instance providing persistent infoset → row mapping.
+        When ``None`` an internal index is created at a temporary directory
+        (useful for standalone tests).
     shm_dir:
         Directory in which to create shared memory files.  Defaults to
         ``/dev/shm``.  Can be overridden to any writable directory (e.g. a
@@ -155,17 +152,29 @@ class SparseRegretTable:
     def __init__(
         self,
         n_actions: int,
-        session_id: str,
-        index: InfosetIndex,
+        table_name: str,
+        index: Optional[InfosetIndex] = None,
         shm_dir: str = "/dev/shm",
     ) -> None:
         if n_actions < 1:
             raise ValueError(f"n_actions must be >= 1, got {n_actions}")
 
         self._n_actions: int = n_actions
-        self._session_id: str = session_id
-        self._index: InfosetIndex = index
+        self._table_name: str = table_name
+        if index is None:
+            import tempfile as _tempfile
+            _tmp = _tempfile.mkdtemp()
+            self._index: InfosetIndex = InfosetIndex(os.path.join(_tmp, "lmdb"))
+            self._owns_index: bool = True
+        else:
+            self._index = index
+            self._owns_index = False
         self._shm_dir: str = shm_dir
+
+        # Per-table row counter (incremented when get_row allocates a new row).
+        # Shared across all processes; used by CheckpointManager instead of
+        # _index.n_entries which is global across all eight tables.
+        self._n_allocated: mp.Value = mp.Value("l", 0)
 
         # Per-chunk local handles — each process maintains its own list.
         # Workers inherit the parent's list after fork; new chunks are lazily
@@ -191,7 +200,7 @@ class SparseRegretTable:
         self._at_sync_boundary: mp.Value = mp.Value("b", 0)
 
         # Restore chunks for any infosets already in the index (resume path).
-        n_existing = index.n_entries
+        n_existing = self._index.n_entries
         if n_existing > 0:
             n_chunks_needed = (n_existing + CHUNK_SIZE - 1) // CHUNK_SIZE
             log.info(
@@ -208,7 +217,7 @@ class SparseRegretTable:
 
     def _chunk_name(self, chunk_id: int) -> str:
         """Return the file name (not full path) for *chunk_id*."""
-        return f"{_CHUNK_PREFIX}_{self._session_id}_{chunk_id:06d}"
+        return f"{self._table_name}_{chunk_id:06d}"
 
     def _chunk_path(self, chunk_id: int) -> str:
         """Return the full path of the shared memory file for *chunk_id*."""
@@ -313,10 +322,46 @@ class SparseRegretTable:
         np.ndarray
             1-D ``int32`` view of shape ``(n_actions,)``.
         """
-        location, _is_new = self._index.get_or_create(info_set)
+        location, is_new = self._index.get_or_create(info_set)
+        if is_new:
+            with self._n_allocated.get_lock():
+                self._n_allocated.value += 1
         chunk_id, row = location
         self._ensure_chunk(chunk_id)
         return self._chunks[chunk_id][row]
+
+    def merge_delta_row(self, info_set: str, delta: np.ndarray) -> None:
+        """Add *delta* to the regret row for *info_set* under the stripe lock.
+
+        Allocates a new row (and increments ``n_allocated``) on first visit.
+        Acquires the stripe lock for the chunk so concurrent worker syncs do
+        not race.
+
+        Parameters
+        ----------
+        info_set:
+            Information set string.
+        delta:
+            1-D array of regret increments of length ``n_actions``.
+            Cast to ``int32`` before adding to the shared row.
+        """
+        location, is_new = self._index.get_or_create(info_set)
+        if is_new:
+            with self._n_allocated.get_lock():
+                self._n_allocated.value += 1
+        chunk_id, row_idx = location
+        self._ensure_chunk(chunk_id)
+        lock = self.get_stripe_lock(chunk_id)
+        lock.acquire()
+        try:
+            np.add(
+                self._chunks[chunk_id][row_idx],
+                delta.astype(np.int32),
+                out=self._chunks[chunk_id][row_idx],
+            )
+            self._mark_dirty(chunk_id)
+        finally:
+            lock.release()
 
     def get_row_if_exists(self, info_set: str) -> Optional[np.ndarray]:
         """Return the regret row for *info_set*, or ``None`` if never visited.
@@ -476,7 +521,7 @@ class SparseRegretTable:
                 f"Discount factor must be in (0, 1], got {factor}"
             )
 
-        n_rows_total: int = self._index.n_entries
+        n_rows_total: int = self.n_allocated
         factor32 = np.float32(factor)
 
         for chunk_idx, chunk in enumerate(self._chunks):
@@ -499,8 +544,34 @@ class SparseRegretTable:
     # -----------------------------------------------------------------------
 
     def list_own_blocks(self) -> List[str]:
-        """Return paths of all chunk files owned by this session."""
+        """Return paths of all chunk files owned by this table."""
         return list(self._shm_paths)
+
+    # -----------------------------------------------------------------------
+    # Resume helper
+    # -----------------------------------------------------------------------
+
+    def _restore_chunk(self, chunk_id: int, arr: np.ndarray) -> None:
+        """Write *arr* into the shared memory for *chunk_id*, creating if needed.
+
+        Used during resume (Phase 6 ``CheckpointManager``) to reload a
+        saved ``.npy`` array back into the shared memory backing store.
+
+        Parameters
+        ----------
+        chunk_id:
+            Chunk index to restore into.
+        arr:
+            2-D ``int32`` array of shape ``(n_rows, n_actions)``.
+            ``n_rows`` must be ≤ ``CHUNK_SIZE``.
+        """
+        self._ensure_chunk(chunk_id)
+        n_rows = arr.shape[0]
+        if n_rows > CHUNK_SIZE:
+            raise ValueError(
+                f"arr has {n_rows} rows but CHUNK_SIZE={CHUNK_SIZE}"
+            )
+        self._chunks[chunk_id][:n_rows] = arr.astype(np.int32)
 
     # -----------------------------------------------------------------------
     # Properties
@@ -517,9 +588,18 @@ class SparseRegretTable:
         return self._n_actions
 
     @property
-    def session_id(self) -> str:
-        """Session ID used in shared memory file names."""
-        return self._session_id
+    def n_allocated(self) -> int:
+        """Number of rows allocated in this table.
+
+        Tracked per-table (not via ``_index.n_entries`` which is global
+        across all eight tables sharing the same LMDB index).
+        """
+        return self._n_allocated.value
+
+    @property
+    def table_name(self) -> str:
+        """Table name used in shared memory file names."""
+        return self._table_name
 
     # -----------------------------------------------------------------------
     # Lifecycle
@@ -539,9 +619,11 @@ class SparseRegretTable:
                 log.warning("Failed to close mmap: %s", exc)
         self._shm_mmaps.clear()
         self._chunks.clear()
+        if self._owns_index:
+            self._index.close()
         log.info(
-            "SparseRegretTable closed for session %s (%d chunks)",
-            self._session_id,
+            "SparseRegretTable closed: table=%s (%d chunks)",
+            self._table_name,
             len(self._shm_paths),
         )
 
@@ -565,10 +647,10 @@ class SparseRegretTable:
     def __repr__(self) -> str:
         return (
             f"SparseRegretTable("
-            f"session={self._session_id!r}, "
+            f"table_name={self._table_name!r}, "
             f"n_chunks={self.n_chunks}, "
             f"n_actions={self._n_actions}, "
-            f"n_infosets={self._index.n_entries}"
+            f"n_allocated={self.n_allocated}"
             f")"
         )
 
