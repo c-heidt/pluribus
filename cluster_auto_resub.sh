@@ -40,7 +40,7 @@ MAX_RESUBMISSIONS=${MAX_RESUBMISSIONS:-2}
 METHOD=${METHOD:-exact}
 
 mkdir -p "$PROJECT_DIR/logs"
-mkdir -p "$SAVE_DIR"
+[ -d "$SAVE_DIR" ] || mkdir -p "$SAVE_DIR"
 
 # Counter file to track resubmissions
 COUNTER_FILE="$SAVE_DIR/.resubmit_counter"
