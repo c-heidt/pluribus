@@ -81,7 +81,7 @@ class InfosetIndex:
         self._path = Path(path)
         self._path.mkdir(parents=True, exist_ok=True)
         self._debug: bool = debug or bool(os.environ.get("POKER_AI_DEBUG", False))
-        self._env: lmdb.Environment = lmdb.open(
+        self._env: lmdb.Environment = lmdb.Environment(
             str(self._path),
             map_size=_MAP_SIZE,
             writemap=True,
@@ -231,7 +231,7 @@ class InfosetIndex:
             self._env.close()
         except Exception:
             pass
-        self._env = lmdb.open(
+        self._env = lmdb.Environment(
             str(self._path),
             map_size=_MAP_SIZE,
             writemap=True,
