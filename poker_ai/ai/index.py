@@ -48,6 +48,23 @@ CHUNK_SIZE: int = 100_000
 
 _MAP_SIZE: int = 50 * 1024 ** 3  # 50 GiB — does not pre-allocate
 
+
+def _open_lmdb(path: str, **kwargs):
+    """Open an LMDB environment, handling API differences across versions.
+
+    ``lmdb.open`` (alias for ``lmdb.Environment``) was added in py-lmdb 0.82
+    and is present in all 1.x releases.  Use whichever exists so the code
+    works across a range of installed versions.
+    """
+    opener = getattr(lmdb, "open", None) or getattr(lmdb, "Environment", None)
+    if opener is None:
+        raise RuntimeError(
+            f"lmdb installation is broken — neither 'open' nor 'Environment' found. "
+            f"Version: {getattr(lmdb, '__version__', 'unknown')}, attrs: {dir(lmdb)}. "
+            "Please reinstall: pip install 'lmdb>=1.0.0'"
+        )
+    return opener(path, **kwargs)
+
 # Special LMDB keys (prefixed with null byte to avoid clash with hash keys).
 _NEXT_ROW_KEY: bytes = b"\x00__next_row__"
 _STR_PREFIX: bytes = b"\x00__str__"
@@ -81,7 +98,7 @@ class InfosetIndex:
         self._path = Path(path)
         self._path.mkdir(parents=True, exist_ok=True)
         self._debug: bool = debug or bool(os.environ.get("POKER_AI_DEBUG", False))
-        self._env: lmdb.Environment = lmdb.Environment(
+        self._env: lmdb.Environment = _open_lmdb(
             str(self._path),
             map_size=_MAP_SIZE,
             writemap=True,
@@ -231,7 +248,7 @@ class InfosetIndex:
             self._env.close()
         except Exception:
             pass
-        self._env = lmdb.Environment(
+        self._env = _open_lmdb(
             str(self._path),
             map_size=_MAP_SIZE,
             writemap=True,
