@@ -7,7 +7,6 @@ import numpy as np
 
 from poker_ai.ai.agent import Agent
 from poker_ai.games.base.state import PokerState
-from poker_ai.games.short_deck.state import ShortDeckPokerState
 
 
 log = logging.getLogger("sync.ai")
@@ -99,7 +98,7 @@ def merge_local_delta(
 
 def update_strategy(
     agent: Agent,
-    state: ShortDeckPokerState,
+    state: PokerState,
     i: int,
     t: int,
 ) -> None:
@@ -113,7 +112,7 @@ def update_strategy(
     ----------
     agent : Agent
         Agent being trained.
-    state : ShortDeckPokerState
+    state : PokerState
         Current game state.
     i : int
         The traversing player index.
@@ -151,22 +150,23 @@ def update_strategy(
             probs[:] = 1.0 / len(legal_actions)
         action: str = np.random.choice(legal_actions, p=probs)
         log.debug("ACTION SAMPLED: ph %s ACTION: %s", state.player_i, action)
-        # Increment the strategy table visit count for the sampled action.
+        # Increment the strategy table visit count for the sampled action,
+        # weighted by iteration t for Linear MCCFR.
         strat_row = agent.strategy_tables[r].get_row(state.info_set)
-        strat_row[a_to_i[action]] += 1
-        new_state: ShortDeckPokerState = state.apply_action(action)
+        strat_row[a_to_i[action]] += t
+        new_state: PokerState = state.apply_action(action)
         update_strategy(agent, new_state, i, t)
     else:
         # Traverse each action for the opponent (full traversal, not sampled)
         for action in legal_actions:
             log.debug("Going to Traverse %s for opponent", action)
-            new_state: ShortDeckPokerState = state.apply_action(action)
+            new_state: PokerState = state.apply_action(action)
             update_strategy(agent, new_state, i, t)
 
 
 def cfr(
     agent: Agent,
-    state: ShortDeckPokerState,
+    state: PokerState,
     i: int,
     t: int,
     local_delta: Optional[Dict[Tuple[int, str], np.ndarray]] = None,
@@ -182,7 +182,7 @@ def cfr(
     ----------
     agent : Agent
         Agent being trained.
-    state : ShortDeckPokerState
+    state : PokerState
         Current game state.
     i : int
         The traversing player index.
@@ -208,7 +208,7 @@ def cfr(
 
 def _cfr_body(
     agent: Agent,
-    state: ShortDeckPokerState,
+    state: PokerState,
     i: int,
     t: int,
     local_delta: Dict[Tuple[int, str], np.ndarray],
@@ -264,7 +264,7 @@ def _cfr_body(
         for action in legal_actions:
             if _debug:
                 log.debug("ACTION TRAVERSED FOR REGRET: ph %s ACTION: %s", state.player_i, action)
-            new_state: ShortDeckPokerState = state.apply_action(action)
+            new_state: PokerState = state.apply_action(action)
             voa[action] = _cfr_body(agent, new_state, i, t, local_delta)
             if _debug:
                 log.debug("Got EV for %s: %s", action, voa[action])
@@ -282,7 +282,8 @@ def _cfr_body(
         if key not in local_delta:
             local_delta[key] = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int64)
         for action in legal_actions:
-            local_delta[key][a_to_i[action]] += int(round(voa[action] - vo))
+            # Weight regret delta by iteration t for Linear MCCFR.
+            local_delta[key][a_to_i[action]] += int(round(t * (voa[action] - vo)))
         return vo
     else:
         # External sampling: sample ONE opponent action from current strategy.
@@ -297,13 +298,13 @@ def _cfr_body(
         action: str = np.random.choice(legal_actions, p=action_probs)
         if _debug:
             log.debug("EXTERNAL SAMPLE: opponent ph %s sampled ACTION: %s", state.player_i, action)
-        new_state: ShortDeckPokerState = state.apply_action(action)
+        new_state: PokerState = state.apply_action(action)
         return _cfr_body(agent, new_state, i, t, local_delta)
 
 
 def cfrp(
     agent: Agent,
-    state: ShortDeckPokerState,
+    state: PokerState,
     i: int,
     t: int,
     c: int,
@@ -315,7 +316,7 @@ def cfrp(
     ----------
     agent : Agent
         Agent being trained.
-    state : ShortDeckPokerState
+    state : PokerState
         Current game state.
     i : int
         The traversing player index.
@@ -338,7 +339,7 @@ def cfrp(
 
 def _cfrp_body(
     agent: Agent,
-    state: ShortDeckPokerState,
+    state: PokerState,
     i: int,
     t: int,
     c: int,
@@ -377,7 +378,7 @@ def _cfrp_body(
         for action in legal_actions:
             regret_at_action = int(regret_row[a_to_i[action]])
             if is_river or regret_at_action > c:
-                new_state: ShortDeckPokerState = state.apply_action(action)
+                new_state: PokerState = state.apply_action(action)
                 voa[action] = _cfrp_body(agent, new_state, i, t, c, local_delta)
                 explored[action] = True
                 vo += sigma[a_to_i[action]] * voa[action]
@@ -386,7 +387,8 @@ def _cfrp_body(
             local_delta[key] = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int64)
         for action in legal_actions:
             if explored[action]:
-                local_delta[key][a_to_i[action]] += int(round(voa[action] - vo))
+                # Weight regret delta by iteration t for Linear MCCFR.
+                local_delta[key][a_to_i[action]] += int(round(t * (voa[action] - vo)))
         return vo
     else:
         # External sampling: sample ONE opponent action from current strategy.
@@ -397,7 +399,7 @@ def _cfrp_body(
         else:
             action_probs[:] = 1.0 / len(legal_actions)
         action: str = np.random.choice(legal_actions, p=action_probs)
-        new_state: ShortDeckPokerState = state.apply_action(action)
+        new_state: PokerState = state.apply_action(action)
         return _cfrp_body(agent, new_state, i, t, c, local_delta)
 
 
