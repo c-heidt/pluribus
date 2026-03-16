@@ -41,13 +41,6 @@ Options:
                                   files. This lookup method is deprecated.
   --single_process / --multi_process
                                   Either use or don't use multiple processes.
-  --sync_update_strategy / --async_update_strategy
-                                  Do or don't synchronise update_strategy.
-  --sync_cfr / --async_cfr        Do or don't synchronuse CFR.
-  --sync_discount / --async_discount
-                                  Do or don't synchronise the discounting.
-  --sync_serialise / --async_serialise
-                                  Do or don't synchronise the serialisation.
   --nickname TEXT                 The nickname of the study.
   --help                          Show this message and exit.
 ```
@@ -200,10 +193,10 @@ def resume(server_config_path: str):
 )
 @click.option(
     "--sync_interval",
-    default=50,
+    default=25,
     help=(
         "How many iterations between worker sync barriers. Higher values keep "
-        "workers busier but delay delta merges. Recommended: 50 for small tests, "
+        "workers busier but delay delta merges. Recommended: 25 for small tests, "
         "100–1000 for large runs."
     ),
 )

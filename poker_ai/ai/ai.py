@@ -152,8 +152,7 @@ def update_strategy(
         log.debug("ACTION SAMPLED: ph %s ACTION: %s", state.player_i, action)
         # Increment the strategy table visit count for the sampled action,
         # weighted by iteration t for Linear MCCFR.
-        strat_row = agent.strategy_tables[r].get_row(state.info_set)
-        strat_row[a_to_i[action]] += t
+        agent.strategy_tables[r].update_row(state.info_set, a_to_i[action], t)
         new_state: PokerState = state.apply_action(action)
         update_strategy(agent, new_state, i, t)
     else:

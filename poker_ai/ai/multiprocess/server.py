@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from typing import Dict, Optional, Union
 
+from poker_ai.ai.checkpoint import CheckpointManager
+
 import enlighten
 
 from poker_ai.ai.agent import Agent
@@ -68,14 +70,29 @@ class Server:
         self._logging_queue: mp.Queue = mp.Queue()
         # Agent with per-street shared-memory tables
         shm_dir = os.environ.get("PLURIBUS_SHM_DIR", "/dev/shm")
+        from poker_ai.ai.index import lmdb_map_size_for_players
+        lmdb_map_size = int(
+            os.environ.get(
+                "PLURIBUS_LMDB_MAP_SIZE",
+                lmdb_map_size_for_players(n_players),
+            )
+        )
+        log.info(
+            f"LMDB map_size={lmdb_map_size // 1024**3} GiB for {n_players} players "
+            f"(sparse file — check real usage with: du -sh <save_path>/lmdb_index/data.mdb)"
+        )
         self._agent = Agent(
             index_path=self._save_path / "lmdb_index",
             shm_dir=shm_dir,
+            lmdb_map_size=lmdb_map_size,
         )
         self._locks: Dict[str, mp.synchronize.Lock] = dict(
             strategy_update_lock=mp.Lock()
         )
-        self._maybe_resume(self._save_path)
+        self._current_t: int = self._start_t
+        # CheckpointManager registers signal handlers and restores from
+        # checkpoint before workers are spawned.
+        self._checkpoint_manager = CheckpointManager(self, self._save_path)
         if os.environ.get("TESTING_SUITE"):
             n_processes = 4
         self._workers = self._start_workers(n_processes)
@@ -87,7 +104,11 @@ class Server:
         progress_bar = progress_bar_manager.counter(
             total=self._n_iterations, desc="Optimisation iterations", unit="iter"
         )
+        sigterm = self._checkpoint_manager.sigterm_event
         for t in range(self._start_t, self._n_iterations + 1):
+            self._current_t = t
+            if sigterm.is_set():
+                break
             while not self._logging_queue.empty():
                 log.info(self._logging_queue.get())
             for i in range(self._n_players):
@@ -95,39 +116,75 @@ class Server:
 
             if t % self._sync_interval == 0:
                 self._job_queue.join()
+                if sigterm.is_set():
+                    break
                 self._broadcast_job("sync")
                 self._job_queue.join()
+                if sigterm.is_set():
+                    break
 
                 if t > self._update_threshold and t % self._strategy_interval == 0:
                     for i in range(self._n_players):
                         self._send_job("update_strategy", t=t, i=i)
                     self._job_queue.join()
+                    if sigterm.is_set():
+                        break
 
                 # Discount window stub — always False until Phase 7
                 if self._discount_window_active(t):
                     self._broadcast_job("discount", t=t)
                     self._job_queue.join()
+                    if sigterm.is_set():
+                        break
 
             if t % self._checkpoint_interval == 0:
-                log.info(f"[t={t}] Checkpoint stub — Phase 6 will implement full write")
+                self._checkpoint_manager.checkpoint(t=t)
 
             progress_bar.update()
 
+        # Drain any jobs still in the queue (last partial sync_interval block),
+        # then flush all worker local deltas before writing the final checkpoint.
+        self._job_queue.join()
+        # Always write a final checkpoint — covers both normal completion and
+        # signal-interrupted runs.  For the signal path this also serves as
+        # the emergency checkpoint before terminate() drains the workers.
+        if sigterm.is_set():
+            log.info("Signal received — writing final checkpoint before shutdown")
+        else:
+            log.info(f"Training complete at t={self._current_t} — writing final checkpoint")
+        self._checkpoint_manager.checkpoint(t=self._current_t)
+
     def terminate(self, safe: bool = True):
         """Broadcast terminate to all workers and join them."""
+        SHUTDOWN_TIMEOUT_SECS = 60
         if safe:
             self._job_queue.join()
         self._broadcast_job("terminate")
         self._job_queue.join()
         for worker in self._workers:
+            deadline = time.monotonic() + SHUTDOWN_TIMEOUT_SECS
             while worker.is_alive():
                 while not self._logging_queue.empty():
                     try:
                         log.info(self._logging_queue.get_nowait())
                     except Exception:
                         pass
-                worker.join(timeout=0.5)
-            log.info(f"worker {worker.name} joined.")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.error(f"{worker.name} stuck after {SHUTDOWN_TIMEOUT_SECS}s — killing")
+                    worker.kill()
+                    break
+                worker.join(timeout=min(0.5, remaining))
+            if worker.exitcode not in (0, None):
+                log.warning(f"{worker.name} exited with code {worker.exitcode}")
+            else:
+                log.info(f"worker {worker.name} joined.")
+        # Drain any remaining log messages after all workers have exited.
+        while not self._logging_queue.empty():
+            try:
+                log.info(self._logging_queue.get_nowait())
+            except Exception:
+                pass
         for r in range(4):
             self._agent.regret_tables[r].close()
             self._agent.strategy_tables[r].close()
@@ -135,9 +192,19 @@ class Server:
             self._agent.strategy_tables[r].unlink_all()
         self._agent._index.close()
 
-    def to_dict(self) -> Dict[str, Union[str, float, int, None]]:
-        """Serialise the server object to save the progress of optimisation."""
+    def to_dict(self, t: Optional[int] = None) -> Dict[str, Union[str, float, int, None]]:
+        """Serialise the server object to save the progress of optimisation.
+
+        Parameters
+        ----------
+        t:
+            Current training iteration to embed in the snapshot.  When
+            omitted, ``self._current_t`` is used (safe to call outside the
+            training loop for testing).
+        """
+        t_val = t if t is not None else self._current_t
         config = dict(
+            t=t_val,
             strategy_interval=self._strategy_interval,
             n_iterations=self._n_iterations,
             lcfr_threshold=self._lcfr_threshold,
@@ -152,6 +219,12 @@ class Server:
             sync_interval=self._sync_interval,
             checkpoint_interval=self._checkpoint_interval,
             start_timestep=self._start_t,
+            n_chunks_per_street={
+                r: self._agent.regret_tables[r].n_chunks for r in range(4)
+            },
+            n_strategy_chunks_per_street={
+                r: self._agent.strategy_tables[r].n_chunks for r in range(4)
+            },
         )
         return {
             k: os.path.abspath(str(v)) if isinstance(v, Path) else v
@@ -172,12 +245,14 @@ class Server:
         for _ in self._workers:
             self._job_queue.put((job_name, kwargs), block=True)
 
-    def _maybe_resume(self, save_path: Path) -> None:
-        """Stub — full resume logic wired in Phase 6."""
-        if (save_path / "server_state.pkl").exists():
-            log.info("Checkpoint found — resume wired in Phase 6")
-        else:
-            log.info("No checkpoint — starting fresh")
+    def flush_all_workers(self) -> None:
+        """Broadcast a sync job and wait until all workers have flushed.
+
+        Called by ``CheckpointManager.checkpoint()`` before writing dirty
+        chunks so that no in-flight local deltas remain in worker buffers.
+        """
+        self._broadcast_job("sync")
+        self._job_queue.join()
 
     def _discount_window_active(self, t: int) -> bool:
         """Stub — discount window logic implemented in Phase 7."""

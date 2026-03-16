@@ -26,9 +26,12 @@ Collision detection (debug mode)
     LMDB storage usage, so it must only be enabled during development.
 
 map_size
-    Set to 50 GiB.  LMDB does not pre-allocate disk space; the actual file
-    grows on demand.  50 GiB is a safe upper bound for a 6-player game with
-    aggressive abstraction.
+    Defaults to 10 GiB.  LMDB pre-extends ``data.mdb`` to this size via
+    ``ftruncate`` on creation, so ``ls -lh`` will show the full value even
+    though no disk blocks are allocated until data is written (sparse file on
+    ext4/xfs/btrfs).  Check real usage with ``du -sh data.mdb``.  For the
+    full 6-player game set ``PLURIBUS_LMDB_MAP_SIZE=53687091200`` (50 GiB) or
+    pass ``map_size=`` directly.
 """
 
 import logging
@@ -46,7 +49,29 @@ log = logging.getLogger("poker_ai.ai.index")
 # Must match SparseRegretTable.CHUNK_SIZE (set consistently in Phase 2).
 CHUNK_SIZE: int = 100_000
 
-_MAP_SIZE: int = 50 * 1024 ** 3  # 50 GiB — does not pre-allocate
+_DEFAULT_MAP_SIZE: int = 10 * 1024 ** 3  # 10 GiB fallback
+_MAP_SIZE: int = int(os.environ.get("PLURIBUS_LMDB_MAP_SIZE", _DEFAULT_MAP_SIZE))
+
+
+def lmdb_map_size_for_players(n_players: int) -> int:
+    """Return an appropriate LMDB map_size for the given player count.
+
+    Both values create a sparse file on Linux — ``du -sh data.mdb`` shows
+    real disk usage; ``ls -lh`` shows the reservation.
+
+    Parameters
+    ----------
+    n_players:
+        Number of players at the table.
+
+    Returns
+    -------
+    int
+        1 GiB for 2-player games; 50 GiB for 3+ player games.
+    """
+    if n_players <= 2:
+        return 1 * 1024 ** 3   # 1 GiB
+    return 50 * 1024 ** 3      # 50 GiB
 
 
 def _open_lmdb(path: str, **kwargs):
@@ -94,13 +119,14 @@ class InfosetIndex:
         Number of infoset entries currently stored (excludes metadata keys).
     """
 
-    def __init__(self, path: Union[str, Path], debug: bool = False):
+    def __init__(self, path: Union[str, Path], debug: bool = False, map_size: Optional[int] = None):
         self._path = Path(path)
         self._path.mkdir(parents=True, exist_ok=True)
         self._debug: bool = debug or bool(os.environ.get("POKER_AI_DEBUG", False))
+        resolved_map_size = map_size if map_size is not None else _MAP_SIZE
         self._env: lmdb.Environment = _open_lmdb(
             str(self._path),
-            map_size=_MAP_SIZE,
+            map_size=resolved_map_size,
             writemap=True,
             map_async=True,
             # Allow multiple readers from different processes so that workers
@@ -108,15 +134,42 @@ class InfosetIndex:
             max_readers=256,
         )
         log.info(
-            "InfosetIndex opened at %s (debug=%s, n_entries=%d)",
+            "InfosetIndex opened at %s (debug=%s, map_size=%d GiB, n_entries=%d). "
+            "data.mdb apparent size = map_size (sparse file); check real usage with: "
+            "du -sh %s/data.mdb",
             self._path,
             self._debug,
+            resolved_map_size // 1024 ** 3,
             self.n_entries,
+            self._path,
         )
+        self._map_size: int = resolved_map_size
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def _reopen(self) -> None:
+        """Double map_size and reopen the LMDB environment.
+
+        Called automatically when ``get_or_create`` catches ``MapFullError``.
+        Safe to call from the server process only — workers must reopen via
+        ``reopen_after_fork()`` after the server has resized.
+        """
+        self._env.close()
+        self._map_size *= 2
+        log.warning(
+            "LMDB map full — reopening %s with map_size=%d GiB",
+            self._path,
+            self._map_size // 1024 ** 3,
+        )
+        self._env = _open_lmdb(
+            str(self._path),
+            map_size=self._map_size,
+            writemap=True,
+            map_async=True,
+            max_readers=256,
+        )
 
     @property
     def n_entries(self) -> int:
@@ -149,6 +202,11 @@ class InfosetIndex:
         different processes are serialised correctly without any additional
         Python-level lock.
 
+        If the LMDB file is full (``MapFullError``), the environment is
+        automatically closed and reopened with double the current ``map_size``
+        before retrying.  On Linux the file is sparse so the doubled
+        reservation does not consume real disk space until data is written.
+
         Returns
         -------
         location : Tuple[int, int]
@@ -157,6 +215,13 @@ class InfosetIndex:
             ``True`` if a new entry was allocated, ``False`` if it already
             existed.
         """
+        while True:
+            try:
+                return self._get_or_create_once(info_set)
+            except lmdb.MapFullError:
+                self._reopen()
+
+    def _get_or_create_once(self, info_set: str) -> Tuple[Tuple[int, int], bool]:
         key = hash_info_set_bytes(info_set)
 
         # Single write transaction for check-and-insert atomicity.

@@ -83,7 +83,11 @@ def simple_search(
         Iteration at which we begin updating strategy.
     """
     utils.random.seed(42)
-    agent = Agent(index_path=save_path / "lmdb_index")
+    from poker_ai.ai.index import lmdb_map_size_for_players
+    agent = Agent(
+        index_path=save_path / "lmdb_index",
+        lmdb_map_size=lmdb_map_size_for_players(n_players),
+    )
     card_info_lut = {}
     for t in trange(1, n_iterations + 1, desc="train iter"):
         if t == 2:
