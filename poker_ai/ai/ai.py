@@ -281,8 +281,7 @@ def _cfr_body(
         if key not in local_delta:
             local_delta[key] = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int64)
         for action in legal_actions:
-            # Weight regret delta by iteration t for Linear MCCFR.
-            local_delta[key][a_to_i[action]] += int(round(t * (voa[action] - vo)))
+            local_delta[key][a_to_i[action]] += int(round(voa[action] - vo))
         return vo
     else:
         # External sampling: sample ONE opponent action from current strategy.
@@ -386,8 +385,7 @@ def _cfrp_body(
             local_delta[key] = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int64)
         for action in legal_actions:
             if explored[action]:
-                # Weight regret delta by iteration t for Linear MCCFR.
-                local_delta[key][a_to_i[action]] += int(round(t * (voa[action] - vo)))
+                local_delta[key][a_to_i[action]] += int(round(voa[action] - vo))
         return vo
     else:
         # External sampling: sample ONE opponent action from current strategy.

@@ -24,9 +24,9 @@ class Server:
     def __init__(
         self,
         strategy_interval: int,
-        n_iterations: int,
-        lcfr_threshold: int,
+        max_runtime_hours: float,
         discount_interval: int,
+        discount_duration_iters: int,
         prune_threshold: int,
         c: int,
         n_players: int,
@@ -52,9 +52,10 @@ class Server:
                 log.info(f"Using {n_processes} processes (cpu_count={mp.cpu_count()})")
 
         self._strategy_interval = strategy_interval
-        self._n_iterations = n_iterations
-        self._lcfr_threshold = lcfr_threshold
+        self._max_runtime_hours = max_runtime_hours
         self._discount_interval = discount_interval
+        self._discount_duration_iters = discount_duration_iters
+        self._discounting_active = True
         self._prune_threshold = prune_threshold
         self._c = c
         self._n_players = n_players
@@ -102,13 +103,20 @@ class Server:
         self._training_start = time.monotonic()
         progress_bar_manager = enlighten.get_manager()
         progress_bar = progress_bar_manager.counter(
-            total=self._n_iterations, desc="Optimisation iterations", unit="iter"
+            desc="Optimisation iterations", unit="iter"
         )
         sigterm = self._checkpoint_manager.sigterm_event
-        for t in range(self._start_t, self._n_iterations + 1):
-            self._current_t = t
+        t = self._start_t
+        while True:
+            elapsed_hours = (time.monotonic() - self._training_start) / 3600.0
+            if elapsed_hours >= self._max_runtime_hours:
+                log.info(
+                    f"Time limit reached after {elapsed_hours:.2f}h — {t - 1} iterations"
+                )
+                break
             if sigterm.is_set():
                 break
+            self._current_t = t
             while not self._logging_queue.empty():
                 log.info(self._logging_queue.get())
             for i in range(self._n_players):
@@ -130,7 +138,6 @@ class Server:
                     if sigterm.is_set():
                         break
 
-                # Discount window stub — always False until Phase 7
                 if self._discount_window_active(t):
                     self._broadcast_job("discount", t=t)
                     self._job_queue.join()
@@ -141,17 +148,18 @@ class Server:
                 self._checkpoint_manager.checkpoint(t=t)
 
             progress_bar.update()
+            t += 1
 
-        # Drain any jobs still in the queue (last partial sync_interval block),
-        # then flush all worker local deltas before writing the final checkpoint.
+        # Drain any jobs still in the queue, then flush all worker local deltas
+        # before writing the final checkpoint.
         self._job_queue.join()
-        # Always write a final checkpoint — covers both normal completion and
-        # signal-interrupted runs.  For the signal path this also serves as
-        # the emergency checkpoint before terminate() drains the workers.
+        elapsed_total = (time.monotonic() - self._training_start) / 3600.0
         if sigterm.is_set():
             log.info("Signal received — writing final checkpoint before shutdown")
         else:
-            log.info(f"Training complete at t={self._current_t} — writing final checkpoint")
+            log.info(
+                f"Training complete — {self._current_t} iters, {elapsed_total:.2f}h elapsed"
+            )
         self._checkpoint_manager.checkpoint(t=self._current_t)
 
     def terminate(self, safe: bool = True):
@@ -206,9 +214,10 @@ class Server:
         config = dict(
             t=t_val,
             strategy_interval=self._strategy_interval,
-            n_iterations=self._n_iterations,
-            lcfr_threshold=self._lcfr_threshold,
+            max_runtime_hours=self._max_runtime_hours,
             discount_interval=self._discount_interval,
+            discount_duration_iters=self._discount_duration_iters,
+            discount_active=self._discounting_active,
             prune_threshold=self._prune_threshold,
             c=self._c,
             n_players=self._n_players,
@@ -255,8 +264,16 @@ class Server:
         self._job_queue.join()
 
     def _discount_window_active(self, t: int) -> bool:
-        """Stub — discount window logic implemented in Phase 7."""
-        return False
+        """Return True if a discount broadcast should fire at iteration t."""
+        if not self._discounting_active:
+            return False
+        if t >= self._discount_duration_iters:
+            log.info(f"Discount window closed after {t} iters")
+            self._broadcast_job("sync")
+            self._job_queue.join()
+            self._discounting_active = False
+            return False
+        return t % self._discount_interval == 0
 
     def _load_lut(self, lut_path, pickle_dir):
         """Load LUT once in the parent process.

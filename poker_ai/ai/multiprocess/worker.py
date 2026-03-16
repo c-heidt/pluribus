@@ -130,20 +130,21 @@ class Worker(mp.Process):
         # not after every traversal (Phase 5 decoupling).
 
     def _discount(self, t):
-        """Apply LCFR discount to all regret tables (never strategy tables)."""
+        """Apply LCFR discount to all regret and strategy tables."""
         discount_factor = (t / self._discount_interval) / (
             (t / self._discount_interval) + 1
         )
         self._logging_queue.put(
-            f"[t={t}] Discounting regrets (factor={discount_factor:.4f})",
+            f"[t={t}] Discounting regrets and strategy (factor={discount_factor:.4f})",
             block=True,
         )
-        # Apply discount to regret tables only (Bug 2 fix).
-        # Strategy tables must never be discounted.
         for r in range(4):
             self._agent.regret_tables[r].set_sync_boundary(True)
             self._agent.regret_tables[r].apply_discount(discount_factor)
             self._agent.regret_tables[r].set_sync_boundary(False)
+            self._agent.strategy_tables[r].set_sync_boundary(True)
+            self._agent.strategy_tables[r].apply_discount(discount_factor)
+            self._agent.strategy_tables[r].set_sync_boundary(False)
 
     def _update_strategy(self, t, i):
         """Update strategy visit counts for all streets."""

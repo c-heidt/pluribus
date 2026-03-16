@@ -116,17 +116,10 @@ def resume(server_config_path: str):
     help="Update the current strategy whenever the iteration % strategy_interval == 0.",
 )
 @click.option(
-    "--n_iterations",
-    default=1500,
-    help="The total number of iterations we should train the model for.",
-)
-@click.option(
-    "--lcfr_threshold",
-    default=400,
-    help=(
-        "A threshold for linear CFR which means don't apply discounting "
-        "before this iteration."
-    ),
+    "--max_runtime_hours",
+    default=1.0,
+    type=float,
+    help="Wall-clock budget for this run in hours. Training stops when elapsed time reaches this limit.",
 )
 @click.option(
     "--discount_interval",
@@ -135,6 +128,17 @@ def resume(server_config_path: str):
         "Discount the current regret and strategy whenever iteration % "
         "discount_interval == 0."
     ),
+)
+@click.option(
+    "--discount_duration_iters",
+    default=10000,
+    help="Total number of iterations for which the discount window is active.",
+)
+@click.option(
+    "--n_iterations",
+    default=1500,
+    hidden=True,
+    help="[Single-process only] Number of iterations for the validation baseline.",
 )
 @click.option(
     "--prune_threshold",
@@ -220,9 +224,10 @@ def resume(server_config_path: str):
 @click.option("--nickname", default="", help="The nickname of the study.")
 def start(
     strategy_interval: int,
-    n_iterations: int,
-    lcfr_threshold: int,
+    max_runtime_hours: float,
     discount_interval: int,
+    discount_duration_iters: int,
+    n_iterations: int,
     prune_threshold: int,
     c: int,
     n_players: int,
@@ -247,6 +252,8 @@ def start(
             "Only one process specified so using poker_ai.ai.singleprocess."
             "simple_search for the optimisation."
         )
+        # simple_search is the validation baseline — it keeps its own
+        # iteration-based parameters and is not affected by Phase 7.
         simple_search(
             config=config,
             save_path=save_path,
@@ -254,7 +261,7 @@ def start(
             pickle_dir=pickle_dir,
             strategy_interval=strategy_interval,
             n_iterations=n_iterations,
-            lcfr_threshold=lcfr_threshold,
+            lcfr_threshold=discount_duration_iters,
             discount_interval=discount_interval,
             prune_threshold=prune_threshold,
             c=c,
@@ -270,9 +277,9 @@ def start(
         # Create the server that controls/coordinates the workers.
         server = Server(
             strategy_interval=strategy_interval,
-            n_iterations=n_iterations,
-            lcfr_threshold=lcfr_threshold,
+            max_runtime_hours=max_runtime_hours,
             discount_interval=discount_interval,
+            discount_duration_iters=discount_duration_iters,
             prune_threshold=prune_threshold,
             c=c,
             n_players=n_players,
