@@ -330,6 +330,30 @@ class SparseRegretTable:
         self._ensure_chunk(chunk_id)
         return self._chunks[chunk_id][row]
 
+    def update_row(self, info_set: str, action_idx: int, amount: int) -> None:
+        """Add *amount* to a single action slot for *info_set* and mark dirty.
+
+        Used by ``update_strategy`` to increment visit counts in the strategy
+        table.  Marks the chunk dirty so the CheckpointManager writes it.
+
+        Parameters
+        ----------
+        info_set:
+            Information set string.
+        action_idx:
+            Index of the action slot to increment.
+        amount:
+            Value to add (e.g. the iteration weight ``t``).
+        """
+        location, is_new = self._index.get_or_create(info_set)
+        if is_new:
+            with self._n_allocated.get_lock():
+                self._n_allocated.value += 1
+        chunk_id, row_idx = location
+        self._ensure_chunk(chunk_id)
+        self._chunks[chunk_id][row_idx, action_idx] += amount
+        self._mark_dirty(chunk_id)
+
     def merge_delta_row(self, info_set: str, delta: np.ndarray) -> None:
         """Add *delta* to the regret row for *info_set* under the stripe lock.
 
@@ -445,13 +469,20 @@ class SparseRegretTable:
     def get_dirty_chunks(self) -> List[int]:
         """Return chunk IDs that have been written since the last checkpoint.
 
+        Uses ``n_allocated`` rather than ``len(self._chunks)`` so that the
+        server process (which never calls ``_ensure_chunk`` on the hot path)
+        can still discover chunks created and dirtied by worker processes.
+
         Returns
         -------
         List[int]
             Sorted list of chunk IDs with their dirty flag set.
         """
-        n_chunks = len(self._chunks)
-        limit = min(n_chunks, _MAX_DIRTY_CHUNKS)
+        n_alloc = self.n_allocated
+        if n_alloc == 0:
+            return []
+        n_chunks_allocated = (n_alloc - 1) // CHUNK_SIZE + 1
+        limit = min(n_chunks_allocated, _MAX_DIRTY_CHUNKS)
         return [i for i in range(limit) if self._dirty_shared[i]]
 
     def clear_dirty(self, chunk_id: int) -> None:

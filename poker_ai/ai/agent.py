@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Dict, Union
 
-from poker_ai.ai.index import InfosetIndex
+from poker_ai.ai.index import InfosetIndex, lmdb_map_size_for_players
 from poker_ai.ai.regret_table import SparseRegretTable
 from poker_ai.games.base.state import PokerState
 
@@ -26,6 +26,13 @@ class Agent:
     shm_dir:
         Directory for shared-memory chunk files.  Defaults to ``/dev/shm``.
         Override to a temporary directory in tests.
+    lmdb_map_size:
+        Maximum size of the LMDB environment in bytes.  The file is sparse on
+        Linux so this is a reservation, not actual disk usage.  Defaults to
+        ``None`` which uses the value of ``PLURIBUS_LMDB_MAP_SIZE`` env var
+        or the module default (1 GiB for 2 players, 50 GiB for 3+).
+        Use ``poker_ai.ai.index.lmdb_map_size_for_players()`` to compute a
+        player-count-appropriate value.
 
     Attributes
     ----------
@@ -41,8 +48,9 @@ class Agent:
         self,
         index_path: Union[str, Path],
         shm_dir: str = "/dev/shm",
+        lmdb_map_size: int = None,
     ) -> None:
-        self._index = InfosetIndex(index_path)
+        self._index = InfosetIndex(index_path, map_size=lmdb_map_size)
         self.regret_tables: Dict[int, SparseRegretTable] = {
             r: SparseRegretTable(
                 n_actions=_MAX_ACTIONS_PER_STREET[r],
