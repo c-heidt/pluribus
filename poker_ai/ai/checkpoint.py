@@ -265,6 +265,10 @@ class CheckpointManager:
         # Advance past the checkpointed iteration.
         self._server._start_t = state_dict["t"] + 1
 
+        # Restore discount window state so the gate continues from where it
+        # left off rather than resetting.
+        self._server._discounting_active = state_dict.get("discount_active", True)
+
         for r in range(4):
             n_regret = state_dict.get("n_chunks_per_street", {}).get(r, 0)
             for chunk_id in range(n_regret):
