@@ -28,7 +28,6 @@ class Worker(mp.Process):
         lut_path: Union[str, Path],
         pickle_dir: bool,
         n_players: int,
-        prune_threshold: int,
         c: int,
         discount_interval: int,
         save_path: Path,
@@ -40,7 +39,6 @@ class Worker(mp.Process):
         self._logging_queue: mp.Queue = logging_queue
         self._locks = locks
         self._n_players = n_players
-        self._prune_threshold = prune_threshold
         self._agent = agent
         self._c = c
         self._discount_interval = discount_interval
@@ -88,9 +86,18 @@ class Worker(mp.Process):
             elif name == "update_strategy":
                 function = self._update_strategy
             else:
+                self._job_queue.task_done()
                 raise ValueError(f"Unrecognised function name: {name}")
-            function(**kwargs)
-            self._job_queue.task_done()
+            try:
+                function(**kwargs)
+            except Exception:
+                log.exception(
+                    f"[worker={self.name}] Unhandled exception in job '{name}' — "
+                    f"marking task done before re-raising"
+                )
+                raise
+            finally:
+                self._job_queue.task_done()
 
     def _set_seed(self):
         """Lose all reproducability as we need unique streams per worker."""
@@ -120,8 +127,7 @@ class Worker(mp.Process):
         """Search over random game and calculate the strategy."""
         self._setup_new_game()
         use_pruning: bool = np.random.uniform() < 0.95
-        pruning_allowed: bool = t > self._prune_threshold
-        if pruning_allowed and use_pruning:
+        if use_pruning:
             ai.cfrp(self._agent, self._state, i, t, self._c, self._local_delta)
         else:
             ai.cfr(self._agent, self._state, i, t, self._local_delta)
@@ -130,21 +136,34 @@ class Worker(mp.Process):
         # not after every traversal (Phase 5 decoupling).
 
     def _discount(self, t):
-        """Apply LCFR discount to all regret and strategy tables."""
+        """Apply LCFR discount to all regret and strategy tables.
+
+        This job must be sent to exactly ONE worker (not broadcast) so that the
+        discount is applied once to each shared-memory chunk.  The worker opens
+        any chunks it hasn't seen yet before iterating, ensuring all chunks
+        across all workers are covered.
+        """
+        from poker_ai.ai.index import CHUNK_SIZE
         discount_factor = (t / self._discount_interval) / (
             (t / self._discount_interval) + 1
         )
         self._logging_queue.put(
             f"[t={t}] Discounting regrets and strategy (factor={discount_factor:.4f})",
-            block=True,
+            block=False,
         )
         for r in range(4):
-            self._agent.regret_tables[r].set_sync_boundary(True)
-            self._agent.regret_tables[r].apply_discount(discount_factor)
-            self._agent.regret_tables[r].set_sync_boundary(False)
-            self._agent.strategy_tables[r].set_sync_boundary(True)
-            self._agent.strategy_tables[r].apply_discount(discount_factor)
-            self._agent.strategy_tables[r].set_sync_boundary(False)
+            for table in (
+                self._agent.regret_tables[r],
+                self._agent.strategy_tables[r],
+            ):
+                n = table.n_allocated
+                if n > 0:
+                    n_chunks = (n + CHUNK_SIZE - 1) // CHUNK_SIZE
+                    for chunk_id in range(n_chunks):
+                        table._ensure_chunk(chunk_id)
+                table.set_sync_boundary(True)
+                table.apply_discount(discount_factor)
+                table.set_sync_boundary(False)
 
     def _update_strategy(self, t, i):
         """Update strategy visit counts for all streets."""

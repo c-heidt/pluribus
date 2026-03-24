@@ -35,9 +35,10 @@ InfoSetLookupTable = Dict[str, Dict[Tuple[int, ...], str]]
 # Turn/River: most coarse (3 sizes for first raise, 2 for subsequent raises)
 #
 # IMPORTANT NOTES:
-# 1. Raise amounts are calculated as: call + (pot_fraction * effective_pot)
-#    where effective_pot = current_pot + amount_to_call
-#    This follows standard NLHE conventions for pot-sized betting.
+# 1. Raise amounts are calculated as: pot_fraction * effective_pot
+#    where effective_pot = current_pot (previous round pot + all bets committed so far
+#    in this round). The total chips added by the player equals this raise amount,
+#    which covers both the implicit call and the raise above it.
 #
 # 2. Positional asymmetry is INTENDED: In multi-way pots, players acting later
 #    see a larger pot (includes earlier actions) and thus have larger raise sizes
@@ -591,26 +592,15 @@ class PokerState(ABC):
 
     def _compute_raise_chip_amount(self, pot_fraction: float, enforce_minimum: bool = True) -> int:
         """Compute the number of chips to ADD to pot based on pot fraction.
-        
-        This method implements standard NLHE pot-sized raise conventions:
-        - Effective pot = current pot + amount needed to call
-        - Raise amount = pot_fraction * effective_pot (rounded up)
-        - Total chips to add = call amount + raise amount
-        
-        IMPORTANT: Returns the total chips to ADD via Player.raise_to(n_chips).
-        Player.raise_to() ADDS n_chips to the pot on top of current bet, despite
-        the confusing method name. It does NOT set total bet to n_chips.
-        
-        INTENDED BEHAVIOR:
-        - Raises are applied ON TOP OF the call amount, not instead of it
-        - In multi-way pots, later positions see larger pots (positional asymmetry)
-          and thus have larger raise sizes for the same abstract action
-        - This asymmetry is realistic and allows CFR to learn position-dependent strategies
-        
-        Example: Pot=$100, need to call $50
-        - Effective pot = $100 + $50 = $150
-        - Pot-sized raise (fraction=1.0): raise $150, ADD $50 + $150 = $200 to pot
-        
+
+        Effective pot = current pot (previous round pot + all bets committed in this
+        round). The raise amount is pot_fraction * effective_pot (rounded up), and
+        this is the TOTAL chips the player adds — covering both the implicit call and
+        the raise above it.
+
+        Example: Previous pot=$300, player 1 bets $100, player 2 bets $100 →
+        effective pot = $500. raise_0.5: player adds $250 → new pot = $750.
+
         Parameters
         ----------
         pot_fraction : float
@@ -618,30 +608,29 @@ class PokerState(ABC):
         enforce_minimum : bool
             If True, ensures raise meets minimum raise requirement.
             If False, returns the exact pot-fraction amount (rounded up).
-            
+
         Returns
         -------
         n_chips_to_add : int
-            Number of chips to ADD to pot (includes call amount + raise amount).
+            Total chips to ADD to pot (covers call + raise above call).
         """
         biggest_bet = max(p.n_bet_chips for p in self.players)
         n_chips_to_call = biggest_bet - self.current_player.n_bet_chips
-        
-        # Pot size for raise calculation includes current pot + amount to call
-        # This is the "effective pot" that the opponent would face
-        effective_pot = self.pot_size + n_chips_to_call
-        
-        # Raise amount is fraction of the effective pot (rounded UP to integer)
-        raise_amount = math.ceil(effective_pot * pot_fraction)
-        
+
+        # Effective pot = all chips committed so far (previous rounds + current round bets)
+        # Does NOT add the call amount — raise is a fraction of the existing pot only
+        effective_pot = self.pot_size
+
+        # Total chips to add = pot_fraction * effective_pot (rounded UP to integer)
+        # This single amount covers both the call and the raise above it
+        n_chips_to_add = math.ceil(effective_pot * pot_fraction)
+
         # Ensure minimum raise requirement if requested
+        # Actual raise above call = n_chips_to_add - n_chips_to_call
         if enforce_minimum:
-            raise_amount = max(raise_amount, self.min_raise_amount)
-        
-        # Total chips to ADD to pot = call + raise
-        # This is what we pass to Player.raise_to() which adds chips
-        n_chips_to_add = n_chips_to_call + raise_amount
-        
+            min_total = n_chips_to_call + self.min_raise_amount
+            n_chips_to_add = max(n_chips_to_add, min_total)
+
         return n_chips_to_add
 
     def _get_available_raise_sizes(self) -> List[str]:

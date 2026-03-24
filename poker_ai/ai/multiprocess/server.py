@@ -25,7 +25,6 @@ class Server:
         self,
         strategy_interval: int,
         max_runtime_hours: float,
-        discount_interval: int,
         discount_duration_iters: int,
         prune_threshold: int,
         c: int,
@@ -53,7 +52,9 @@ class Server:
 
         self._strategy_interval = strategy_interval
         self._max_runtime_hours = max_runtime_hours
-        self._discount_interval = discount_interval
+        # Discount fires every sync; use sync_interval as the time-scale for
+        # the LCFR factor formula so the decay rate matches the new frequency.
+        self._discount_interval = sync_interval
         self._discount_duration_iters = discount_duration_iters
         self._discounting_active = True
         self._prune_threshold = prune_threshold
@@ -139,7 +140,9 @@ class Server:
                         break
 
                 if self._discount_window_active(t):
-                    self._broadcast_job("discount", t=t)
+                    # Send to exactly ONE worker — discount must be applied once.
+                    # All other workers are idle at this barrier point.
+                    self._send_job("discount", t=t)
                     self._job_queue.join()
                     if sigterm.is_set():
                         break
@@ -215,7 +218,6 @@ class Server:
             t=t_val,
             strategy_interval=self._strategy_interval,
             max_runtime_hours=self._max_runtime_hours,
-            discount_interval=self._discount_interval,
             discount_duration_iters=self._discount_duration_iters,
             discount_active=self._discounting_active,
             prune_threshold=self._prune_threshold,
@@ -264,16 +266,18 @@ class Server:
         self._job_queue.join()
 
     def _discount_window_active(self, t: int) -> bool:
-        """Return True if a discount broadcast should fire at iteration t."""
+        """Return True if a discount should fire at iteration t.
+
+        Discount is applied on every sync until ``discount_duration_iters`` is
+        reached (i.e. the effective discount interval equals sync_interval).
+        """
         if not self._discounting_active:
             return False
         if t >= self._discount_duration_iters:
             log.info(f"Discount window closed after {t} iters")
-            self._broadcast_job("sync")
-            self._job_queue.join()
             self._discounting_active = False
             return False
-        return t % self._discount_interval == 0
+        return True
 
     def _load_lut(self, lut_path, pickle_dir):
         """Load LUT once in the parent process.
