@@ -280,8 +280,5 @@ dmypy.json
 # Mac stuff
 .DS_Store
 
-# Clustering results
-/data/**
-
 # VS Code
 .vscode/**
