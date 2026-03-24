@@ -112,7 +112,7 @@ def resume(server_config_path: str):
 @train.command()
 @click.option(
     "--strategy_interval",
-    default=20,
+    default=5000,
     help="Update the current strategy whenever the iteration % strategy_interval == 0.",
 )
 @click.option(
@@ -122,27 +122,19 @@ def resume(server_config_path: str):
     help="Wall-clock budget for this run in hours. Training stops when elapsed time reaches this limit.",
 )
 @click.option(
-    "--discount_interval",
-    default=400,
-    help=(
-        "Discount the current regret and strategy whenever iteration % "
-        "discount_interval == 0."
-    ),
-)
-@click.option(
     "--discount_duration_iters",
     default=10000,
     help="Total number of iterations for which the discount window is active.",
 )
 @click.option(
     "--n_iterations",
-    default=1500,
+    default=10000,
     hidden=True,
     help="[Single-process only] Number of iterations for the validation baseline.",
 )
 @click.option(
     "--prune_threshold",
-    default=400,
+    default=5000,
     help=(
         "When a uniform random number is less than 95%, and the iteration > "
         "prune_threshold, use CFR with pruning."
@@ -150,17 +142,21 @@ def resume(server_config_path: str):
 )
 @click.option(
     "--c",
-    default=-20000,
+    default=-300000000,
     help=(
         "Pruning threshold for regret, which means when we are using CFR with "
         "pruning and have a state with a regret of less than `c`, then we'll "
         "elect to not recusrively visit it and it's child nodes."
     ),
 )
-@click.option("--n_players", default=3, help="The number of players in the game.")
+@click.option(
+    "--n_players",
+    default=3,
+    help="The number of players in the game."
+)
 @click.option(
     "--dump_iteration",
-    default=20,
+    default=1000,
     help=(
         "When the iteration % dump_iteration == 0, we will compute a new strategy "
         "and write that to the accumlated strategy, which gets normalised at a "
@@ -169,7 +165,7 @@ def resume(server_config_path: str):
 )
 @click.option(
     "--update_threshold",
-    default=400,
+    default=1000,
     help=(
         "When the iteration is greater than update_threshold we can start "
         "updating the strategy."
@@ -197,19 +193,17 @@ def resume(server_config_path: str):
 )
 @click.option(
     "--sync_interval",
-    default=25,
+    default=250,
     help=(
         "How many iterations between worker sync barriers. Higher values keep "
-        "workers busier but delay delta merges. Recommended: 25 for small tests, "
-        "100–1000 for large runs."
+        "workers busier but delay delta merges."
     ),
 )
 @click.option(
     "--checkpoint_interval",
-    default=1000,
+    default=10000,
     help=(
-        "Write a training checkpoint every N iterations. Used by Phase 6 "
-        "resume logic; Phase 5 logs only."
+        "Write a training checkpoint every N iterations. "
     ),
 )
 @click.option(
@@ -225,7 +219,6 @@ def resume(server_config_path: str):
 def start(
     strategy_interval: int,
     max_runtime_hours: float,
-    discount_interval: int,
     discount_duration_iters: int,
     n_iterations: int,
     prune_threshold: int,
@@ -262,8 +255,7 @@ def start(
             strategy_interval=strategy_interval,
             n_iterations=n_iterations,
             lcfr_threshold=discount_duration_iters,
-            discount_interval=discount_interval,
-            prune_threshold=prune_threshold,
+            discount_interval=sync_interval,
             c=c,
             n_players=n_players,
             dump_iteration=dump_iteration,
@@ -278,7 +270,6 @@ def start(
         server = Server(
             strategy_interval=strategy_interval,
             max_runtime_hours=max_runtime_hours,
-            discount_interval=discount_interval,
             discount_duration_iters=discount_duration_iters,
             prune_threshold=prune_threshold,
             c=c,
