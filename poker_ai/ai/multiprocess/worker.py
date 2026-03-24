@@ -28,8 +28,8 @@ class Worker(mp.Process):
         lut_path: Union[str, Path],
         pickle_dir: bool,
         n_players: int,
+        prune_threshold: int,
         c: int,
-        discount_interval: int,
         save_path: Path,
         info_set_lut=None,
     ):
@@ -41,7 +41,7 @@ class Worker(mp.Process):
         self._n_players = n_players
         self._agent = agent
         self._c = c
-        self._discount_interval = discount_interval
+        self._prune_threshold = prune_threshold
         self._save_path = Path(save_path)
         self._lut_path = str(lut_path)
         self._pickle_dir = pickle_dir
@@ -81,8 +81,6 @@ class Worker(mp.Process):
                 function = self._cfr
             elif name == "sync":
                 function = self._sync_to_master
-            elif name == "discount":
-                function = self._discount
             elif name == "update_strategy":
                 function = self._update_strategy
             else:
@@ -127,43 +125,13 @@ class Worker(mp.Process):
         """Search over random game and calculate the strategy."""
         self._setup_new_game()
         use_pruning: bool = np.random.uniform() < 0.95
-        if use_pruning:
+        if use_pruning and t > self._prune_threshold:
             ai.cfrp(self._agent, self._state, i, t, self._c, self._local_delta)
         else:
             ai.cfr(self._agent, self._state, i, t, self._local_delta)
         self._local_iteration_count += 1
         # Delta is flushed on explicit "sync" jobs dispatched by the server,
         # not after every traversal (Phase 5 decoupling).
-
-    def _discount(self, t):
-        """Apply LCFR discount to all regret and strategy tables.
-
-        This job must be sent to exactly ONE worker (not broadcast) so that the
-        discount is applied once to each shared-memory chunk.  The worker opens
-        any chunks it hasn't seen yet before iterating, ensuring all chunks
-        across all workers are covered.
-        """
-        from poker_ai.ai.index import CHUNK_SIZE
-        discount_factor = (t / self._discount_interval) / (
-            (t / self._discount_interval) + 1
-        )
-        self._logging_queue.put(
-            f"[t={t}] Discounting regrets and strategy (factor={discount_factor:.4f})",
-            block=False,
-        )
-        for r in range(4):
-            for table in (
-                self._agent.regret_tables[r],
-                self._agent.strategy_tables[r],
-            ):
-                n = table.n_allocated
-                if n > 0:
-                    n_chunks = (n + CHUNK_SIZE - 1) // CHUNK_SIZE
-                    for chunk_id in range(n_chunks):
-                        table._ensure_chunk(chunk_id)
-                table.set_sync_boundary(True)
-                table.apply_discount(discount_factor)
-                table.set_sync_boundary(False)
 
     def _update_strategy(self, t, i):
         """Update strategy visit counts for all streets."""

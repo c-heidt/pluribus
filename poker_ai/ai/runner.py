@@ -255,7 +255,6 @@ def start(
             strategy_interval=strategy_interval,
             n_iterations=n_iterations,
             lcfr_threshold=discount_duration_iters,
-            discount_interval=sync_interval,
             c=c,
             n_players=n_players,
             dump_iteration=dump_iteration,
