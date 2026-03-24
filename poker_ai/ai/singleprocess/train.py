@@ -45,7 +45,6 @@ def simple_search(
     strategy_interval: int,
     n_iterations: int,
     lcfr_threshold: int,
-    discount_interval: int,
     prune_threshold: int,
     c: int,
     n_players: int,
@@ -69,8 +68,6 @@ def simple_search(
         Number of iterations.
     lcfr_threshold : int
         Iteration at which to begin linear CFR.
-    discount_interval : int
-        Iteration at which to discount strategy and regret.
     prune_threshold : int
         Iteration at which to begin pruning.
     c : int
@@ -82,6 +79,7 @@ def simple_search(
     update_threshold : int
         Iteration at which we begin updating strategy.
     """
+    discount_step: int = 0
     utils.random.seed(42)
     from poker_ai.ai.index import lmdb_map_size_for_players
     agent = Agent(
@@ -112,12 +110,10 @@ def simple_search(
             else:
                 ai.cfr(agent=agent, state=state, i=i, t=t, local_delta=local_delta)
             ai.merge_local_delta(agent=agent, local_delta=local_delta)
-        # Bug 1 fix: `&` had higher precedence than `<` and `==`, so the
-        # condition was never True.  Use `and` for correct boolean short-circuit.
-        if t < lcfr_threshold and t % discount_interval == 0:
-            d = (t / discount_interval) / ((t / discount_interval) + 1)
-            # Per Pluribus paper only regret is discounted (Bug 2 fix).
-            # Strategy tables must never be discounted.
+        if t < lcfr_threshold:
+            discount_step += 1
+            d = discount_step / (discount_step + 1)
+            # Per Pluribus paper only regret is discounted.
             for r in range(4):
                 agent.regret_tables[r].apply_discount(d)
         if (t > update_threshold) and (t % dump_iteration == 0):

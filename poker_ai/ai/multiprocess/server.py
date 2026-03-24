@@ -52,11 +52,9 @@ class Server:
 
         self._strategy_interval = strategy_interval
         self._max_runtime_hours = max_runtime_hours
-        # Discount fires every sync; use sync_interval as the time-scale for
-        # the LCFR factor formula so the decay rate matches the new frequency.
-        self._discount_interval = sync_interval
         self._discount_duration_iters = discount_duration_iters
         self._discounting_active = True
+        self._discount_step: int = 0
         self._prune_threshold = prune_threshold
         self._c = c
         self._n_players = n_players
@@ -139,13 +137,7 @@ class Server:
                     if sigterm.is_set():
                         break
 
-                if self._discount_window_active(t):
-                    # Send to exactly ONE worker — discount must be applied once.
-                    # All other workers are idle at this barrier point.
-                    self._send_job("discount", t=t)
-                    self._job_queue.join()
-                    if sigterm.is_set():
-                        break
+                self._apply_discount(t)
 
             if t % self._checkpoint_interval == 0:
                 self._checkpoint_manager.checkpoint(t=t)
@@ -265,19 +257,40 @@ class Server:
         self._broadcast_job("sync")
         self._job_queue.join()
 
-    def _discount_window_active(self, t: int) -> bool:
-        """Return True if a discount should fire at iteration t.
+    def _apply_discount(self, t: int) -> None:
+        """Apply LCFR discount directly to all shared-memory tables.
 
-        Discount is applied on every sync until ``discount_duration_iters`` is
-        reached (i.e. the effective discount interval equals sync_interval).
+        Called by the server after every sync barrier while the discount window
+        is active.  Running in the server process (not a worker job) guarantees
+        the discount is applied exactly once per sync with no concurrency.
         """
         if not self._discounting_active:
-            return False
+            return
         if t >= self._discount_duration_iters:
             log.info(f"Discount window closed after {t} iters")
             self._discounting_active = False
-            return False
-        return True
+            return
+        from poker_ai.ai.index import CHUNK_SIZE
+        self._discount_step += 1
+        discount_factor = self._discount_step / (self._discount_step + 1)
+        log.info(
+            f"[t={t}] Discounting regrets and strategy "
+            f"(step={self._discount_step}, factor={discount_factor:.4f})"
+        )
+        for r in range(4):
+            for table in (
+                self._agent.regret_tables[r],
+                self._agent.strategy_tables[r],
+            ):
+                n = table.n_allocated
+                if n > 0:
+                    n_chunks = (n + CHUNK_SIZE - 1) // CHUNK_SIZE
+                    for chunk_id in range(n_chunks):
+                        table._ensure_chunk(chunk_id)
+                table.set_sync_boundary(True)
+                table.apply_discount(discount_factor)
+                table.set_sync_boundary(False)
+
 
     def _load_lut(self, lut_path, pickle_dir):
         """Load LUT once in the parent process.
@@ -308,7 +321,6 @@ class Server:
                 n_players=self._n_players,
                 prune_threshold=self._prune_threshold,
                 c=self._c,
-                discount_interval=self._discount_interval,
                 save_path=self._save_path,
                 info_set_lut=self._info_set_lut,
             )
