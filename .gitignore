@@ -282,3 +282,6 @@ dmypy.json
 
 # Clustering results
 /data/**
+
+# VS Code
+.vscode/**

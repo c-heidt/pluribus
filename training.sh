@@ -8,7 +8,7 @@
 #SBATCH --partition=cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=24:00:00
+#SBATCH --time=1:00:00
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=38G
 #SBATCH --mail-type=All
@@ -21,10 +21,11 @@ set -euo pipefail
 CONDA_ENV=${CONDA_ENV:-pluribus}
 PROJECT_DIR=${PROJECT_DIR:-"$HOME/pluribus"}
 WORKSPACE=${WORKSPACE:-/pfs/work9/workspace/scratch/ka_gu4593-clustering_20}
-N_PLAYERS=${N_PLAYERS:-2}
+N_PLAYERS=${N_PLAYERS:-6}
 UPDATE_THRESHOLD=${UPDATE_THRESHOLD:-50}
-N_ITERATIONS=${N_ITERATIONS:-1000}
-DUMP_ITERATION=${DUMP_ITERATION:-10}
+MAX_RUNTIME_HOURS=${MAX_RUNTIME_HOURS:-0.75}
+DISCOUNT_INTERVAL=${DISCOUNT_INTERVAL:-100}
+DISCOUNT_DURATION_ITERS=${DISCOUNT_DURATION_ITERS:-5000}
 LUT_PATH=${LUT_PATH:-"$WORKSPACE/exact"}
 NICKNAME=${NICKNAME:-"models/2player_20cards"}
 
@@ -59,20 +60,22 @@ if [ ! -d "$LUT_PATH" ]; then
 fi
 
 echo "Starting training with:"
-echo "  - Players: $N_PLAYERS"
-echo "  - Update threshold: $UPDATE_THRESHOLD"
-echo "  - Iterations: $N_ITERATIONS"
-echo "  - Dump iteration: $DUMP_ITERATION"
-echo "  - LUT path: $LUT_PATH"
-echo "  - Nickname: $NICKNAME"
-echo "  - CPUs: $SLURM_CPUS_PER_TASK"
+echo "  - Players:                $N_PLAYERS"
+echo "  - Update threshold:       $UPDATE_THRESHOLD"
+echo "  - Max runtime (hours):    $MAX_RUNTIME_HOURS"
+echo "  - Discount interval:      $DISCOUNT_INTERVAL"
+echo "  - Discount duration iters:$DISCOUNT_DURATION_ITERS"
+echo "  - LUT path:               $LUT_PATH"
+echo "  - Nickname:               $NICKNAME"
+echo "  - CPUs:                   $SLURM_CPUS_PER_TASK"
 
 # Run training using the installed CLI with multiprocessing
 poker_ai train start \
   --multi_process \
   --n_players "$N_PLAYERS" \
   --update_threshold "$UPDATE_THRESHOLD" \
-  --n_iterations "$N_ITERATIONS" \
-  --dump_iteration "$DUMP_ITERATION" \
+  --max_runtime_hours "$MAX_RUNTIME_HOURS" \
+  --discount_interval "$DISCOUNT_INTERVAL" \
+  --discount_duration_iters "$DISCOUNT_DURATION_ITERS" \
   --lut_path "$LUT_PATH" \
   --nickname "$NICKNAME"
