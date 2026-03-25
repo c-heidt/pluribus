@@ -3,7 +3,7 @@ import mmap as _mmap
 import multiprocessing as mp
 import os
 from pathlib import Path
-from typing import Dict, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import joblib
 import numpy as np
@@ -32,6 +32,7 @@ class Worker(mp.Process):
         c: int,
         save_path: Path,
         info_set_lut=None,
+        error_event: Optional[mp.Event] = None, # type: ignore
     ):
         """Construct the process, setup the state."""
         super().__init__(group=None, name=None, args=(), kwargs={}, daemon=None)
@@ -45,6 +46,7 @@ class Worker(mp.Process):
         self._save_path = Path(save_path)
         self._lut_path = str(lut_path)
         self._pickle_dir = pickle_dir
+        self._error_event: Optional[mp.Event] = error_event # type: ignore
         if info_set_lut is not None:
             self._info_set_lut = info_set_lut
         # Per-traversal regret accumulator keyed by (betting_round, info_set).
@@ -91,10 +93,13 @@ class Worker(mp.Process):
             except Exception:
                 log.exception(
                     f"[worker={self.name}] Unhandled exception in job '{name}' — "
-                    f"marking task done before re-raising"
+                    f"signaling shutdown"
                 )
-                raise
-            finally:
+                if self._error_event is not None:
+                    self._error_event.set()
+                self._job_queue.task_done()
+                break
+            else:
                 self._job_queue.task_done()
 
     def _set_seed(self):

@@ -54,7 +54,7 @@ import joblib
 import yaml
 
 from poker_ai import utils
-from poker_ai.ai.multiprocess.server import Server
+from poker_ai.ai.multiprocess.server import Server, WorkerError
 from poker_ai.ai.singleprocess.train import simple_search
 
 
@@ -65,12 +65,16 @@ def _safe_search(server: Server):
     """Safely run the server, and allow user to control c."""
     try:
         server.search()
+    except WorkerError as exc:
+        log.error(f"Fatal worker error: {exc}")
+        server.terminate(safe=False)
     except (KeyboardInterrupt, SystemExit):
         log.info(
             "Early termination of program. Please wait for workers to "
             "terminate."
         )
-    finally:
+        server.terminate()
+    else:
         server.terminate()
     log.info("All workers terminated. Quitting program - thanks for using me!")
 
