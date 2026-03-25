@@ -2,6 +2,7 @@ import logging
 import mmap as _mmap
 import multiprocessing as mp
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Dict, Optional, Union
@@ -12,10 +13,14 @@ import enlighten
 
 from poker_ai.ai.agent import Agent
 from poker_ai import utils
-from poker_ai.games.short_deck import state
 from poker_ai.ai.multiprocess.worker import Worker
 
 log = logging.getLogger("sync.server")
+
+
+class WorkerError(RuntimeError):
+    """Raised when a worker process encounters a fatal error."""
+    pass
 
 
 class Server:
@@ -89,6 +94,7 @@ class Server:
         self._locks: Dict[str, mp.synchronize.Lock] = dict(
             strategy_update_lock=mp.Lock()
         )
+        self._error_event: mp.Event = mp.Event() # type: ignore
         self._current_t: int = self._start_t
         # CheckpointManager registers signal handlers and restores from
         # checkpoint before workers are spawned.
@@ -106,62 +112,78 @@ class Server:
         )
         sigterm = self._checkpoint_manager.sigterm_event
         t = self._start_t
-        while True:
-            elapsed_hours = (time.monotonic() - self._training_start) / 3600.0
-            if elapsed_hours >= self._max_runtime_hours:
-                log.info(
-                    f"Time limit reached after {elapsed_hours:.2f}h — {t - 1} iterations"
-                )
-                break
-            if sigterm.is_set():
-                break
-            self._current_t = t
-            while not self._logging_queue.empty():
-                log.info(self._logging_queue.get())
-            for i in range(self._n_players):
-                self._send_job("cfr", t=t, i=i)
-
-            if t % self._sync_interval == 0:
-                self._job_queue.join()
+        try:
+            while True:
+                elapsed_hours = (time.monotonic() - self._training_start) / 3600.0
+                if elapsed_hours >= self._max_runtime_hours:
+                    log.info(
+                        f"Time limit reached after {elapsed_hours:.2f}h — {t - 1} iterations"
+                    )
+                    break
                 if sigterm.is_set():
                     break
-                self._broadcast_job("sync")
-                self._job_queue.join()
-                if sigterm.is_set():
-                    break
+                self._current_t = t
+                while not self._logging_queue.empty():
+                    log.info(self._logging_queue.get())
+                for i in range(self._n_players):
+                    self._send_job("cfr", t=t, i=i)
 
-                if t > self._update_threshold and t % self._strategy_interval == 0:
-                    for i in range(self._n_players):
-                        self._send_job("update_strategy", t=t, i=i)
-                    self._job_queue.join()
+                if t % self._sync_interval == 0:
+                    self._join_queue()
+                    if sigterm.is_set():
+                        break
+                    self._broadcast_job("sync")
+                    self._join_queue()
                     if sigterm.is_set():
                         break
 
-                self._apply_discount(t)
+                    if t > self._update_threshold and t % self._strategy_interval == 0:
+                        for i in range(self._n_players):
+                            self._send_job("update_strategy", t=t, i=i)
+                        self._join_queue()
+                        if sigterm.is_set():
+                            break
 
-            if t % self._checkpoint_interval == 0:
-                self._checkpoint_manager.checkpoint(t=t)
+                    self._apply_discount(t)
 
-            progress_bar.update()
-            t += 1
+                if t % self._checkpoint_interval == 0:
+                    self._checkpoint_manager.checkpoint(t=t)
 
-        # Drain any jobs still in the queue, then flush all worker local deltas
-        # before writing the final checkpoint.
-        self._job_queue.join()
-        elapsed_total = (time.monotonic() - self._training_start) / 3600.0
-        if sigterm.is_set():
-            log.info("Signal received — writing final checkpoint before shutdown")
-        else:
-            log.info(
-                f"Training complete — {self._current_t} iters, {elapsed_total:.2f}h elapsed"
-            )
-        self._checkpoint_manager.checkpoint(t=self._current_t)
+                progress_bar.update()
+                t += 1
+
+            # Drain any jobs still in the queue, then flush all worker local deltas
+            # before writing the final checkpoint.
+            self._join_queue()
+            elapsed_total = (time.monotonic() - self._training_start) / 3600.0
+            if sigterm.is_set():
+                log.info("Signal received — writing final checkpoint before shutdown")
+            else:
+                log.info(
+                    f"Training complete — {self._current_t} iters, {elapsed_total:.2f}h elapsed"
+                )
+            self._checkpoint_manager.checkpoint(t=self._current_t)
+        except WorkerError:
+            log.error("A worker encountered a fatal error — terminating all workers")
+            raise
 
     def terminate(self, safe: bool = True):
         """Broadcast terminate to all workers and join them."""
         SHUTDOWN_TIMEOUT_SECS = 60
-        if safe:
-            self._job_queue.join()
+        if not safe:
+            # Emergency shutdown: kill all workers immediately without waiting
+            # for the job queue (it may be deadlocked due to the worker error).
+            log.warning("Unsafe termination — killing all workers immediately")
+            for worker in self._workers:
+                if worker.is_alive():
+                    worker.kill()
+            for worker in self._workers:
+                worker.join(timeout=SHUTDOWN_TIMEOUT_SECS)
+                if worker.exitcode not in (0, None, -9):
+                    log.warning(f"{worker.name} exited with code {worker.exitcode}")
+            self._cleanup()
+            return
+        self._job_queue.join()
         self._broadcast_job("terminate")
         self._job_queue.join()
         for worker in self._workers:
@@ -188,6 +210,10 @@ class Server:
                 log.info(self._logging_queue.get_nowait())
             except Exception:
                 pass
+        self._cleanup()
+
+    def _cleanup(self):
+        """Close and unlink all shared-memory agent tables."""
         for r in range(4):
             self._agent.regret_tables[r].close()
             self._agent.strategy_tables[r].close()
@@ -239,14 +265,31 @@ class Server:
         """Load serialised server and return instance."""
         return Server(**config)
 
+    def _join_queue(self):
+        """Block until the job queue drains, raising WorkerError if a worker dies."""
+        t = threading.Thread(target=self._job_queue.join, daemon=True)
+        t.start()
+        while t.is_alive():
+            if self._error_event.is_set():
+                raise WorkerError("A worker encountered a fatal error")
+            t.join(timeout=0.5)
+
     def _send_job(self, job_name: str, **kwargs):
         """Send job of type ``job_name`` with arguments to worker pool."""
-        self._job_queue.put((job_name, kwargs), block=True)
+        while True:
+            if self._error_event.is_set():
+                raise WorkerError("A worker encountered a fatal error")
+            try:
+                self._job_queue.put((job_name, kwargs), block=True, timeout=0.5)
+                return
+            except Exception:
+                # Queue full — retry after checking error event
+                pass
 
     def _broadcast_job(self, job_name: str, **kwargs):
         """Send ``job_name`` to every worker in the pool."""
         for _ in self._workers:
-            self._job_queue.put((job_name, kwargs), block=True)
+            self._send_job(job_name, **kwargs)
 
     def flush_all_workers(self) -> None:
         """Broadcast a sync job and wait until all workers have flushed.
@@ -255,7 +298,7 @@ class Server:
         chunks so that no in-flight local deltas remain in worker buffers.
         """
         self._broadcast_job("sync")
-        self._job_queue.join()
+        self._join_queue()
 
     def _apply_discount(self, t: int) -> None:
         """Apply LCFR discount directly to all shared-memory tables.
@@ -323,6 +366,7 @@ class Server:
                 c=self._c,
                 save_path=self._save_path,
                 info_set_lut=self._info_set_lut,
+                error_event=self._error_event,
             )
             workers.append(worker)
         for worker in workers:

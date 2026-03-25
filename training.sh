@@ -21,7 +21,7 @@ set -euo pipefail
 # User-configurable
 CONDA_ENV=${CONDA_ENV:-pluribus}
 PROJECT_DIR=${PROJECT_DIR:-"$HOME/pluribus"}
-WORKSPACE=${WORKSPACE:-/pfs/work9/workspace/scratch/ka_gu4593-clustering_20}
+WORKSPACE=${WORKSPACE:-/pfs/work9/workspace/scratch/ka_gu4593-clustering_52}
 
 # Training parameters (all correspond to poker_ai train start options)
 N_PLAYERS=${N_PLAYERS:-6}
