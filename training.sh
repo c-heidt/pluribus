@@ -21,7 +21,7 @@ set -euo pipefail
 # User-configurable
 CONDA_ENV=${CONDA_ENV:-pluribus}
 PROJECT_DIR=${PROJECT_DIR:-"$HOME/pluribus"}
-WORKSPACE=${WORKSPACE:-/pfs/work9/workspace/scratch/ka_gu4593-clustering_52}
+WORKSPACE=${WORKSPACE:-/pfs/work9/workspace/scratch/ka_gu4593-clustering_20}
 
 # Training parameters (all correspond to poker_ai train start options)
 N_PLAYERS=${N_PLAYERS:-6}
@@ -37,7 +37,7 @@ DUMP_ITERATION=${DUMP_ITERATION:-500}
 PICKLE_DIR=${PICKLE_DIR:-false}
 N_PROCESSES=${N_PROCESSES:-}
 LUT_PATH=${LUT_PATH:-"$PROJECT_DIR/data/clustering/20cards_exact"}
-NICKNAME=${NICKNAME:-"models/6player_20cards"}
+NICKNAME=${NICKNAME:-"$WORKSPACE/models/6player_20cards"}
 
 mkdir -p "$PROJECT_DIR/logs"
 mkdir -p "$(dirname "$NICKNAME")"
