@@ -36,7 +36,7 @@ C=${C:--300000000}
 DUMP_ITERATION=${DUMP_ITERATION:-500}
 PICKLE_DIR=${PICKLE_DIR:-false}
 N_PROCESSES=${N_PROCESSES:-}
-LUT_PATH=${LUT_PATH:-"$WORKSPACE/exact"}
+LUT_PATH=${LUT_PATH:-"$PROJECT_DIR/data/clusterin/20cards_exact"}
 NICKNAME=${NICKNAME:-"models/6player_20cards"}
 
 mkdir -p "$PROJECT_DIR/logs"
