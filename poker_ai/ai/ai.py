@@ -130,37 +130,32 @@ def update_strategy(
     if not legal_actions:
         return
 
+    canonical = CANONICAL_ACTIONS[r]
+    legal_set = set(legal_actions)
+    valid_mask = np.array([a in legal_set for a in canonical], dtype=bool)
+    row = agent.regret_tables[r].get_row_if_exists(state.info_set)
+    regret_row = (
+        row if row is not None
+        else np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
+    )
+    sigma = calculate_strategy_from_row(regret_row, valid_mask)
+    a_to_i = ACTION_TO_IDX[r]
+    probs = np.array([sigma[a_to_i[a]] for a in legal_actions], dtype=np.float64)
+    prob_sum = probs.sum()
+    if prob_sum > 0:
+        probs /= prob_sum
+    else:
+        probs[:] = 1.0 / len(legal_actions)
+    action: str = np.random.choice(legal_actions, p=probs)
+
     if ph == i:
-        canonical = CANONICAL_ACTIONS[r]
-        legal_set = set(legal_actions)
-        valid_mask = np.array([a in legal_set for a in canonical], dtype=bool)
-        row = agent.regret_tables[r].get_row_if_exists(state.info_set)
-        regret_row = (
-            row if row is not None
-            else np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
-        )
-        sigma = calculate_strategy_from_row(regret_row, valid_mask)
-        # Sample action weighted by strategy (valid actions only)
-        a_to_i = ACTION_TO_IDX[r]
-        probs = np.array([sigma[a_to_i[a]] for a in legal_actions], dtype=np.float64)
-        prob_sum = probs.sum()
-        if prob_sum > 0:
-            probs /= prob_sum
-        else:
-            probs[:] = 1.0 / len(legal_actions)
-        action: str = np.random.choice(legal_actions, p=probs)
         log.debug("ACTION SAMPLED: ph %s ACTION: %s", state.player_i, action)
         # Increment the strategy table visit count for the sampled action,
         # weighted by iteration t for Linear MCCFR.
         agent.strategy_tables[r].update_row(state.info_set, a_to_i[action], t)
-        new_state: PokerState = state.apply_action(action)
-        update_strategy(agent, new_state, i, t)
-    else:
-        # Traverse each action for the opponent (full traversal, not sampled)
-        for action in legal_actions:
-            log.debug("Going to Traverse %s for opponent", action)
-            new_state: PokerState = state.apply_action(action)
-            update_strategy(agent, new_state, i, t)
+
+    new_state: PokerState = state.apply_action(action)
+    update_strategy(agent, new_state, i, t)
 
 
 def cfr(

@@ -141,9 +141,7 @@ class Worker(mp.Process):
     def _update_strategy(self, t, i):
         """Update strategy visit counts for all streets."""
         self._setup_new_game()
-        self._locks["strategy_update_lock"].acquire()
         ai.update_strategy(self._agent, self._state, i, t)
-        self._locks["strategy_update_lock"].release()
 
     def _setup_new_game(self):
         """Setup up new poker game."""
