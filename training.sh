@@ -25,15 +25,16 @@ WORKSPACE=${WORKSPACE:-/pfs/work9/workspace/scratch/ka_gu4593-clustering_20}
 
 # Training parameters (all correspond to poker_ai train start options)
 N_PLAYERS=${N_PLAYERS:-6}
-UPDATE_THRESHOLD=${UPDATE_THRESHOLD:-1000}
+UPDATE_THRESHOLD=${UPDATE_THRESHOLD:-50000}
 MAX_RUNTIME_HOURS=${MAX_RUNTIME_HOURS:-0.75}
-DISCOUNT_DURATION_ITERS=${DISCOUNT_DURATION_ITERS:-10000}
-STRATEGY_INTERVAL=${STRATEGY_INTERVAL:-5000}
-SYNC_INTERVAL=${SYNC_INTERVAL:-250}
-CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-10000}
-PRUNE_THRESHOLD=${PRUNE_THRESHOLD:-5000}
+DISCOUNT_DURATION_ITERS=${DISCOUNT_DURATION_ITERS:-1000000}
+STRATEGY_INTERVAL=${STRATEGY_INTERVAL:-10000}
+SYNC_INTERVAL=${SYNC_INTERVAL:-1000}
+DISCOUNT_INTERVAL=${DISCOUNT_INTERVAL:-5}
+CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-100000}
+PRUNE_THRESHOLD=${PRUNE_THRESHOLD:-500000}
 C=${C:--300000000}
-DUMP_ITERATION=${DUMP_ITERATION:-500}
+DUMP_ITERATION=${DUMP_ITERATION:-1000}
 PICKLE_DIR=${PICKLE_DIR:-false}
 N_PROCESSES=${N_PROCESSES:-}
 LUT_PATH=${LUT_PATH:-"$PROJECT_DIR/data/clustering/20cards_exact"}
@@ -76,6 +77,7 @@ echo "  - Max runtime (hours):    $MAX_RUNTIME_HOURS"
 echo "  - Discount duration iters:$DISCOUNT_DURATION_ITERS"
 echo "  - Strategy interval:      $STRATEGY_INTERVAL"
 echo "  - Sync interval:          $SYNC_INTERVAL"
+echo "  - Discount interval:      $DISCOUNT_INTERVAL"
 echo "  - Checkpoint interval:    $CHECKPOINT_INTERVAL"
 echo "  - Prune threshold:        $PRUNE_THRESHOLD"
 echo "  - C (pruning regret):     $C"
@@ -104,6 +106,7 @@ poker_ai train start \
   --discount_duration_iters "$DISCOUNT_DURATION_ITERS" \
   --strategy_interval "$STRATEGY_INTERVAL" \
   --sync_interval "$SYNC_INTERVAL" \
+  --discount_interval "$DISCOUNT_INTERVAL" \
   --checkpoint_interval "$CHECKPOINT_INTERVAL" \
   --prune_threshold "$PRUNE_THRESHOLD" \
   --c "$C" \

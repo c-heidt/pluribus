@@ -39,6 +39,7 @@ class Server:
         lut_path: Union[str, Path] = ".",
         pickle_dir: bool = False,
         sync_interval: int = 10,
+        discount_interval: int = 1,
         checkpoint_interval: int = 1000,
         start_timestep: int = 1,
         n_processes: Optional[int] = None,
@@ -59,7 +60,6 @@ class Server:
         self._max_runtime_hours = max_runtime_hours
         self._discount_duration_iters = discount_duration_iters
         self._discounting_active = True
-        self._discount_step: int = 0
         self._prune_threshold = prune_threshold
         self._c = c
         self._n_players = n_players
@@ -68,6 +68,7 @@ class Server:
         self._lut_path = lut_path
         self._pickle_dir = pickle_dir
         self._sync_interval = sync_interval
+        self._discount_interval = discount_interval
         self._checkpoint_interval = checkpoint_interval
         self._start_t = start_timestep
         self._info_set_lut = self._load_lut(lut_path, pickle_dir)
@@ -91,9 +92,7 @@ class Server:
             shm_dir=shm_dir,
             lmdb_map_size=lmdb_map_size,
         )
-        self._locks: Dict[str, mp.synchronize.Lock] = dict(
-            strategy_update_lock=mp.Lock()
-        )
+        self._locks: Dict[str, mp.synchronize.Lock] = {}
         self._error_event: mp.Event = mp.Event() # type: ignore
         self._current_t: int = self._start_t
         # CheckpointManager registers signal handlers and restores from
@@ -144,7 +143,9 @@ class Server:
                         if sigterm.is_set():
                             break
 
-                    self._apply_discount(t)
+                    sync_step = t // self._sync_interval
+                    if sync_step % self._discount_interval == 0:
+                        self._apply_discount(t)
 
                 if t % self._checkpoint_interval == 0:
                     self._checkpoint_manager.checkpoint(t=t)
@@ -246,6 +247,7 @@ class Server:
             lut_path=self._lut_path,
             pickle_dir=self._pickle_dir,
             sync_interval=self._sync_interval,
+            discount_interval=self._discount_interval,
             checkpoint_interval=self._checkpoint_interval,
             start_timestep=self._start_t,
             n_chunks_per_street={
@@ -314,11 +316,11 @@ class Server:
             self._discounting_active = False
             return
         from poker_ai.ai.index import CHUNK_SIZE
-        self._discount_step += 1
-        discount_factor = self._discount_step / (self._discount_step + 1)
+        discount_step = t // (self._sync_interval * self._discount_interval)
+        discount_factor = discount_step / (discount_step + 1)
         log.info(
             f"[t={t}] Discounting regrets and strategy "
-            f"(step={self._discount_step}, factor={discount_factor:.4f})"
+            f"(step={discount_step}, factor={discount_factor:.4f})"
         )
         for r in range(4):
             for table in (

@@ -3,47 +3,52 @@
 CLI Use
 -------
 
-Below you can run `python runner.py --help` to get the following description of
-the two commands available in the CLI, `resume` and `search`:
-```
-Usage: poker_ai train start [OPTIONS]
+Below you can run `poker_ai train start --help` to see available options::
 
-  Train agent from scratch.
+    Usage: poker_ai train start [OPTIONS]
 
-Options:
-  --strategy_interval INTEGER     Update the current strategy whenever the
-                                  iteration % strategy_interval == 0.
-  --n_iterations INTEGER          The total number of iterations we should
-                                  train the model for.
-  --lcfr_threshold INTEGER        A threshold for linear CFR which means don't
-                                  apply discounting before this iteration.
-  --discount_interval INTEGER     Discount the current regret and strategy
-                                  whenever iteration % discount_interval == 0.
-  --prune_threshold INTEGER       When a uniform random number is less than
-                                  95%, and the iteration > prune_threshold,
-                                  use CFR with pruning.
-  --c INTEGER                     Pruning threshold for regret, which means
-                                  when we are using CFR with pruning and have
-                                  a state with a regret of less than `c`, then
-                                  we'll elect to not recusrively visit it and
-                                  it's child nodes.
-  --n_players INTEGER             The number of players in the game.
-  --dump_iteration INTEGER        When the iteration % dump_iteration == 0, we
-                                  will compute a new strategy and write that
-                                  to the accumlated strategy, which gets
-                                  normalised at a later time.
-  --update_threshold INTEGER      When the iteration is greater than
-                                  update_threshold we can start updating the
-                                  strategy.
-  --lut_path TEXT                 The path to the files for clustering the
-                                  infosets.
-  --pickle_dir TEXT               Whether or not the lut files are pickle
-                                  files. This lookup method is deprecated.
-  --single_process / --multi_process
-                                  Either use or don't use multiple processes.
-  --nickname TEXT                 The nickname of the study.
-  --help                          Show this message and exit.
-```
+      Train agent from scratch.
+
+    Options:
+      --strategy_interval INTEGER     Update the current strategy whenever the
+                                      iteration % strategy_interval == 0.
+      --max_runtime_hours FLOAT       Wall-clock budget for this run in hours.
+                                      Training stops when elapsed time reaches
+                                      this limit.
+      --discount_duration_iters INTEGER
+                                      Total number of iterations for which the
+                                      LCFR discount window is active.
+      --prune_threshold INTEGER       When a uniform random number is less than
+                                      95%, and the iteration > prune_threshold,
+                                      use CFR with pruning.
+      --c INTEGER                     Pruning threshold for regret below which
+                                      subtrees are not recursively visited
+                                      during CFR with pruning.
+      --n_players INTEGER             The number of players in the game.
+      --dump_iteration INTEGER        Compute and accumulate a new strategy
+                                      snapshot every dump_iteration iterations.
+      --update_threshold INTEGER      Start updating the strategy after this
+                                      many iterations.
+      --lut_path TEXT                 Path to the clustering infoset files.
+      --pickle_dir                    Whether the LUT files are pickle files
+                                      (deprecated).
+      --single_process / --multi_process
+                                      Either use or don't use multiple
+                                      processes.
+      --sync_interval INTEGER         Iterations between worker sync barriers.
+                                      Higher values keep workers busier but
+                                      delay delta merges.
+      --discount_interval INTEGER     Apply LCFR discounting every N sync
+                                      barriers (i.e. every sync_interval * N
+                                      iterations). Default 1 discounts at
+                                      every sync.
+      --checkpoint_interval INTEGER   Write a training checkpoint every N
+                                      iterations.
+      --n_processes INTEGER           Number of worker processes to spawn.
+                                      Defaults to cpu_count-1 (or
+                                      SLURM_CPUS_PER_TASK-1 under Slurm).
+      --nickname TEXT                 The nickname of the study.
+      --help                          Show this message and exit.
 """
 import logging
 from pathlib import Path
@@ -204,6 +209,15 @@ def resume(server_config_path: str):
     ),
 )
 @click.option(
+    "--discount_interval",
+    default=10,
+    help=(
+        "Apply LCFR discounting every N sync barriers (i.e. every "
+        "sync_interval * discount_interval iterations). Default 1 discounts "
+        "at every sync."
+    ),
+)
+@click.option(
     "--checkpoint_interval",
     default=10000,
     help=(
@@ -234,6 +248,7 @@ def start(
     pickle_dir: bool,
     single_process: bool,
     sync_interval: int,
+    discount_interval: int,
     checkpoint_interval: int,
     n_processes,
     nickname: str,
@@ -282,6 +297,7 @@ def start(
             lut_path=lut_path,
             pickle_dir=pickle_dir,
             sync_interval=sync_interval,
+            discount_interval=discount_interval,
             checkpoint_interval=checkpoint_interval,
             n_processes=n_processes,
         )
