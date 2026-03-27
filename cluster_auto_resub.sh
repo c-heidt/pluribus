@@ -9,10 +9,10 @@
 #SBATCH --partition=highmem
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=72:00:00
+#SBATCH --time=24:00:00
 #SBATCH --signal=B:USR1@300
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=2300000mb
+#SBATCH --mem=1000000mb
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=uvizo@student.kit.edu
 
