@@ -5,12 +5,12 @@
 #SBATCH --job-name=pluribus-train
 #SBATCH --output=logs/training-%j.out
 #SBATCH --error=logs/training-%j_error.out
-#SBATCH --partition=cpu
+#SBATCH --partition=highmem
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=1:00:00
+#SBATCH --time=72:00:00
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=38G
+#SBATCH --mem=2300000mb
 #SBATCH --signal=SIGTERM@300
 #SBATCH --mail-type=All
 #SBATCH --mail-user=uvizo@student.kit.edu
@@ -21,24 +21,24 @@ set -euo pipefail
 # User-configurable
 CONDA_ENV=${CONDA_ENV:-pluribus}
 PROJECT_DIR=${PROJECT_DIR:-"$HOME/pluribus"}
-WORKSPACE=${WORKSPACE:-/pfs/work9/workspace/scratch/ka_gu4593-clustering_20}
+WORKSPACE=${WORKSPACE:-/pfs/work9/workspace/scratch/ka_gu4593-clustering_52}
 
 # Training parameters (all correspond to poker_ai train start options)
 N_PLAYERS=${N_PLAYERS:-6}
 UPDATE_THRESHOLD=${UPDATE_THRESHOLD:-50000}
-MAX_RUNTIME_HOURS=${MAX_RUNTIME_HOURS:-0.75}
-DISCOUNT_DURATION_ITERS=${DISCOUNT_DURATION_ITERS:-1000000}
-STRATEGY_INTERVAL=${STRATEGY_INTERVAL:-10000}
+MAX_RUNTIME_HOURS=${MAX_RUNTIME_HOURS:-71.5}
+DISCOUNT_DURATION_ITERS=${DISCOUNT_DURATION_ITERS:-250000}
+STRATEGY_INTERVAL=${STRATEGY_INTERVAL:-25000}
 SYNC_INTERVAL=${SYNC_INTERVAL:-1000}
 DISCOUNT_INTERVAL=${DISCOUNT_INTERVAL:-5}
 CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-100000}
-PRUNE_THRESHOLD=${PRUNE_THRESHOLD:-500000}
+PRUNE_THRESHOLD=${PRUNE_THRESHOLD:-125000}
 C=${C:--300000000}
 DUMP_ITERATION=${DUMP_ITERATION:-1000}
 PICKLE_DIR=${PICKLE_DIR:-false}
 N_PROCESSES=${N_PROCESSES:-}
-LUT_PATH=${LUT_PATH:-"$PROJECT_DIR/data/clustering/20cards_exact"}
-NICKNAME=${NICKNAME:-"$WORKSPACE/models/6player_20cards"}
+LUT_PATH=${LUT_PATH:-"$WORKSPACE/exact"}
+NICKNAME=${NICKNAME:-"$WORKSPACE/models/6player_52cards"}
 
 mkdir -p "$PROJECT_DIR/logs"
 mkdir -p "$(dirname "$NICKNAME")"
