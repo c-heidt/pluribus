@@ -20,6 +20,29 @@ import numpy as np
 log = logging.getLogger("poker_ai.clustering.chunked_processor")
 
 
+class CorruptChunkError(Exception):
+    """Raised when corrupt chunk files are detected during merge.
+
+    Attributes
+    ----------
+    street : str
+        The street whose chunks are corrupt.
+    corrupt_indices : List[int]
+        Chunk indices that were corrupt (already unmarked and deleted).
+    """
+
+    def __init__(self, street: str, corrupt_indices: List[int]):
+        self.street = street
+        self.corrupt_indices = corrupt_indices
+        preview = str(corrupt_indices[:20])
+        if len(corrupt_indices) > 20:
+            preview = preview[:-1] + ", ...]"
+        super().__init__(
+            f"{len(corrupt_indices)} corrupt chunk(s) detected for {street} "
+            f"(truncated/killed write). Indices: {preview}"
+        )
+
+
 def _process_single_chunk_worker(
     chunk_idx: int,
     chunk_combos: np.ndarray,
@@ -342,11 +365,39 @@ class ChunkedProcessor:
         temp_chunk = chunk_path.parent / f"chunk_{chunk_idx:06d}{temp_ext}"
         try:
             data_to_save = data.astype(self.storage_dtype)
+            expected_elements = data_to_save.size
+
             if self.use_compression:
                 with gzip.open(temp_chunk, 'wb', compresslevel=4) as f:
                     np.save(f, data_to_save)
             else:
                 np.save(temp_chunk, data_to_save)
+
+            # Flush to durable storage before rename.  On parallel
+            # filesystems (Lustre, GPFS, BeeGFS) data can sit in a
+            # write-back buffer after close(); without fsync a node
+            # crash or quota exhaustion silently truncates the file.
+            fd = os.open(str(temp_chunk), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+            # Verify the file is readable and has the right shape before
+            # committing.  Catches silent truncation from quota/FS errors
+            # that fsync alone may not surface on all filesystems.
+            if self.use_compression:
+                with gzip.open(temp_chunk, 'rb') as f:
+                    verify = np.load(f, allow_pickle=True)
+            else:
+                verify = np.load(temp_chunk, allow_pickle=True)
+            if verify.size != expected_elements:
+                raise IOError(
+                    f"Verification failed: wrote {expected_elements} elements "
+                    f"but read back {verify.size}"
+                )
+            del verify
+
             shutil.move(str(temp_chunk), str(chunk_path))
         except Exception as e:
             if temp_chunk.exists():
@@ -613,12 +664,23 @@ class ChunkedProcessor:
         # Second pass: copy data to memory-mapped file
         current_row = 0
         flush_interval = 10  # Flush every 10 chunks for safety
+        corrupt_chunks = []
         for i, chunk_idx in enumerate(completed_chunks):
-            chunk_data, chunk_combos_file = self.load_chunk(street, chunk_idx)
+            try:
+                chunk_data, chunk_combos_file = self.load_chunk(street, chunk_idx)
+            except Exception as e:
+                log.warning(f"Chunk {chunk_idx} for {street} is corrupt: {e}")
+                corrupt_chunks.append(chunk_idx)
+                continue
             n_rows = chunk_data.shape[0]
 
             if chunk_data.ndim == 1:
                 chunk_data = chunk_data.reshape(-1, 1)
+
+            if corrupt_chunks:
+                # Once any chunk is corrupt we can't write contiguous data;
+                # just scan for remaining corrupt chunks to report them all.
+                continue
 
             merged_data[current_row:current_row + n_rows] = chunk_data
 
@@ -639,6 +701,24 @@ class ChunkedProcessor:
             # Periodic flush to ensure progress is saved to disk
             if (i + 1) % flush_interval == 0:
                 merged_data.flush()
+
+        # If any chunks were corrupt, unmark them so they get reprocessed
+        if corrupt_chunks:
+            valid_set = set(completed_chunks) - set(corrupt_chunks)
+            self._checkpoint["streets"][street]["completed_chunks"] = sorted(valid_set)
+            self._checkpoint["streets"][street]["merge_done"] = False
+            self._save_checkpoint(merge_with_disk=False)
+            for cidx in corrupt_chunks:
+                chunk_path = self.get_chunk_path(street, cidx)
+                if chunk_path.exists():
+                    chunk_path.unlink()
+            # Clean up the partial memmap file
+            del merged_data
+            merged_path.unlink(missing_ok=True)
+            raise CorruptChunkError(
+                street=street,
+                corrupt_indices=corrupt_chunks,
+            )
         
         # Final flush to disk
         merged_data.flush()
