@@ -3,54 +3,52 @@
 CLI Use
 -------
 
-Below you can run `python runner.py --help` to get the following description of
-the two commands available in the CLI, `resume` and `search`:
-```
-Usage: poker_ai train start [OPTIONS]
+Below you can run `poker_ai train start --help` to see available options::
 
-  Train agent from scratch.
+    Usage: poker_ai train start [OPTIONS]
 
-Options:
-  --strategy_interval INTEGER     Update the current strategy whenever the
-                                  iteration % strategy_interval == 0.
-  --n_iterations INTEGER          The total number of iterations we should
-                                  train the model for.
-  --lcfr_threshold INTEGER        A threshold for linear CFR which means don't
-                                  apply discounting before this iteration.
-  --discount_interval INTEGER     Discount the current regret and strategy
-                                  whenever iteration % discount_interval == 0.
-  --prune_threshold INTEGER       When a uniform random number is less than
-                                  95%, and the iteration > prune_threshold,
-                                  use CFR with pruning.
-  --c INTEGER                     Pruning threshold for regret, which means
-                                  when we are using CFR with pruning and have
-                                  a state with a regret of less than `c`, then
-                                  we'll elect to not recusrively visit it and
-                                  it's child nodes.
-  --n_players INTEGER             The number of players in the game.
-  --dump_iteration INTEGER        When the iteration % dump_iteration == 0, we
-                                  will compute a new strategy and write that
-                                  to the accumlated strategy, which gets
-                                  normalised at a later time.
-  --update_threshold INTEGER      When the iteration is greater than
-                                  update_threshold we can start updating the
-                                  strategy.
-  --lut_path TEXT                 The path to the files for clustering the
-                                  infosets.
-  --pickle_dir TEXT               Whether or not the lut files are pickle
-                                  files. This lookup method is deprecated.
-  --single_process / --multi_process
-                                  Either use or don't use multiple processes.
-  --sync_update_strategy / --async_update_strategy
-                                  Do or don't synchronise update_strategy.
-  --sync_cfr / --async_cfr        Do or don't synchronuse CFR.
-  --sync_discount / --async_discount
-                                  Do or don't synchronise the discounting.
-  --sync_serialise / --async_serialise
-                                  Do or don't synchronise the serialisation.
-  --nickname TEXT                 The nickname of the study.
-  --help                          Show this message and exit.
-```
+      Train agent from scratch.
+
+    Options:
+      --strategy_interval INTEGER     Update the current strategy whenever the
+                                      iteration % strategy_interval == 0.
+      --max_runtime_hours FLOAT       Wall-clock budget for this run in hours.
+                                      Training stops when elapsed time reaches
+                                      this limit.
+      --discount_duration_iters INTEGER
+                                      Total number of iterations for which the
+                                      LCFR discount window is active.
+      --prune_threshold INTEGER       When a uniform random number is less than
+                                      95%, and the iteration > prune_threshold,
+                                      use CFR with pruning.
+      --c INTEGER                     Pruning threshold for regret below which
+                                      subtrees are not recursively visited
+                                      during CFR with pruning.
+      --n_players INTEGER             The number of players in the game.
+      --dump_iteration INTEGER        Compute and accumulate a new strategy
+                                      snapshot every dump_iteration iterations.
+      --update_threshold INTEGER      Start updating the strategy after this
+                                      many iterations.
+      --lut_path TEXT                 Path to the clustering infoset files.
+      --pickle_dir                    Whether the LUT files are pickle files
+                                      (deprecated).
+      --single_process / --multi_process
+                                      Either use or don't use multiple
+                                      processes.
+      --sync_interval INTEGER         Iterations between worker sync barriers.
+                                      Higher values keep workers busier but
+                                      delay delta merges.
+      --discount_interval INTEGER     Apply LCFR discounting every N sync
+                                      barriers (i.e. every sync_interval * N
+                                      iterations). Default 1 discounts at
+                                      every sync.
+      --checkpoint_interval INTEGER   Write a training checkpoint every N
+                                      iterations.
+      --n_processes INTEGER           Number of worker processes to spawn.
+                                      Defaults to cpu_count-1 (or
+                                      SLURM_CPUS_PER_TASK-1 under Slurm).
+      --nickname TEXT                 The nickname of the study.
+      --help                          Show this message and exit.
 """
 import logging
 from pathlib import Path
@@ -61,7 +59,7 @@ import joblib
 import yaml
 
 from poker_ai import utils
-from poker_ai.ai.multiprocess.server import Server
+from poker_ai.ai.multiprocess.server import Server, WorkerError
 from poker_ai.ai.singleprocess.train import simple_search
 
 
@@ -72,12 +70,16 @@ def _safe_search(server: Server):
     """Safely run the server, and allow user to control c."""
     try:
         server.search()
+    except WorkerError as exc:
+        log.error(f"Fatal worker error: {exc}")
+        server.terminate(safe=False)
     except (KeyboardInterrupt, SystemExit):
         log.info(
             "Early termination of program. Please wait for workers to "
             "terminate."
         )
-    finally:
+        server.terminate()
+    else:
         server.terminate()
     log.info("All workers terminated. Quitting program - thanks for using me!")
 
@@ -119,33 +121,29 @@ def resume(server_config_path: str):
 @train.command()
 @click.option(
     "--strategy_interval",
-    default=20,
+    default=5000,
     help="Update the current strategy whenever the iteration % strategy_interval == 0.",
 )
 @click.option(
+    "--max_runtime_hours",
+    default=1.0,
+    type=float,
+    help="Wall-clock budget for this run in hours. Training stops when elapsed time reaches this limit.",
+)
+@click.option(
+    "--discount_duration_iters",
+    default=10000,
+    help="Total number of iterations for which the discount window is active.",
+)
+@click.option(
     "--n_iterations",
-    default=1500,
-    help="The total number of iterations we should train the model for.",
-)
-@click.option(
-    "--lcfr_threshold",
-    default=400,
-    help=(
-        "A threshold for linear CFR which means don't apply discounting "
-        "before this iteration."
-    ),
-)
-@click.option(
-    "--discount_interval",
-    default=400,
-    help=(
-        "Discount the current regret and strategy whenever iteration % "
-        "discount_interval == 0."
-    ),
+    default=10000,
+    hidden=True,
+    help="[Single-process only] Number of iterations for the validation baseline.",
 )
 @click.option(
     "--prune_threshold",
-    default=400,
+    default=5000,
     help=(
         "When a uniform random number is less than 95%, and the iteration > "
         "prune_threshold, use CFR with pruning."
@@ -153,17 +151,21 @@ def resume(server_config_path: str):
 )
 @click.option(
     "--c",
-    default=-20000,
+    default=-300000000,
     help=(
         "Pruning threshold for regret, which means when we are using CFR with "
         "pruning and have a state with a regret of less than `c`, then we'll "
         "elect to not recusrively visit it and it's child nodes."
     ),
 )
-@click.option("--n_players", default=3, help="The number of players in the game.")
+@click.option(
+    "--n_players",
+    default=3,
+    help="The number of players in the game."
+)
 @click.option(
     "--dump_iteration",
-    default=20,
+    default=1000,
     help=(
         "When the iteration % dump_iteration == 0, we will compute a new strategy "
         "and write that to the accumlated strategy, which gets normalised at a "
@@ -172,7 +174,7 @@ def resume(server_config_path: str):
 )
 @click.option(
     "--update_threshold",
-    default=400,
+    default=1000,
     help=(
         "When the iteration is greater than update_threshold we can start "
         "updating the strategy."
@@ -199,29 +201,44 @@ def resume(server_config_path: str):
     help="Either use or don't use multiple processes.",
 )
 @click.option(
-    "--sync_update_strategy/--async_update_strategy",
-    default=False,
-    help="Do or don't synchronise update_strategy.",
+    "--sync_interval",
+    default=250,
+    help=(
+        "How many iterations between worker sync barriers. Higher values keep "
+        "workers busier but delay delta merges."
+    ),
 )
 @click.option(
-    "--sync_cfr/--async_cfr", default=False, help="Do or don't synchronuse CFR."
+    "--discount_interval",
+    default=10,
+    help=(
+        "Apply LCFR discounting every N sync barriers (i.e. every "
+        "sync_interval * discount_interval iterations). Default 1 discounts "
+        "at every sync."
+    ),
 )
 @click.option(
-    "--sync_discount/--async_discount",
-    default=False,
-    help="Do or don't synchronise the discounting.",
+    "--checkpoint_interval",
+    default=10000,
+    help=(
+        "Write a training checkpoint every N iterations. "
+    ),
 )
 @click.option(
-    "--sync_serialise/--async_serialise",
-    default=False,
-    help="Do or don't synchronise the serialisation.",
+    "--n_processes",
+    default=None,
+    type=int,
+    help=(
+        "Number of worker processes to spawn. Defaults to cpu_count-1 "
+        "(or SLURM_CPUS_PER_TASK-1 when running under Slurm)."
+    ),
 )
 @click.option("--nickname", default="", help="The nickname of the study.")
 def start(
     strategy_interval: int,
+    max_runtime_hours: float,
+    discount_duration_iters: int,
     n_iterations: int,
-    lcfr_threshold: int,
-    discount_interval: int,
     prune_threshold: int,
     c: int,
     n_players: int,
@@ -230,10 +247,10 @@ def start(
     lut_path: str,
     pickle_dir: bool,
     single_process: bool,
-    sync_update_strategy: bool,
-    sync_cfr: bool,
-    sync_discount: bool,
-    sync_serialise: bool,
+    sync_interval: int,
+    discount_interval: int,
+    checkpoint_interval: int,
+    n_processes,
     nickname: str,
 ):
     """Train agent from scratch."""
@@ -247,6 +264,8 @@ def start(
             "Only one process specified so using poker_ai.ai.singleprocess."
             "simple_search for the optimisation."
         )
+        # simple_search is the validation baseline — it keeps its own
+        # iteration-based parameters and is not affected by Phase 7.
         simple_search(
             config=config,
             save_path=save_path,
@@ -254,9 +273,7 @@ def start(
             pickle_dir=pickle_dir,
             strategy_interval=strategy_interval,
             n_iterations=n_iterations,
-            lcfr_threshold=lcfr_threshold,
-            discount_interval=discount_interval,
-            prune_threshold=prune_threshold,
+            lcfr_threshold=discount_duration_iters,
             c=c,
             n_players=n_players,
             dump_iteration=dump_iteration,
@@ -270,21 +287,19 @@ def start(
         # Create the server that controls/coordinates the workers.
         server = Server(
             strategy_interval=strategy_interval,
-            n_iterations=n_iterations,
-            lcfr_threshold=lcfr_threshold,
-            discount_interval=discount_interval,
+            max_runtime_hours=max_runtime_hours,
+            discount_duration_iters=discount_duration_iters,
             prune_threshold=prune_threshold,
             c=c,
             n_players=n_players,
-            dump_iteration=dump_iteration,
             update_threshold=update_threshold,
             save_path=save_path,
             lut_path=lut_path,
             pickle_dir=pickle_dir,
-            sync_update_strategy=sync_update_strategy,
-            sync_cfr=sync_cfr,
-            sync_discount=sync_discount,
-            sync_serialise=sync_serialise,
+            sync_interval=sync_interval,
+            discount_interval=discount_interval,
+            checkpoint_interval=checkpoint_interval,
+            n_processes=n_processes,
         )
         _safe_search(server)
 

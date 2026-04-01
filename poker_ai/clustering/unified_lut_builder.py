@@ -44,26 +44,11 @@ from sklearn.cluster import KMeans, MiniBatchKMeans
 from tqdm import tqdm
 
 from poker_ai.clustering.card_combos import CardCombos, _lex_rank
-from poker_ai.clustering.chunked_processor import ChunkedProcessor
+from poker_ai.clustering.chunked_processor import ChunkedProcessor, CorruptChunkError
 from poker_ai.clustering.preflop import compute_preflop_lossless_abstraction
+from poker_ai.utils.io import atomic_joblib_dump
 
 log = logging.getLogger("poker_ai.clustering.unified_lut_builder")
-
-
-# ---------------------------------------------------------------------------
-# Atomic save utility
-# ---------------------------------------------------------------------------
-
-def atomic_joblib_dump(obj: Any, path: Path):
-    """Save an object with joblib atomically using a temp file."""
-    temp_path = path.with_suffix(".tmp.joblib")
-    try:
-        joblib.dump(obj, temp_path)
-        shutil.move(str(temp_path), str(path))
-    except Exception as e:
-        if temp_path.exists():
-            temp_path.unlink()
-        raise RuntimeError(f"Failed to save {path}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -551,33 +536,30 @@ class UnifiedLutBuilder(CardCombos):
                 f"Re-run the script to retry them automatically."
             )
 
-        # Cluster (or load existing clustering results)
-        if self.chunked_processor.is_clustering_done(street):
-            log.info(f"Loading existing clustering results for {street}")
-            self.centroids[street] = self.chunked_processor.load_centroids(
-                street
-            )
-            clusters = self.chunked_processor.load_clusters(street)
-            merged_data, all_combos = (
-                self.chunked_processor.get_or_merge_data(street, all_combos_full=combos)
-            )
-        else:
-            merged_data, all_combos = (
-                self.chunked_processor.get_or_merge_data(street, all_combos_full=combos)
-            )
-            self.centroids[street], clusters = self._cluster(
-                num_clusters=n_clusters, X=merged_data, street=street,
-            )
-            self.chunked_processor.save_centroids(
-                street, self.centroids[street],
-            )
-            self.chunked_processor.save_clusters(street, clusters)
-            self.chunked_processor.mark_clustering_done(street)
-            log.info(
-                f"Cleaning up intermediate chunk files for {street}..."
-            )
-            self.chunked_processor.cleanup_chunks(street)
-            self.chunked_processor.cleanup_partial_clustering(street)
+        # Merge and cluster, with automatic recovery for corrupt chunks.
+        # If a killed HPC job left truncated chunk files on disk, the merge
+        # detects them, deletes the bad files, and raises CorruptChunkError.
+        # We then reprocess just those chunks and retry the merge — no need
+        # to resubmit the whole job.
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                merged_data, all_combos, clusters = self._merge_and_cluster(
+                    street, n_clusters, combos, chunk_processor_fn,
+                )
+                break
+            except CorruptChunkError as e:
+                if attempt == max_retries:
+                    raise RuntimeError(
+                        f"Still have corrupt chunks for {street} after "
+                        f"{max_retries} recovery attempts. "
+                        f"Last error: {e}"
+                    ) from e
+                log.warning(
+                    f"Attempt {attempt}/{max_retries}: {e}. "
+                    f"Reprocessing {len(e.corrupt_indices)} corrupt chunk(s)..."
+                )
+                chunk_processor_fn(e.corrupt_indices)
 
         # Pre-populate process cache for the next street's workers
         self._on_street_clustering_complete(
@@ -602,6 +584,46 @@ class UnifiedLutBuilder(CardCombos):
             n_cards=self._n_cards,
             n_rows=len(all_combos),
         )
+
+    def _merge_and_cluster(
+        self,
+        street: str,
+        n_clusters: int,
+        combos: np.ndarray,
+        chunk_processor_fn,
+    ) -> Tuple[np.memmap, np.ndarray, np.ndarray]:
+        """Merge chunks and cluster. Raises CorruptChunkError on bad files."""
+        if self.chunked_processor.is_clustering_done(street):
+            log.info(f"Loading existing clustering results for {street}")
+            self.centroids[street] = self.chunked_processor.load_centroids(
+                street
+            )
+            clusters = self.chunked_processor.load_clusters(street)
+            merged_data, all_combos = (
+                self.chunked_processor.get_or_merge_data(
+                    street, all_combos_full=combos,
+                )
+            )
+        else:
+            merged_data, all_combos = (
+                self.chunked_processor.get_or_merge_data(
+                    street, all_combos_full=combos,
+                )
+            )
+            self.centroids[street], clusters = self._cluster(
+                num_clusters=n_clusters, X=merged_data, street=street,
+            )
+            self.chunked_processor.save_centroids(
+                street, self.centroids[street],
+            )
+            self.chunked_processor.save_clusters(street, clusters)
+            self.chunked_processor.mark_clustering_done(street)
+            log.info(
+                f"Cleaning up intermediate chunk files for {street}..."
+            )
+            self.chunked_processor.cleanup_chunks(street)
+            self.chunked_processor.cleanup_partial_clustering(street)
+        return merged_data, all_combos, clusters
 
     # ------------------------------------------------------------------
     # Chunk dispatch

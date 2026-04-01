@@ -1,9 +1,9 @@
-import copy
 import logging
+import mmap as _mmap
 import multiprocessing as mp
 import os
 from pathlib import Path
-from typing import Dict, Union
+from typing import Dict, Optional, Tuple, Union
 
 import joblib
 import numpy as np
@@ -22,65 +22,85 @@ class Worker(mp.Process):
     def __init__(
         self,
         job_queue: mp.Queue,
-        status_queue: mp.Queue,
         logging_queue: mp.Queue,
         locks: Dict[str, mp.synchronize.Lock],
         agent: Agent,
-        info_set_lut: state.InfoSetLookupTable,
+        lut_path: Union[str, Path],
+        pickle_dir: bool,
         n_players: int,
         prune_threshold: int,
         c: int,
-        lcfr_threshold: int,
-        discount_interval: int,
-        update_threshold: int,
-        dump_iteration: int,
         save_path: Path,
+        info_set_lut=None,
+        error_event: Optional[mp.Event] = None, # type: ignore
     ):
         """Construct the process, setup the state."""
         super().__init__(group=None, name=None, args=(), kwargs={}, daemon=None)
         self._job_queue: mp.Queue = job_queue
-        self._status_queue: mp.Queue = status_queue
         self._logging_queue: mp.Queue = logging_queue
         self._locks = locks
         self._n_players = n_players
-        self._prune_threshold = prune_threshold
         self._agent = agent
         self._c = c
-        self._lcfr_threshold = lcfr_threshold
-        self._discount_interval = discount_interval
-        self._update_threshold = update_threshold
-        self._dump_iteration = dump_iteration
+        self._prune_threshold = prune_threshold
         self._save_path = Path(save_path)
-        self._info_set_lut: state.InfoSetLookupTable = info_set_lut
-        self._setup_new_game()
+        self._lut_path = str(lut_path)
+        self._pickle_dir = pickle_dir
+        self._error_event: Optional[mp.Event] = error_event # type: ignore
+        if info_set_lut is not None:
+            self._info_set_lut = info_set_lut
+        # Per-traversal regret accumulator keyed by (betting_round, info_set).
+        # Values are int64 delta arrays of length MAX_ACTIONS_PER_STREET[r].
+        self._local_delta: Dict[Tuple[int, str], np.ndarray] = {}
+        self._local_iteration_count: int = 0
 
     def run(self):
-        """Compute the next job the server sent."""
-        # Seed process.
+        """Load the LUT, seed RNG, then process jobs dispatched by the server."""
+        # Reopen the LMDB environment after fork so this process gets its own
+        # reader lock-table slot (avoids MDB_BAD_RSLOT).
+        self._agent._index.reopen_after_fork()
+        if not hasattr(self, "_info_set_lut"):
+            if not self._pickle_dir:
+                lut_file_path = os.path.join(self._lut_path, "card_info_lut.joblib")
+                lut_file = open(lut_file_path, "rb")
+                lut_mmap = _mmap.mmap(lut_file.fileno(), 0, access=_mmap.ACCESS_READ)
+                self._info_set_lut = joblib.load(lut_mmap)
+                lut_mmap.close()
+                lut_file.close()
+            else:
+                self._info_set_lut = utils.io.load_info_set_lut(
+                    self._lut_path, self._pickle_dir
+                )
         self._set_seed()
-        # Start processing loop, that will block on a wait for the next job
-        # that will be sent from the server to be consumed by the worker(s).
+        self._setup_new_game()
         while True:
-            # Get the name of the method and the key word arguments needed for
-            # the method.
-            self._update_status("idle")
             name, kwargs = self._job_queue.get(block=True)
             if name == "terminate":
+                self._sync_to_master()
+                self._job_queue.task_done()
                 break
             elif name == "cfr":
                 function = self._cfr
-            elif name == "discount":
-                function = self._discount
+            elif name == "sync":
+                function = self._sync_to_master
             elif name == "update_strategy":
                 function = self._update_strategy
-            elif name == "serialise":
-                function = self._serialise
             else:
+                self._job_queue.task_done()
                 raise ValueError(f"Unrecognised function name: {name}")
-            self._update_status(name)
-            function(**kwargs)
-            # Notify the job queue that the task is done.
-            self._job_queue.task_done()
+            try:
+                function(**kwargs)
+            except Exception:
+                log.exception(
+                    f"[worker={self.name}] Unhandled exception in job '{name}' — "
+                    f"signaling shutdown"
+                )
+                if self._error_event is not None:
+                    self._error_event.set()
+                self._job_queue.task_done()
+                break
+            else:
+                self._job_queue.task_done()
 
     def _set_seed(self):
         """Lose all reproducability as we need unique streams per worker."""
@@ -89,66 +109,39 @@ class Worker(mp.Process):
         random_seed: int = int.from_bytes(os.urandom(4), byteorder="little")
         utils.random.seed(random_seed)
 
+    def _sync_to_master(self) -> None:
+        """Flush ``_local_delta`` into the agent's per-street regret tables.
+
+        Routes each ``(betting_round, info_set)`` delta into the correct
+        ``SparseRegretTable`` via ``merge_delta_row`` which holds the stripe
+        lock internally.  After the flush ``_local_delta`` is cleared.
+        """
+        if not self._local_delta:
+            return
+        n_infosets = len(self._local_delta)
+        ai.merge_local_delta(self._agent, self._local_delta)
+        self._local_delta.clear()
+        self._logging_queue.put(
+            f"[worker={self.name}] Synced {n_infosets:,} infosets to master",
+            block=True,
+        )
+
     def _cfr(self, t, i):
         """Search over random game and calculate the strategy."""
         self._setup_new_game()
         use_pruning: bool = np.random.uniform() < 0.95
-        pruning_allowed: bool = t > self._prune_threshold
-        if pruning_allowed and use_pruning:
-            ai.cfrp(self._agent, self._state, i, t, self._c, self._locks)
+        if use_pruning and t > self._prune_threshold:
+            ai.cfrp(self._agent, self._state, i, t, self._c, self._local_delta)
         else:
-            ai.cfr(self._agent, self._state, i, t, self._locks)
-
-    def _discount(self, t):
-        """Discount previous regrets and strategy."""
-        # TODO(fedden): Is discount_interval actually set/managed in
-        #               minutes here? In Algorithm 1 this should be managed
-        #               in minutes using perhaps the time module, but here
-        #               it appears to be being managed by the iterations
-        #               count.
-        discount_factor = (t / self._discount_interval) / (
-            (t / self._discount_interval) + 1
-        )
-        self._logging_queue.put(
-            f"[t={t}] Discounting regrets and strategy (factor={discount_factor:.4f})",
-            block=True,
-        )
-        self._locks["regret"].acquire()
-        for info_set in self._agent.regret.keys():
-            for action in self._agent.regret[info_set].keys():
-                self._agent.regret[info_set][action] *= discount_factor
-        self._locks["regret"].release()
-        self._locks["strategy"].acquire()
-        for info_set in self._agent.strategy.keys():
-            for action in self._agent.strategy[info_set].keys():
-                self._agent.strategy[info_set][action] *= discount_factor
-        self._locks["strategy"].release()
+            ai.cfr(self._agent, self._state, i, t, self._local_delta)
+        self._local_iteration_count += 1
+        # Delta is flushed on explicit "sync" jobs dispatched by the server,
+        # not after every traversal (Phase 5 decoupling).
 
     def _update_strategy(self, t, i):
-        """Update the strategy."""
-        ai.update_strategy(self._agent, self._state, i, t, self._locks)
-
-    def _serialise(self, t: int, server_state: Dict[str, Union[str, float, int, None]]):
-        """Write progress of optimising agent (and server state) to file."""
-        self._logging_queue.put(
-            f"[t={t}] Saving checkpoint to {self._save_path}", block=True
-        )
-        ai.serialise(
-            agent=self._agent,
-            save_path=self._save_path,
-            t=t,
-            server_state=server_state,
-            locks=self._locks,
-        )
-        n_info_sets = len(self._agent.regret)
-        self._logging_queue.put(
-            f"[t={t}] Checkpoint saved — {n_info_sets:,} info sets in regret table",
-            block=True,
-        )
-
-    def _update_status(self, status):
-        """Update the status of this worker by posting it to the server."""
-        self._status_queue.put((self.name, status), block=True)
+        """Update strategy visit counts for all streets."""
+        self._setup_new_game()
+        ai.update_strategy(self._agent, self._state, i, t)
 
     def _setup_new_game(self):
         """Setup up new poker game."""
