@@ -5,10 +5,10 @@ import pytest
 def test_hand(n_players):
     """Test a hand can be played."""
     from poker_ai import utils
-    from poker_ai.poker.random_player import RandomPlayer
-    from poker_ai.poker.table import PokerTable
-    from poker_ai.poker.engine import PokerEngine
-    from poker_ai.poker.pot import Pot
+    from poker_ai.environment.random_player import RandomPlayer
+    from poker_ai.environment.table import PokerTable
+    from poker_ai.environment.engine import PokerEngine
+    from poker_ai.environment.pot import Pot
     utils.random.seed(42)
     initial_chips_amount = 10000
     small_blind_amount = 10

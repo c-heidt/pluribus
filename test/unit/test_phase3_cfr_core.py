@@ -124,7 +124,7 @@ class MockState:
         return 0
 
     def get_valid_mask(self) -> np.ndarray:
-        from poker_ai.games.base.state import PokerState
+        from poker_ai.environment.game_state import PokerState
         canonical = PokerState.get_canonical_actions(self.betting_round)
         legal_set = set(self._actions)
         return np.array([a in legal_set for a in canonical], dtype=bool)
@@ -552,7 +552,7 @@ class TestUpdateStrategy:
                 return 1  # flop
 
             def get_valid_mask(self):
-                from poker_ai.games.base.state import PokerState
+                from poker_ai.environment.game_state import PokerState
                 canonical = PokerState.get_canonical_actions(1)
                 legal_set = set(self._actions)
                 return np.array([a in legal_set for a in canonical], dtype=bool)
@@ -695,7 +695,7 @@ def test_cfr_1000_iterations_small_game():
     - update_strategy populates strategy_tables[0]
     - serialise (stub) does not crash
     """
-    from poker_ai.games.short_deck.state import new_game
+    from poker_ai.environment.game_state import new_game
 
     lut_path = "data/clustering/20cards_exact"
     if not os.path.exists(lut_path + "/card_info_lut.joblib"):

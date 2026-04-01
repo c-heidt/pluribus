@@ -1,8 +1,8 @@
-"""Base state class for poker game variants.
+"""Unified poker game state supporting any deck size.
 
-This module provides an abstract base class that implements all common poker
-game logic, allowing specific variants (Short Deck, Texas Hold'em, etc.) to
-inherit and override only variant-specific behavior.
+This module provides a single PokerState class and new_game() factory that
+work with arbitrary deck sizes specified via low_card_rank/high_card_rank
+parameters. All decks use the standard poker hand evaluator.
 """
 
 from __future__ import annotations
@@ -13,19 +13,21 @@ import json
 import logging
 import math
 import operator
-from abc import ABC, abstractmethod
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
+import joblib
 import numpy as np
 
 from poker_ai import utils
-from poker_ai.poker.card import Card
-from poker_ai.poker.engine import PokerEngine
-from poker_ai.poker.player import Player
-from poker_ai.poker.pot import Pot
-from poker_ai.poker.table import PokerTable
+from poker_ai.environment.card import Card
+from poker_ai.environment.engine import PokerEngine
+from poker_ai.environment.evaluation.evaluator import Evaluator
+from poker_ai.environment.player import Player
+from poker_ai.environment.pot import Pot
+from poker_ai.environment.table import PokerTable
 
-logger = logging.getLogger("poker_ai.games.base.state")
+logger = logging.getLogger("poker_ai.environment.game_state")
 InfoSetLookupTable = Dict[str, Dict[Tuple[int, ...], str]]
 
 # Action abstraction configuration: raise sizes as fractions of the pot.
@@ -61,13 +63,13 @@ RAISE_SIZES_BY_STAGE: Dict[str, Dict[str, List[float]]] = {
     },
     "turn": {
         # At most 3 raise sizes for first raise, 2 for remaining (all_in is always added)
-        "first_raise": [0.5, 1.0],  
-        "subsequent_raise": [1.0],  
+        "first_raise": [0.5, 1.0],
+        "subsequent_raise": [1.0],
     },
     "river": {
         # Same as turn: at most 3 raise sizes for first raise, 2 for remaining (all_in is always added)
-        "first_raise": [0.5, 1.0],  
-        "subsequent_raise": [1.0],  
+        "first_raise": [0.5, 1.0],
+        "subsequent_raise": [1.0],
     },
 }
 
@@ -75,16 +77,77 @@ RAISE_SIZES_BY_STAGE: Dict[str, Dict[str, List[float]]] = {
 MAX_RAISES_PER_ROUND: int = 3
 
 
-class PokerState(ABC):
-    """Abstract base class for poker game state at some given point in time.
+def new_game(
+    n_players: int,
+    card_info_lut: InfoSetLookupTable = None,
+    low_card_rank: int = 2,
+    high_card_rank: int = 14,
+    small_blind: int = 50,
+    big_blind: int = 100,
+    initial_chips: int = 10000,
+    **kwargs,
+) -> PokerState:
+    """Create a new poker game with the specified deck configuration.
+
+    Parameters
+    ----------
+    n_players : int
+        Number of players.
+    card_info_lut : InfoSetLookupTable, optional
+        Card information cluster lookup table. If provided, it will be
+        attached without reloading from disk.
+    low_card_rank : int
+        Lowest rank to include in the deck (2=Two, ..., 14=Ace).
+    high_card_rank : int
+        Highest rank to include in the deck (2=Two, ..., 14=Ace).
+    small_blind : int
+        Small blind amount.
+    big_blind : int
+        Big blind amount.
+    initial_chips : int
+        Starting chip count per player.
+
+    Returns
+    -------
+    state : PokerState
+        Initial game state.
+    """
+    pot = Pot()
+    players = [
+        Player(player_i=player_i, initial_chips=initial_chips, pot=pot)
+        for player_i in range(n_players)
+    ]
+    if card_info_lut is not None:
+        state = PokerState(
+            players=players,
+            load_card_lut=False,
+            low_card_rank=low_card_rank,
+            high_card_rank=high_card_rank,
+            small_blind=small_blind,
+            big_blind=big_blind,
+            **kwargs,
+        )
+        state.card_info_lut = card_info_lut
+    else:
+        state = PokerState(
+            players=players,
+            low_card_rank=low_card_rank,
+            high_card_rank=high_card_rank,
+            small_blind=small_blind,
+            big_blind=big_blind,
+            **kwargs,
+        )
+    return state
+
+
+class PokerState:
+    """Poker game state at some given point in time.
+
+    Supports any deck size via low_card_rank/high_card_rank parameters.
+    All deck configurations use the standard poker hand evaluator.
 
     The class is immutable and new state can be instantiated from once an
     action is applied via the `apply_action` method.
-    
-    Subclasses must implement:
-    - _get_deck_ranks(): Return list of ranks to include in deck
-    - info_set: Property that returns information set string
-    - load_card_lut(): Static method to load card clustering lookup tables
     """
 
     def __init__(
@@ -95,9 +158,11 @@ class PokerState(ABC):
         lut_path: str = ".",
         pickle_dir: bool = False,
         load_card_lut: bool = True,
+        low_card_rank: int = 2,
+        high_card_rank: int = 14,
     ):
         """Initialise state.
-        
+
         Parameters
         ----------
         players : List[Player]
@@ -112,6 +177,10 @@ class PokerState(ABC):
             Whether lut_path is a directory of pickle files (deprecated).
         load_card_lut : bool
             Whether to load card clustering lookup tables.
+        low_card_rank : int
+            Lowest rank to include in the deck (2=Two, ..., 14=Ace).
+        high_card_rank : int
+            Highest rank to include in the deck (2=Two, ..., 14=Ace).
         """
         n_players = len(players)
         if n_players <= 1:
@@ -119,13 +188,35 @@ class PokerState(ABC):
                 f"At least 2 players must be provided but only {n_players} "
                 f"were provided."
             )
+        if low_card_rank < 2 or high_card_rank > 14:
+            raise ValueError(
+                f"Card ranks must be in range [2, 14], got "
+                f"low_card_rank={low_card_rank}, high_card_rank={high_card_rank}."
+            )
+        if low_card_rank > high_card_rank:
+            raise ValueError(
+                f"low_card_rank ({low_card_rank}) must be <= "
+                f"high_card_rank ({high_card_rank})."
+            )
+        n_ranks = high_card_rank - low_card_rank + 1
+        n_cards = n_ranks * 4
+        # Need at least 2 hole cards per player + 5 community cards
+        min_cards = n_players * 2 + 5
+        if n_cards < min_cards:
+            raise ValueError(
+                f"Deck has {n_cards} cards but need at least {min_cards} "
+                f"({n_players} players * 2 + 5 community cards). "
+                f"Use fewer players or a larger deck."
+            )
+
+        self._low_card_rank = low_card_rank
+        self._high_card_rank = high_card_rank
         self._pickle_dir = pickle_dir
         if load_card_lut:
             self.card_info_lut = self.load_card_lut(lut_path, self._pickle_dir)
         else:
             self.card_info_lut = {}
-        # Get a reference of the pot from the first player.
-        # Get variant-specific deck ranks.
+        # Get deck ranks from parameters.
         deck_ranks = self._get_deck_ranks()
         self._table = PokerTable(
             players=players, pot=players[0].pot, include_ranks=deck_ranks
@@ -134,16 +225,15 @@ class PokerState(ABC):
         self._initial_n_chips = players[0].n_chips
         self.small_blind = small_blind
         self.big_blind = big_blind
-        # Get variant-specific evaluator.
-        evaluator = self._get_evaluator()
+        # Always use standard evaluator.
+        evaluator = Evaluator()
         self._poker_engine = PokerEngine(
             table=self._table,
             small_blind=small_blind,
             big_blind=big_blind,
             evaluator=evaluator,
         )
-        # Reset the pot, assign betting order to players (might need to remove
-        # this), assign blinds to the players.
+        # Reset the pot, assign betting order to players, assign blinds.
         self._poker_engine.round_setup()
         # Deal private cards to players.
         self._table.dealer.deal_private_cards(self._table.players)
@@ -179,117 +269,57 @@ class PokerState(ABC):
             player.is_turn = False
         self.current_player.is_turn = True
 
-    @abstractmethod
     def _get_deck_ranks(self) -> List[int]:
-        """Return the list of card ranks to include in the deck.
-        
-        Returns
-        -------
-        ranks : List[int]
-            List of ranks (e.g., [2, 3, ..., 14] for full deck,
-            [10, 11, 12, 13, 14] for short deck).
-        """
-        pass
-
-    @abstractmethod
-    def _get_evaluator(self):
-        """Return the hand evaluator for this poker variant.
-        
-        Returns
-        -------
-        evaluator : Evaluator
-            Hand evaluator instance (e.g., Evaluator for standard poker,
-            ShortDeckEvaluator for short deck).
-        """
-        pass
-
-    @staticmethod
-    @abstractmethod
-    def load_card_lut(
-        lut_path: str = ".",
-        pickle_dir: bool = False
-    ) -> Dict[str, Dict[Tuple[int, ...], str]]:
-        """Load card information lookup table.
-
-        Must be implemented by subclasses to load variant-specific
-        clustering data.
-
-        Parameters
-        ----------
-        lut_path : str
-            Path to lookup table.
-        pickle_dir : bool
-            Whether the lut_path is a path to pickle files or not.
-
-        Returns
-        -------
-        card_info_lut : InfoSetLookupTable
-            Card information cluster lookup table.
-        """
-        pass
+        """Return the list of card ranks for this deck configuration."""
+        return list(range(self._low_card_rank, self._high_card_rank + 1))
 
     @property
-    @abstractmethod
-    def info_set(self) -> str:
-        """Get the information set for the current player.
-        
-        Must be implemented by subclasses to provide variant-specific
-        card clustering and information set generation.
-        
-        Returns
-        -------
-        info_set : str
-            JSON string encoding the information set.
-        """
-        pass
+    def deck_size(self) -> int:
+        """Return the total number of cards in the deck."""
+        return (self._high_card_rank - self._low_card_rank + 1) * 4
+
+    @property
+    def low_card_rank(self) -> int:
+        """Return the lowest card rank in the deck."""
+        return self._low_card_rank
+
+    @property
+    def high_card_rank(self) -> int:
+        """Return the highest card rank in the deck."""
+        return self._high_card_rank
 
     def __repr__(self):
         """Return a helpful description of object in strings and debugger."""
-        class_name = self.__class__.__name__
-        return f"<{class_name} player_i={self.player_i} betting_stage={self._betting_stage}>"
+        return (
+            f"<PokerState player_i={self.player_i} "
+            f"betting_stage={self._betting_stage} "
+            f"deck={self.deck_size}>"
+        )
 
     def _map_to_closest_legal_action(self, invalid_action: str) -> str:
-        """Map an invalid action to the closest legal action.
-        
-        Parameters
-        ----------
-        invalid_action : str
-            The invalid action that was attempted.
-            
-        Returns
-        -------
-        closest_action : str
-            The closest legal action to the invalid action.
-        """
+        """Map an invalid action to the closest legal action."""
         legal = self.legal_actions
-        
-        # If the invalid action is all_in, map to all_in if available
+
         if invalid_action == "all_in" and "all_in" in legal:
             return "all_in"
-        
-        # If the invalid action is a raise with a specific fraction
+
         if invalid_action and invalid_action.startswith("raise:"):
             try:
                 target_fraction = float(invalid_action.split(":")[1])
-                
-                # Find all legal raise actions and their fractions
                 legal_raises = [a for a in legal if a and a.startswith("raise:")]
-                
+
                 if legal_raises:
-                    # Find the closest raise by fraction
                     def get_fraction(action_str):
                         parts = action_str.split(":")
                         return float(parts[1]) if len(parts) > 1 else 0.0
-                    
+
                     closest = min(legal_raises, key=lambda a: abs(get_fraction(a) - target_fraction))
                     return closest
                 elif "all_in" in legal:
-                    # If no raise fractions available but all_in is, use it
                     return "all_in"
             except (ValueError, IndexError):
                 pass
-        
-        # Default mapping: prefer all_in > call > fold > first available
+
         if "all_in" in legal:
             return "all_in"
         elif "call" in legal:
@@ -298,8 +328,8 @@ class PokerState(ABC):
             return "fold"
         elif legal and legal[0] is not None:
             return legal[0]
-        
-        return "fold"  # Last resort
+
+        return "fold"
 
     def apply_action(self, action_str: Optional[str]) -> PokerState:
         """Create a new state after applying an action.
@@ -308,9 +338,7 @@ class PokerState(ABC):
         ----------
         action_str : str or None
             The description of the action the current player is making. Can be
-            any of {"fold", "call", "raise:<fraction>", "all_in"}. The "all_in"
-            action is used whenever the player goes all-in, including when calling
-            would result in going all-in.
+            any of {"fold", "call", "raise:<fraction>", "all_in"}.
 
         Returns
         -------
@@ -318,7 +346,6 @@ class PokerState(ABC):
             A poker state instance that represents the game in the next
             timestep, after the action has been applied.
         """
-        # Map invalid actions to closest legal action with logging
         original_action = action_str
         if action_str not in self.legal_actions:
             logger.warning(
@@ -328,18 +355,13 @@ class PokerState(ABC):
             )
             action_str = self._map_to_closest_legal_action(action_str)
             logger.info(f"Mapped '{original_action}' -> '{action_str}'")
-        
-        # Deep copy the parts of state that are needed that must be immutable
-        # from state to state.
+
         lut = self.card_info_lut
         self.card_info_lut = {}
         new_state = copy.deepcopy(self)
         new_state.card_info_lut = self.card_info_lut = lut
-        # An action has been made, so alas we are not in the first move of the
-        # current betting round.
         new_state._first_move_of_current_round = False
         if action_str is None:
-            # Assert active player has folded already.
             assert (
                 not new_state.current_player.is_active
             ), "Active player cannot do nothing!"
@@ -349,51 +371,35 @@ class PokerState(ABC):
         elif action_str == "fold":
             action = new_state.current_player.fold()
         elif action_str == "all_in":
-            # All-in: add all remaining chips to the pot
-            # This action is used for any all-in situation (raises or calls that go all-in)
             n_chips_to_add = new_state.current_player.n_chips
-            
-            # Determine if this is a raise or just a call/all-in
+
             biggest_bet = max(p.n_bet_chips for p in new_state.players)
             current_bet = new_state.current_player.n_bet_chips
             n_chips_to_call = biggest_bet - current_bet
             actual_raise_amount = n_chips_to_add - n_chips_to_call
-            
-            # Only count as a raise and update minimum if it exceeds current minimum
+
             if actual_raise_amount >= new_state._last_raise_amount:
                 new_state._last_raise_amount = actual_raise_amount
                 new_state._n_raises += 1
-            
+
             logger.debug(f"going all-in with {n_chips_to_add} chips")
             action = new_state.current_player.raise_to(n_chips=n_chips_to_add)
         elif action_str.startswith("raise:"):
-            # Parse the raise action to get the pot fraction
             raise_type = action_str.split(":")[1]
-            
-            # IMPORTANT: Player.raise_to(n) ADDS n chips to the pot (on top of current bet)
-            # So we calculate the total chips to ADD, not the final bet total
-            
-            # Pot-fraction raise: use EXACT pot fraction since action is legal
-            # Do NOT enforce minimum - it was already validated in legal_actions
             pot_fraction = float(raise_type)
             n_chips_to_add = new_state._compute_raise_chip_amount(
                 pot_fraction, enforce_minimum=False
             )
-            
-            # Track the actual raise amount for minimum raise enforcement
-            # actual_raise_amount is the amount raised ABOVE the call amount
+
             biggest_bet = max(p.n_bet_chips for p in new_state.players)
             current_bet = new_state.current_player.n_bet_chips
             n_chips_to_call = biggest_bet - current_bet
             actual_raise_amount = n_chips_to_add - n_chips_to_call
-            
-            # Only update minimum raise if this raise meets the current minimum
-            # This prevents all-ins below minimum from allowing subsequent small raises
+
             if actual_raise_amount >= new_state._last_raise_amount:
                 new_state._last_raise_amount = actual_raise_amount
-            
+
             logger.debug(f"adding {n_chips_to_add} chips to pot (action: {action_str})")
-            # Player.raise_to() adds chips to pot (semantically confusing name, but correct)
             action = new_state.current_player.raise_to(n_chips=n_chips_to_add)
             new_state._n_raises += 1
         else:
@@ -401,22 +407,15 @@ class PokerState(ABC):
                 f"Unrecognized action '{action_str}'. Expected 'fold', 'call', "
                 f"'raise:<fraction>' or 'all_in'."
             )
-        # Update the new state.
         skip_actions = ["skip" for _ in range(new_state._skip_counter)]
         new_state._history[new_state.betting_stage] += skip_actions
         new_state._history[new_state.betting_stage].append(action_str)
         new_state._n_actions += 1
         new_state._skip_counter = 0
-        # Player has made move, increment the player that is next.
         while True:
             new_state._move_to_next_player()
-            # If we have finished betting, (i.e: All players have put the
-            # same amount of chips in), then increment the stage of
-            # betting.
             finished_betting = not new_state._poker_engine.more_betting_needed
             if finished_betting and new_state.all_players_have_actioned:
-                # We have done atleast one full round of betting, increment
-                # stage of the game.
                 new_state._increment_stage()
                 new_state._reset_betting_round_state()
                 new_state._first_move_of_current_round = True
@@ -425,13 +424,10 @@ class PokerState(ABC):
                 assert not new_state.current_player.is_active
             elif new_state.current_player.is_active:
                 if new_state._poker_engine.n_players_with_moves == 1:
-                    # No players left.
                     new_state._betting_stage = "terminal"
                     if not new_state._table.community_cards:
                         new_state._poker_engine.table.dealer.deal_flop(new_state._table)
-                # Now check if the game is terminal.
                 if new_state._betting_stage in {"terminal", "show_down"}:
-                    # Distribute winnings.
                     new_state._poker_engine.compute_winners()
                 break
         for player in new_state.players:
@@ -450,7 +446,7 @@ class PokerState(ABC):
         self._all_players_have_made_action = False
         self._n_actions = 0
         self._n_raises = 0
-        self._last_raise_amount = self.big_blind  # Reset to big blind each round
+        self._last_raise_amount = self.big_blind
         self._player_i_index = 0
         self._n_players_started_round = self._poker_engine.n_active_players
         while not self.current_player.is_active:
@@ -459,21 +455,16 @@ class PokerState(ABC):
 
     def _increment_stage(self):
         """Once betting has finished, increment the stage of the poker game."""
-        # Progress the stage of the game.
         if self._betting_stage == "pre_flop":
-            # Progress from private cards to the flop.
             self._betting_stage = "flop"
             self._poker_engine.table.dealer.deal_flop(self._table)
         elif self._betting_stage == "flop":
-            # Progress from flop to turn.
             self._betting_stage = "turn"
             self._poker_engine.table.dealer.deal_turn(self._table)
         elif self._betting_stage == "turn":
-            # Progress from turn to river.
             self._betting_stage = "river"
             self._poker_engine.table.dealer.deal_river(self._table)
         elif self._betting_stage == "river":
-            # Progress to the showdown.
             self._betting_stage = "show_down"
         elif self._betting_stage in {"show_down", "terminal"}:
             pass
@@ -507,7 +498,7 @@ class PokerState(ABC):
 
     @property
     def all_players_have_actioned(self) -> bool:
-        """Return whether all players have made atleast one action."""
+        """Return whether all players have made at least one action."""
         return self._n_actions >= self._n_players_started_round
 
     @property
@@ -527,12 +518,12 @@ class PokerState(ABC):
 
     @property
     def betting_round(self) -> int:
-        """Betting stagee in integer form."""
+        """Betting stage in integer form."""
         try:
             betting_round = self._betting_stage_to_round[self._betting_stage]
         except KeyError:
             raise ValueError(
-                f"Attemped to get betting round for stage "
+                f"Attempted to get betting round for stage "
                 f"{self._betting_stage} but was not supported in the lut with "
                 f"keys: {list(self._betting_stage_to_round.keys())}"
             )
@@ -548,11 +539,7 @@ class PokerState(ABC):
 
     @property
     def is_terminal(self) -> bool:
-        """Returns whether this state is terminal or not.
-
-        The state is terminal once all rounds of betting are complete and we
-        are at the show down stage of the game or if all players have folded.
-        """
+        """Returns whether this state is terminal or not."""
         return self._betting_stage in {"show_down", "terminal"}
 
     @property
@@ -567,190 +554,90 @@ class PokerState(ABC):
 
     @property
     def pot_size(self) -> int:
-        """Return the current size of the pot.
-        
-        Returns
-        -------
-        pot_size : int
-            Total chips in the pot from all players.
-        """
+        """Return the current size of the pot."""
         return self._table.pot.total
 
     @property
     def min_raise_amount(self) -> int:
-        """Return the minimum legal raise amount.
-        
-        In No-Limit Hold'em, the minimum raise must be at least the size
-        of the previous raise, or the big blind if no previous raise.
-        
-        Returns
-        -------
-        min_raise : int
-            Minimum chips to raise (on top of calling).
-        """
+        """Return the minimum legal raise amount."""
         return self._last_raise_amount
 
     def _compute_raise_chip_amount(self, pot_fraction: float, enforce_minimum: bool = True) -> int:
-        """Compute the number of chips to ADD to pot based on pot fraction.
-
-        Effective pot = current pot (previous round pot + all bets committed in this
-        round). The raise amount is pot_fraction * effective_pot (rounded up), and
-        this is the TOTAL chips the player adds — covering both the implicit call and
-        the raise above it.
-
-        Example: Previous pot=$300, player 1 bets $100, player 2 bets $100 →
-        effective pot = $500. raise_0.5: player adds $250 → new pot = $750.
-
-        Parameters
-        ----------
-        pot_fraction : float
-            Fraction of the pot to raise (e.g., 0.5 for half-pot, 1.0 for pot).
-        enforce_minimum : bool
-            If True, ensures raise meets minimum raise requirement.
-            If False, returns the exact pot-fraction amount (rounded up).
-
-        Returns
-        -------
-        n_chips_to_add : int
-            Total chips to ADD to pot (covers call + raise above call).
-        """
+        """Compute the number of chips to ADD to pot based on pot fraction."""
         biggest_bet = max(p.n_bet_chips for p in self.players)
         n_chips_to_call = biggest_bet - self.current_player.n_bet_chips
-
-        # Effective pot = all chips committed so far (previous rounds + current round bets)
-        # Does NOT add the call amount — raise is a fraction of the existing pot only
         effective_pot = self.pot_size
-
-        # Total chips to add = pot_fraction * effective_pot (rounded UP to integer)
-        # This single amount covers both the call and the raise above it
         n_chips_to_add = math.ceil(effective_pot * pot_fraction)
-
-        # Ensure minimum raise requirement if requested
-        # Actual raise above call = n_chips_to_add - n_chips_to_call
         if enforce_minimum:
             min_total = n_chips_to_call + self.min_raise_amount
             n_chips_to_add = max(n_chips_to_add, min_total)
-
         return n_chips_to_add
 
     def _get_available_raise_sizes(self) -> List[str]:
-        """Get the available raise sizes for the current game state.
-        
-        Returns raise actions as strings like "raise:0.5", "raise:1.0", "all_in".
-        Filters out raise sizes that would exceed player's chip stack or be
-        less than min raise.
-        
-        Returns
-        -------
-        raise_actions : List[str]
-            List of available raise action strings (including "all_in").
-        """
+        """Get the available raise sizes for the current game state."""
         if self._betting_stage in {"terminal", "show_down"}:
             return []
-        
-        # Get raise size configuration for current betting stage
+
         stage_config = RAISE_SIZES_BY_STAGE.get(self._betting_stage, {})
-        
-        # Determine if this is the first raise or a subsequent raise
+
         if self._n_raises == 0:
             pot_fractions = stage_config.get("first_raise", [1.0])
         else:
             pot_fractions = stage_config.get("subsequent_raise", [1.0])
-        
+
         raise_actions: List[str] = []
         player = self.current_player
         biggest_bet = max(p.n_bet_chips for p in self.players)
         n_chips_to_call = biggest_bet - player.n_bet_chips
         chips_available = player.n_chips
-        
-        # Track chips amounts to avoid duplicates and detect all-in equivalents
+
         added_amounts: set = set()
-        
+
         for fraction in pot_fractions:
-            # First check if this pot fraction would meet minimum raise (without enforcement)
             n_chips_for_fraction = self._compute_raise_chip_amount(fraction, enforce_minimum=False)
-            
-            # Calculate the actual raise amount (not including call)
             actual_raise_amount = n_chips_for_fraction - n_chips_to_call
-            
-            # Skip if this raise would be below the minimum legal raise
+
             if actual_raise_amount < self.min_raise_amount:
                 continue
-            
-            # Now compute with enforcement to ensure we meet all requirements
+
             n_chips_to_add = self._compute_raise_chip_amount(fraction, enforce_minimum=True)
-            
-            # Skip if player can't afford this raise
+
             if n_chips_to_add > chips_available:
                 continue
-            
-            # Skip if this would be effectively all-in (within 1 chip tolerance)
-            # We'll add "all_in" separately to keep semantics clear
+
             if n_chips_to_add >= chips_available - 1:
                 continue
-            
-            # Skip duplicates (can happen with rounding or min raise adjustments)
+
             if n_chips_to_add in added_amounts:
                 continue
-            
+
             added_amounts.add(n_chips_to_add)
             raise_actions.append(f"raise:{fraction}")
-        
-        # ALWAYS add all-in option if player has chips and can at least call
-        # All-in is valid even if below minimum raise (NLHE rules allow it)
+
         if chips_available > 0 and chips_available >= n_chips_to_call:
-            # Only add if not already covered by a pot-fraction action
             if chips_available not in added_amounts:
                 raise_actions.append("all_in")
-        
+
         return raise_actions
 
     @property
     def legal_actions(self) -> List[Optional[str]]:
-        """Return the actions that are legal for this game state.
-        
-        Action abstraction provides multiple raise sizes as fractions of the pot:
-        - Pre-flop: Fine-grained (many options for blueprint strategy)
-        - Flop: Coarser abstraction
-        - Turn/River: Most coarse (3 options for first raise, 2 for subsequent)
-        
-        Raise actions are formatted as "raise:<fraction>" or "all_in".
-        Examples: "raise:0.5" (half-pot), "raise:1.0" (pot-size), "all_in"
-        
-        The "all_in" action is used whenever going all-in, including when calling
-        would result in all-in. In such cases, "call" is not available.
-        
-        POSITIONAL ASYMMETRY (INTENDED):
-        In multi-way pots, players acting later will have different raise sizes
-        than earlier players for the same pot fraction, because they see a larger
-        pot after earlier players have acted. This is realistic poker behavior and
-        the CFR algorithm naturally learns position-dependent strategies.
-        
-        Returns
-        -------
-        actions : List[Optional[str]]
-            List of legal action strings.
-        """
+        """Return the actions that are legal for this game state."""
         actions: List[Optional[str]] = []
         if self.current_player.is_active:
-            # Check if calling would result in all-in
             biggest_bet = max(p.n_bet_chips for p in self.players)
             n_chips_to_call = biggest_bet - self.current_player.n_bet_chips
             chips_available = self.current_player.n_chips
-            
+
             actions.append("fold")
-            
-            # If calling would be all-in, use "all_in" action instead of "call"
+
             if n_chips_to_call >= chips_available:
-                if chips_available > 0:  # Only if player has chips to add
+                if chips_available > 0:
                     actions.append("all_in")
             else:
-                # Normal call is available
                 actions.append("call")
-                
-                # Check if raises are still allowed this round
+
                 if self._n_raises < MAX_RAISES_PER_ROUND:
-                    # Get pot-fraction based raise actions (includes "all_in" if raising)
                     raise_actions = self._get_available_raise_sizes()
                     actions += raise_actions
         else:
@@ -759,24 +646,7 @@ class PokerState(ABC):
 
     @staticmethod
     def get_canonical_actions(betting_round: int) -> List[str]:
-        """Return the full abstract action set for *betting_round* in stable order.
-
-        This is the superset of every possible element of ``legal_actions`` at
-        any node in the given street.  Used at startup to build
-        ``action_to_idx`` mappings and to determine row widths for
-        ``SparseRegretTable``; never called on the hot path.
-
-        Parameters
-        ----------
-        betting_round:
-            0 = pre_flop, 1 = flop, 2 = turn, 3 = river.
-
-        Returns
-        -------
-        List[str]
-            Actions in stable order: ``fold``, ``call``, ``all_in``,
-            then ``raise:<fraction>`` entries sorted by fraction value.
-        """
+        """Return the full abstract action set for *betting_round* in stable order."""
         stage_names = {0: "pre_flop", 1: "flop", 2: "turn", 3: "river"}
         stage = stage_names.get(betting_round)
         if stage is None:
@@ -788,19 +658,85 @@ class PokerState(ABC):
         return ["fold", "call", "all_in"] + [f"raise:{f}" for f in all_fracs]
 
     def get_valid_mask(self) -> np.ndarray:
-        """Return a boolean mask over the canonical action set for this state.
-
-        The mask has one entry per canonical action at ``self.betting_round``.
-        An entry is ``True`` iff the corresponding action appears in
-        ``self.legal_actions``.  Used by ``calculate_strategy_from_row`` to
-        zero invalid slots before regret matching.
-
-        Returns
-        -------
-        np.ndarray
-            Boolean array of shape ``(max_actions_for_street,)``.
-        """
+        """Return a boolean mask over the canonical action set for this state."""
         r = self.betting_round
         canonical = PokerState.get_canonical_actions(r)
         legal_set = {a for a in self.legal_actions if a is not None}
         return np.array([a in legal_set for a in canonical], dtype=bool)
+
+    @staticmethod
+    def load_card_lut(
+        lut_path: str = ".",
+        pickle_dir: bool = False,
+    ) -> Dict[str, Dict[Tuple[int, ...], str]]:
+        """Load card information lookup table.
+
+        Parameters
+        ----------
+        lut_path : str
+            Path to lookup table.
+        pickle_dir : bool
+            Whether the lut_path is a path to pickle files or not.
+
+        Returns
+        -------
+        card_info_lut : InfoSetLookupTable
+            Card information cluster lookup table.
+        """
+        if pickle_dir:
+            logger.info("Loading card information lut in deprecated way")
+            file_names = [
+                "preflop_lossless.pkl",
+                "flop_lossy_2.pkl",
+                "turn_lossy_2.pkl",
+                "river_lossy_2.pkl",
+            ]
+            betting_stages = ["pre_flop", "flop", "turn", "river"]
+            card_info_lut: Dict[str, Dict[Tuple[int, ...], str]] = {}
+            for file_name, betting_stage in zip(file_names, betting_stages):
+                file_path = os.path.join(lut_path, file_name)
+                if not os.path.isfile(file_path):
+                    raise ValueError(
+                        f"File path not found {file_path}. Ensure lut_path is "
+                        f"set to directory containing pickle files"
+                    )
+                with open(file_path, "rb") as fp:
+                    card_info_lut[betting_stage] = joblib.load(fp)
+        elif lut_path:
+            logger.info(f"Loading card from single file at path: {lut_path}")
+            card_info_lut = joblib.load(lut_path + '/card_info_lut.joblib')
+        else:
+            card_info_lut = {}
+        return card_info_lut
+
+    @property
+    def info_set(self) -> str:
+        """Get the information set for the current player."""
+        cards = sorted(
+            self.current_player.cards,
+            key=operator.attrgetter("eval_card"),
+        )
+        cards += sorted(
+            self._table.community_cards,
+            key=operator.attrgetter("eval_card"),
+        )
+        if self._pickle_dir:
+            lookup_cards = tuple([card.eval_card for card in cards])
+        else:
+            lookup_cards = tuple(cards)
+        try:
+            cards_cluster = self.card_info_lut[self._betting_stage][lookup_cards]
+        except KeyError:
+            if self.betting_stage not in {"terminal", "show_down"}:
+                raise ValueError("You should have these cards in your lut.")
+            return "default info set, please ensure you load it correctly"
+        info_set_dict = {
+            "cards_cluster": cards_cluster,
+            "history": [
+                {betting_stage: [str(action) for action in actions]}
+                for betting_stage, actions in self._history.items()
+            ],
+        }
+        return json.dumps(
+            info_set_dict, separators=(",", ":"), cls=utils.io.NumpyJSONEncoder
+        )

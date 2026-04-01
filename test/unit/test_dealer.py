@@ -1,5 +1,5 @@
-from poker_ai.poker.dealer import Dealer
-from poker_ai.poker.card import Card
+from poker_ai.environment.dealer import Dealer
+from poker_ai.environment.card import Card
 
 
 def test_dealer_1():

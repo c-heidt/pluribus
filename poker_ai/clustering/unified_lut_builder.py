@@ -295,15 +295,8 @@ class UnifiedLutBuilder(CardCombos):
         )
 
         # Evaluator ----------------------------------------------------------
-        n_ranks = high_card_rank - low_card_rank + 1
-        if n_ranks in (5, 9):  # 20-card or 36-card deck
-            from poker_ai.poker.evaluation.short_deck_evaluator import (
-                ShortDeckEvaluator,
-            )
-            self._evaluator = ShortDeckEvaluator()
-        else:  # 52-card deck
-            from poker_ai.poker.evaluation import Evaluator
-            self._evaluator = Evaluator()
+        from poker_ai.environment.evaluation import Evaluator
+        self._evaluator = Evaluator()
 
         # File paths ----------------------------------------------------------
         self.save_dir = Path(save_dir)

@@ -7,7 +7,7 @@ import joblib
 import numpy as np
 from blessed import Terminal
 
-from poker_ai.games.short_deck.state import new_game, ShortDeckPokerState
+from poker_ai.environment.game_state import new_game, PokerState
 from poker_ai.terminal.ascii_objects.card_collection import AsciiCardCollection
 from poker_ai.terminal.ascii_objects.player import AsciiPlayer
 from poker_ai.terminal.ascii_objects.logger import AsciiLogger
@@ -53,9 +53,9 @@ def run_terminal_app(
     term = Terminal()
     log = AsciiLogger(term)
     if debug_quick_start:
-        state: ShortDeckPokerState = new_game(n_players, {}, load_card_lut=False)
+        state: PokerState = new_game(n_players, {}, load_card_lut=False)
     else:
-        state: ShortDeckPokerState = new_game(
+        state: PokerState = new_game(
             n_players,
             lut_path=lut_path,
             pickle_dir=pickle_dir
@@ -156,11 +156,11 @@ def run_terminal_app(
                         log.clear()
                         log.info(term.green("new game"))
                         if debug_quick_start:
-                            state: ShortDeckPokerState = new_game(
+                            state: PokerState = new_game(
                                 n_players, state.card_info_lut, load_card_lut=False,
                             )
                         else:
-                            state: ShortDeckPokerState = new_game(
+                            state: PokerState = new_game(
                                 n_players, state.card_info_lut,
                             )
                         n_table_rotations -= 1
@@ -168,7 +168,7 @@ def run_terminal_app(
                             n_table_rotations = n_players - 1
                     else:
                         log.info(term.green(f"{current_player_name} chose {action}"))
-                        state: ShortDeckPokerState = state.apply_action(action)
+                        state: PokerState = state.apply_action(action)
             else:
                 if agent == "random":
                     action = random.choice(state.legal_actions)
@@ -201,7 +201,7 @@ def run_terminal_app(
                     action = np.random.choice(actions, p=probabilties)
                     time.sleep(0.8)
                 log.info(f"{current_player_name} chose {action}")
-                state: ShortDeckPokerState = state.apply_action(action)
+                state: PokerState = state.apply_action(action)
 
 
 if __name__ == "__main__":

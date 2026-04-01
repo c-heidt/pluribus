@@ -3,9 +3,9 @@ from typing import List
 
 import numpy as np
 
-from poker_ai.poker.player import Player
-from poker_ai.poker.pot import Pot
-from poker_ai.poker.state import PokerGameState
+from poker_ai.environment.player import Player
+from poker_ai.environment.pot import Pot
+from poker_ai.environment.legacy_state import PokerGameState
 
 logger = logging.getLogger(__name__)
 

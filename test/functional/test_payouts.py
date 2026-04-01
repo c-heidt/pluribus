@@ -3,11 +3,11 @@
 
 from typing import List
 
-from poker_ai.poker.card import Card
-from poker_ai.poker.table import PokerTable
-from poker_ai.poker.engine import PokerEngine
-from poker_ai.poker.pot import Pot
-from poker_ai.poker.random_player import RandomPlayer
+from poker_ai.environment.card import Card
+from poker_ai.environment.table import PokerTable
+from poker_ai.environment.engine import PokerEngine
+from poker_ai.environment.pot import Pot
+from poker_ai.environment.random_player import RandomPlayer
 
 
 def _scenario_helper(

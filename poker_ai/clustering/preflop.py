@@ -1,7 +1,7 @@
 from typing import Dict, Tuple, List
 import operator
 
-from poker_ai.poker.card import Card
+from poker_ai.environment.card import Card
 
 
 def make_starting_hand_bucket(starting_hand: List[Card], rank_to_index: Dict[int, int]) -> int:
@@ -89,10 +89,10 @@ def compute_preflop_lossless_abstraction(builder) -> Dict[Tuple[Card, Card], int
     rank_to_index = {rank: idx for idx, rank in enumerate(found_ranks)}
     
     # Validate deck configuration
-    if n_ranks not in [5, 9, 13]:
+    if n_ranks < 2:
         raise ValueError(
-            f"Preflop abstraction supports 20-card (5 ranks), 36-card (9 ranks), "
-            f"or 52-card (13 ranks) decks. Found {n_ranks} ranks: {found_ranks}"
+            f"Preflop abstraction requires at least 2 ranks. "
+            f"Found {n_ranks} ranks: {found_ranks}"
         )
     
     # Compute expected number of buckets

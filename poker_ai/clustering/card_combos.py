@@ -13,8 +13,8 @@ import operator
 import numpy as np
 from tqdm import tqdm
 
-from poker_ai.poker.card import Card
-from poker_ai.poker.deck import get_all_suits
+from poker_ai.environment.card import Card
+from poker_ai.environment.deck import get_all_suits
 
 
 log = logging.getLogger("poker_ai.clustering.runner")

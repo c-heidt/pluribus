@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 
 from poker_ai.ai.agent import Agent
-from poker_ai.games.base.state import PokerState
+from poker_ai.environment.game_state import PokerState
 
 
 log = logging.getLogger("sync.ai")

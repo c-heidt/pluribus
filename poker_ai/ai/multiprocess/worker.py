@@ -11,7 +11,7 @@ import numpy as np
 from poker_ai.ai import ai
 from poker_ai.ai.agent import Agent
 from poker_ai import utils
-from poker_ai.games.short_deck import state
+from poker_ai.environment import game_state as state
 
 log = logging.getLogger("sync.worker")
 
@@ -145,6 +145,6 @@ class Worker(mp.Process):
 
     def _setup_new_game(self):
         """Setup up new poker game."""
-        self._state: state.ShortDeckPokerState = state.new_game(
+        self._state: state.PokerState = state.new_game(
             self._n_players, self._info_set_lut,
         )

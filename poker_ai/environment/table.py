@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from typing import List, TYPE_CHECKING
 
-from poker_ai.poker.dealer import Dealer
+from poker_ai.environment.dealer import Dealer
 
 if TYPE_CHECKING:
-    from poker_ai.poker.player import Player
-    from poker_ai.poker.pot import Pot
-    from poker_ai.poker.cards import Card
+    from poker_ai.environment.player import Player
+    from poker_ai.environment.pot import Pot
+    from poker_ai.environment.cards import Card
 
 
 class PokerTable:

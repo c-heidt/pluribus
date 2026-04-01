@@ -4,7 +4,7 @@ import threading
 
 from flask import Flask, render_template
 from flask_socketio import SocketIO, emit
-from poker_ai.games.short_deck.state import ShortDeckPokerState
+from poker_ai.environment.game_state import PokerState
 
 from backend import convert
 
@@ -36,7 +36,7 @@ class PokerPlot:
         self._thread = threading.Thread(target=socketio.run, args=args, kwargs=kwargs)
         self._thread.start()
 
-    def update_state(self, state: ShortDeckPokerState):
+    def update_state(self, state: PokerState):
         """Update the state that should be visualised."""
         state_dict = {
             "player_playing": state.player_i,

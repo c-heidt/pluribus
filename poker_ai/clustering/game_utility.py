@@ -2,8 +2,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from poker_ai.poker.evaluation import Evaluator
-from poker_ai.poker.evaluation.short_deck_evaluator import ShortDeckEvaluator
+from poker_ai.environment.evaluation import Evaluator
 
 
 class GameUtility:
@@ -32,17 +31,10 @@ class GameUtility:
         cards : np.ndarray
             All cards in the deck (as integers/eval_card values).
         evaluator : Optional[Evaluator]
-            Evaluator to use. If None, selects based on deck size:
-            - 20 or 36 cards: ShortDeckEvaluator
-            - 52 cards: Standard Evaluator
+            Evaluator to use. If None, uses standard Evaluator.
         """
         if evaluator is None:
-            # Auto-select evaluator based on deck size
-            n_cards = len(cards)
-            if n_cards in [20, 36]:
-                self._evaluator = ShortDeckEvaluator()
-            else:
-                self._evaluator = Evaluator()
+            self._evaluator = Evaluator()
         else:
             self._evaluator = evaluator
         

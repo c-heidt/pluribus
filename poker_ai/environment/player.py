@@ -5,12 +5,12 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import List, TYPE_CHECKING
 
-from poker_ai.poker.actions import Call, Fold, Raise
-from poker_ai.poker.state import PokerGameState
+from poker_ai.environment.actions import Call, Fold, Raise
+from poker_ai.environment.legacy_state import PokerGameState
 
 if TYPE_CHECKING:
-    from poker_ai.poker.card import Card
-    from poker_ai.poker.pot import Pot
+    from poker_ai.environment.card import Card
+    from poker_ai.environment.pot import Pot
 
 
 logger = logging.getLogger(__name__)
@@ -28,8 +28,31 @@ class Player:
     of all players' contributions.
     """
 
-    def __init__(self, name: str, initial_chips: int, pot: Pot):
-        """Instanciate a player."""
+    def __init__(
+        self,
+        name: str = None,
+        initial_chips: int = 10000,
+        pot: Pot = None,
+        player_i: int = None,
+    ):
+        """Instantiate a player.
+
+        Parameters
+        ----------
+        name : str, optional
+            Player name. If None and player_i is provided, auto-generates
+            "player_{player_i}".
+        initial_chips : int
+            Starting chip count.
+        pot : Pot, optional
+            Shared pot instance.
+        player_i : int, optional
+            Player index, used for auto-naming.
+        """
+        if name is None and player_i is not None:
+            name = f"player_{player_i}"
+        elif name is None:
+            name = "unnamed"
         self.name: str = name
         self.n_chips: int = initial_chips
         self.cards: List[Card] = []
@@ -40,6 +63,7 @@ class Player:
         self.is_small_blind = False
         self.is_big_blind = False
         self.is_dealer = False
+        self.is_turn = False
 
     def __repr__(self):
         """"""

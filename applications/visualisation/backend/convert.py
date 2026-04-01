@@ -1,13 +1,13 @@
 from typing import Any, Dict
 
-from poker_ai.games.short_deck.player import ShortDeckPokerPlayer
-from poker_ai.poker.card import Card
+from poker_ai.environment.player import Player
+from poker_ai.environment.card import Card
 
 _colours = ["cyan", "lightcoral", "crimson", "#444", "forestgreen", "goldenrod", "gold"]
 _suit_lut = {"spades": "P", "diamonds": "D", "clubs": "C", "hearts": "H"}
 
 
-def to_player_dict(player_i: int, player: ShortDeckPokerPlayer) -> Dict[str, Any]:
+def to_player_dict(player_i: int, player: Player) -> Dict[str, Any]:
     """Create dictionary to describe player for frontend."""
     return {
         "name": player.name,

@@ -7,7 +7,7 @@ import time
 from itertools import combinations
 
 from poker_ai.clustering.card_combos import CardCombos
-from poker_ai.poker.evaluation import Evaluator
+from poker_ai.environment.evaluation import Evaluator
 
 
 def naive_river_ehs(evaluator, our_hand, board, card_ints):

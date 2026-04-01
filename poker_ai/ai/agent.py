@@ -3,7 +3,7 @@ from typing import Dict, Union
 
 from poker_ai.ai.index import InfosetIndex, lmdb_map_size_for_players
 from poker_ai.ai.regret_table import SparseRegretTable
-from poker_ai.games.base.state import PokerState
+from poker_ai.environment.game_state import PokerState
 
 # Max number of abstract actions per betting round, derived from the action
 # abstraction defined in RAISE_SIZES_BY_STAGE.  Built once at import time.

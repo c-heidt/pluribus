@@ -6,12 +6,12 @@ import logging
 import operator
 from typing import Dict, List, Optional, TYPE_CHECKING
 
-from poker_ai.poker.evaluation.evaluator import Evaluator
-from poker_ai.poker.state import PokerGameState
+from poker_ai.environment.evaluation.evaluator import Evaluator
+from poker_ai.environment.legacy_state import PokerGameState
 
 if TYPE_CHECKING:
-    from poker_ai.poker.player import Player
-    from poker_ai.poker.table import PokerTable
+    from poker_ai.environment.player import Player
+    from poker_ai.environment.table import PokerTable
 
 
 logger = logging.getLogger(__name__)

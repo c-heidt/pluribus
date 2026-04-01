@@ -13,11 +13,11 @@ import pytest
 import numpy as np
 import dill as pickle
 
-from poker_ai.games.short_deck.state import ShortDeckPokerState
-from poker_ai.games.short_deck.player import ShortDeckPokerPlayer
-from poker_ai.poker.card import Card
-from poker_ai.poker.pot import Pot
-from poker_ai.poker.evaluation.short_deck_evaluator import ShortDeckEvaluator
+from poker_ai.environment.game_state import PokerState
+from poker_ai.environment.player import Player
+from poker_ai.environment.card import Card
+from poker_ai.environment.pot import Pot
+from poker_ai.environment.evaluation.evaluator import Evaluator
 from poker_ai.utils.random import seed
 
 
@@ -30,14 +30,16 @@ def _new_game(
     """Create a new short deck game."""
     pot = Pot()
     players = [
-        ShortDeckPokerPlayer(player_i=player_i, pot=pot, initial_chips=initial_chips)
+        Player(player_i=player_i, pot=pot, initial_chips=initial_chips)
         for player_i in range(n_players)
     ]
-    state = ShortDeckPokerState(
+    state = PokerState(
         players=players,
         load_card_lut=False,
         small_blind=small_blind,
         big_blind=big_blind,
+        low_card_rank=10,
+        high_card_rank=14,
     )
     return state, pot
 
@@ -68,8 +70,8 @@ class TestShortDeckSpecifics:
         """Test that Short Deck uses custom evaluator with adjusted rankings."""
         state, _ = _new_game(n_players=2)
         
-        evaluator = state._get_evaluator()
-        assert isinstance(evaluator, ShortDeckEvaluator)
+        evaluator = Evaluator()
+        assert isinstance(evaluator, Evaluator)
     
     def test_short_deck_no_low_cards(self):
         """Test that low cards (2-9) don't appear in Short Deck."""
