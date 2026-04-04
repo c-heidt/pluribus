@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import joblib
 import numpy as np
 
-from poker_ai.environment import game_state as state
+from poker_ai.environment import poker_env as state
 
 log = logging.getLogger("poker_ai.utils.io")
 
@@ -35,7 +35,7 @@ class NumpyJSONEncoder(json.JSONEncoder):
 
 def load_info_set_lut(lut_path: Union[str, Path], pickle_dir: bool):
     """Load the info set abstraction lookup table."""
-    info_set_lut = state.PokerState.load_card_lut(lut_path, pickle_dir)
+    info_set_lut = state.PokerEnv.load_card_lut(lut_path, pickle_dir)
     return info_set_lut
 
 

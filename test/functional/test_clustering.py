@@ -36,7 +36,7 @@ def test_clustering_1(low_card_rank: int):
         low_card_rank=low_card_rank,
         high_card_rank=high_card_rank,
     )
-    n_cards = len(card_combos._cards)
+    n_cards = len(card_combos._card_ints)
     n_hole_cards = _get_num_combos(n_cards, 2)
     assert len(card_combos.starting_hands) == n_hole_cards
     # Number of hole card, and separately public card, combinations.

@@ -1,155 +1,186 @@
+"""Poker player data and betting logic."""
+
 from __future__ import annotations
 
 import logging
-import uuid
-from abc import ABC, abstractmethod
-from typing import List, TYPE_CHECKING
-
-from poker_ai.environment.actions import Call, Fold, Raise
-from poker_ai.environment.legacy_state import PokerGameState
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from poker_ai.environment.card import Card
     from poker_ai.environment.pot import Pot
-
 
 logger = logging.getLogger(__name__)
 
 
 class Player:
-    """Abstract base class for all poker-playing agents.
+    """A poker player: holds chips, hole cards, and positional flags.
 
-    All agents should inherit from this class and implement the take_action
-    method.
+    Hole cards are stored as a tuple of 32-bit card integers (see
+    ``utils.py`` for the encoding). Betting methods take the shared
+    ``Pot`` as an explicit argument.
 
-    A poker player has a name, holds chips to bet with, and has private cards
-    to play with. The n_chips of contributions to the pot for a given hand of
-    poker are stored cumulative, as the total pot to cash out is just the sum
-    of all players' contributions.
+    Attributes
+    ----------
+    player_i : int
+        Zero-based player index; used as the key in the shared Pot.
+    name : str
+        Display name.
+    n_chips : int
+        Chips currently in the player's stack (not in the pot).
+    n_bet_chips : int
+        Chips committed to the pot in the current betting round.
+    is_small_blind : bool
+        Whether this player posted the small blind.
+    is_big_blind : bool
+        Whether this player posted the big blind.
+    is_dealer : bool
+        Whether this player is the dealer (button).
+    is_turn : bool
+        Whether it is currently this player's turn to act.
+    order : int
+        Betting order index (set by ``dynamics.assign_order``).
     """
+
+    __slots__ = (
+        "player_i",
+        "name",
+        "n_chips",
+        "n_bet_chips",
+        "_cards",
+        "_is_active",
+        "is_small_blind",
+        "is_big_blind",
+        "is_dealer",
+        "is_turn",
+        "order",
+    )
 
     def __init__(
         self,
-        name: str = None,
+        player_i: int,
         initial_chips: int = 10000,
-        pot: Pot = None,
-        player_i: int = None,
+        name: str = None,
     ):
-        """Instantiate a player.
+        """Initialise a player.
 
         Parameters
         ----------
-        name : str, optional
-            Player name. If None and player_i is provided, auto-generates
-            "player_{player_i}".
+        player_i : int
+            Zero-based player index used as the key in the shared Pot.
         initial_chips : int
             Starting chip count.
-        pot : Pot, optional
-            Shared pot instance.
-        player_i : int, optional
-            Player index, used for auto-naming.
+        name : str, optional
+            Display name. Defaults to ``"player_{player_i}"``.
         """
-        if name is None and player_i is not None:
-            name = f"player_{player_i}"
-        elif name is None:
-            name = "unnamed"
-        self.name: str = name
+        self.player_i: int = player_i
+        self.name: str = name if name is not None else f"player_{player_i}"
         self.n_chips: int = initial_chips
-        self.cards: List[Card] = []
-        self._is_active = True
-        self.id = int(uuid.uuid4().hex, 16)
-        self.pot = pot
-        self.order = None
-        self.is_small_blind = False
-        self.is_big_blind = False
-        self.is_dealer = False
-        self.is_turn = False
+        self.n_bet_chips: int = 0
+        self._cards: tuple = ()
+        self._is_active: bool = True
+        self.is_small_blind: bool = False
+        self.is_big_blind: bool = False
+        self.is_dealer: bool = False
+        self.is_turn: bool = False
+        self.order: int = 0
 
-    def __repr__(self):
-        """"""
-        return '<Player name="{}" n_chips={:05d} n_bet_chips={:05d} ' \
-            'folded={}>'.format(
-                self.name,
-                self.n_chips,
-                self.n_bet_chips,
-                int(not self._is_active))
+    def __repr__(self) -> str:
+        return (
+            f'<Player name="{self.name}" n_chips={self.n_chips:05d} '
+            f"n_bet_chips={self.n_bet_chips:05d} folded={int(not self._is_active)}>"
+        )
 
-    def add_chips(self, chips: int):
-        """Add chips."""
+    # ------------------------------------------------------------------
+    # Chip management
+    # ------------------------------------------------------------------
+
+    def add_chips(self, chips: int) -> None:
+        """Add chips to this player's stack.
+
+        Parameters
+        ----------
+        chips : int
+            Number of chips to add.
+        """
         self.n_chips += chips
 
-    def fold(self):
-        """Deactivate player for this hand by folding cards."""
-        self.is_active = False
-        return Fold()
+    def add_to_pot(self, pot: Pot, n_chips: int) -> int:
+        """Commit chips to the pot, capped to the player's remaining stack.
 
-    def call(self, players: List[Player]):
-        """Call the highest bet among all active players."""
-        if self.is_all_in:
-            return Call()
-        else:
-            biggest_bet = max(p.n_bet_chips for p in players)
-            n_chips_to_call = biggest_bet - self.n_bet_chips
-            self.add_to_pot(n_chips_to_call)
-            return Call()
+        Parameters
+        ----------
+        pot : Pot
+            The shared pot instance.
+        n_chips : int
+            Desired number of chips to add.
 
-    def raise_to(self, n_chips: int):
-        """Raise your bet to a certain n_chips."""
-        n_chips = self.add_to_pot(n_chips)
-        raise_action = Raise()
-        raise_action(n_chips)
-        return raise_action
-
-    def _try_to_make_full_bet(self, n_chips: int):
-        """Ensures no bet is greater than the n_chips of chips left."""
-        if self.n_chips - n_chips < 0:
-            # We can't bet more than we have.
-            n_chips = self.n_chips
-        return n_chips
-
-    def add_to_pot(self, n_chips: int):
-        """Add to the n_chips put into the pot by this player."""
-        if n_chips < 0:
-            raise ValueError(f'Can not subtract chips from pot.')
-        # TODO(fedden): This code is called by engine.py for the small and big
-        #               blind. What if the player can't actually add the blind?
-        #               What do the rules stipulate in these circumstances.
-        #               Ensure that this is sorted.
-        n_chips = self._try_to_make_full_bet(n_chips)
-        self.pot.add_chips(self, n_chips)
-        self.n_chips -= n_chips
-        return n_chips
-
-    def add_private_card(self, card: Card):
-        """Add a private card to this player."""
-        self.cards.append(card)
-
-    # @abstractmethod
-    def take_action(self, game_state: PokerGameState) -> PokerGameState:
-        """All poker strategy is implemented here.
-
-        Smart agents have to implement this method to compete. To take an
-        action, agents receive the current game state and have to emit the next
-        state.
+        Returns
+        -------
+        int
+            Actual number of chips added (may be less if going all-in).
         """
-        pass
+        if n_chips < 0:
+            raise ValueError("Cannot subtract chips from pot.")
+        actual = min(n_chips, self.n_chips)
+        pot.add_chips(self.player_i, actual)
+        self.n_chips -= actual
+        self.n_bet_chips += actual
+        return actual
+
+    # ------------------------------------------------------------------
+    # Actions (called from dynamics.py or poker_env.py)
+    # ------------------------------------------------------------------
+
+    def fold(self) -> None:
+        """Fold: deactivate this player for the rest of the hand."""
+        self._is_active = False
+
+    def call(self, players: list, pot: Pot) -> None:
+        """Call the highest current bet.
+
+        Parameters
+        ----------
+        players : list[Player]
+            All players at the table (to find the biggest bet).
+        pot : Pot
+            The shared pot instance.
+        """
+        if self.is_all_in:
+            return
+        biggest_bet = max(p.n_bet_chips for p in players)
+        n_chips_to_call = biggest_bet - self.n_bet_chips
+        self.add_to_pot(pot, n_chips_to_call)
+
+    def raise_to(self, pot: Pot, n_chips: int) -> None:
+        """Raise the total bet for this round to ``n_chips``.
+
+        Parameters
+        ----------
+        pot : Pot
+            The shared pot instance.
+        n_chips : int
+            Total chips to commit this round (includes implied call amount).
+        """
+        self.add_to_pot(pot, n_chips)
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def cards(self) -> tuple:
+        """Hole cards as a tuple of eval_card integers."""
+        return self._cards
 
     @property
     def is_active(self) -> bool:
-        """Getter for if the player is playing or not."""
+        """Whether the player is still in the hand (has not folded)."""
         return self._is_active
 
     @is_active.setter
-    def is_active(self, x):
-        """Setter for if the player is playing or not."""
-        self._is_active = x
+    def is_active(self, value: bool) -> None:
+        self._is_active = value
 
     @property
     def is_all_in(self) -> bool:
-        """Return if the player is all in or not."""
+        """True if the player is active but has no chips remaining."""
         return self._is_active and self.n_chips == 0
-
-    @property
-    def n_bet_chips(self) -> int:
-        """Returns the n_chips this player has bet so far."""
-        return self.pot[self]

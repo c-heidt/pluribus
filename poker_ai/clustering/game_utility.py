@@ -2,7 +2,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from poker_ai.environment.evaluation import Evaluator
+from poker_ai.environment.evaluator import Evaluator
 
 
 class GameUtility:

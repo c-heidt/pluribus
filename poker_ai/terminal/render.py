@@ -4,7 +4,7 @@ from typing import Dict, List
 
 from blessed import Terminal
 
-from poker_ai.environment.game_state import PokerState
+from poker_ai.environment.poker_env import PokerEnv as PokerState
 from poker_ai.terminal.ascii_objects.card_collection import AsciiCardCollection
 from poker_ai.terminal.ascii_objects.logger import AsciiLogger
 from poker_ai.terminal.ascii_objects.player import AsciiPlayer

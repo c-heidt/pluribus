@@ -7,7 +7,7 @@ import joblib
 import numpy as np
 from blessed import Terminal
 
-from poker_ai.environment.game_state import new_game, PokerState
+from poker_ai.environment.poker_env import new_game, PokerEnv as PokerState
 from poker_ai.terminal.ascii_objects.card_collection import AsciiCardCollection
 from poker_ai.terminal.ascii_objects.player import AsciiPlayer
 from poker_ai.terminal.ascii_objects.logger import AsciiLogger

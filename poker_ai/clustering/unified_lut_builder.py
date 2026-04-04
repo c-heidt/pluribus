@@ -101,7 +101,7 @@ class MemmapLookup:
     # ------------------------------------------------------------------
 
     def __getitem__(self, combo):
-        """Return the cluster ID for *combo* (tuple of Card objects or ints)."""
+        """Return the cluster ID for *combo* (tuple of eval_card ints)."""
         self._load()
         ints = [int(c) for c in combo]
         row = self._get_row_index(ints[:2], ints[2:])
@@ -295,7 +295,7 @@ class UnifiedLutBuilder(CardCombos):
         )
 
         # Evaluator ----------------------------------------------------------
-        from poker_ai.environment.evaluation import Evaluator
+        from poker_ai.environment.evaluator import Evaluator
         self._evaluator = Evaluator()
 
         # File paths ----------------------------------------------------------

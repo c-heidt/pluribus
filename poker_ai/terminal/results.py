@@ -5,7 +5,7 @@ from typing import Dict, Any
 import numpy as np
 import yaml
 
-from poker_ai.environment.game_state import PokerState
+from poker_ai.environment.poker_env import PokerEnv as PokerState
 
 
 class UserResults:

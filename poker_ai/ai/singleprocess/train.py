@@ -16,7 +16,7 @@ from tqdm import tqdm, trange
 from poker_ai.ai.agent import Agent
 from poker_ai.ai import ai
 from poker_ai import utils
-from poker_ai.environment.game_state import new_game, PokerState
+from poker_ai.environment.poker_env import new_game, PokerEnv as PokerState
 
 
 def print_strategy(strategy: Dict[str, Dict[str, int]]):

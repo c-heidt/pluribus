@@ -35,6 +35,7 @@ map_size
 """
 
 import logging
+import multiprocessing as mp
 import os
 import struct
 from pathlib import Path
@@ -144,6 +145,11 @@ class InfosetIndex:
             self._path,
         )
         self._map_size: int = resolved_map_size
+        # Shared counter mirroring __next_row__ in LMDB.  Initialised here
+        # (pre-fork, safe to read LMDB) so the checkpoint can query it from
+        # the server process without opening a new LMDB transaction (which
+        # triggers MDB_BAD_RSLOT after workers have called reopen_after_fork).
+        self._n_entries_mp: mp.Value = mp.Value("Q", self.n_entries)
 
     # ------------------------------------------------------------------
     # Public API
@@ -242,6 +248,8 @@ class InfosetIndex:
             packed_val = struct.pack("<II", chunk_id, row)
             txn.put(key, packed_val)
             txn.put(_NEXT_ROW_KEY, struct.pack("<Q", next_global_row + 1))
+            with self._n_entries_mp.get_lock():
+                self._n_entries_mp.value = next_global_row + 1
 
             if self._debug:
                 # Store original string under shadow key to detect future

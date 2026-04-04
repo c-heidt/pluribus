@@ -4,7 +4,7 @@ import threading
 
 from flask import Flask, render_template
 from flask_socketio import SocketIO, emit
-from poker_ai.environment.game_state import PokerState
+from poker_ai.environment.poker_env import PokerEnv as PokerState
 
 from backend import convert
 
@@ -45,7 +45,7 @@ class PokerPlot:
                 for i, p in enumerate(state.players)
             ],
             "five_cards": [
-                convert.to_card_dict(c) for c in state._table.community_cards
+                convert.to_card_dict(c) for c in state.community_cards
             ],
         }
         with self._app.app_context():

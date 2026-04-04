@@ -1,0 +1,17 @@
+c: -300000000
+checkpoint_interval: 10000
+discount_duration_iters: 10000
+discount_interval: 10
+dump_iteration: 1000
+lut_path: data/clustering/20cards_exact
+max_runtime_hours: 0.1
+n_iterations: 10000
+n_players: 6
+n_processes: null
+nickname: 6player_20cards
+pickle_dir: false
+prune_threshold: 5000
+single_process: false
+strategy_interval: 5000
+sync_interval: 250
+update_threshold: 1000

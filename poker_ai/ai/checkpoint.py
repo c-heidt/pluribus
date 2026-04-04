@@ -144,10 +144,20 @@ class CheckpointManager:
                         # not opened it yet (workers create chunks; the server
                         # never touches them on the hot path).
                         table._ensure_chunk(chunk_id)
-                        # Use per-table n_allocated, not _index.n_entries which
-                        # is shared across all eight tables and gives wrong counts.
+                        # All eight tables share one InfosetIndex, so the
+                        # same (chunk_id, row) coordinates are valid for every
+                        # table.  Per-table n_allocated is wrong for strategy
+                        # tables because regret tables register info sets first
+                        # (is_new=False on subsequent tables), leaving strategy
+                        # n_allocated at 0.
+                        #
+                        # index.n_entries reads LMDB, which triggers
+                        # MDB_BAD_RSLOT after workers have forked and called
+                        # reopen_after_fork().  Use the shared mp.Value mirror
+                        # instead — correct on fresh runs and after resume.
+                        n_index_entries = self._server._agent._index._n_entries_mp.value
                         valid_rows = min(
-                            table.n_allocated - chunk_id * CHUNK_SIZE,
+                            n_index_entries - chunk_id * CHUNK_SIZE,
                             CHUNK_SIZE,
                         )
                         if valid_rows <= 0:
@@ -252,6 +262,11 @@ class CheckpointManager:
             for chunk_id in range(n_chunks.get(r, 0)):
                 if not (path / f"regret_{r}_chunk_{chunk_id:06d}.npy").exists():
                     return False
+        n_strategy_chunks = state_dict.get("n_strategy_chunks_per_street", {})
+        for r in range(4):
+            for chunk_id in range(n_strategy_chunks.get(r, 0)):
+                if not (path / f"strategy_{r}_chunk_{chunk_id:06d}.npy").exists():
+                    return False
         return True
 
     def _restore_from_checkpoint(self, path: Path) -> None:
@@ -277,7 +292,14 @@ class CheckpointManager:
 
             n_strategy = state_dict.get("n_strategy_chunks_per_street", {}).get(r, 0)
             for chunk_id in range(n_strategy):
-                arr = np.load(path / f"strategy_{r}_chunk_{chunk_id:06d}.npy")
+                strategy_path = path / f"strategy_{r}_chunk_{chunk_id:06d}.npy"
+                if not strategy_path.exists():
+                    log.warning(
+                        f"Strategy chunk missing from checkpoint: {strategy_path} "
+                        f"— leaving table zero-initialised for this chunk"
+                    )
+                    continue
+                arr = np.load(strategy_path)
                 self._server._agent.strategy_tables[r]._restore_chunk(chunk_id, arr)
 
         log.info(
