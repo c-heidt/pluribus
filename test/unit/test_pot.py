@@ -153,6 +153,17 @@ class TestComputeUtility:
         payouts = pot.compute_utility(players, ranked)
         assert sum(payouts.values()) == pot.total
 
+    def test_chip_conservation_all_payout_cases(self):
+        pot = Pot(3)
+        players = [_player(i) for i in range(3)]
+        pot.add_chips(0, 100)
+        pot.add_chips(1, 100)
+        pot.add_chips(2, 100)
+        total = pot.total
+        ranked = [[players[0]], [players[1]], [players[2]]]
+        payouts = pot.compute_utility(players, ranked)
+        assert sum(payouts.values()) == total
+
     def test_all_in_player_wins_main_pot_only(self):
         # player 0 all-in for 50; player 1 and 2 contribute 100
         # player 0 has best hand but was all-in
@@ -169,3 +180,55 @@ class TestComputeUtility:
         # p1 wins side pot: 50 * 2 = 100
         assert payouts[1] == 100
         assert payouts[2] == 0
+
+
+class TestSidePotEdgeCases:
+    def test_folded_player_chips_awarded_to_winner(self):
+        # Player 2 folded; only active players contest the pot, but
+        # folded player's chips remain in the pot and go to winner.
+        pot = Pot(3)
+        players = [_player(i) for i in range(3)]
+        pot.add_chips(0, 100)
+        pot.add_chips(1, 100)
+        pot.add_chips(2, 100)
+        players[2].fold()
+        # ranked_groups only has active players; player 0 wins
+        ranked = [[players[0]], [players[1]]]
+        payouts = pot.compute_utility(players, ranked)
+        assert payouts[0] == 300
+        assert payouts[1] == 0
+        assert payouts[2] == 0
+
+    def test_side_pots_boundary_minimum_contribution(self):
+        # P0=50, P1=50, P2=100 → main pot (50*3=150) + side pot (50*1=50)
+        pot = Pot(3)
+        pot.add_chips(0, 50)
+        pot.add_chips(1, 50)
+        pot.add_chips(2, 100)
+        sp = pot.side_pots
+        assert len(sp) == 2
+        assert sum(sp[0].values()) == 150
+        assert sum(sp[1].values()) == 50
+
+    def test_compute_utility_single_winner_odd_total(self):
+        # Odd total with 1 winner — all chips including remainder go to winner
+        pot = Pot(2)
+        players = [_player(i) for i in range(2)]
+        pot.add_chips(0, 51)
+        pot.add_chips(1, 50)
+        ranked = [[players[0]], [players[1]]]
+        payouts = pot.compute_utility(players, ranked)
+        assert payouts[0] == 101
+        assert payouts[1] == 0
+
+    def test_chip_conservation_three_way_unequal(self):
+        # Three players with different contributions; total is conserved
+        pot = Pot(3)
+        players = [_player(i) for i in range(3)]
+        pot.add_chips(0, 30)
+        pot.add_chips(1, 60)
+        pot.add_chips(2, 90)
+        total = pot.total
+        ranked = [[players[0]], [players[1]], [players[2]]]
+        payouts = pot.compute_utility(players, ranked)
+        assert sum(payouts.values()) == total

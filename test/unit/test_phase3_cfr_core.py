@@ -30,7 +30,6 @@ from poker_ai.ai.ai import (
     cfr,
     cfrp,
     merge_local_delta,
-    serialise,
     update_strategy,
 )
 
@@ -586,28 +585,6 @@ class TestUpdateStrategy:
 
 
 # ---------------------------------------------------------------------------
-# serialise (Phase 5 stub — implementation deferred to Phase 6)
-# ---------------------------------------------------------------------------
-
-
-class TestSerialise:
-    def test_serialise_does_not_raise(self, tmp_path):
-        """serialise is a stub in Phase 5 and must not raise."""
-        tables = _fresh_tables()
-        serialise(tables, tmp_path, t=1, server_state={})  # must not raise
-
-    def test_serialise_accepts_required_args(self, tmp_path):
-        """serialise must accept (tables, save_path, t, server_state) keywords."""
-        import inspect
-        sig = inspect.signature(serialise)
-        params = set(sig.parameters)
-        assert "tables" in params
-        assert "save_path" in params
-        assert "t" in params
-        assert "server_state" in params
-
-
-# ---------------------------------------------------------------------------
 # Bug regression tests
 # ---------------------------------------------------------------------------
 
@@ -691,7 +668,6 @@ def test_cfr_1000_iterations_small_game():
     - local_delta + merge gives non-empty regret after 1000 iterations
     - All regret values are finite
     - update_strategy populates strategy_tables[0]
-    - serialise (stub) does not crash
     """
     from poker_ai.environment.poker_env import new_game
 
@@ -719,5 +695,3 @@ def test_cfr_1000_iterations_small_game():
 
     # regret_tables[0] must be non-empty
     assert tables.regret[0].n_allocated > 0, "Regret table must be non-empty after 1000 iterations"
-    # serialise is a stub — must not raise
-    serialise(tables, Path(tempfile.mkdtemp()), t=1000, server_state={"n_iterations": 1000})

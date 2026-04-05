@@ -501,3 +501,171 @@ class TestClosestLegalAction:
         env2 = env.apply_action("fold")
         # Continue past the skip; eventually game is terminal or another player acts
         assert env2 is not None
+
+
+# ---------------------------------------------------------------------------
+# Positional flags (Bug 1 regression)
+# ---------------------------------------------------------------------------
+
+class TestPositionalFlagsAfterConstruction:
+    def test_heads_up_dealer_is_player_0(self):
+        env = new_game(n_players=2, card_info_lut={})
+        assert env.players[0].is_dealer is True
+
+    def test_heads_up_dealer_is_not_player_1(self):
+        env = new_game(n_players=2, card_info_lut={})
+        assert env.players[1].is_dealer is False
+
+    def test_heads_up_dealer_same_player_as_small_blind(self):
+        env = new_game(n_players=2, card_info_lut={})
+        dealer = next(p for p in env.players if p.is_dealer)
+        sb = next(p for p in env.players if p.is_small_blind)
+        assert dealer.name == sb.name
+
+    @pytest.mark.parametrize("n", [3, 4, 6])
+    def test_multiway_dealer_is_last_player(self, n):
+        env = new_game(n_players=n, card_info_lut={})
+        assert env.players[-1].is_dealer is True
+
+    @pytest.mark.parametrize("n", [2, 3, 4, 6])
+    def test_exactly_one_dealer(self, n):
+        env = new_game(n_players=n, card_info_lut={})
+        assert sum(p.is_dealer for p in env.players) == 1
+
+    @pytest.mark.parametrize("n", [2, 3, 4, 6])
+    def test_exactly_one_small_blind(self, n):
+        env = new_game(n_players=n, card_info_lut={})
+        assert sum(p.is_small_blind for p in env.players) == 1
+
+    @pytest.mark.parametrize("n", [2, 3, 4, 6])
+    def test_exactly_one_big_blind(self, n):
+        env = new_game(n_players=n, card_info_lut={})
+        assert sum(p.is_big_blind for p in env.players) == 1
+
+    def test_small_blind_player_posted_blind(self):
+        env = new_game(n_players=2, card_info_lut={}, small_blind=50, initial_chips=10000)
+        sb = next(p for p in env.players if p.is_small_blind)
+        assert sb.n_chips == 10000 - 50
+
+
+# ---------------------------------------------------------------------------
+# Bet reset at stage transitions (Bug 3 regression)
+# ---------------------------------------------------------------------------
+
+class TestBetResetViaApplyAction:
+    def _advance_to_stage(self, env, target_stage):
+        while env.betting_stage != target_stage and not env.is_terminal:
+            env = env.apply_action("call")
+        return env
+
+    def test_n_bet_chips_zero_at_flop_start(self):
+        env = new_game(n_players=2, card_info_lut={})
+        env = self._advance_to_stage(env, "flop")
+        assert env.betting_stage == "flop"
+        for p in env.players:
+            assert p.n_bet_chips == 0
+
+    def test_n_bet_chips_zero_at_turn_start(self):
+        env = new_game(n_players=2, card_info_lut={})
+        env = self._advance_to_stage(env, "turn")
+        assert env.betting_stage == "turn"
+        for p in env.players:
+            assert p.n_bet_chips == 0
+
+    def test_n_bet_chips_zero_at_river_start(self):
+        env = new_game(n_players=2, card_info_lut={})
+        env = self._advance_to_stage(env, "river")
+        assert env.betting_stage == "river"
+        for p in env.players:
+            assert p.n_bet_chips == 0
+
+    def test_raise_before_stage_transition_is_reset(self):
+        env = new_game(n_players=2, card_info_lut={})
+        # Raise pre-flop so n_bet_chips > 0
+        raise_actions = [a for a in env.legal_actions if a and a.startswith("raise:")]
+        if raise_actions:
+            env = env.apply_action(raise_actions[0])
+            assert any(p.n_bet_chips > 0 for p in env.players)
+        # Drive to flop and verify reset
+        env = self._advance_to_stage(env, "flop")
+        if env.betting_stage == "flop":
+            for p in env.players:
+                assert p.n_bet_chips == 0
+
+    def test_n_bet_chips_zero_three_player_game(self):
+        env = new_game(n_players=3, card_info_lut={})
+        env = self._advance_to_stage(env, "flop")
+        if env.betting_stage == "flop":
+            for p in env.players:
+                assert p.n_bet_chips == 0
+
+    def test_n_bet_chips_zero_at_all_stages(self):
+        env = new_game(n_players=2, card_info_lut={})
+        for target in ("flop", "turn", "river"):
+            env = self._advance_to_stage(env, target)
+            if env.betting_stage == target:
+                for p in env.players:
+                    assert p.n_bet_chips == 0
+
+
+# ---------------------------------------------------------------------------
+# All-in board completion (Bug 4 regression)
+# ---------------------------------------------------------------------------
+
+class TestAllInBoardCompletion:
+    def _advance_to_stage(self, env, target_stage):
+        while env.betting_stage != target_stage and not env.is_terminal:
+            env = env.apply_action("call")
+        return env
+
+    def test_all_in_preflop_has_5_community_cards(self):
+        env = new_game(n_players=2, card_info_lut={})
+        assert "all_in" in env.legal_actions
+        env = env.apply_action("all_in")
+        assert env.is_terminal
+        assert len(env.community_cards) == 5
+
+    def test_all_in_at_flop_has_5_community_cards(self):
+        env = new_game(n_players=2, card_info_lut={})
+        env = self._advance_to_stage(env, "flop")
+        assert env.betting_stage == "flop"
+        assert "all_in" in env.legal_actions
+        env = env.apply_action("all_in")
+        assert env.is_terminal
+        assert len(env.community_cards) == 5
+
+    def test_all_in_at_turn_has_5_community_cards(self):
+        env = new_game(n_players=2, card_info_lut={})
+        env = self._advance_to_stage(env, "turn")
+        assert env.betting_stage == "turn"
+        assert "all_in" in env.legal_actions
+        env = env.apply_action("all_in")
+        assert env.is_terminal
+        assert len(env.community_cards) == 5
+
+    def test_all_in_at_river_has_5_community_cards(self):
+        env = new_game(n_players=2, card_info_lut={})
+        env = self._advance_to_stage(env, "river")
+        assert env.betting_stage == "river"
+        assert "all_in" in env.legal_actions
+        env = env.apply_action("all_in")
+        assert env.is_terminal
+        assert len(env.community_cards) == 5
+
+    def test_fold_terminal_has_5_community_cards(self):
+        env = new_game(n_players=2, card_info_lut={})
+        env = env.apply_action("fold")
+        assert env.is_terminal
+        assert len(env.community_cards) == 5
+
+    def test_community_cards_unique_after_all_in(self):
+        env = new_game(n_players=2, card_info_lut={})
+        env = env.apply_action("all_in")
+        assert len(env.community_cards) == len(set(env.community_cards))
+
+    def test_community_cards_no_overlap_with_hole_cards(self):
+        env = new_game(n_players=2, card_info_lut={})
+        hole_cards = {c for p in env.players for c in p.cards}
+        env = env.apply_action("all_in")
+        for c in env.community_cards:
+            assert c not in hole_cards

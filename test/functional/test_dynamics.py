@@ -318,6 +318,27 @@ class TestComputeWinners:
         final_total = sum(p.n_chips for p in env.players)
         assert final_total == initial_chips + pot_total
 
+    def test_compute_winners_awards_folded_player_chips_to_winner(self):
+        # Even when a player folded, their chips in the pot go to the winner.
+        community = tuple(make_card(r, "spades") for r in [14, 13, 12, 11, 10])
+        env = _setup_showdown(
+            community,
+            (make_card(2, "clubs"), make_card(3, "clubs")),
+            (make_card(4, "clubs"), make_card(5, "clubs")),
+            (make_card(6, "clubs"), make_card(7, "clubs")),
+        )
+        env.pot.reset()
+        env.pot.add_chips(0, 100)
+        env.pot.add_chips(1, 100)
+        env.pot.add_chips(2, 100)
+        env.players[2].fold()
+        # Chips before payout
+        chips_before = {p.player_i: p.n_chips for p in env.players}
+        dynamics.compute_winners(env)
+        total_after = sum(p.n_chips for p in env.players)
+        # All 300 chips must be distributed
+        assert total_after == sum(chips_before.values()) + 300
+
     def test_split_pot_two_tied_players(self):
         # Both players share exactly the same best hand via the board
         community = tuple(make_card(r, "spades") for r in [14, 13, 12, 11, 10])
@@ -335,3 +356,84 @@ class TestComputeWinners:
         # Both gain equal amounts (500 each)
         assert env.players[0].n_chips == chips_0_before + 500
         assert env.players[1].n_chips == chips_1_before + 500
+
+
+# ---------------------------------------------------------------------------
+# Bet reset at each stage (Bug 3 regression at dynamics level)
+# ---------------------------------------------------------------------------
+
+class TestBetChipsResetInAdvanceStage:
+    def _env_with_bets(self, stage):
+        """Build a fresh env, set stage directly, and give players non-zero bets."""
+        env = _env(2)
+        env._betting_stage = stage
+        for p in env.players:
+            p.n_bet_chips = 200
+        return env
+
+    def test_advance_from_preflop_resets_n_bet_chips(self):
+        env = self._env_with_bets("pre_flop")
+        dynamics.advance_stage(env)
+        for p in env.players:
+            assert p.n_bet_chips == 0
+
+    def test_advance_from_flop_resets_n_bet_chips(self):
+        env = self._env_with_bets("flop")
+        dynamics.advance_stage(env)
+        for p in env.players:
+            assert p.n_bet_chips == 0
+
+    def test_advance_from_turn_resets_n_bet_chips(self):
+        env = self._env_with_bets("turn")
+        dynamics.advance_stage(env)
+        for p in env.players:
+            assert p.n_bet_chips == 0
+
+    def test_advance_from_river_resets_n_bet_chips(self):
+        env = self._env_with_bets("river")
+        dynamics.advance_stage(env)
+        for p in env.players:
+            assert p.n_bet_chips == 0
+
+    def test_more_betting_needed_false_after_advance(self):
+        env = _env(2)
+        env._betting_stage = "pre_flop"
+        env.players[0].n_bet_chips = 100
+        env.players[1].n_bet_chips = 200
+        assert dynamics.more_betting_needed(env) is True
+        dynamics.advance_stage(env)
+        assert dynamics.more_betting_needed(env) is False
+
+
+# ---------------------------------------------------------------------------
+# rank_players_by_best_hand with folded players
+# ---------------------------------------------------------------------------
+
+class TestRankPlayersWithFolds:
+    def test_rank_players_ignores_folded_players(self):
+        community = tuple(make_card(r, "spades") for r in [14, 13, 12, 11, 10])
+        env = _setup_showdown(
+            community,
+            (make_card(2, "hearts"), make_card(3, "hearts")),
+            (make_card(4, "hearts"), make_card(5, "hearts")),
+            (make_card(6, "hearts"), make_card(7, "hearts")),
+        )
+        env.players[0].fold()
+        ranked = dynamics.rank_players_by_best_hand(env)
+        # Only 2 active players; folded player 0 must not appear
+        all_ranked = [p for group in ranked for p in group]
+        assert all(p.player_i != 0 for p in all_ranked)
+        assert len(all_ranked) == 2
+
+    def test_assign_blinds_caps_to_stack_when_short(self):
+        # Player with fewer chips than the big blind posts all they can
+        env = _env(2)
+        env.pot.reset()
+        env.players[0].n_chips = 30   # less than big_blind (100)
+        env.players[0].n_bet_chips = 0
+        env.players[1].n_chips = 10000
+        env.players[1].n_bet_chips = 0
+        dynamics.assign_blinds(env)
+        # Small blind player had only 30; they contribute all 30
+        assert env.players[0].n_chips == 0
+        assert env.pot[0] == 30

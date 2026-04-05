@@ -168,3 +168,76 @@ class TestProperties:
         player._cards = (make_card(14, "spades"), make_card(13, "hearts"))
         assert isinstance(player.cards, tuple)
         assert len(player.cards) == 2
+
+
+class TestPositionalFlags:
+    def test_is_dealer_settable(self):
+        p = Player(0)
+        p.is_dealer = True
+        assert p.is_dealer is True
+
+    def test_is_small_blind_settable(self):
+        p = Player(0)
+        p.is_small_blind = True
+        assert p.is_small_blind is True
+
+    def test_is_big_blind_settable(self):
+        p = Player(0)
+        p.is_big_blind = True
+        assert p.is_big_blind is True
+
+    def test_flags_independent(self):
+        p = Player(0)
+        p.is_dealer = True
+        assert p.is_small_blind is False
+        assert p.is_big_blind is False
+        assert p.is_turn is False
+
+    def test_order_default_zero(self):
+        p = Player(0)
+        assert p.order == 0
+
+    def test_order_set_by_game(self):
+        from poker_ai.environment import dynamics
+        from poker_ai.environment.poker_env import new_game
+        env = new_game(n_players=3, card_info_lut={})
+        for i, player in enumerate(env.players):
+            assert player.order == i
+
+
+class TestCallEdgeCases:
+    def test_call_when_already_at_biggest_bet_is_noop(self):
+        players = [Player(0, 10000), Player(1, 10000)]
+        pot = Pot(2)
+        players[0].add_to_pot(pot, 100)
+        players[1].add_to_pot(pot, 100)
+        chips_before = players[0].n_chips
+        bet_before = players[0].n_bet_chips
+        players[0].call(players, pot)
+        assert players[0].n_chips == chips_before
+        assert players[0].n_bet_chips == bet_before
+
+    def test_call_when_no_bets_is_noop(self):
+        players = [Player(0, 10000), Player(1, 10000)]
+        pot = Pot(2)
+        chips_before = players[0].n_chips
+        bet_before = players[0].n_bet_chips
+        players[0].call(players, pot)
+        assert players[0].n_chips == chips_before
+        assert players[0].n_bet_chips == bet_before
+
+    def test_cards_unchanged_after_call(self):
+        players = [Player(0, 10000), Player(1, 10000)]
+        pot = Pot(2)
+        cards = (make_card(14, "spades"), make_card(13, "hearts"))
+        players[0]._cards = cards
+        players[1].add_to_pot(pot, 200)
+        players[0].call(players, pot)
+        assert players[0].cards == cards
+
+    def test_cards_unchanged_after_fold(self):
+        p = Player(0, 10000)
+        cards = (make_card(14, "spades"), make_card(13, "hearts"))
+        p._cards = cards
+        p.fold()
+        assert p.cards == cards

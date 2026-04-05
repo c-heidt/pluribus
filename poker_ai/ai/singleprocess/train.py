@@ -116,14 +116,6 @@ def simple_search(
             discount_step += 1
             d = discount_step / (discount_step + 1)
             tables.apply_discount(d)
-        if (t > update_threshold) and (t % dump_iteration == 0):
-            # dump the current strategy (sigma) throughout training and then
-            # take an average. This allows for estimation of expected value in
-            # leaf nodes later on using modified versions of the blueprint
-            # strategy.
-            ai.serialise(
-                tables=tables, save_path=save_path, t=t, server_state=config,
-            )
 
 
 if __name__ == "__main__":

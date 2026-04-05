@@ -133,3 +133,30 @@ class TestRemaining:
         deck2 = Deck(2, 14)
         # It is astronomically unlikely both are in the same order
         assert not np.array_equal(deck1.remaining, deck2.remaining)
+
+
+class TestDeckEdgeCases:
+    def test_deal_community_zero_returns_empty_tuple(self):
+        deck = Deck(2, 14)
+        result = deck.deal_community(0)
+        assert result == ()
+
+    def test_deal_community_zero_does_not_advance_index(self):
+        deck = Deck(2, 14)
+        before = len(deck.remaining)
+        deck.deal_community(0)
+        assert len(deck.remaining) == before
+
+    def test_remaining_accounts_for_private_and_community(self):
+        deck = Deck(2, 14)
+        players = [Player(i, 10000) for i in range(2)]
+        deck.deal_private_cards(players)  # 4 cards dealt
+        deck.deal_community(3)            # 3 more
+        assert len(deck.remaining) == 52 - 4 - 3
+
+    def test_deal_community_five_cards(self):
+        deck = Deck(2, 14)
+        cards = deck.deal_community(5)
+        assert isinstance(cards, tuple)
+        assert len(cards) == 5
+        assert len(deck.remaining) == 52 - 5

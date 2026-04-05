@@ -255,7 +255,12 @@ class PokerEnv:
         player_i_order: List[int] = list(range(n_players))
         self.players[0].is_small_blind = True
         self.players[1].is_big_blind = True
-        self.players[-1].is_dealer = True
+        # In heads-up the dealer is the small blind (players[0]); for 3+
+        # players the dealer sits at the end of the list (players[-1]).
+        if n_players == 2:
+            self.players[0].is_dealer = True
+        else:
+            self.players[-1].is_dealer = True
         self._player_i_lut: Dict[str, List[int]] = {
             "pre_flop": player_i_order[2:] + player_i_order[:2],
             "flop":     player_i_order,
@@ -414,8 +419,9 @@ class PokerEnv:
             elif new_env.current_player.is_active:
                 if dynamics.n_players_with_moves(new_env) == 1:
                     new_env._betting_stage = "terminal"
-                    if not new_env.community_cards:
-                        new_env.community_cards += new_env.deck.deal_community(3)
+                    cards_needed = 5 - len(new_env.community_cards)
+                    if cards_needed > 0:
+                        new_env.community_cards += new_env.deck.deal_community(cards_needed)
                 if new_env._betting_stage in {"terminal", "show_down"}:
                     dynamics.compute_winners(new_env)
                 break
@@ -452,6 +458,9 @@ class PokerEnv:
 
         Transitions: pre_flop → flop (deal 3), flop → turn (deal 1),
         turn → river (deal 1), river → show_down (no deal).
+
+        Also resets each player's ``n_bet_chips`` to zero so that
+        bet-equality checks start fresh for the new betting round.
         """
         if self._betting_stage == "pre_flop":
             self._betting_stage = "flop"
@@ -468,6 +477,8 @@ class PokerEnv:
             pass
         else:
             raise ValueError(f"Unknown betting_stage: {self._betting_stage}")
+        for player in self.players:
+            player.n_bet_chips = 0
 
     def _map_to_closest_legal_action(self, invalid_action: str) -> str:
         """Map an out-of-range action to the closest legal one.
