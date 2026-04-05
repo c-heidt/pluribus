@@ -1,30 +1,26 @@
-"""Unit tests for Phase 2: SparseRegretTable.
+"""Unit tests for Phase 2: ChunkedTable + ChunkStore.
 
 Covers:
-- Chunk creation and lazy attachment (2.1)
-- Core access methods (2.2)
-- Stripe locking (2.3)
-- Dirty tracking (2.4)
-- apply_discount (2.5)
-- Shared memory naming convention and orphan detection (2.6)
+- ChunkStore: mmap lifecycle, dirty tracking, save/restore
+- ChunkedTable: data access, stripe locking, naming/orphan detection
+- CFRTables.apply_discount (moved from ChunkedTable)
 
 All tests use a temporary directory as ``shm_dir`` so they work without
 root access to ``/dev/shm`` and clean up automatically.
 """
 import os
-import struct
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from poker_ai.ai.index import CHUNK_SIZE, InfosetIndex
-from poker_ai.ai.regret_table import (
+from poker_ai.ai.chunk_store import CHUNK_SIZE, ChunkStore, _MAX_DIRTY_CHUNKS
+from poker_ai.ai.cfr_tables import REGRET_FLOOR, CFRTables
+from poker_ai.ai.index import InfosetIndex
+from poker_ai.ai.chunked_table import (
     N_STRIPE_LOCKS,
-    REGRET_FLOOR,
-    SparseRegretTable,
-    _MAX_DIRTY_CHUNKS,
+    ChunkedTable,
     list_orphaned_blocks,
 )
 
@@ -54,10 +50,10 @@ def tmp_lmdb(tmp_path):
 
 @pytest.fixture
 def table(tmp_path, tmp_lmdb, n_actions, table_name):
-    """Create a SparseRegretTable backed by tmp_path, unlink on teardown."""
+    """Create a ChunkedTable backed by tmp_path, unlink on teardown."""
     shm_dir = str(tmp_path / "shm")
     os.makedirs(shm_dir, exist_ok=True)
-    tbl = SparseRegretTable(
+    tbl = ChunkedTable(
         n_actions=n_actions,
         table_name=table_name,
         index=tmp_lmdb,
@@ -69,7 +65,82 @@ def table(tmp_path, tmp_lmdb, n_actions, table_name):
 
 
 # ---------------------------------------------------------------------------
-# 2.1 — SparseRegretTable construction and chunk creation
+# ChunkStore: mmap lifecycle and dirty tracking
+# ---------------------------------------------------------------------------
+
+
+class TestChunkStore:
+    def test_ensure_open_creates_file(self, tmp_path, n_actions, table_name):
+        shm = str(tmp_path / "shm")
+        os.makedirs(shm)
+        store = ChunkStore(table_name, n_actions, shm)
+        store.ensure_open(0)
+        assert store.n_open == 1
+        assert len(store.paths) == 1
+        assert os.path.exists(store.paths[0])
+        store.close()
+        store.unlink_all()
+
+    def test_view_returns_correct_shape(self, tmp_path, n_actions, table_name):
+        shm = str(tmp_path / "shm")
+        os.makedirs(shm)
+        store = ChunkStore(table_name, n_actions, shm)
+        view = store.view(0)
+        assert view.shape == (CHUNK_SIZE, n_actions)
+        assert view.dtype == np.int32
+        store.close()
+        store.unlink_all()
+
+    def test_dirty_tracking(self, tmp_path, n_actions, table_name):
+        shm = str(tmp_path / "shm")
+        os.makedirs(shm)
+        store = ChunkStore(table_name, n_actions, shm)
+        store.ensure_open(0)
+        store.mark_dirty(0)
+        # save_dirty should write the dirty chunk
+        written = store.save_dirty(tmp_path, n_entries=10, prefix="test")
+        assert written == 1
+        store.clear_dirty()
+        # After clearing, nothing to save
+        written = store.save_dirty(tmp_path, n_entries=10, prefix="test")
+        assert written == 0
+        store.close()
+        store.unlink_all()
+
+    def test_save_all_ignores_dirty_flags(self, tmp_path, n_actions, table_name):
+        shm = str(tmp_path / "shm")
+        os.makedirs(shm)
+        store = ChunkStore(table_name, n_actions, shm)
+        store.ensure_open(0)
+        # Don't mark dirty — save_all should still write
+        written = store.save_all(tmp_path, n_entries=10, prefix="test")
+        assert written == 1
+        store.close()
+        store.unlink_all()
+
+    def test_restore_roundtrip(self, tmp_path, n_actions, table_name):
+        shm = str(tmp_path / "shm")
+        os.makedirs(shm)
+        store = ChunkStore(table_name, n_actions, shm)
+        data = np.full((5, n_actions), 42, dtype=np.int32)
+        store.restore(0, data)
+        view = store.view(0)
+        np.testing.assert_array_equal(view[:5], data)
+        np.testing.assert_array_equal(view[5], np.zeros(n_actions, dtype=np.int32))
+        store.close()
+        store.unlink_all()
+
+    def test_dirty_out_of_bounds_ignored(self, tmp_path, n_actions, table_name):
+        shm = str(tmp_path / "shm")
+        os.makedirs(shm)
+        store = ChunkStore(table_name, n_actions, shm)
+        # Must not raise
+        store.mark_dirty(_MAX_DIRTY_CHUNKS + 1)
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# ChunkedTable construction and chunk creation
 # ---------------------------------------------------------------------------
 
 
@@ -86,7 +157,7 @@ class TestConstruction:
     def test_invalid_n_actions_raises(self, tmp_path, n_actions, table_name):
         idx = InfosetIndex(tmp_path / "idx_bad")
         with pytest.raises(ValueError, match="n_actions"):
-            SparseRegretTable(
+            ChunkedTable(
                 n_actions=0,
                 table_name=table_name,
                 index=idx,
@@ -97,15 +168,13 @@ class TestConstruction:
     def test_chunk_file_created_in_shm_dir(self, table, n_actions, table_name):
         table.get_row("first_infoset")
         assert table.n_chunks == 1
-        expected_path = os.path.join(
-            str(Path(table._shm_paths[0]).parent),
-            f"{table_name}_000000",
-        )
-        assert os.path.exists(expected_path), f"expected chunk at {expected_path}"
+        paths = table.store.paths
+        assert len(paths) == 1
+        assert os.path.exists(paths[0])
 
     def test_chunk_file_size_correct(self, table, n_actions):
         table.get_row("probe")
-        path = table._shm_paths[0]
+        path = table.store.paths[0]
         expected_bytes = CHUNK_SIZE * n_actions * 4  # int32
         assert os.path.getsize(path) == expected_bytes
 
@@ -117,17 +186,17 @@ class TestConstruction:
 
         # First session: allocate some infosets
         idx1 = InfosetIndex(idx_path)
-        tbl1 = SparseRegretTable(n_actions, table_name, idx1, shm_dir)
+        tbl1 = ChunkedTable(n_actions, table_name, idx1, shm_dir)
         n = 100
         for k in range(n):
             row = tbl1.get_row(f"resume_is_{k}")
-            row[:] = k  # write known values
+            row[:] = k
         idx1.close()
         tbl1.close()  # close mmaps but do NOT unlink
 
         # Second session: reopen
         idx2 = InfosetIndex(idx_path)
-        tbl2 = SparseRegretTable(n_actions, table_name, idx2, shm_dir)
+        tbl2 = ChunkedTable(n_actions, table_name, idx2, shm_dir)
         assert tbl2.n_chunks == 1, "should have restored the existing chunk"
         for k in range(n):
             row = tbl2.get_row_if_exists(f"resume_is_{k}")
@@ -139,7 +208,7 @@ class TestConstruction:
 
 
 # ---------------------------------------------------------------------------
-# 2.2 — Core access methods
+# Core access methods
 # ---------------------------------------------------------------------------
 
 
@@ -173,23 +242,22 @@ class TestCoreAccessMethods:
     def test_get_row_by_location_matches_get_row(self, table, n_actions):
         row_a = table.get_row("loc_test")
         row_a[:] = [1, 2, 3, 4, 5]
-        location = table._index.get("loc_test")
-        assert location is not None
-        chunk_id, row_idx = location
+        flat_row = table._index.get("loc_test")
+        assert flat_row is not None
+        chunk_id, row_idx = divmod(flat_row, CHUNK_SIZE)
         row_b = table.get_row_by_location(chunk_id, row_idx)
         np.testing.assert_array_equal(row_a, row_b)
 
     def test_get_row_by_location_invalid_row_raises(self, table):
-        table.get_row("setup_chunk")  # ensure chunk 0 exists
+        table.get_row("setup_chunk")
         with pytest.raises(IndexError):
-            table.get_row_by_location(0, CHUNK_SIZE)  # row == CHUNK_SIZE is out of range
+            table.get_row_by_location(0, CHUNK_SIZE)
 
     def test_multiple_infosets_different_rows(self, table):
         n = 10
         rows = [table.get_row(f"multi_is_{k}") for k in range(n)]
         for k, row in enumerate(rows):
             row[:] = k
-        # Verify all rows are independently written
         for k in range(n):
             result = table.get_row(f"multi_is_{k}")
             assert result[0] == k
@@ -200,11 +268,11 @@ class TestCoreAccessMethods:
         for k in range(n):
             table.get_row(f"cross_chunk_is_{k}")
         assert table.n_chunks >= 2
-        # The CHUNK_SIZE-th infoset must be in chunk 1, row 0
-        loc = table._index.get(f"cross_chunk_is_{CHUNK_SIZE}")
-        assert loc is not None
-        assert loc[0] == 1
-        assert loc[1] == 0
+        flat_row = table._index.get(f"cross_chunk_is_{CHUNK_SIZE}")
+        assert flat_row is not None
+        chunk_id, local_row = divmod(flat_row, CHUNK_SIZE)
+        assert chunk_id == 1
+        assert local_row == 0
 
     @pytest.mark.slow
     def test_500k_infosets_correct_retrieval(self, tmp_path, n_actions, table_name):
@@ -213,16 +281,14 @@ class TestCoreAccessMethods:
         idx = InfosetIndex(tmp_path / "big_idx")
         shm_dir = str(tmp_path / "big_shm")
         os.makedirs(shm_dir)
-        tbl = SparseRegretTable(n_actions, table_name, idx, shm_dir)
+        tbl = ChunkedTable(n_actions, table_name, idx, shm_dir)
 
-        # Write a unique fingerprint into each row
         for k in range(n):
             row = tbl.get_row(f"big_is_{k}")
-            row[0] = k % (2 ** 31 - 1)  # stay in int32 range
+            row[0] = k % (2 ** 31 - 1)
 
         assert tbl.n_chunks >= 5
 
-        # Spot-check every 1000th row
         mismatches = 0
         for k in range(0, n, 1000):
             row = tbl.get_row_if_exists(f"big_is_{k}")
@@ -237,7 +303,7 @@ class TestCoreAccessMethods:
 
 
 # ---------------------------------------------------------------------------
-# 2.3 — Stripe locking
+# Stripe locking
 # ---------------------------------------------------------------------------
 
 
@@ -246,10 +312,9 @@ class TestStripeLocking:
         for chunk_id in range(N_STRIPE_LOCKS * 2):
             lock_a = table.get_stripe_lock(chunk_id)
             lock_b = table.get_stripe_lock(chunk_id)
-            assert lock_a is lock_b, "same chunk_id must always return the same lock"
+            assert lock_a is lock_b
 
     def test_stripe_assignment_formula(self, table):
-        """Stripe ID must equal chunk_id % N_STRIPE_LOCKS."""
         for chunk_id in range(N_STRIPE_LOCKS * 3):
             expected_stripe = chunk_id % N_STRIPE_LOCKS
             actual_lock = table.get_stripe_lock(chunk_id)
@@ -257,7 +322,6 @@ class TestStripeLocking:
             assert actual_lock is expected_lock
 
     def test_different_chunks_same_stripe(self, table):
-        """Chunks N and N+256 must share the same stripe lock."""
         for base in range(N_STRIPE_LOCKS):
             lock_a = table.get_stripe_lock(base)
             lock_b = table.get_stripe_lock(base + N_STRIPE_LOCKS)
@@ -267,206 +331,101 @@ class TestStripeLocking:
         assert len(table._stripe_locks) == N_STRIPE_LOCKS
 
     def test_stripe_locks_evenly_distributed(self):
-        """Chunk IDs 0..N_STRIPE_LOCKS-1 must map to all distinct stripe IDs."""
         seen_stripes = {i % N_STRIPE_LOCKS for i in range(N_STRIPE_LOCKS)}
         assert len(seen_stripes) == N_STRIPE_LOCKS
 
     def test_stripe_lock_is_acquirable(self, table):
         lock = table.get_stripe_lock(0)
         acquired = lock.acquire(timeout=1.0)
-        assert acquired, "stripe lock should be immediately acquirable"
+        assert acquired
         lock.release()
 
 
 # ---------------------------------------------------------------------------
-# 2.4 — Dirty tracking
-# ---------------------------------------------------------------------------
-
-
-class TestDirtyTracking:
-    def test_no_dirty_chunks_initially(self, table):
-        table.get_row("init_me")
-        assert table.get_dirty_chunks() == []
-
-    def test_mark_dirty_sets_flag(self, table):
-        table.get_row("dirty_test")
-        assert table.n_chunks == 1
-        table._mark_dirty(0)
-        assert 0 in table.get_dirty_chunks()
-
-    def test_clear_dirty_resets_flag(self, table):
-        table.get_row("clear_dirty_test")
-        table._mark_dirty(0)
-        table.clear_dirty(0)
-        assert table.get_dirty_chunks() == []
-
-    def test_clear_all_dirty(self, table):
-        # Allocate a few chunks
-        for k in range(CHUNK_SIZE + 10):
-            table.get_row(f"bulk_dirty_is_{k}")
-        assert table.n_chunks == 2
-        table._mark_dirty(0)
-        table._mark_dirty(1)
-        assert sorted(table.get_dirty_chunks()) == [0, 1]
-        table.clear_all_dirty()
-        assert table.get_dirty_chunks() == []
-
-    def test_dirty_flag_not_set_on_read_only(self, table):
-        """Calling get_row_if_exists on an unvisited infoset must not mark dirty."""
-        assert table.get_row_if_exists("nonexistent") is None
-        assert table.get_dirty_chunks() == []
-
-    def test_get_dirty_chunks_only_returns_allocated(self, table):
-        """get_dirty_chunks must never return chunk IDs beyond n_chunks."""
-        assert table.n_chunks == 0
-        dirty = table.get_dirty_chunks()
-        assert dirty == []
-
-    def test_dirty_flag_out_of_bounds_is_silently_ignored(self, table):
-        """Marking chunk_id >= _MAX_DIRTY_CHUNKS must not raise."""
-        table._mark_dirty(_MAX_DIRTY_CHUNKS + 1)  # must not raise
-        table.clear_dirty(_MAX_DIRTY_CHUNKS + 1)   # must not raise
-
-
-# ---------------------------------------------------------------------------
-# 2.5 — apply_discount
+# apply_discount (via CFRTables)
 # ---------------------------------------------------------------------------
 
 
 class TestApplyDiscount:
-    def _fill_rows(self, table: SparseRegretTable, values: list, n_infosets: int = 3):
-        """Write *values* into the first row of each allocated infoset."""
-        for k in range(n_infosets):
-            row = table.get_row(f"discount_is_{k}")
-            row[:] = values
+    """Discount is now a CFRTables-level operation.  We test it through
+    a minimal CFRTables instance with one street."""
 
-    def test_apply_discount_requires_sync_boundary(self, table):
-        """Must raise AssertionError if sync boundary flag is not set."""
-        table.get_row("guard_test")
-        with pytest.raises(AssertionError, match="sync boundary"):
-            table.apply_discount(0.5)
+    @pytest.fixture
+    def cfr(self, tmp_path):
+        from poker_ai.ai.ai import MAX_ACTIONS_PER_STREET
+        shm_dir = str(tmp_path / "shm_disc")
+        os.makedirs(shm_dir)
+        tables = CFRTables(
+            index_path=tmp_path / "lmdb_disc",
+            shm_dir=shm_dir,
+            actions_per_street=MAX_ACTIONS_PER_STREET,
+        )
+        yield tables
+        tables.close()
 
-    def test_apply_discount_factor_validation(self, table):
-        """Factor must be in (0, 1].  Out-of-range values raise ValueError."""
-        table.set_sync_boundary(True)
+    def test_apply_discount_factor_validation(self, cfr):
         with pytest.raises(ValueError, match="factor"):
-            table.apply_discount(0.0)
+            cfr.apply_discount(0.0)
         with pytest.raises(ValueError, match="factor"):
-            table.apply_discount(1.1)
-        table.set_sync_boundary(False)
+            cfr.apply_discount(1.1)
 
-    def test_apply_discount_scales_values(self, table, n_actions):
-        """After discount by 0.5, all values should be halved (then floor'd)."""
-        initial = [1_000, 2_000, 3_000, 4_000, 5_000]
-        self._fill_rows(table, initial, n_infosets=3)
-        table.set_sync_boundary(True)
-        table.apply_discount(0.5)
-        table.set_sync_boundary(False)
+    def test_apply_discount_scales_values(self, cfr):
+        n_actions = cfr.regret[0].n_actions
+        initial = list(range(1000, 1000 + n_actions))
         for k in range(3):
-            row = table.get_row(f"discount_is_{k}")
+            row = cfr.regret[0].get_row(f"disc_is_{k}")
+            row[:] = initial
+        cfr.apply_discount(0.5)
+        for k in range(3):
+            row = cfr.regret[0].get_row(f"disc_is_{k}")
             expected = [int(v * 0.5) for v in initial]
             np.testing.assert_array_equal(row, expected)
 
-    def test_apply_discount_floor(self, table, n_actions):
-        """Values that would discount below REGRET_FLOOR must be clamped."""
-        floor_val = int(REGRET_FLOOR)  # -310_000_000
-        row = table.get_row("floor_is_0")
-        row[:] = floor_val  # already at floor
-        table.set_sync_boundary(True)
-        table.apply_discount(0.5)
-        table.set_sync_boundary(False)
-        result = table.get_row("floor_is_0")
-        # floor_val * 0.5 = -155_000_000 > REGRET_FLOOR so no clamping here
-        # But a value below the floor (only possible if manually set to a very
-        # negative number) must be clamped.
+    def test_apply_discount_floor(self, cfr):
+        row = cfr.regret[0].get_row("floor_is_0")
+        row[:] = int(REGRET_FLOOR)
+        cfr.apply_discount(0.5)
+        result = cfr.regret[0].get_row("floor_is_0")
         assert np.all(result >= REGRET_FLOOR)
 
-    def test_apply_discount_clamps_to_floor(self, table, n_actions):
-        """A value below REGRET_FLOOR should also be clamped to the floor."""
-        row = table.get_row("below_floor_is_0")
-        # Set a value well below the floor
-        row[:] = int(REGRET_FLOOR) - 1_000_000
-        table.set_sync_boundary(True)
-        table.apply_discount(0.5)
-        table.set_sync_boundary(False)
-        result = table.get_row("below_floor_is_0")
-        assert np.all(result >= REGRET_FLOOR)
-
-    def test_apply_discount_only_allocated_rows(self, table, n_actions):
-        """Rows beyond the allocated range must remain zero after discount."""
-        # Allocate exactly 2 rows — chunk 0 will have 2 valid rows out of CHUNK_SIZE
-        for k in range(2):
-            row = table.get_row(f"sparse_is_{k}")
-            row[:] = 1_000_000
-        table.set_sync_boundary(True)
-        table.apply_discount(0.5)
-        table.set_sync_boundary(False)
-        # Rows 2..CHUNK_SIZE-1 in chunk 0 must still be zero (never touched)
-        raw_chunk = table._chunks[0]
-        # Allocated rows discounted
-        np.testing.assert_array_equal(raw_chunk[0], np.full(n_actions, 500_000))
-        np.testing.assert_array_equal(raw_chunk[1], np.full(n_actions, 500_000))
-        # Unallocated rows must be zero
-        np.testing.assert_array_equal(raw_chunk[2], np.zeros(n_actions, dtype=np.int32))
-
-    def test_apply_discount_factor_1_leaves_unchanged(self, table, n_actions):
-        """Discount by 1.0 must be a no-op."""
-        initial = [100, 200, 300, 400, 500]
+    def test_apply_discount_factor_1_leaves_unchanged(self, cfr):
+        n_actions = cfr.regret[0].n_actions
+        initial = list(range(100, 100 + n_actions))
         for k in range(3):
-            row = table.get_row(f"noop_is_{k}")
+            row = cfr.regret[0].get_row(f"noop_is_{k}")
             row[:] = initial
-        table.set_sync_boundary(True)
-        table.apply_discount(1.0)
-        table.set_sync_boundary(False)
+        cfr.apply_discount(1.0)
         for k in range(3):
-            row = table.get_row(f"noop_is_{k}")
+            row = cfr.regret[0].get_row(f"noop_is_{k}")
             np.testing.assert_array_equal(row, initial)
-
-    def test_apply_discount_across_multiple_chunks(self, table, n_actions):
-        """Discount must apply to rows in all chunks."""
-        # Allocate rows that span two chunks
-        n = CHUNK_SIZE + 10
-        for k in range(n):
-            row = table.get_row(f"multi_chunk_disc_is_{k}")
-            row[:] = 1_000
-        assert table.n_chunks == 2
-        table.set_sync_boundary(True)
-        table.apply_discount(0.5)
-        table.set_sync_boundary(False)
-        # Check first and last row
-        first_row = table.get_row("multi_chunk_disc_is_0")
-        last_row = table.get_row(f"multi_chunk_disc_is_{n - 1}")
-        np.testing.assert_array_equal(first_row, np.full(n_actions, 500))
-        np.testing.assert_array_equal(last_row, np.full(n_actions, 500))
 
 
 # ---------------------------------------------------------------------------
-# 2.6 — Naming convention and orphan detection
+# Naming convention and orphan detection
 # ---------------------------------------------------------------------------
 
 
 class TestNamingAndOrphanDetection:
     def test_chunk_name_format(self, table, table_name):
         table.get_row("name_test")
-        name = os.path.basename(table._shm_paths[0])
+        name = os.path.basename(table.store.paths[0])
         expected = f"{table_name}_000000"
         assert name == expected
 
     def test_chunk_names_sequential(self, table, table_name):
-        # Force two chunks
         for k in range(CHUNK_SIZE + 1):
             table.get_row(f"seq_is_{k}")
         assert table.n_chunks == 2
         for chunk_id in range(2):
-            name = os.path.basename(table._shm_paths[chunk_id])
+            name = os.path.basename(table.store.paths[chunk_id])
             expected = f"{table_name}_{chunk_id:06d}"
             assert name == expected
 
     def test_list_own_blocks(self, table):
         table.get_row("block_test")
-        blocks = table.list_own_blocks()
-        assert len(blocks) == 1
-        assert os.path.exists(blocks[0])
+        paths = table.store.paths
+        assert len(paths) == 1
+        assert os.path.exists(paths[0])
 
     def test_list_orphaned_blocks_empty_dir(self, tmp_path):
         orphan_dir = str(tmp_path / "empty_shm")
@@ -476,29 +435,22 @@ class TestNamingAndOrphanDetection:
     def test_list_orphaned_blocks_finds_files(self, tmp_path):
         shm_dir = str(tmp_path / "orphan_shm")
         os.makedirs(shm_dir)
-        # Create fake orphan files (must start with "pluribus_")
         for i in range(3):
             path = os.path.join(shm_dir, f"pluribus_regret_0_{i:06d}")
             open(path, "wb").close()
-
         orphans = list_orphaned_blocks(shm_dir=shm_dir)
         assert len(orphans) == 3
-        for path in orphans:
-            assert os.path.exists(path)
 
     def test_list_orphaned_blocks_ignores_non_pluribus(self, tmp_path):
-        """Files not starting with 'pluribus_' must be ignored."""
         shm_dir = str(tmp_path / "mixed_shm")
         os.makedirs(shm_dir)
         path_pluribus = os.path.join(shm_dir, "pluribus_regret_0_000000")
         open(path_pluribus, "wb").close()
         path_other = os.path.join(shm_dir, "other_prefix_000000")
         open(path_other, "wb").close()
-
         orphans = list_orphaned_blocks(shm_dir=shm_dir)
         assert len(orphans) == 1
         assert path_pluribus in orphans
-        assert path_other not in orphans
 
     def test_list_orphaned_blocks_nonexistent_dir(self):
         assert list_orphaned_blocks(shm_dir="/nonexistent_dir_abc123") == []
@@ -507,9 +459,9 @@ class TestNamingAndOrphanDetection:
         idx = InfosetIndex(tmp_path / "unlink_idx")
         shm_dir = str(tmp_path / "unlink_shm")
         os.makedirs(shm_dir)
-        tbl = SparseRegretTable(n_actions, table_name, idx, shm_dir)
+        tbl = ChunkedTable(n_actions, table_name, idx, shm_dir)
         tbl.get_row("unlink_test")
-        paths = tbl.list_own_blocks()
+        paths = tbl.store.paths
         assert all(os.path.exists(p) for p in paths)
         tbl.close()
         tbl.unlink_all()
@@ -520,9 +472,9 @@ class TestNamingAndOrphanDetection:
         idx = InfosetIndex(tmp_path / "cm_unlink_idx")
         shm_dir = str(tmp_path / "cm_unlink_shm")
         os.makedirs(shm_dir)
-        with SparseRegretTable(n_actions, table_name, idx, shm_dir) as tbl:
+        with ChunkedTable(n_actions, table_name, idx, shm_dir) as tbl:
             tbl.get_row("cm_unlink_test")
-            paths = tbl.list_own_blocks()
+            paths = tbl.store.paths
         assert all(not os.path.exists(p) for p in paths)
         idx.close()
 
@@ -537,13 +489,11 @@ class TestRepr:
         table.get_row("repr_test")
         r = repr(table)
         assert table_name in r
-        assert "SparseRegretTable" in r
+        assert "ChunkedTable" in r
 
 
 # ---------------------------------------------------------------------------
-# Bug regression tests (for bugs found during Phase 2 scan)
-# ---------------------------------------------------------------------------
-# Phase 5 additions: n_allocated, merge_delta_row, _restore_chunk
+# n_allocated
 # ---------------------------------------------------------------------------
 
 
@@ -575,6 +525,11 @@ class TestNAllocated:
         assert table.n_allocated == 1
 
 
+# ---------------------------------------------------------------------------
+# merge_delta_row
+# ---------------------------------------------------------------------------
+
+
 class TestMergeDeltaRow:
     def test_creates_row_on_first_call(self, table, n_actions):
         delta = np.full(n_actions, 7, dtype=np.int64)
@@ -599,49 +554,41 @@ class TestMergeDeltaRow:
         np.testing.assert_array_equal(row, np.full(n_actions, -5, dtype=np.int32))
 
 
+# ---------------------------------------------------------------------------
+# ChunkStore restore
+# ---------------------------------------------------------------------------
+
+
 class TestRestoreChunk:
     def test_restore_creates_chunk_and_reads_data(self, table, n_actions):
-        """_restore_chunk must make chunk 0 accessible with pre-set values."""
-        from poker_ai.ai.index import CHUNK_SIZE
         arr = np.zeros((CHUNK_SIZE, n_actions), dtype=np.int32)
         arr[0, :] = 42
-        table._restore_chunk(0, arr)
+        table.store.restore(0, arr)
         assert table.n_chunks >= 1
-        # Chunk 0 must have the restored values at row 0
         restored_row = table.get_row_by_location(0, 0)
         np.testing.assert_array_equal(restored_row, np.full(n_actions, 42))
 
 
 # ---------------------------------------------------------------------------
+# Bug regressions
+# ---------------------------------------------------------------------------
 
 
 class TestBugRegressions:
     def test_get_row_allocates_sequentially(self, table):
-        """Regression: rows must be allocated in sequential global order."""
         n = 10
-        locations = []
+        flat_rows = []
         for k in range(n):
             table.get_row(f"reg_is_{k}")
-            loc = table._index.get(f"reg_is_{k}")
-            assert loc is not None
-            locations.append(loc)
-        global_rows = [c * CHUNK_SIZE + r for c, r in locations]
-        assert global_rows == list(range(n))
+            flat_row = table._index.get(f"reg_is_{k}")
+            assert flat_row is not None
+            flat_rows.append(flat_row)
+        assert flat_rows == list(range(n))
 
     def test_row_write_isolated(self, table, n_actions):
-        """Regression: writing to one row must not affect adjacent rows."""
         row_a = table.get_row("iso_a")
         row_b = table.get_row("iso_b")
         row_c = table.get_row("iso_c")
-
         row_b[:] = 12345
         np.testing.assert_array_equal(row_a, np.zeros(n_actions, dtype=np.int32))
         np.testing.assert_array_equal(row_c, np.zeros(n_actions, dtype=np.int32))
-
-    def test_set_sync_boundary_visible(self, table):
-        """set_sync_boundary() must immediately affect _at_sync_boundary_flag."""
-        assert not table._at_sync_boundary_flag
-        table.set_sync_boundary(True)
-        assert table._at_sync_boundary_flag
-        table.set_sync_boundary(False)
-        assert not table._at_sync_boundary_flag

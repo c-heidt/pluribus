@@ -21,7 +21,8 @@ from poker_ai.utils.io import (
     hash_info_set_128,
     hash_info_set_bytes,
 )
-from poker_ai.ai.index import CHUNK_SIZE, InfosetIndex
+from poker_ai.ai.chunk_store import CHUNK_SIZE
+from poker_ai.ai.index import InfosetIndex
 
 
 # ===========================================================================
@@ -184,138 +185,100 @@ class TestInfosetIndex:
 
     def test_get_or_create_new_entry(self, tmp_path):
         with InfosetIndex(tmp_path / "idx") as idx:
-            location, is_new = idx.get_or_create("first_infoset")
+            flat_row, is_new = idx.get_or_create("first_infoset")
             assert is_new is True
-            chunk_id, row = location
-            assert chunk_id == 0
-            assert row == 0
+            assert flat_row == 0
 
     def test_get_or_create_existing_entry(self, tmp_path):
         with InfosetIndex(tmp_path / "idx") as idx:
-            loc1, new1 = idx.get_or_create("same_infoset")
-            loc2, new2 = idx.get_or_create("same_infoset")
+            row1, new1 = idx.get_or_create("same_infoset")
+            row2, new2 = idx.get_or_create("same_infoset")
             assert new1 is True
             assert new2 is False
-            assert loc1 == loc2
+            assert row1 == row2
 
     def test_get_after_create(self, tmp_path):
         with InfosetIndex(tmp_path / "idx") as idx:
-            location, _ = idx.get_or_create("my_infoset")
-            assert idx.get("my_infoset") == location
+            flat_row, _ = idx.get_or_create("my_infoset")
+            assert idx.get("my_infoset") == flat_row
 
     def test_sequential_allocation_increments_rows(self, tmp_path):
         n = 10
         with InfosetIndex(tmp_path / "idx") as idx:
-            locations = []
+            rows = []
             for i in range(n):
-                loc, is_new = idx.get_or_create(f"infoset_{i}")
+                row, is_new = idx.get_or_create(f"infoset_{i}")
                 assert is_new
-                locations.append(loc)
-
-        # Locations must be (0, 0), (0, 1), ..., (0, n-1)
-        expected = [(0, i) for i in range(n)]
-        assert locations == expected
+                rows.append(row)
+        assert rows == list(range(n))
 
     def test_chunk_boundary_allocation(self, tmp_path):
-        """The second chunk starts when global row count exceeds CHUNK_SIZE."""
+        """Row numbers are flat; callers decompose into chunks."""
         n = CHUNK_SIZE + 5
         with InfosetIndex(tmp_path / "idx") as idx:
             for i in range(n):
                 idx.get_or_create(f"is_{i}")
-            loc, _ = idx.get_or_create(f"is_{n}")
-            # Row CHUNK_SIZE belongs in chunk 1, row 0.
-            # The n-th entry (0-indexed) == CHUNK_SIZE:
-            assert loc == (1, 0) or loc[0] == 1
+            row, _ = idx.get_or_create(f"is_{n}")
+            assert row == n
 
-    def test_n_entries_tracks_count(self, tmp_path):
+    def test_n_allocated_rows_tracks_count(self, tmp_path):
         n = 50
         with InfosetIndex(tmp_path / "idx") as idx:
             for i in range(n):
                 idx.get_or_create(f"entry_{i}")
-            assert idx.n_entries == n
+            assert idx.n_allocated_rows == n
 
     def test_persist_and_reload(self, tmp_path):
         """Close and reopen the index — all entries must survive."""
         idx_path = tmp_path / "persistent_idx"
         infosets = [f"persist_is_{i}" for i in range(500)]
-        locations_before = {}
+        rows_before = {}
 
         with InfosetIndex(idx_path) as idx:
             for s in infosets:
-                loc, _ = idx.get_or_create(s)
-                locations_before[s] = loc
+                row, _ = idx.get_or_create(s)
+                rows_before[s] = row
 
-        # Reopen from disk.
         with InfosetIndex(idx_path) as idx:
-            assert idx.n_entries == len(infosets)
+            assert idx.n_allocated_rows == len(infosets)
             for s in infosets:
-                loc = idx.get(s)
-                assert loc is not None, f"{s!r} should exist after reload"
-                assert loc == locations_before[s], (
-                    f"Location mismatch for {s!r}: "
-                    f"before={locations_before[s]}, after={loc}"
-                )
-
-    def test_put_explicit_mapping(self, tmp_path):
-        with InfosetIndex(tmp_path / "idx") as idx:
-            idx.put("manual_entry", chunk_id=2, row=77)
-            loc = idx.get("manual_entry")
-            assert loc == (2, 77)
-
-    def test_put_conflict_raises(self, tmp_path):
-        with InfosetIndex(tmp_path / "idx") as idx:
-            idx.put("conflict_entry", chunk_id=0, row=0)
-            with pytest.raises(ValueError, match="conflict"):
-                idx.put("conflict_entry", chunk_id=0, row=1)
-
-    def test_put_idempotent(self, tmp_path):
-        """Putting the same mapping twice should not raise."""
-        with InfosetIndex(tmp_path / "idx") as idx:
-            idx.put("same", 1, 5)
-            idx.put("same", 1, 5)  # must not raise
-            assert idx.get("same") == (1, 5)
+                row = idx.get(s)
+                assert row is not None, f"{s!r} should exist after reload"
+                assert row == rows_before[s]
 
     def test_flush_does_not_raise(self, tmp_path):
         with InfosetIndex(tmp_path / "idx") as idx:
             idx.get_or_create("some_entry")
-            idx.flush()  # should not raise
+            idx.flush()
 
     @pytest.mark.slow
     def test_1m_insert_then_reload(self, tmp_path):
-        """Insert 1M synthetic infosets, close, reopen, verify all present.
-
-        Marked slow — run with ``pytest -m slow``.
-        """
+        """Insert 1M synthetic infosets, close, reopen, verify all present."""
         n = 1_000_000
         idx_path = tmp_path / "large_idx"
         infosets = [f"p0|Ah_3c|Kd_Qs_Jh|r3|seq_{i}" for i in range(n)]
 
         with InfosetIndex(idx_path) as idx:
-            locs = {}
+            rows = {}
             for s in infosets:
-                loc, _ = idx.get_or_create(s)
-                locs[s] = loc
-            assert idx.n_entries == n
+                row, _ = idx.get_or_create(s)
+                rows[s] = row
+            assert idx.n_allocated_rows == n
 
         mismatches = 0
         with InfosetIndex(idx_path) as idx:
             for s in infosets:
-                loc = idx.get(s)
-                if loc != locs[s]:
+                row = idx.get(s)
+                if row != rows[s]:
                     mismatches += 1
-        assert mismatches == 0, f"{mismatches} location mismatches after reload"
+        assert mismatches == 0, f"{mismatches} row mismatches after reload"
 
     def test_debug_mode_no_false_collision(self, tmp_path):
-        """Debug mode must not raise for distinct strings that land on
-        different hash keys (the normal case)."""
         with InfosetIndex(tmp_path / "idx", debug=True) as idx:
             for i in range(1000):
                 idx.get_or_create(f"debug_is_{i}")
 
     def test_context_manager_closes_cleanly(self, tmp_path):
-        """__exit__ must close the environment without error."""
         with InfosetIndex(tmp_path / "cm_idx") as idx:
             idx.get_or_create("cm_test")
-        # After the context manager, the env is closed.  Accessing the path
-        # should still exist on disk.
         assert (tmp_path / "cm_idx").exists()

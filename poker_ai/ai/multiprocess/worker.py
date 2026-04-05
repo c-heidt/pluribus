@@ -9,7 +9,7 @@ import joblib
 import numpy as np
 
 from poker_ai.ai import ai
-from poker_ai.ai.agent import Agent
+from poker_ai.ai.cfr_tables import CFRTables
 from poker_ai import utils
 from poker_ai.environment import poker_env as state
 
@@ -24,7 +24,7 @@ class Worker(mp.Process):
         job_queue: mp.Queue,
         logging_queue: mp.Queue,
         locks: Dict[str, mp.synchronize.Lock],
-        agent: Agent,
+        tables: CFRTables,
         lut_path: Union[str, Path],
         pickle_dir: bool,
         n_players: int,
@@ -40,7 +40,7 @@ class Worker(mp.Process):
         self._logging_queue: mp.Queue = logging_queue
         self._locks = locks
         self._n_players = n_players
-        self._agent = agent
+        self._tables = tables
         self._c = c
         self._prune_threshold = prune_threshold
         self._save_path = Path(save_path)
@@ -56,9 +56,9 @@ class Worker(mp.Process):
 
     def run(self):
         """Load the LUT, seed RNG, then process jobs dispatched by the server."""
-        # Reopen the LMDB environment after fork so this process gets its own
-        # reader lock-table slot (avoids MDB_BAD_RSLOT).
-        self._agent._index.reopen_after_fork()
+        # Reopen all per-street LMDB indexes after fork so this process gets
+        # its own reader lock-table slots (avoids MDB_BAD_RSLOT).
+        self._tables.reopen_after_fork()
         if not hasattr(self, "_info_set_lut"):
             if not self._pickle_dir:
                 lut_file_path = os.path.join(self._lut_path, "card_info_lut.joblib")
@@ -119,7 +119,7 @@ class Worker(mp.Process):
         if not self._local_delta:
             return
         n_infosets = len(self._local_delta)
-        ai.merge_local_delta(self._agent, self._local_delta)
+        ai.merge_local_delta(self._tables, self._local_delta)
         self._local_delta.clear()
         self._logging_queue.put(
             f"[worker={self.name}] Synced {n_infosets:,} infosets to master",
@@ -131,9 +131,9 @@ class Worker(mp.Process):
         self._setup_new_game()
         use_pruning: bool = np.random.uniform() < 0.95
         if use_pruning and t > self._prune_threshold:
-            ai.cfrp(self._agent, self._state, i, t, self._c, self._local_delta)
+            ai.cfrp(self._tables, self._state, i, t, self._c, self._local_delta)
         else:
-            ai.cfr(self._agent, self._state, i, t, self._local_delta)
+            ai.cfr(self._tables, self._state, i, t, self._local_delta)
         self._local_iteration_count += 1
         # Delta is flushed on explicit "sync" jobs dispatched by the server,
         # not after every traversal (Phase 5 decoupling).
@@ -141,7 +141,7 @@ class Worker(mp.Process):
     def _update_strategy(self, t, i):
         """Update strategy visit counts for all streets."""
         self._setup_new_game()
-        ai.update_strategy(self._agent, self._state, i, t)
+        ai.update_strategy(self._tables, self._state, i, t)
 
     def _setup_new_game(self):
         """Setup up new poker game."""

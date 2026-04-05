@@ -11,7 +11,9 @@ from poker_ai.ai.checkpoint import CheckpointManager
 
 import enlighten
 
-from poker_ai.ai.agent import Agent
+import math
+
+from poker_ai.ai.cfr_tables import CFRTables
 from poker_ai import utils
 from poker_ai.ai.multiprocess.worker import Worker
 
@@ -74,9 +76,10 @@ class Server:
         self._info_set_lut = self._load_lut(lut_path, pickle_dir)
         self._job_queue: mp.JoinableQueue = mp.JoinableQueue(maxsize=n_processes)
         self._logging_queue: mp.Queue = mp.Queue()
-        # Agent with per-street shared-memory tables
+        # Per-street shared-memory tables
         shm_dir = os.environ.get("PLURIBUS_SHM_DIR", "/dev/shm")
         from poker_ai.ai.index import lmdb_map_size_for_players
+        from poker_ai.ai.ai import MAX_ACTIONS_PER_STREET
         lmdb_map_size = int(
             os.environ.get(
                 "PLURIBUS_LMDB_MAP_SIZE",
@@ -84,13 +87,13 @@ class Server:
             )
         )
         log.info(
-            f"LMDB map_size={lmdb_map_size // 1024**3} GiB for {n_players} players "
-            f"(sparse file — check real usage with: du -sh <save_path>/lmdb_index/data.mdb)"
+            f"LMDB map_size={lmdb_map_size // 1024**3} GiB for {n_players} players"
         )
-        self._agent = Agent(
+        self._tables = CFRTables(
             index_path=self._save_path / "lmdb_index",
             shm_dir=shm_dir,
             lmdb_map_size=lmdb_map_size,
+            actions_per_street=MAX_ACTIONS_PER_STREET,
         )
         self._locks: Dict[str, mp.synchronize.Lock] = {}
         self._error_event: mp.Event = mp.Event() # type: ignore
@@ -214,13 +217,8 @@ class Server:
         self._cleanup()
 
     def _cleanup(self):
-        """Close and unlink all shared-memory agent tables."""
-        for r in range(4):
-            self._agent.regret_tables[r].close()
-            self._agent.strategy_tables[r].close()
-            self._agent.regret_tables[r].unlink_all()
-            self._agent.strategy_tables[r].unlink_all()
-        self._agent._index.close()
+        """Close and unlink all shared-memory tables and indexes."""
+        self._tables.close()
 
     def to_dict(self, t: Optional[int] = None) -> Dict[str, Union[str, float, int, None]]:
         """Serialise the server object to save the progress of optimisation.
@@ -250,12 +248,7 @@ class Server:
             discount_interval=self._discount_interval,
             checkpoint_interval=self._checkpoint_interval,
             start_timestep=self._start_t,
-            n_chunks_per_street={
-                r: self._agent.regret_tables[r].n_chunks for r in range(4)
-            },
-            n_strategy_chunks_per_street={
-                r: self._agent.strategy_tables[r].n_chunks for r in range(4)
-            },
+            n_chunks_per_street=self._tables.n_chunks_per_street(),
         )
         return {
             k: os.path.abspath(str(v)) if isinstance(v, Path) else v
@@ -315,26 +308,13 @@ class Server:
             log.info(f"Discount window closed after {t} iters")
             self._discounting_active = False
             return
-        from poker_ai.ai.index import CHUNK_SIZE
         discount_step = t // (self._sync_interval * self._discount_interval)
         discount_factor = discount_step / (discount_step + 1)
         log.info(
             f"[t={t}] Discounting regrets and strategy "
             f"(step={discount_step}, factor={discount_factor:.4f})"
         )
-        for r in range(4):
-            for table in (
-                self._agent.regret_tables[r],
-                self._agent.strategy_tables[r],
-            ):
-                n = table.n_allocated
-                if n > 0:
-                    n_chunks = (n + CHUNK_SIZE - 1) // CHUNK_SIZE
-                    for chunk_id in range(n_chunks):
-                        table._ensure_chunk(chunk_id)
-                table.set_sync_boundary(True)
-                table.apply_discount(discount_factor)
-                table.set_sync_boundary(False)
+        self._tables.apply_discount(discount_factor)
 
 
     def _load_lut(self, lut_path, pickle_dir):
@@ -360,7 +340,7 @@ class Server:
                 job_queue=self._job_queue,
                 logging_queue=self._logging_queue,
                 locks=self._locks,
-                agent=self._agent,
+                tables=self._tables,
                 lut_path=self._lut_path,
                 pickle_dir=self._pickle_dir,
                 n_players=self._n_players,

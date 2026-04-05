@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
-from poker_ai.ai.agent import Agent
+from poker_ai.ai.cfr_tables import CFRTables
 from poker_ai.environment.poker_env import PokerEnv as PokerState
 
 
@@ -74,44 +74,44 @@ def calculate_strategy_from_row(
 
 
 def merge_local_delta(
-    agent: Agent,
+    tables: CFRTables,
     local_delta: Dict[Tuple[int, str], np.ndarray],
 ) -> None:
-    """Merge a local CFR regret accumulator into the agent's regret tables.
+    """Merge a local CFR regret accumulator into the regret tables.
 
     For each ``(betting_round, info_set)`` key, the corresponding numpy delta
-    array is added to the row in ``agent.regret_tables[betting_round]`` under
+    array is added to the row in ``tables.regret[betting_round]`` under
     the chunk's stripe lock.
 
     Parameters
     ----------
-    agent : Agent
-        Agent whose ``regret_tables`` will be updated in-place.
+    tables : CFRTables
+        Tables whose regret tables will be updated in-place.
     local_delta : Dict[Tuple[int, str], np.ndarray]
         Per-infoset regret increments keyed by ``(betting_round, info_set)``.
         Values are int64 delta arrays (positive or negative), not absolute
         regrets.
     """
     for (r, info_set), delta in local_delta.items():
-        agent.regret_tables[r].merge_delta_row(info_set, delta)
+        tables.regret[r].merge_delta_row(info_set, delta)
 
 
 def update_strategy(
-    agent: Agent,
+    tables: CFRTables,
     state: PokerState,
     i: int,
     t: int,
 ) -> None:
     """Update strategy visit counts for all streets.
 
-    Reads regret from ``agent.regret_tables[r]`` and increments the sampled
-    action's visit count in ``agent.strategy_tables[r]`` for the current
+    Reads regret from ``tables.regret[r]`` and increments the sampled
+    action's visit count in ``tables.strategy[r]`` for the current
     betting round ``r``.
 
     Parameters
     ----------
-    agent : Agent
-        Agent being trained.
+    tables : CFRTables
+        CFR tables being trained.
     state : PokerState
         Current game state.
     i : int
@@ -133,7 +133,7 @@ def update_strategy(
     canonical = CANONICAL_ACTIONS[r]
     legal_set = set(legal_actions)
     valid_mask = np.array([a in legal_set for a in canonical], dtype=bool)
-    row = agent.regret_tables[r].get_row_if_exists(state.info_set)
+    row = tables.regret[r].get_row_if_exists(state.info_set)
     regret_row = (
         row if row is not None
         else np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
@@ -152,14 +152,14 @@ def update_strategy(
         log.debug("ACTION SAMPLED: ph %s ACTION: %s", state.player_i, action)
         # Increment the strategy table visit count for the sampled action,
         # weighted by iteration t for Linear MCCFR.
-        agent.strategy_tables[r].update_row(state.info_set, a_to_i[action], t)
+        tables.strategy[r].update_row(state.info_set, a_to_i[action], t)
 
     new_state: PokerState = state.apply_action(action)
-    update_strategy(agent, new_state, i, t)
+    update_strategy(tables, new_state, i, t)
 
 
 def cfr(
-    agent: Agent,
+    tables: CFRTables,
     state: PokerState,
     i: int,
     t: int,
@@ -174,8 +174,8 @@ def cfr(
 
     Parameters
     ----------
-    agent : Agent
-        Agent being trained.
+    tables : CFRTables
+        CFR tables being trained.
     state : PokerState
         Current game state.
     i : int
@@ -194,14 +194,14 @@ def cfr(
     if _own_delta:
         local_delta = {}
     try:
-        return _cfr_body(agent, state, i, t, local_delta)
+        return _cfr_body(tables, state, i, t, local_delta)
     finally:
         if _own_delta:
-            merge_local_delta(agent, local_delta)
+            merge_local_delta(tables, local_delta)
 
 
 def _cfr_body(
-    agent: Agent,
+    tables: CFRTables,
     state: PokerState,
     i: int,
     t: int,
@@ -243,7 +243,7 @@ def _cfr_body(
     legal_set = set(legal_actions)
     valid_mask = np.array([a in legal_set for a in canonical], dtype=bool)
 
-    row = agent.regret_tables[r].get_row_if_exists(state.info_set)
+    row = tables.regret[r].get_row_if_exists(state.info_set)
     regret_row = (
         row if row is not None
         else np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
@@ -259,7 +259,7 @@ def _cfr_body(
             if _debug:
                 log.debug("ACTION TRAVERSED FOR REGRET: ph %s ACTION: %s", state.player_i, action)
             new_state: PokerState = state.apply_action(action)
-            voa[action] = _cfr_body(agent, new_state, i, t, local_delta)
+            voa[action] = _cfr_body(tables, new_state, i, t, local_delta)
             if _debug:
                 log.debug("Got EV for %s: %s", action, voa[action])
             vo += sigma[a_to_i[action]] * voa[action]
@@ -292,11 +292,11 @@ def _cfr_body(
         if _debug:
             log.debug("EXTERNAL SAMPLE: opponent ph %s sampled ACTION: %s", state.player_i, action)
         new_state: PokerState = state.apply_action(action)
-        return _cfr_body(agent, new_state, i, t, local_delta)
+        return _cfr_body(tables, new_state, i, t, local_delta)
 
 
 def cfrp(
-    agent: Agent,
+    tables: CFRTables,
     state: PokerState,
     i: int,
     t: int,
@@ -307,8 +307,8 @@ def cfrp(
 
     Parameters
     ----------
-    agent : Agent
-        Agent being trained.
+    tables : CFRTables
+        CFR tables being trained.
     state : PokerState
         Current game state.
     i : int
@@ -324,14 +324,14 @@ def cfrp(
     if _own_delta:
         local_delta = {}
     try:
-        return _cfrp_body(agent, state, i, t, c, local_delta)
+        return _cfrp_body(tables, state, i, t, c, local_delta)
     finally:
         if _own_delta:
-            merge_local_delta(agent, local_delta)
+            merge_local_delta(tables, local_delta)
 
 
 def _cfrp_body(
-    agent: Agent,
+    tables: CFRTables,
     state: PokerState,
     i: int,
     t: int,
@@ -354,7 +354,7 @@ def _cfrp_body(
     legal_set = set(legal_actions)
     valid_mask = np.array([a in legal_set for a in canonical], dtype=bool)
 
-    row = agent.regret_tables[r].get_row_if_exists(state.info_set)
+    row = tables.regret[r].get_row_if_exists(state.info_set)
     regret_row = (
         row if row is not None
         else np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
@@ -372,7 +372,7 @@ def _cfrp_body(
             regret_at_action = int(regret_row[a_to_i[action]])
             if is_river or regret_at_action > c:
                 new_state: PokerState = state.apply_action(action)
-                voa[action] = _cfrp_body(agent, new_state, i, t, c, local_delta)
+                voa[action] = _cfrp_body(tables, new_state, i, t, c, local_delta)
                 explored[action] = True
                 vo += sigma[a_to_i[action]] * voa[action]
         key = (r, state.info_set)
@@ -392,11 +392,11 @@ def _cfrp_body(
             action_probs[:] = 1.0 / len(legal_actions)
         action: str = np.random.choice(legal_actions, p=action_probs)
         new_state: PokerState = state.apply_action(action)
-        return _cfrp_body(agent, new_state, i, t, c, local_delta)
+        return _cfrp_body(tables, new_state, i, t, c, local_delta)
 
 
 def serialise(
-    agent: Agent,
+    tables: CFRTables,
     save_path: Path,
     t: int,
     server_state: Dict[str, Union[str, float, int, None]],

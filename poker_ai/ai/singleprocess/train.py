@@ -13,7 +13,7 @@ import numpy as np
 import yaml
 from tqdm import tqdm, trange
 
-from poker_ai.ai.agent import Agent
+from poker_ai.ai.cfr_tables import CFRTables
 from poker_ai.ai import ai
 from poker_ai import utils
 from poker_ai.environment.poker_env import new_game, PokerEnv as PokerState
@@ -82,9 +82,11 @@ def simple_search(
     discount_step: int = 0
     utils.random.seed(42)
     from poker_ai.ai.index import lmdb_map_size_for_players
-    agent = Agent(
+    from poker_ai.ai.ai import MAX_ACTIONS_PER_STREET
+    tables = CFRTables(
         index_path=save_path / "lmdb_index",
         lmdb_map_size=lmdb_map_size_for_players(n_players),
+        actions_per_street=MAX_ACTIONS_PER_STREET,
     )
     card_info_lut = {}
     for t in trange(1, n_iterations + 1, desc="train iter"):
@@ -100,29 +102,27 @@ def simple_search(
             )
             card_info_lut = state.card_info_lut
             if t > update_threshold and t % strategy_interval == 0:
-                ai.update_strategy(agent=agent, state=state, i=i, t=t)
+                ai.update_strategy(tables=tables, state=state, i=i, t=t)
             local_delta: Dict[Tuple[int, str], np.ndarray] = {}
             if t > prune_threshold:
                 if random.uniform(0, 1) < 0.05:
-                    ai.cfr(agent=agent, state=state, i=i, t=t, local_delta=local_delta)
+                    ai.cfr(tables=tables, state=state, i=i, t=t, local_delta=local_delta)
                 else:
-                    ai.cfrp(agent=agent, state=state, i=i, t=t, c=c, local_delta=local_delta)
+                    ai.cfrp(tables=tables, state=state, i=i, t=t, c=c, local_delta=local_delta)
             else:
-                ai.cfr(agent=agent, state=state, i=i, t=t, local_delta=local_delta)
-            ai.merge_local_delta(agent=agent, local_delta=local_delta)
+                ai.cfr(tables=tables, state=state, i=i, t=t, local_delta=local_delta)
+            ai.merge_local_delta(tables=tables, local_delta=local_delta)
         if t < lcfr_threshold:
             discount_step += 1
             d = discount_step / (discount_step + 1)
-            # Per Pluribus paper only regret is discounted.
-            for r in range(4):
-                agent.regret_tables[r].apply_discount(d)
+            tables.apply_discount(d)
         if (t > update_threshold) and (t % dump_iteration == 0):
             # dump the current strategy (sigma) throughout training and then
             # take an average. This allows for estimation of expected value in
             # leaf nodes later on using modified versions of the blueprint
             # strategy.
             ai.serialise(
-                agent=agent, save_path=save_path, t=t, server_state=config,
+                tables=tables, save_path=save_path, t=t, server_state=config,
             )
 
 

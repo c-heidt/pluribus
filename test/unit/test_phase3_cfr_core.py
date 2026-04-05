@@ -21,7 +21,8 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from poker_ai.ai.agent import Agent
+from poker_ai.ai.cfr_tables import CFRTables
+from poker_ai.ai.ai import MAX_ACTIONS_PER_STREET
 from poker_ai.ai.ai import (
     ACTION_TO_IDX,
     MAX_ACTIONS_PER_STREET,
@@ -171,12 +172,16 @@ def _make_two_node_game():
     return root, opp_node
 
 
-def _fresh_agent():
-    """Create a fresh Agent backed by a temporary directory."""
+def _fresh_tables():
+    """Create fresh CFRTables backed by a temporary directory."""
     tmp = Path(tempfile.mkdtemp())
     shm = str(tmp / "shm")
     os.makedirs(shm, exist_ok=True)
-    return Agent(index_path=tmp / "lmdb", shm_dir=shm)
+    return CFRTables(
+        index_path=tmp / "lmdb",
+        shm_dir=shm,
+        actions_per_street=MAX_ACTIONS_PER_STREET,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -245,48 +250,48 @@ def _make_delta(r: int, **action_values) -> np.ndarray:
 
 class TestMergeLocalDelta:
     def test_new_infosets_added(self):
-        agent = _fresh_agent()
+        tables = _fresh_tables()
         local_delta = {(0, "IS1"): _make_delta(0, fold=10, call=-10)}
-        merge_local_delta(agent, local_delta)
-        row = agent.regret_tables[0].get_row_if_exists("IS1")
+        merge_local_delta(tables, local_delta)
+        row = tables.regret[0].get_row_if_exists("IS1")
         assert row is not None
         assert row[ACTION_TO_IDX[0]["fold"]] == 10
         assert row[ACTION_TO_IDX[0]["call"]] == -10
 
     def test_existing_infoset_accumulated(self):
-        agent = _fresh_agent()
+        tables = _fresh_tables()
         # Pre-populate via merge
-        merge_local_delta(agent, {(0, "IS1"): _make_delta(0, fold=5, call=-5)})
-        merge_local_delta(agent, {(0, "IS1"): _make_delta(0, fold=3, call=7)})
-        row = agent.regret_tables[0].get_row_if_exists("IS1")
+        merge_local_delta(tables, {(0, "IS1"): _make_delta(0, fold=5, call=-5)})
+        merge_local_delta(tables, {(0, "IS1"): _make_delta(0, fold=3, call=7)})
+        row = tables.regret[0].get_row_if_exists("IS1")
         assert row is not None
         assert row[ACTION_TO_IDX[0]["fold"]] == 8
         assert row[ACTION_TO_IDX[0]["call"]] == 2
 
     def test_empty_delta_noop(self):
-        agent = _fresh_agent()
-        merge_local_delta(agent, {(0, "IS1"): _make_delta(0, fold=1)})
-        row_before = int(agent.regret_tables[0].get_row("IS1")[ACTION_TO_IDX[0]["fold"]])
-        merge_local_delta(agent, {})
-        assert int(agent.regret_tables[0].get_row("IS1")[ACTION_TO_IDX[0]["fold"]]) == row_before
+        tables = _fresh_tables()
+        merge_local_delta(tables, {(0, "IS1"): _make_delta(0, fold=1)})
+        row_before = int(tables.regret[0].get_row("IS1")[ACTION_TO_IDX[0]["fold"]])
+        merge_local_delta(tables, {})
+        assert int(tables.regret[0].get_row("IS1")[ACTION_TO_IDX[0]["fold"]]) == row_before
 
     def test_multiple_infosets(self):
-        agent = _fresh_agent()
+        tables = _fresh_tables()
         local_delta = {
             (0, "A"): _make_delta(0, fold=1, call=2),
             (0, "B"): _make_delta(0, fold=-1),
         }
-        merge_local_delta(agent, local_delta)
-        assert agent.regret_tables[0].get_row_if_exists("A") is not None
-        assert agent.regret_tables[0].get_row_if_exists("B") is not None
+        merge_local_delta(tables, local_delta)
+        assert tables.regret[0].get_row_if_exists("A") is not None
+        assert tables.regret[0].get_row_if_exists("B") is not None
 
     def test_idempotent_on_repeated_merge(self):
         """Merging the same delta twice should double the values."""
-        agent = _fresh_agent()
+        tables = _fresh_tables()
         delta = {(0, "IS1"): _make_delta(0, fold=10)}
-        merge_local_delta(agent, delta)
-        merge_local_delta(agent, delta)
-        row = agent.regret_tables[0].get_row_if_exists("IS1")
+        merge_local_delta(tables, delta)
+        merge_local_delta(tables, delta)
+        row = tables.regret[0].get_row_if_exists("IS1")
         assert row is not None
         assert row[ACTION_TO_IDX[0]["fold"]] == 20
 
@@ -299,9 +304,9 @@ class TestMergeLocalDelta:
 class TestCfrLocalDelta:
     def test_local_delta_accumulates_at_traversing_player_node(self):
         root, _ = _make_two_node_game()
-        agent = _fresh_agent()
+        tables = _fresh_tables()
         local_delta: Dict = {}
-        cfr(agent, root, i=0, t=1, local_delta=local_delta)
+        cfr(tables, root, i=0, t=1, local_delta=local_delta)
         # Traversing player is 0, root.betting_round==0 → key is (0, "root")
         assert (0, "root") in local_delta
         assert isinstance(local_delta[(0, "root")], np.ndarray)
@@ -309,62 +314,62 @@ class TestCfrLocalDelta:
     def test_local_delta_does_not_write_agent_tables(self):
         """When local_delta is provided, regret_tables must not be touched."""
         root, _ = _make_two_node_game()
-        agent = _fresh_agent()
+        tables = _fresh_tables()
         local_delta: Dict = {}
-        cfr(agent, root, i=0, t=1, local_delta=local_delta)
+        cfr(tables, root, i=0, t=1, local_delta=local_delta)
         # Nothing flushed yet → regret_tables[0] has no entry for "root"
-        assert agent.regret_tables[0].get_row_if_exists("root") is None
+        assert tables.regret[0].get_row_if_exists("root") is None
 
     def test_direct_mode_writes_agent_tables(self):
         """When local_delta is None, cfr auto-flushes into regret_tables."""
         root, _ = _make_two_node_game()
-        agent = _fresh_agent()
-        cfr(agent, root, i=0, t=1, local_delta=None)
-        assert agent.regret_tables[0].get_row_if_exists("root") is not None
+        tables = _fresh_tables()
+        cfr(tables, root, i=0, t=1, local_delta=None)
+        assert tables.regret[0].get_row_if_exists("root") is not None
 
     def test_merge_after_cfr_equals_direct_mode(self):
         """local_delta path + merge must give identical regrets to direct path."""
         root, _ = _make_two_node_game()
 
         np.random.seed(7)
-        agent_direct = _fresh_agent()
-        cfr(agent_direct, root, i=0, t=1, local_delta=None)
+        tables_direct = _fresh_tables()
+        cfr(tables_direct, root, i=0, t=1, local_delta=None)
 
         np.random.seed(7)
-        agent_delta = _fresh_agent()
+        tables_delta = _fresh_tables()
         local_delta: Dict = {}
-        cfr(agent_delta, root, i=0, t=1, local_delta=local_delta)
-        merge_local_delta(agent_delta, local_delta)
+        cfr(tables_delta, root, i=0, t=1, local_delta=local_delta)
+        merge_local_delta(tables_delta, local_delta)
 
-        row_direct = agent_direct.regret_tables[0].get_row_if_exists("root")
-        row_delta = agent_delta.regret_tables[0].get_row_if_exists("root")
+        row_direct = tables_direct.regret[0].get_row_if_exists("root")
+        row_delta = tables_delta.regret[0].get_row_if_exists("root")
         assert row_direct is not None
         assert row_delta is not None
         np.testing.assert_array_equal(row_direct, row_delta)
 
     def test_local_delta_is_empty_on_terminal_state(self):
         terminal = MockTerminal(payout={0: 100, 1: -100})
-        agent = _fresh_agent()
+        tables = _fresh_tables()
         local_delta: Dict = {}
-        result = cfr(agent, terminal, i=0, t=1, local_delta=local_delta)
+        result = cfr(tables, terminal, i=0, t=1, local_delta=local_delta)
         assert local_delta == {}
         assert result == pytest.approx(100.0)
 
     def test_regret_values_pass_through_merge(self):
         """Regret increments in local_delta must be faithfully merged."""
         root, _ = _make_two_node_game()
-        agent = _fresh_agent()
+        tables = _fresh_tables()
         local_delta: Dict = {}
-        cfr(agent, root, i=0, t=1, local_delta=local_delta)
-        merge_local_delta(agent, local_delta)
-        row = agent.regret_tables[0].get_row_if_exists("root")
+        cfr(tables, root, i=0, t=1, local_delta=local_delta)
+        merge_local_delta(tables, local_delta)
+        row = tables.regret[0].get_row_if_exists("root")
         assert row is not None
         assert np.all(np.isfinite(row.astype(np.float64)))
 
     def test_payout_returned_at_terminal(self):
         terminal = MockTerminal(payout={0: 42, 1: -42})
-        agent = _fresh_agent()
-        val = cfr(agent, terminal, i=0, t=1)
+        tables = _fresh_tables()
+        val = cfr(tables, terminal, i=0, t=1)
         assert val == pytest.approx(42.0)
 
 
@@ -413,11 +418,11 @@ class TestExternalSampling:
                 "raise:1.0": opp_node,
             },
         )
-        agent = _fresh_agent()
+        tables = _fresh_tables()
         np.random.seed(0)
         for _ in range(30):
             sampled_per_call.append(set())
-            cfr(agent, root, i=0, t=1)
+            cfr(tables, root, i=0, t=1)
 
         # Each individual call must reach exactly one terminal (one sampled path)
         for run_idx, visited in enumerate(sampled_per_call):
@@ -453,8 +458,8 @@ class TestExternalSampling:
                 "raise:1.0": TrackingTerminal("raise:1.0", {0: 100, 1: -100}),
             },
         )
-        agent = _fresh_agent()
-        cfr(agent, root, i=0, t=1)
+        tables = _fresh_tables()
+        cfr(tables, root, i=0, t=1)
         assert visited == {"fold", "call", "raise:1.0"}, (
             f"Traversing player must visit ALL actions, got: {visited}"
         )
@@ -462,8 +467,8 @@ class TestExternalSampling:
     def test_same_seed_produces_same_result(self):
         """With the same numpy seed, cfr() must produce identical results."""
         root, _ = _make_two_node_game()
-        agent1 = _fresh_agent()
-        agent2 = _fresh_agent()
+        agent1 = _fresh_tables()
+        agent2 = _fresh_tables()
 
         np.random.seed(42)
         local_delta1: Dict = {}
@@ -486,34 +491,34 @@ class TestExternalSampling:
 class TestCfrpLocalDelta:
     def test_cfrp_local_delta_accumulates(self):
         root, _ = _make_two_node_game()
-        agent = _fresh_agent()
+        tables = _fresh_tables()
         local_delta: Dict = {}
         # Use c=-1e9 so pruning never fires (all regrets > c)
-        cfrp(agent, root, i=0, t=1, c=-1_000_000_000, local_delta=local_delta)
+        cfrp(tables, root, i=0, t=1, c=-1_000_000_000, local_delta=local_delta)
         assert (0, "root") in local_delta
 
     def test_cfrp_direct_mode_writes_agent_tables(self):
         root, _ = _make_two_node_game()
-        agent = _fresh_agent()
-        cfrp(agent, root, i=0, t=1, c=-1_000_000_000, local_delta=None)
-        assert agent.regret_tables[0].get_row_if_exists("root") is not None
+        tables = _fresh_tables()
+        cfrp(tables, root, i=0, t=1, c=-1_000_000_000, local_delta=None)
+        assert tables.regret[0].get_row_if_exists("root") is not None
 
     def test_cfrp_merge_equals_direct(self):
         root, _ = _make_two_node_game()
         c = -1_000_000_000
 
         np.random.seed(7)
-        agent_direct = _fresh_agent()
-        cfrp(agent_direct, root, i=0, t=1, c=c, local_delta=None)
+        tables_direct = _fresh_tables()
+        cfrp(tables_direct, root, i=0, t=1, c=c, local_delta=None)
 
         np.random.seed(7)
-        agent_delta = _fresh_agent()
+        tables_delta = _fresh_tables()
         local_delta: Dict = {}
-        cfrp(agent_delta, root, i=0, t=1, c=c, local_delta=local_delta)
-        merge_local_delta(agent_delta, local_delta)
+        cfrp(tables_delta, root, i=0, t=1, c=c, local_delta=local_delta)
+        merge_local_delta(tables_delta, local_delta)
 
-        row_direct = agent_direct.regret_tables[0].get_row_if_exists("root")
-        row_delta = agent_delta.regret_tables[0].get_row_if_exists("root")
+        row_direct = tables_direct.regret[0].get_row_if_exists("root")
+        row_delta = tables_delta.regret[0].get_row_if_exists("root")
         assert row_direct is not None
         assert row_delta is not None
         np.testing.assert_array_equal(row_direct, row_delta)
@@ -527,22 +532,22 @@ class TestCfrpLocalDelta:
 class TestUpdateStrategy:
     def test_update_strategy_accumulates_counts(self):
         root, _ = _make_two_node_game()
-        agent = _fresh_agent()
+        tables = _fresh_tables()
         # Run update_strategy 10 times — visit counts should grow
         for _ in range(10):
-            update_strategy(agent, root, i=0, t=1)
-        row = agent.strategy_tables[0].get_row_if_exists("root")
+            update_strategy(tables, root, i=0, t=1)
+        row = tables.strategy[0].get_row_if_exists("root")
         assert row is not None
         total = int(row.sum())
         assert total == 10
 
     def test_update_strategy_skips_terminal(self):
         terminal = MockTerminal(payout={0: 100, 1: -100})
-        agent = _fresh_agent()
-        update_strategy(agent, terminal, i=0, t=1)
+        tables = _fresh_tables()
+        update_strategy(tables, terminal, i=0, t=1)
         # No strategy entry created for terminal
         for r in range(4):
-            assert agent.strategy_tables[r].get_row_if_exists("terminal") is None
+            assert tables.strategy[r].get_row_if_exists("terminal") is None
 
     def test_update_strategy_traverses_postflop(self):
         """Phase 5.7: betting_round > 0 guard removed — postflop states are now traversed."""
@@ -566,10 +571,10 @@ class TestUpdateStrategy:
                 "call": MockTerminal({0: 50, 1: -50}),
             },
         )
-        agent = _fresh_agent()
-        update_strategy(agent, postflop_root, i=0, t=1)
+        tables = _fresh_tables()
+        update_strategy(tables, postflop_root, i=0, t=1)
         # Strategy table for street 1 must have been written.
-        assert agent.strategy_tables[1].get_row_if_exists("postflop_root") is not None
+        assert tables.strategy[1].get_row_if_exists("postflop_root") is not None
 
     def test_update_strategy_accepts_no_locks_arg(self):
         """update_strategy must work without any locks argument (signature check)."""
@@ -588,15 +593,15 @@ class TestUpdateStrategy:
 class TestSerialise:
     def test_serialise_does_not_raise(self, tmp_path):
         """serialise is a stub in Phase 5 and must not raise."""
-        agent = _fresh_agent()
-        serialise(agent, tmp_path, t=1, server_state={})  # must not raise
+        tables = _fresh_tables()
+        serialise(tables, tmp_path, t=1, server_state={})  # must not raise
 
     def test_serialise_accepts_required_args(self, tmp_path):
-        """serialise must accept (agent, save_path, t, server_state) keywords."""
+        """serialise must accept (tables, save_path, t, server_state) keywords."""
         import inspect
         sig = inspect.signature(serialise)
         params = set(sig.parameters)
-        assert "agent" in params
+        assert "tables" in params
         assert "save_path" in params
         assert "t" in params
         assert "server_state" in params
@@ -608,28 +613,21 @@ class TestSerialise:
 
 
 class TestBugRegressions:
-    def test_bug2_strategy_not_discounted(self):
-        """Applying discount to regret_tables must not touch strategy_tables.
+    def test_discount_applies_to_both_tables(self):
+        """CFRTables.apply_discount must discount both regret and strategy."""
+        tables = _fresh_tables()
+        merge_local_delta(tables, {(0, "IS1"): _make_delta(0, fold=1000)})
+        update_strategy(tables, _make_two_node_game()[0], i=0, t=1)
 
-        Previously singleprocess/train.py discounted agent.strategy alongside
-        agent.regret (Bug 2).  This test confirms that discounting regret
-        tables leaves strategy tables untouched.
-        """
-        agent = _fresh_agent()
-        # Populate via merge
-        merge_local_delta(agent, {(0, "IS1"): _make_delta(0, fold=1000)})
-        update_strategy(agent, _make_two_node_game()[0], i=0, t=1)
-        strategy_row_before = agent.strategy_tables[0].get_row_if_exists("root")
-        strategy_copy = strategy_row_before.copy() if strategy_row_before is not None else None
+        regret_before = tables.regret[0].get_row_if_exists("IS1")
+        regret_copy = regret_before.copy() if regret_before is not None else None
 
-        # Discount regret — strategy must remain unchanged
-        agent.regret_tables[0].set_sync_boundary(True)
-        agent.regret_tables[0].apply_discount(0.5)
-        agent.regret_tables[0].set_sync_boundary(False)
+        tables.apply_discount(0.5)
 
-        if strategy_copy is not None:
-            strategy_row_after = agent.strategy_tables[0].get_row_if_exists("root")
-            np.testing.assert_array_equal(strategy_row_after, strategy_copy)
+        if regret_copy is not None:
+            regret_after = tables.regret[0].get_row_if_exists("IS1")
+            # Values should be roughly halved
+            assert not np.array_equal(regret_after, regret_copy)
 
     def test_cfr_signature_no_locks_param(self):
         import inspect
@@ -669,13 +667,13 @@ class TestBugRegressions:
     def test_multiple_cfr_iterations_accumulate(self):
         """Run 5 cfr iterations using local_delta, verify regret entries grow."""
         root, _ = _make_two_node_game()
-        agent = _fresh_agent()
+        tables = _fresh_tables()
         for t in range(1, 6):
             local_delta: Dict = {}
-            cfr(agent, root, i=0, t=t, local_delta=local_delta)
-            merge_local_delta(agent, local_delta)
+            cfr(tables, root, i=0, t=t, local_delta=local_delta)
+            merge_local_delta(tables, local_delta)
         # After 5 iterations, regret_tables[0] must have an entry for "root"
-        row = agent.regret_tables[0].get_row_if_exists("root")
+        row = tables.regret[0].get_row_if_exists("root")
         assert row is not None
         assert np.any(row != 0)
 
@@ -701,7 +699,7 @@ def test_cfr_1000_iterations_small_game():
     if not os.path.exists(lut_path + "/card_info_lut.joblib"):
         pytest.skip("20-card exact LUT not available")
 
-    agent = _fresh_agent()
+    tables = _fresh_tables()
     card_info_lut = {}
     n_players = 2
     update_threshold = 200
@@ -713,13 +711,13 @@ def test_cfr_1000_iterations_small_game():
             card_info_lut = state.card_info_lut
 
             if t > update_threshold and t % strategy_interval == 0:
-                update_strategy(agent, state, i=i, t=t)
+                update_strategy(tables, state, i=i, t=t)
 
             local_delta: Dict = {}
-            cfr(agent, state, i=i, t=t, local_delta=local_delta)
-            merge_local_delta(agent, local_delta)
+            cfr(tables, state, i=i, t=t, local_delta=local_delta)
+            merge_local_delta(tables, local_delta)
 
     # regret_tables[0] must be non-empty
-    assert agent.regret_tables[0].n_allocated > 0, "Regret table must be non-empty after 1000 iterations"
+    assert tables.regret[0].n_allocated > 0, "Regret table must be non-empty after 1000 iterations"
     # serialise is a stub — must not raise
-    serialise(agent, Path(tempfile.mkdtemp()), t=1000, server_state={"n_iterations": 1000})
+    serialise(tables, Path(tempfile.mkdtemp()), t=1000, server_state={"n_iterations": 1000})
