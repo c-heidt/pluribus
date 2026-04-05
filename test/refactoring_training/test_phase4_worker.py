@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from poker_ai.ai.cfr_tables import CFRTables
-from poker_ai.ai.ai import ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
+from poker_ai.ai.action_space import ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
 from poker_ai.ai.multiprocess.worker import Worker
 
 

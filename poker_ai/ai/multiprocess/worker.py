@@ -8,7 +8,8 @@ from typing import Dict, Optional, Tuple, Union
 import joblib
 import numpy as np
 
-from poker_ai.ai import ai
+from poker_ai.ai.cfr import cfr, cfrp, merge_local_delta
+from poker_ai.ai.strategy import update_strategy
 from poker_ai.ai.cfr_tables import CFRTables
 from poker_ai import utils
 from poker_ai.environment import poker_env as state
@@ -119,7 +120,7 @@ class Worker(mp.Process):
         if not self._local_delta:
             return
         n_infosets = len(self._local_delta)
-        ai.merge_local_delta(self._tables, self._local_delta)
+        merge_local_delta(self._tables, self._local_delta)
         self._local_delta.clear()
         self._logging_queue.put(
             f"[worker={self.name}] Synced {n_infosets:,} infosets to master",
@@ -131,9 +132,9 @@ class Worker(mp.Process):
         self._setup_new_game()
         use_pruning: bool = np.random.uniform() < 0.95
         if use_pruning and t > self._prune_threshold:
-            ai.cfrp(self._tables, self._state, i, t, self._c, self._local_delta)
+            cfrp(self._tables, self._state, i, t, self._c, self._local_delta)
         else:
-            ai.cfr(self._tables, self._state, i, t, self._local_delta)
+            cfr(self._tables, self._state, i, t, self._local_delta)
         self._local_iteration_count += 1
         # Delta is flushed on explicit "sync" jobs dispatched by the server,
         # not after every traversal (Phase 5 decoupling).
@@ -141,7 +142,7 @@ class Worker(mp.Process):
     def _update_strategy(self, t, i):
         """Update strategy visit counts for all streets."""
         self._setup_new_game()
-        ai.update_strategy(self._tables, self._state, i, t)
+        update_strategy(self._tables, self._state, i, t)
 
     def _setup_new_game(self):
         """Setup up new poker game."""

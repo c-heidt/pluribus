@@ -22,16 +22,10 @@ import numpy as np
 import pytest
 
 from poker_ai.ai.cfr_tables import CFRTables
-from poker_ai.ai.ai import MAX_ACTIONS_PER_STREET
-from poker_ai.ai.ai import (
-    ACTION_TO_IDX,
-    MAX_ACTIONS_PER_STREET,
-    calculate_strategy_from_row,
-    cfr,
-    cfrp,
-    merge_local_delta,
-    update_strategy,
-)
+from poker_ai.ai.action_space import ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
+from poker_ai.ai.tree_utils import calculate_strategy_from_row
+from poker_ai.ai.cfr import cfr, cfrp, merge_local_delta
+from poker_ai.ai.strategy import update_strategy
 
 
 # ---------------------------------------------------------------------------
@@ -632,13 +626,13 @@ class TestBugRegressions:
         assert "locks" not in sig.parameters
 
     def test_calculate_strategy_from_row_imported(self):
-        """calculate_strategy_from_row must be importable from poker_ai.ai.ai."""
-        from poker_ai.ai.ai import calculate_strategy_from_row as csfr
+        """calculate_strategy_from_row must be importable from tree_utils."""
+        from poker_ai.ai.tree_utils import calculate_strategy_from_row as csfr
         assert callable(csfr)
 
     def test_merge_local_delta_imported(self):
-        """merge_local_delta must be importable from poker_ai.ai.ai."""
-        from poker_ai.ai.ai import merge_local_delta as mld
+        """merge_local_delta must be importable from cfr."""
+        from poker_ai.ai.cfr import merge_local_delta as mld
         assert callable(mld)
 
     def test_multiple_cfr_iterations_accumulate(self):

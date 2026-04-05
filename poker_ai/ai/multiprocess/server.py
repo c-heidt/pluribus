@@ -79,7 +79,7 @@ class Server:
         # Per-street shared-memory tables
         shm_dir = os.environ.get("PLURIBUS_SHM_DIR", "/dev/shm")
         from poker_ai.ai.index import lmdb_map_size_for_players
-        from poker_ai.ai.ai import MAX_ACTIONS_PER_STREET
+        from poker_ai.ai.action_space import MAX_ACTIONS_PER_STREET
         lmdb_map_size = int(
             os.environ.get(
                 "PLURIBUS_LMDB_MAP_SIZE",

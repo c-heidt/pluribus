@@ -13,8 +13,10 @@ import numpy as np
 import yaml
 from tqdm import tqdm, trange
 
+from poker_ai.ai.action_space import MAX_ACTIONS_PER_STREET
+from poker_ai.ai.cfr import cfr, cfrp, merge_local_delta
 from poker_ai.ai.cfr_tables import CFRTables
-from poker_ai.ai import ai
+from poker_ai.ai.strategy import update_strategy
 from poker_ai import utils
 from poker_ai.environment.poker_env import new_game, PokerEnv as PokerState
 
@@ -82,7 +84,6 @@ def simple_search(
     discount_step: int = 0
     utils.random.seed(42)
     from poker_ai.ai.index import lmdb_map_size_for_players
-    from poker_ai.ai.ai import MAX_ACTIONS_PER_STREET
     tables = CFRTables(
         index_path=save_path / "lmdb_index",
         lmdb_map_size=lmdb_map_size_for_players(n_players),
@@ -102,16 +103,16 @@ def simple_search(
             )
             card_info_lut = state.card_info_lut
             if t > update_threshold and t % strategy_interval == 0:
-                ai.update_strategy(tables=tables, state=state, i=i, t=t)
+                update_strategy(tables=tables, state=state, i=i, t=t)
             local_delta: Dict[Tuple[int, str], np.ndarray] = {}
             if t > prune_threshold:
                 if random.uniform(0, 1) < 0.05:
-                    ai.cfr(tables=tables, state=state, i=i, t=t, local_delta=local_delta)
+                    cfr(tables=tables, state=state, i=i, t=t, local_delta=local_delta)
                 else:
-                    ai.cfrp(tables=tables, state=state, i=i, t=t, c=c, local_delta=local_delta)
+                    cfrp(tables=tables, state=state, i=i, t=t, c=c, local_delta=local_delta)
             else:
-                ai.cfr(tables=tables, state=state, i=i, t=t, local_delta=local_delta)
-            ai.merge_local_delta(tables=tables, local_delta=local_delta)
+                cfr(tables=tables, state=state, i=i, t=t, local_delta=local_delta)
+            merge_local_delta(tables=tables, local_delta=local_delta)
         if t < lcfr_threshold:
             discount_step += 1
             d = discount_step / (discount_step + 1)
