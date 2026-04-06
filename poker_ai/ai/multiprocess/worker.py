@@ -1,24 +1,43 @@
+"""Worker process for multi-process CFR training.
+
+Each :class:`Worker` is a long-lived ``multiprocessing.Process`` that
+consumes jobs from a shared queue dispatched by the
+:class:`poker_ai.ai.multiprocess.server.Server`.  All real training
+logic lives in :mod:`poker_ai.ai.training`; this class is a thin
+dispatch loop around those primitives.
+
+Worker-specific concerns that stay here:
+
+- Post-fork LMDB reopen (reader slots must not be shared across forks).
+- Post-fork LUT attach (``_info_set_lut`` may have been inherited via
+  copy-on-write or must be loaded from disk).
+- Per-process RNG seeding (each worker needs an independent stream).
+- The persistent ``_local_delta`` accumulator that batches regret
+  updates across many CFR calls before flushing at a sync barrier.
+"""
 import logging
-import mmap as _mmap
 import multiprocessing as mp
 import os
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
-import joblib
 import numpy as np
 
-from poker_ai.ai.cfr import cfr, cfrp, merge_local_delta
-from poker_ai.ai.strategy import update_strategy
-from poker_ai.ai.cfr_tables import CFRTables
 from poker_ai import utils
+from poker_ai.ai.cfr import merge_local_delta
+from poker_ai.ai.cfr_tables import CFRTables
+from poker_ai.ai.training import (
+    cfr_step,
+    load_info_set_lut,
+    strategy_step,
+)
 from poker_ai.environment import poker_env as state
 
 log = logging.getLogger("sync.worker")
 
 
 class Worker(mp.Process):
-    """Subclass of multiprocessing Process to handle agent optimisation."""
+    """Long-lived worker process running CFR jobs dispatched by the server."""
 
     def __init__(
         self,
@@ -33,9 +52,8 @@ class Worker(mp.Process):
         c: int,
         save_path: Path,
         info_set_lut=None,
-        error_event: Optional[mp.Event] = None, # type: ignore
+        error_event: Optional[mp.Event] = None,  # type: ignore
     ):
-        """Construct the process, setup the state."""
         super().__init__(group=None, name=None, args=(), kwargs={}, daemon=None)
         self._job_queue: mp.Queue = job_queue
         self._logging_queue: mp.Queue = logging_queue
@@ -47,50 +65,52 @@ class Worker(mp.Process):
         self._save_path = Path(save_path)
         self._lut_path = str(lut_path)
         self._pickle_dir = pickle_dir
-        self._error_event: Optional[mp.Event] = error_event # type: ignore
+        self._error_event: Optional[mp.Event] = error_event  # type: ignore
         if info_set_lut is not None:
             self._info_set_lut = info_set_lut
-        # Per-traversal regret accumulator keyed by (betting_round, info_set).
-        # Values are int64 delta arrays of length MAX_ACTIONS_PER_STREET[r].
+        # Persistent regret accumulator keyed by (betting_round, info_set).
+        # Batched across many CFR calls and flushed on explicit "sync" jobs
+        # dispatched by the server (Phase 5 decoupling).
         self._local_delta: Dict[Tuple[int, str], np.ndarray] = {}
-        self._local_iteration_count: int = 0
 
     def run(self):
-        """Load the LUT, seed RNG, then process jobs dispatched by the server."""
-        # Reopen all per-street LMDB indexes after fork so this process gets
-        # its own reader lock-table slots (avoids MDB_BAD_RSLOT).
+        """Set up post-fork state, then process jobs from the queue."""
+        # Reopen LMDB indexes so this process gets its own reader lock-table
+        # slots (avoids MDB_BAD_RSLOT on concurrent transactions).
         self._tables.reopen_after_fork()
         if not hasattr(self, "_info_set_lut"):
-            if not self._pickle_dir:
-                lut_file_path = os.path.join(self._lut_path, "card_info_lut.joblib")
-                lut_file = open(lut_file_path, "rb")
-                lut_mmap = _mmap.mmap(lut_file.fileno(), 0, access=_mmap.ACCESS_READ)
-                self._info_set_lut = joblib.load(lut_mmap)
-                lut_mmap.close()
-                lut_file.close()
-            else:
-                self._info_set_lut = utils.io.load_info_set_lut(
-                    self._lut_path, self._pickle_dir
-                )
+            self._info_set_lut = load_info_set_lut(self._lut_path, self._pickle_dir)
         self._set_seed()
-        self._setup_new_game()
+
         while True:
             name, kwargs = self._job_queue.get(block=True)
-            if name == "terminate":
-                self._sync_to_master()
-                self._job_queue.task_done()
-                break
-            elif name == "cfr":
-                function = self._cfr
-            elif name == "sync":
-                function = self._sync_to_master
-            elif name == "update_strategy":
-                function = self._update_strategy
-            else:
-                self._job_queue.task_done()
-                raise ValueError(f"Unrecognised function name: {name}")
+            should_break = False
             try:
-                function(**kwargs)
+                if name == "terminate":
+                    self._flush_delta()
+                    should_break = True
+                elif name == "cfr":
+                    game_state = state.new_game(
+                        self._n_players, self._info_set_lut,
+                    )
+                    cfr_step(
+                        self._tables,
+                        game_state,
+                        kwargs["i"],
+                        kwargs["t"],
+                        self._prune_threshold,
+                        self._c,
+                        self._local_delta,
+                    )
+                elif name == "sync":
+                    self._flush_delta()
+                elif name == "update_strategy":
+                    game_state = state.new_game(
+                        self._n_players, self._info_set_lut,
+                    )
+                    strategy_step(self._tables, game_state, kwargs["i"])
+                else:
+                    raise ValueError(f"Unrecognised job name: {name}")
             except Exception:
                 log.exception(
                     f"[worker={self.name}] Unhandled exception in job '{name}' — "
@@ -98,24 +118,28 @@ class Worker(mp.Process):
                 )
                 if self._error_event is not None:
                     self._error_event.set()
+                should_break = True
+            finally:
                 self._job_queue.task_done()
+            if should_break:
                 break
-            else:
-                self._job_queue.task_done()
 
     def _set_seed(self):
-        """Lose all reproducability as we need unique streams per worker."""
-        # NOTE(fedden): NumPy in particular has a problem with processes and
-        #               seeds: https://github.com/numpy/numpy/issues/9650
+        """Seed the RNG with an independent stream for this worker.
+
+        NumPy in particular has a problem with processes and seeds:
+        https://github.com/numpy/numpy/issues/9650
+        """
         random_seed: int = int.from_bytes(os.urandom(4), byteorder="little")
         utils.random.seed(random_seed)
 
-    def _sync_to_master(self) -> None:
-        """Flush ``_local_delta`` into the agent's per-street regret tables.
+    def _flush_delta(self) -> None:
+        """Flush ``_local_delta`` into the shared regret tables.
 
-        Routes each ``(betting_round, info_set)`` delta into the correct
-        ``SparseRegretTable`` via ``merge_delta_row`` which holds the stripe
-        lock internally.  After the flush ``_local_delta`` is cleared.
+        Each ``(betting_round, info_set)`` delta is routed into the
+        correct per-street regret table via ``merge_delta_row``, which
+        acquires the stripe lock internally.  ``_local_delta`` is
+        cleared after the flush.
         """
         if not self._local_delta:
             return
@@ -125,27 +149,4 @@ class Worker(mp.Process):
         self._logging_queue.put(
             f"[worker={self.name}] Synced {n_infosets:,} infosets to master",
             block=True,
-        )
-
-    def _cfr(self, t, i):
-        """Search over random game and calculate the strategy."""
-        self._setup_new_game()
-        use_pruning: bool = np.random.uniform() < 0.95
-        if use_pruning and t > self._prune_threshold:
-            cfrp(self._tables, self._state, i, t, self._c, self._local_delta)
-        else:
-            cfr(self._tables, self._state, i, t, self._local_delta)
-        self._local_iteration_count += 1
-        # Delta is flushed on explicit "sync" jobs dispatched by the server,
-        # not after every traversal (Phase 5 decoupling).
-
-    def _update_strategy(self, i):
-        """Update strategy visit counts for all streets."""
-        self._setup_new_game()
-        update_strategy(self._tables, self._state, i)
-
-    def _setup_new_game(self):
-        """Setup up new poker game."""
-        self._state: state.PokerEnv = state.new_game(
-            self._n_players, self._info_set_lut,
         )

@@ -221,22 +221,18 @@ class CheckpointManager:
         and ``nickname`` are intentionally *not* checked — they are
         allowed to differ between runs.
         """
-        attr_map = {
-            "n_players": "_n_players",
-            "sync_interval": "_sync_interval",
-            "discount_interval": "_discount_interval",
-            "discount_duration_cycles": "_discount_duration_cycles",
-            "strategy_interval": "_strategy_interval",
-            "update_threshold": "_update_threshold",
-            "prune_threshold": "_prune_threshold",
-            "c": "_c",
-        }
+        def _current(key: str):
+            # discount_duration_cycles now lives on Server._discount_state.
+            if key == "discount_duration_cycles":
+                return self._server._discount_state.duration_cycles
+            return getattr(self._server, "_" + key)
+
         mismatches = []
         for key in self._STRUCTURAL_KEYS:
             if key not in state_dict:
                 continue  # old checkpoint format — skip silently
             saved = state_dict[key]
-            current = getattr(self._server, attr_map[key])
+            current = _current(key)
             if saved != current:
                 mismatches.append(f"{key}: saved={saved!r} current={current!r}")
         if mismatches:
@@ -255,7 +251,7 @@ class CheckpointManager:
         self._validate_config_compatibility(state_dict)
 
         self._server._start_t = state_dict["t"] + 1
-        self._server._discounting_active = state_dict.get("discount_active", True)
+        self._server._discount_state.active = state_dict.get("discount_active", True)
 
         ncs = _extract_n_chunks_per_street(state_dict)
         self._server._tables.restore_chunks(path, ncs)

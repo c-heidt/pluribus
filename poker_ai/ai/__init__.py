@@ -6,5 +6,6 @@ from . import action_space
 from . import tree_utils
 from . import cfr
 from . import strategy
+from . import training
 from . import multiprocess
 from . import runner

@@ -1,5 +1,12 @@
+"""Training server for multi-process CFR.
+
+Owns the worker pool, the shared job queue, signal handling, the
+checkpoint manager, and progress tracking.  All training-step logic
+(CFR traversals, discount formula, schedule predicates, LUT loading)
+lives in :mod:`poker_ai.ai.training`; this class is a thin orchestrator
+around those primitives.
+"""
 import logging
-import mmap as _mmap
 import multiprocessing as mp
 import os
 import threading
@@ -7,15 +14,19 @@ import time
 from pathlib import Path
 from typing import Dict, Optional, Union
 
-from poker_ai.ai.checkpoint import CheckpointManager
-
 import enlighten
 
-import math
-
+from poker_ai.ai.checkpoint import CheckpointManager
 from poker_ai.ai.cfr_tables import CFRTables
-from poker_ai import utils
 from poker_ai.ai.multiprocess.worker import Worker
+from poker_ai.ai.training import (
+    DiscountState,
+    at_sync_barrier,
+    load_info_set_lut,
+    should_checkpoint,
+    should_discount,
+    should_update_strategy,
+)
 
 log = logging.getLogger("sync.server")
 
@@ -26,7 +37,7 @@ class WorkerError(RuntimeError):
 
 
 class Server:
-    """Server class to manage all workers optimising CFR algorithm."""
+    """Coordinates a pool of :class:`Worker` processes running CFR."""
 
     def __init__(
         self,
@@ -55,9 +66,7 @@ class Server:
         exception is ``prune_threshold``, which is checked per CFR call
         and therefore stays in raw iterations.
         """
-        # Determine number of processes to use
         if n_processes is None:
-            # Check if running under Slurm
             slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
             if slurm_cpus is not None:
                 n_processes = int(slurm_cpus) - 1
@@ -68,8 +77,6 @@ class Server:
 
         self._strategy_interval = strategy_interval
         self._max_runtime_hours = max_runtime_hours
-        self._discount_duration_cycles = discount_duration_cycles
-        self._discounting_active = True
         self._prune_threshold = prune_threshold
         self._c = c
         self._n_players = n_players
@@ -81,10 +88,18 @@ class Server:
         self._discount_interval = discount_interval
         self._checkpoint_interval = checkpoint_interval
         self._start_t = start_timestep
-        self._info_set_lut = self._load_lut(lut_path, pickle_dir)
+        self._discount_state = DiscountState(
+            duration_cycles=discount_duration_cycles,
+            discount_interval=discount_interval,
+        )
+
+        # Load LUT once in the parent; workers inherit via fork copy-on-write.
+        self._info_set_lut = load_info_set_lut(lut_path, pickle_dir)
+
         self._job_queue: mp.JoinableQueue = mp.JoinableQueue(maxsize=n_processes)
         self._logging_queue: mp.Queue = mp.Queue()
-        # Per-street shared-memory tables
+
+        # Per-street shared-memory tables.
         shm_dir = os.environ.get("PLURIBUS_SHM_DIR", "/dev/shm")
         from poker_ai.ai.index import lmdb_map_size_for_players
         from poker_ai.ai.action_space import MAX_ACTIONS_PER_STREET
@@ -104,8 +119,9 @@ class Server:
             actions_per_street=MAX_ACTIONS_PER_STREET,
         )
         self._locks: Dict[str, mp.synchronize.Lock] = {}
-        self._error_event: mp.Event = mp.Event() # type: ignore
+        self._error_event: mp.Event = mp.Event()  # type: ignore
         self._current_t: int = self._start_t
+
         # CheckpointManager registers signal handlers and restores from
         # checkpoint before workers are spawned.
         self._checkpoint_manager = CheckpointManager(self, self._save_path)
@@ -113,11 +129,14 @@ class Server:
             n_processes = 4
         self._workers = self._start_workers(n_processes)
 
+    # ------------------------------------------------------------------
+    # Main training loop
+    # ------------------------------------------------------------------
+
     def search(self):
-        """Perform MCCFR and train the agent."""
+        """Run the MCCFR training loop until time or signal stops it."""
         self._training_start = time.monotonic()
-        progress_bar_manager = enlighten.get_manager()
-        progress_bar = progress_bar_manager.counter(
+        progress_bar = enlighten.get_manager().counter(
             desc="Optimisation iterations", unit="iter"
         )
         sigterm = self._checkpoint_manager.sigterm_event
@@ -132,13 +151,14 @@ class Server:
                     break
                 if sigterm.is_set():
                     break
+
                 self._current_t = t
-                while not self._logging_queue.empty():
-                    log.info(self._logging_queue.get())
+                self._drain_logging_queue()
+
                 for i in range(self._n_players):
                     self._send_job("cfr", t=t, i=i)
 
-                if t % self._sync_interval == 0:
+                if at_sync_barrier(t, self._sync_interval):
                     self._join_queue()
                     if sigterm.is_set():
                         break
@@ -149,9 +169,8 @@ class Server:
 
                     sync_step = t // self._sync_interval
 
-                    if (
-                        sync_step > self._update_threshold
-                        and sync_step % self._strategy_interval == 0
+                    if should_update_strategy(
+                        sync_step, self._strategy_interval, self._update_threshold
                     ):
                         for i in range(self._n_players):
                             self._send_job("update_strategy", i=i)
@@ -159,17 +178,16 @@ class Server:
                         if sigterm.is_set():
                             break
 
-                    if sync_step % self._discount_interval == 0:
-                        self._apply_discount(sync_step)
+                    if should_discount(sync_step, self._discount_interval):
+                        self._discount_state.apply(self._tables, sync_step)
 
-                    if sync_step % self._checkpoint_interval == 0:
+                    if should_checkpoint(sync_step, self._checkpoint_interval):
                         self._checkpoint_manager.checkpoint(t=t)
 
                 progress_bar.update()
                 t += 1
 
-            # Drain any jobs still in the queue, then flush all worker local deltas
-            # before writing the final checkpoint.
+            # Drain any jobs still in the queue, then write the final checkpoint.
             self._join_queue()
             elapsed_total = (time.monotonic() - self._training_start) / 3600.0
             if sigterm.is_set():
@@ -182,6 +200,10 @@ class Server:
         except WorkerError:
             log.error("A worker encountered a fatal error — terminating all workers")
             raise
+
+    # ------------------------------------------------------------------
+    # Worker lifecycle
+    # ------------------------------------------------------------------
 
     def terminate(self, safe: bool = True):
         """Broadcast terminate to all workers and join them."""
@@ -205,11 +227,7 @@ class Server:
         for worker in self._workers:
             deadline = time.monotonic() + SHUTDOWN_TIMEOUT_SECS
             while worker.is_alive():
-                while not self._logging_queue.empty():
-                    try:
-                        log.info(self._logging_queue.get_nowait())
-                    except Exception:
-                        pass
+                self._drain_logging_queue(nowait=True)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     log.error(f"{worker.name} stuck after {SHUTDOWN_TIMEOUT_SECS}s — killing")
@@ -220,133 +238,15 @@ class Server:
                 log.warning(f"{worker.name} exited with code {worker.exitcode}")
             else:
                 log.info(f"worker {worker.name} joined.")
-        # Drain any remaining log messages after all workers have exited.
-        while not self._logging_queue.empty():
-            try:
-                log.info(self._logging_queue.get_nowait())
-            except Exception:
-                pass
+        self._drain_logging_queue(nowait=True)
         self._cleanup()
 
     def _cleanup(self):
         """Close and unlink all shared-memory tables and indexes."""
         self._tables.close()
 
-    def to_dict(self, t: Optional[int] = None) -> Dict[str, Union[str, float, int, None]]:
-        """Serialise the server object to save the progress of optimisation.
-
-        Parameters
-        ----------
-        t:
-            Current training iteration to embed in the snapshot.  When
-            omitted, ``self._current_t`` is used (safe to call outside the
-            training loop for testing).
-        """
-        t_val = t if t is not None else self._current_t
-        config = dict(
-            t=t_val,
-            strategy_interval=self._strategy_interval,
-            max_runtime_hours=self._max_runtime_hours,
-            discount_duration_cycles=self._discount_duration_cycles,
-            discount_active=self._discounting_active,
-            prune_threshold=self._prune_threshold,
-            c=self._c,
-            n_players=self._n_players,
-            update_threshold=self._update_threshold,
-            save_path=self._save_path,
-            lut_path=self._lut_path,
-            pickle_dir=self._pickle_dir,
-            sync_interval=self._sync_interval,
-            discount_interval=self._discount_interval,
-            checkpoint_interval=self._checkpoint_interval,
-            start_timestep=self._start_t,
-            n_chunks_per_street=self._tables.n_chunks_per_street(),
-        )
-        return {
-            k: os.path.abspath(str(v)) if isinstance(v, Path) else v
-            for k, v in sorted(config.items())
-        }
-
-    def _join_queue(self):
-        """Block until the job queue drains, raising WorkerError if a worker dies."""
-        t = threading.Thread(target=self._job_queue.join, daemon=True)
-        t.start()
-        while t.is_alive():
-            if self._error_event.is_set():
-                raise WorkerError("A worker encountered a fatal error")
-            t.join(timeout=0.5)
-
-    def _send_job(self, job_name: str, **kwargs):
-        """Send job of type ``job_name`` with arguments to worker pool."""
-        while True:
-            if self._error_event.is_set():
-                raise WorkerError("A worker encountered a fatal error")
-            try:
-                self._job_queue.put((job_name, kwargs), block=True, timeout=0.5)
-                return
-            except Exception:
-                # Queue full — retry after checking error event
-                pass
-
-    def _broadcast_job(self, job_name: str, **kwargs):
-        """Send ``job_name`` to every worker in the pool."""
-        for _ in self._workers:
-            self._send_job(job_name, **kwargs)
-
-    def flush_all_workers(self) -> None:
-        """Broadcast a sync job and wait until all workers have flushed.
-
-        Called by ``CheckpointManager.checkpoint()`` before writing dirty
-        chunks so that no in-flight local deltas remain in worker buffers.
-        """
-        self._broadcast_job("sync")
-        self._join_queue()
-
-    def _apply_discount(self, sync_step: int) -> None:
-        """Apply LCFR discount directly to all shared-memory tables.
-
-        Called by the server after every sync barrier while the discount
-        window is active.  Running in the server process (not a worker
-        job) guarantees the discount is applied exactly once per sync
-        cycle with no concurrency.
-
-        Parameters
-        ----------
-        sync_step:
-            Current sync-cycle counter (``t // sync_interval``).
-        """
-        if not self._discounting_active:
-            return
-        if sync_step >= self._discount_duration_cycles:
-            log.info(f"Discount window closed after {sync_step} sync cycles")
-            self._discounting_active = False
-            return
-        discount_step = sync_step // self._discount_interval
-        discount_factor = discount_step / (discount_step + 1)
-        log.info(
-            f"[sync_step={sync_step}] Discounting regrets and strategy "
-            f"(step={discount_step}, factor={discount_factor:.4f})"
-        )
-        self._tables.apply_discount(discount_factor)
-
-
-    def _load_lut(self, lut_path, pickle_dir):
-        """Load LUT once in the parent process.
-
-        Workers inherit the deserialized Python object via fork copy-on-write.
-        Only one deserialization happens regardless of worker count.
-        """
-        if pickle_dir:
-            return utils.io.load_info_set_lut(str(lut_path), pickle_dir)
-        lut_file_path = os.path.join(str(lut_path), "card_info_lut.joblib")
-        log.info(f"Loading LUT from {lut_file_path} ...")
-        import joblib as _joblib
-        lut = _joblib.load(lut_file_path)
-        log.info("LUT loaded.")
-        return lut
-
     def _start_workers(self, n_processes: int):
-        """Begin the worker processes."""
+        """Spawn *n_processes* worker processes."""
         workers = []
         for _ in range(n_processes):
             worker = Worker(
@@ -368,3 +268,94 @@ class Server:
             worker.start()
             log.info(f"started worker {worker.name}")
         return workers
+
+    # ------------------------------------------------------------------
+    # Checkpoint integration
+    # ------------------------------------------------------------------
+
+    def to_dict(self, t: Optional[int] = None) -> Dict[str, Union[str, float, int, None]]:
+        """Serialise the server state for checkpointing.
+
+        Parameters
+        ----------
+        t:
+            Current training iteration to embed in the snapshot.  When
+            omitted, ``self._current_t`` is used (safe to call outside
+            the training loop).
+        """
+        t_val = t if t is not None else self._current_t
+        config = dict(
+            t=t_val,
+            strategy_interval=self._strategy_interval,
+            max_runtime_hours=self._max_runtime_hours,
+            discount_duration_cycles=self._discount_state.duration_cycles,
+            discount_active=self._discount_state.active,
+            prune_threshold=self._prune_threshold,
+            c=self._c,
+            n_players=self._n_players,
+            update_threshold=self._update_threshold,
+            save_path=self._save_path,
+            lut_path=self._lut_path,
+            pickle_dir=self._pickle_dir,
+            sync_interval=self._sync_interval,
+            discount_interval=self._discount_interval,
+            checkpoint_interval=self._checkpoint_interval,
+            start_timestep=self._start_t,
+            n_chunks_per_street=self._tables.n_chunks_per_street(),
+        )
+        return {
+            k: os.path.abspath(str(v)) if isinstance(v, Path) else v
+            for k, v in sorted(config.items())
+        }
+
+    def flush_all_workers(self) -> None:
+        """Broadcast a sync job and wait until all workers have flushed.
+
+        Called by :meth:`CheckpointManager.checkpoint` before writing
+        dirty chunks so that no in-flight local deltas remain in worker
+        buffers.
+        """
+        self._broadcast_job("sync")
+        self._join_queue()
+
+    # ------------------------------------------------------------------
+    # Queue plumbing
+    # ------------------------------------------------------------------
+
+    def _join_queue(self):
+        """Block until the job queue drains, raising WorkerError if a worker dies."""
+        t = threading.Thread(target=self._job_queue.join, daemon=True)
+        t.start()
+        while t.is_alive():
+            if self._error_event.is_set():
+                raise WorkerError("A worker encountered a fatal error")
+            t.join(timeout=0.5)
+
+    def _send_job(self, job_name: str, **kwargs):
+        """Send a single job of type *job_name* to the worker pool."""
+        while True:
+            if self._error_event.is_set():
+                raise WorkerError("A worker encountered a fatal error")
+            try:
+                self._job_queue.put((job_name, kwargs), block=True, timeout=0.5)
+                return
+            except Exception:
+                # Queue full — retry after checking error event.
+                pass
+
+    def _broadcast_job(self, job_name: str, **kwargs):
+        """Send *job_name* to every worker in the pool (once each)."""
+        for _ in self._workers:
+            self._send_job(job_name, **kwargs)
+
+    def _drain_logging_queue(self, nowait: bool = False) -> None:
+        """Emit any pending worker log messages via the server logger."""
+        while not self._logging_queue.empty():
+            try:
+                msg = (
+                    self._logging_queue.get_nowait() if nowait
+                    else self._logging_queue.get()
+                )
+            except Exception:
+                return
+            log.info(msg)
