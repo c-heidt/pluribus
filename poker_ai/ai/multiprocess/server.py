@@ -1,11 +1,34 @@
 """Training server for multi-process CFR.
 
-Owns the worker pool, the shared job queue, signal handling, the
-checkpoint manager, and progress tracking.  All training-step logic
-(CFR traversals, discount formula, schedule predicates, LUT loading)
-lives in :mod:`poker_ai.ai.training`; this class is a thin orchestrator
-around those primitives.
+The :class:`Server` is the process-level orchestrator: it spawns a
+pool of :class:`~poker_ai.ai.multiprocess.worker.Worker` subprocesses,
+owns the shared :class:`~poker_ai.ai.cfr_tables.CFRTables`, dispatches
+training jobs through a multiprocessing queue, and drives the
+sync-cycle-based schedule (sync barriers, strategy updates,
+discounting, checkpoints).  All per-step training logic (CFR
+traversals, pruning decisions, the discount formula, LUT loading)
+lives in :mod:`poker_ai.ai.training` so this class stays a thin
+orchestrator.
+
+Process and concurrency model
+-----------------------------
+- The server process owns the :class:`CFRTables`, the LMDB indexes,
+  the shared-memory chunk files, and the
+  :class:`~poker_ai.ai.checkpoint.CheckpointManager`.  Workers
+  inherit everything via fork copy-on-write.
+- Jobs travel over a bounded :class:`multiprocessing.JoinableQueue`.
+  Sync barriers are implemented by draining the queue with
+  :meth:`_join_queue`, broadcasting a ``sync`` job to every worker,
+  and draining again.
+- Fatal worker exceptions are surfaced via a shared
+  :class:`multiprocessing.Event`.  :meth:`_join_queue` polls the
+  event and raises :class:`WorkerError` so the server loop can stop
+  cleanly without blocking on a dead worker.
+- ``SIGTERM`` / ``SIGINT`` are handled by the
+  :class:`CheckpointManager`, which sets an event that the main loop
+  polls at every iteration.
 """
+
 import logging
 import multiprocessing as mp
 import os
@@ -32,12 +55,28 @@ log = logging.getLogger("sync.server")
 
 
 class WorkerError(RuntimeError):
-    """Raised when a worker process encounters a fatal error."""
+    """Raised by the server loop when a worker has reported a fatal error.
+
+    Workers set a shared error event before breaking out of their
+    dispatch loop; the server turns that event into this exception via
+    :meth:`Server._join_queue` so the main loop can unwind cleanly and
+    trigger an unsafe :meth:`Server.terminate`.
+    """
     pass
 
 
 class Server:
-    """Coordinates a pool of :class:`Worker` processes running CFR."""
+    """Coordinates a pool of :class:`Worker` processes running CFR.
+
+    A single :class:`Server` instance is the entry point for a
+    multi-process training run.  Constructing it loads the card-info
+    LUT, opens the shared tables, restores from a checkpoint if one
+    exists, and spawns the worker pool.  Calling :meth:`search` then
+    drives the training loop until the wall-clock budget is
+    exhausted or a shutdown signal is received.  The caller is
+    responsible for calling :meth:`terminate` afterwards to tear down
+    the pool.
+    """
 
     def __init__(
         self,
@@ -57,14 +96,54 @@ class Server:
         start_timestep: int = 1,
         n_processes: Optional[int] = None,
     ):
-        """Set up the optimisation server.
+        """Initialise the server and spawn the worker pool.
 
-        All interval/threshold parameters (``strategy_interval``,
-        ``discount_interval``, ``checkpoint_interval``,
-        ``discount_duration_cycles``, ``update_threshold``) are counted
-        in **sync cycles** (= ``sync_interval`` iterations).  The only
-        exception is ``prune_threshold``, which is checked per CFR call
-        and therefore stays in raw iterations.
+        All interval and threshold parameters except ``prune_threshold``
+        are counted in **sync cycles**.  A sync cycle is
+        ``sync_interval`` raw training iterations.  ``prune_threshold``
+        stays in raw iterations because it is checked inside the
+        per-traversal pruning decision in :func:`cfr_step`.
+
+        Parameters
+        ----------
+        strategy_interval : int
+            Period (in sync cycles) between strategy-update passes.
+        max_runtime_hours : float
+            Wall-clock budget for this run.  Training stops when
+            elapsed time reaches this bound.
+        discount_duration_cycles : int
+            Length of the LCFR discount window in sync cycles.
+        prune_threshold : int
+            Raw iteration at which CFR-P becomes eligible in
+            :func:`poker_ai.ai.training.cfr_step`.
+        c : int
+            Regret threshold for CFR-P (see
+            :func:`poker_ai.ai.cfr.cfrp`).
+        n_players : int
+            Number of players in the game.
+        update_threshold : int
+            Warm-up in sync cycles before strategy updates begin.
+        save_path : str or Path
+            Root directory for checkpoints, LMDB indexes, and logs.
+        lut_path : str or Path, optional
+            Directory holding the card-info LUT.
+        pickle_dir : bool, optional
+            Use the legacy pickle-directory LUT layout.  Defaults to
+            ``False``.
+        sync_interval : int, optional
+            Number of iterations between sync barriers.  The base
+            unit for every other cycle-based parameter.
+        discount_interval : int, optional
+            Period (in sync cycles) between LCFR discount applications.
+        checkpoint_interval : int, optional
+            Period (in sync cycles) between checkpoint writes.
+        start_timestep : int, optional
+            Initial iteration counter.  Overridden on resume by the
+            checkpoint manager.
+        n_processes : int, optional
+            Number of worker processes to spawn.  Defaults to
+            ``SLURM_CPUS_PER_TASK - 1`` when running under SLURM or
+            ``cpu_count() - 1`` otherwise.
         """
         if n_processes is None:
             slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
@@ -93,13 +172,16 @@ class Server:
             discount_interval=discount_interval,
         )
 
-        # Load LUT once in the parent; workers inherit via fork copy-on-write.
+        # Load the LUT once in the parent; workers inherit the
+        # deserialised object via fork copy-on-write, avoiding one
+        # load per worker.
         self._info_set_lut = load_info_set_lut(lut_path, pickle_dir)
 
         self._job_queue: mp.JoinableQueue = mp.JoinableQueue(maxsize=n_processes)
         self._logging_queue: mp.Queue = mp.Queue()
 
-        # Per-street shared-memory tables.
+        # Per-street shared-memory tables.  The LMDB map_size can be
+        # overridden from the environment for very large runs.
         shm_dir = os.environ.get("PLURIBUS_SHM_DIR", "/dev/shm")
         from poker_ai.ai.index import lmdb_map_size_for_players
         from poker_ai.ai.action_space import MAX_ACTIONS_PER_STREET
@@ -122,8 +204,9 @@ class Server:
         self._error_event: mp.Event = mp.Event()  # type: ignore
         self._current_t: int = self._start_t
 
-        # CheckpointManager registers signal handlers and restores from
-        # checkpoint before workers are spawned.
+        # CheckpointManager registers signal handlers and restores
+        # from an existing checkpoint before any worker is spawned so
+        # workers observe the restored state.
         self._checkpoint_manager = CheckpointManager(self, self._save_path)
         if os.environ.get("TESTING_SUITE"):
             n_processes = 4
@@ -134,7 +217,27 @@ class Server:
     # ------------------------------------------------------------------
 
     def search(self):
-        """Run the MCCFR training loop until time or signal stops it."""
+        """Run the CFR training loop until time or signal stops it.
+
+        Each iteration:
+
+        1. Dispatches one ``cfr`` job per player into the worker pool.
+        2. At sync barriers, drains the queue, broadcasts a ``sync``
+           job so workers flush their accumulated deltas, then
+           re-drains the queue.
+        3. At sync barriers that satisfy the strategy-interval
+           schedule, dispatches one ``update_strategy`` job per
+           player and waits for them all to complete.
+        4. At sync barriers that satisfy the discount schedule,
+           applies an LCFR discount to the shared tables.
+        5. At sync barriers that satisfy the checkpoint schedule,
+           writes a checkpoint via the checkpoint manager.
+
+        The loop exits when :attr:`max_runtime_hours` is reached or
+        when the checkpoint manager's sigterm event is set.  After
+        the loop exits, one final checkpoint is written so no work
+        is lost.
+        """
         self._training_start = time.monotonic()
         progress_bar = enlighten.get_manager().counter(
             desc="Optimisation iterations", unit="iter"
@@ -187,7 +290,8 @@ class Server:
                 progress_bar.update()
                 t += 1
 
-            # Drain any jobs still in the queue, then write the final checkpoint.
+            # Drain any jobs still in the queue, then write the final
+            # checkpoint so the run can be resumed from its last iteration.
             self._join_queue()
             elapsed_total = (time.monotonic() - self._training_start) / 3600.0
             if sigterm.is_set():
@@ -206,11 +310,34 @@ class Server:
     # ------------------------------------------------------------------
 
     def terminate(self, safe: bool = True):
-        """Broadcast terminate to all workers and join them."""
+        """Shut down the worker pool and release shared resources.
+
+        Two paths are supported:
+
+        - **Safe shutdown** (default): drain the job queue, broadcast
+          ``terminate`` to every worker, then join each worker with a
+          timeout.  Workers that refuse to exit within the timeout
+          are killed.  This is the normal exit path after
+          :meth:`search` returns.
+        - **Unsafe shutdown** (``safe=False``): kill every worker
+          immediately without going through the queue.  Used when
+          the queue may be deadlocked because a worker has already
+          crashed and raised :class:`WorkerError`.
+
+        In both cases the shared tables are closed and unlinked
+        before the method returns.
+
+        Parameters
+        ----------
+        safe : bool, optional
+            Whether to attempt an orderly shutdown.  Defaults to
+            ``True``.
+        """
         SHUTDOWN_TIMEOUT_SECS = 60
         if not safe:
-            # Emergency shutdown: kill all workers immediately without waiting
-            # for the job queue (it may be deadlocked due to the worker error).
+            # Emergency shutdown: kill all workers immediately without
+            # waiting for the job queue, which may be deadlocked due
+            # to a worker error.
             log.warning("Unsafe termination — killing all workers immediately")
             for worker in self._workers:
                 if worker.is_alive():
@@ -242,11 +369,17 @@ class Server:
         self._cleanup()
 
     def _cleanup(self):
-        """Close and unlink all shared-memory tables and indexes."""
+        """Close and unlink shared tables after the worker pool exits."""
         self._tables.close()
 
     def _start_workers(self, n_processes: int):
-        """Spawn *n_processes* worker processes."""
+        """Construct and start *n_processes* worker processes.
+
+        Each worker receives a reference to the shared tables, the
+        job and logging queues, the training hyperparameters it
+        needs, and the pre-loaded LUT so it does not have to repeat
+        the deserialisation in the child process.
+        """
         workers = []
         for _ in range(n_processes):
             worker = Worker(
@@ -274,14 +407,26 @@ class Server:
     # ------------------------------------------------------------------
 
     def to_dict(self, t: Optional[int] = None) -> Dict[str, Union[str, float, int, None]]:
-        """Serialise the server state for checkpointing.
+        """Serialise the server state into a JSON-compatible dict.
+
+        The returned dict is persisted by the checkpoint manager as
+        ``server_state.pkl``.  It contains every hyperparameter
+        needed for the resume-time structural compatibility check plus
+        the iteration counter and per-street chunk counts needed to
+        locate the on-disk chunk files.
 
         Parameters
         ----------
-        t:
-            Current training iteration to embed in the snapshot.  When
-            omitted, ``self._current_t`` is used (safe to call outside
-            the training loop).
+        t : int, optional
+            Iteration counter to embed in the snapshot.  When
+            omitted, ``self._current_t`` is used (safe to call
+            outside the training loop).
+
+        Returns
+        -------
+        dict
+            Flat dict with path-like values converted to absolute
+            strings so the checkpoint is portable between CWDs.
         """
         t_val = t if t is not None else self._current_t
         config = dict(
@@ -309,11 +454,12 @@ class Server:
         }
 
     def flush_all_workers(self) -> None:
-        """Broadcast a sync job and wait until all workers have flushed.
+        """Broadcast a ``sync`` job and wait for every worker to flush.
 
         Called by :meth:`CheckpointManager.checkpoint` before writing
-        dirty chunks so that no in-flight local deltas remain in worker
-        buffers.
+        dirty chunks so no in-flight regret delta is left in a
+        worker's local accumulator at the time the chunks are
+        serialised.
         """
         self._broadcast_job("sync")
         self._join_queue()
@@ -323,7 +469,19 @@ class Server:
     # ------------------------------------------------------------------
 
     def _join_queue(self):
-        """Block until the job queue drains, raising WorkerError if a worker dies."""
+        """Block until the job queue drains, surfacing worker errors.
+
+        Uses a dedicated daemon thread to drain the queue so the main
+        thread can continue polling the shared ``_error_event``.  If
+        a worker sets the event while the queue is being drained,
+        this method raises :class:`WorkerError` immediately instead
+        of blocking forever on a queue that will never empty.
+
+        Raises
+        ------
+        WorkerError
+            If a worker has signalled a fatal error during the wait.
+        """
         t = threading.Thread(target=self._job_queue.join, daemon=True)
         t.start()
         while t.is_alive():
@@ -332,7 +490,25 @@ class Server:
             t.join(timeout=0.5)
 
     def _send_job(self, job_name: str, **kwargs):
-        """Send a single job of type *job_name* to the worker pool."""
+        """Enqueue one job, retrying if the bounded queue is full.
+
+        Retries until the put succeeds or the error event fires.  The
+        bounded queue acts as back-pressure: if every worker is busy,
+        this method blocks the server until a worker picks up a job,
+        keeping the pipeline depth under control.
+
+        Parameters
+        ----------
+        job_name : str
+            Dispatch key read by :meth:`Worker.run`.
+        **kwargs
+            Keyword arguments forwarded to the worker method.
+
+        Raises
+        ------
+        WorkerError
+            If the error event fires before the put succeeds.
+        """
         while True:
             if self._error_event.is_set():
                 raise WorkerError("A worker encountered a fatal error")
@@ -340,16 +516,33 @@ class Server:
                 self._job_queue.put((job_name, kwargs), block=True, timeout=0.5)
                 return
             except Exception:
-                # Queue full — retry after checking error event.
+                # Queue full — retry after checking the error event.
                 pass
 
     def _broadcast_job(self, job_name: str, **kwargs):
-        """Send *job_name* to every worker in the pool (once each)."""
+        """Enqueue *job_name* once for every worker in the pool.
+
+        Used for operations that every worker must perform exactly
+        once — typically ``sync`` and ``terminate``.
+        """
         for _ in self._workers:
             self._send_job(job_name, **kwargs)
 
     def _drain_logging_queue(self, nowait: bool = False) -> None:
-        """Emit any pending worker log messages via the server logger."""
+        """Emit any pending worker log messages via the server logger.
+
+        Workers push human-readable status strings onto the shared
+        logging queue; this helper drains them into the server's
+        logger so they appear in the normal run log.  Uses the
+        non-blocking variant during shutdown, where we do not want
+        to block on an empty queue.
+
+        Parameters
+        ----------
+        nowait : bool, optional
+            Use :meth:`Queue.get_nowait` instead of :meth:`Queue.get`.
+            Defaults to ``False``.
+        """
         while not self._logging_queue.empty():
             try:
                 msg = (

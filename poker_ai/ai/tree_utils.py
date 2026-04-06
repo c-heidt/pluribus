@@ -1,9 +1,26 @@
-"""Shared game-tree primitives for CFR training and real-time search.
+"""Stateless game-tree primitives used by CFR training and search.
 
-All functions in this module are stateless and have no dependency on
-CFR-specific concepts like regret deltas or training iterations.
-Real-time search algorithms can import directly from here without
-touching the CFR training machinery.
+This module holds the building blocks that any CFR-style tree traversal
+needs — terminal detection, legal-action extraction, regret matching,
+strategy lookup, opponent sampling, and regret accumulation — in a form
+that is decoupled from the training loop.  Nothing in this file
+mutates training-wide state; callers pass in the tables and
+accumulators explicitly.
+
+The same primitives are used by:
+
+- :mod:`poker_ai.ai.cfr` — the training traversal
+  (``cfr`` / ``cfrp``).
+- :mod:`poker_ai.ai.strategy` — the strategy-sampling traversal
+  (``update_strategy``).
+- Any future real-time search algorithm that needs to walk the game
+  tree against a trained strategy without re-implementing the
+  primitives.
+
+All functions are pure with respect to their inputs.  ``accumulate_regrets``
+is the only function that writes to a mutable container — the
+caller-owned ``local_delta`` dictionary — and does not touch any shared
+table.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -22,14 +39,33 @@ from poker_ai.environment.poker_env import PokerEnv as PokerState
 def is_terminal(state: PokerState, i: int) -> Optional[float]:
     """Return the terminal payout for player *i* if the node is terminal.
 
-    A node is treated as terminal when the hand has ended *or* when the
-    traversing player has folded (they can no longer affect the outcome).
+    A node is terminal for the traversing player when either the hand
+    has ended or the traversing player has already folded — once the
+    traversing player is inactive, no future decision can change their
+    payout, so the traversal can stop here and return the locked-in
+    value.
 
-    Returns ``None`` at non-terminal nodes so callers can write::
+    Returning ``None`` at non-terminal nodes lets callers use the
+    idiom::
 
         value = is_terminal(state, i)
         if value is not None:
             return value
+
+    which avoids an explicit boolean check.
+
+    Parameters
+    ----------
+    state : PokerState
+        Current game state.
+    i : int
+        Traversing player index.
+
+    Returns
+    -------
+    float or None
+        Player *i*'s payout at a terminal node, or ``None`` at
+        non-terminal nodes.
     """
     if state.is_terminal or not state.players[i].is_active:
         return float(state.payout[i])
@@ -37,10 +73,22 @@ def is_terminal(state: PokerState, i: int) -> Optional[float]:
 
 
 def get_legal_actions(state: PokerState) -> List[str]:
-    """Return the list of legal action strings at *state*, filtering out ``None``.
+    """Return the legal action strings at *state*, filtering ``None`` entries.
 
-    ``PokerState.legal_actions`` may contain ``None`` entries for inactive
-    players; this function strips them so callers always receive clean strings.
+    :attr:`PokerState.legal_actions <poker_ai.environment.poker_env.PokerEnv.legal_actions>`
+    may contain ``None`` placeholders for slots that do not apply at
+    the current node (e.g. inactive players).  Callers always want a
+    clean list of action strings, so this helper strips the placeholders.
+
+    Parameters
+    ----------
+    state : PokerState
+        Current game state.
+
+    Returns
+    -------
+    list[str]
+        Legal abstract action strings at *state*.
     """
     return [a for a in state.legal_actions if a is not None]
 
@@ -51,27 +99,33 @@ def get_node_strategy(
 ) -> Tuple[np.ndarray, int, Dict[str, int], np.ndarray]:
     """Compute the current mixed strategy at *state* via regret matching.
 
-    Looks up the cumulative regret row for the current information set from
-    ``tables.regret[r]``.  If the infoset has never been visited the regret
-    row is treated as all-zeros (uniform strategy).
+    Looks up the cumulative regret row for the current information set
+    from ``tables.regret[r]``.  Information sets that have never been
+    visited are treated as all-zero regret vectors, yielding the
+    uniform strategy.  The result is passed through
+    :func:`calculate_strategy_from_row` with a mask constructed from the
+    legal actions at *state* so illegal actions are guaranteed zero
+    probability.
 
     Parameters
     ----------
-    tables:
-        CFR tables containing per-street regret data.
-    state:
+    tables : CFRTables
+        Per-street regret and strategy tables.
+    state : PokerState
         Current game state.
 
     Returns
     -------
     sigma : np.ndarray
-        Float32 strategy vector over canonical actions (sums to 1).
+        Float32 mixed strategy over canonical actions (sums to 1).
     r : int
-        Betting round index (0–3).
-    a_to_i : Dict[str, int]
-        Canonical action → column index for this street.
+        Betting round index (0 = pre-flop, 3 = river).
+    a_to_i : dict[str, int]
+        Canonical action → column index for this street (shared reference,
+        do not mutate).
     regret_row : np.ndarray
-        Int32 cumulative regret vector (zero-vector if unseen).
+        Int32 cumulative regret vector, either the live row from the
+        table or a fresh zero vector when the infoset is unseen.
     """
     r = state.betting_round
     legal_actions = get_legal_actions(state)
@@ -96,11 +150,32 @@ def sample_action(
 ) -> str:
     """Sample one action from the current strategy (external sampling).
 
-    Used for opponent nodes: instead of exploring all opponent actions,
-    external sampling draws a single action proportional to the current
-    strategy, reducing the branching factor by the number of players.
+    External sampling is the variance-reduction technique at the heart
+    of MCCFR: at opponent nodes we draw a single action proportional to
+    the current strategy instead of recursing into every opponent
+    action.  This reduces the per-traversal branching factor by the
+    number of non-traversing players.
 
-    Falls back to uniform if all strategy probabilities are zero.
+    When all strategy probabilities at the node are zero (i.e. every
+    entry of the regret row is non-positive and the caller did not mask
+    the illegal actions), the function falls back to a uniform
+    distribution over ``legal_actions`` so the sampler never sees a
+    degenerate probability vector.
+
+    Parameters
+    ----------
+    legal_actions : list[str]
+        Legal abstract action strings to sample from.
+    sigma : np.ndarray
+        Float32 mixed strategy over *all* canonical actions for this
+        street (may include zero entries for illegal actions).
+    a_to_i : dict[str, int]
+        Canonical action → column index for this street.
+
+    Returns
+    -------
+    str
+        One action string drawn from ``legal_actions``.
     """
     probs = np.array([sigma[a_to_i[a]] for a in legal_actions], dtype=np.float64)
     prob_sum = probs.sum()
@@ -121,23 +196,33 @@ def accumulate_regrets(
 ) -> None:
     """Write counterfactual regret increments into *local_delta*.
 
-    Only actions present in *voa* receive an update — actions that were
-    pruned (i.e. not explored) are simply not included in *voa* and are
-    therefore skipped, which is the correct behaviour for CFR-P.
+    For each explored action ``a``, the counterfactual regret
+    increment is ``round(voa[a] - vo)``, where *vo* is the node value
+    (strategy-weighted expected value of the explored actions) and
+    ``voa[a]`` is the value obtained by playing ``a``.  Only actions
+    present in ``voa`` receive an update — actions that were pruned
+    (not explored) are simply not in the dict, which is the correct
+    behaviour for CFR-P.
+
+    The target row in ``local_delta`` is lazily allocated as a zero
+    int64 vector on first write; subsequent calls for the same infoset
+    accumulate into the same array.
 
     Parameters
     ----------
-    local_delta:
-        Lock-free per-infoset accumulator keyed by ``(r, info_set)``.
-    r:
-        Betting round index.
-    info_set:
+    local_delta : dict[tuple[int, str], np.ndarray]
+        Caller-owned regret accumulator keyed by ``(betting_round,
+        info_set)``.  Flushed into the shared tables later via
+        :func:`poker_ai.ai.cfr.merge_local_delta`.
+    r : int
+        Betting round index for *info_set*.
+    info_set : str
         Information set string for the current node.
-    voa:
+    voa : dict[str, float]
         Counterfactual value per explored action.
-    vo:
-        Node value (weighted sum over all explored actions).
-    a_to_i:
+    vo : float
+        Node value — strategy-weighted sum of ``voa`` values.
+    a_to_i : dict[str, int]
         Canonical action → column index for this street.
     """
     key = (r, info_set)
@@ -151,26 +236,36 @@ def calculate_strategy_from_row(
     regret_row: np.ndarray,
     valid_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Convert a cumulative regret array into a probability distribution.
+    """Convert a cumulative regret vector into a probability distribution.
 
-    Applies regret matching: only positive regrets contribute to the
-    strategy; if all regrets are non-positive, the result is uniform over
-    valid actions.
+    Implements standard regret matching: the probability mass on each
+    action is proportional to its positive cumulative regret.  If every
+    positive regret is zero (e.g. a fresh information set) the
+    distribution falls back to uniform over the valid actions.
+
+    When ``valid_mask`` is provided, illegal actions are zeroed out
+    before the regret-matching step so the uniform fallback only
+    distributes probability over the legal subset.  This keeps the
+    returned vector a valid mixed strategy even at nodes where most
+    canonical actions are illegal (e.g. pre-flop where only
+    fold/call/raise apply).
 
     Parameters
     ----------
-    regret_row:
-        1-D int32 (or float-compatible) array of per-action cumulative regrets
-        indexed by the canonical action ordering for this street.
-    valid_mask:
-        Boolean mask of length ``n_actions``.  When provided, invalid actions
-        are zeroed before regret matching so the uniform fallback distributes
-        probability only over legal actions.
+    regret_row : np.ndarray
+        1-D array of per-action cumulative regrets indexed by the
+        canonical action ordering for this street.  Typically int32 but
+        any numeric dtype is accepted and internally promoted to float32.
+    valid_mask : np.ndarray, optional
+        Boolean mask of the same length as ``regret_row`` marking legal
+        actions.  When omitted, all actions are treated as legal.
 
     Returns
     -------
     np.ndarray
-        1-D float32 probability array of shape ``(n_actions,)`` summing to 1.
+        Float32 probability vector of shape ``(n_actions,)`` that sums
+        to 1 (or to 0 if no actions are valid, which should not occur
+        in a well-formed game state).
     """
     masked = regret_row.astype(np.float32)
     if valid_mask is not None:

@@ -1,14 +1,34 @@
-"""Strategy traversal — the strategy-sampling phase of Linear MCCFR.
+"""Strategy-sampling traversal for Linear Monte Carlo CFR.
 
-``update_strategy`` is architecturally separate from regret accumulation:
-it reads regrets to compute a current strategy, samples one action per
-information set for the traversing player, and increments that action's
-visit count in the strategy table.  It never modifies regret tables.
+In Linear MCCFR the *average* strategy is the quantity that converges
+to the Nash equilibrium; the per-iteration strategy derived by regret
+matching is only a stepping stone.  The codebase stores the average
+strategy as a running sum of visit counts in
+``tables.strategy[betting_round]`` and normalises it at play time by
+dividing each action's count by the row sum — the standard "accumulate
+during training, normalise at read" pattern.
 
-Accumulation is unweighted (``amount=1``) — linear weighting of the
-average strategy is produced by the periodic LCFR discount applied in
-:meth:`CFRTables.apply_discount`, exactly symmetric with how regrets
-are linearly weighted.
+This module implements the traversal that increments those counts:
+
+1. Walk the game tree from the root.
+2. At every non-terminal node, compute the current mixed strategy
+   from the regrets and sample a single action proportional to it.
+3. If the current player is the traversing player, increment the
+   sampled action's count in ``tables.strategy[r]`` by 1.
+4. Recurse into the sampled successor state.
+
+Accumulation is unweighted (each visit adds ``1``) because linear
+weighting of the average strategy is produced by the periodic LCFR
+discount applied by
+:meth:`~poker_ai.ai.cfr_tables.CFRTables.apply_discount`, exactly
+symmetric with how regrets are linearly weighted.  Doing both at once
+(weighting by ``t`` *and* discounting) would produce super-linear
+weighting.
+
+The traversal terminates early when either the hand has ended or the
+traversing player is no longer active — beyond that point the
+traversing player cannot make any further decisions that would update
+their average strategy.
 """
 
 import logging
@@ -30,23 +50,31 @@ def update_strategy(
     state: PokerState,
     i: int,
 ) -> None:
-    """Sample an action and record it in the strategy table for player *i*.
+    """Sample a play-through from *state* and record player *i*'s actions.
 
-    Recursively traverses the game tree.  At every node:
-    - Computes the current mixed strategy from regrets.
-    - Samples one action proportional to that strategy.
-    - If the current player is the traversing player *i*, increments the
-      sampled action's visit count in ``tables.strategy[r]`` by 1.
-    - Recurses into the sampled successor state.
+    Recursively walks the game tree starting from *state*.  At every
+    node the function draws one action from the current regret-matching
+    strategy; when the current player is *i* the sampled action's
+    visit count is incremented in ``tables.strategy[r]`` by 1, where
+    ``r`` is the betting round of the current node.  The traversal
+    then descends into the sampled successor.
+
+    Opponent decisions are also sampled — the traversal follows a
+    single playthrough rather than branching — but they do not write
+    anything to the strategy tables.
+
+    The function returns nothing; all state updates happen in place on
+    ``tables.strategy``.
 
     Parameters
     ----------
-    tables:
-        CFR tables being trained.
-    state:
-        Current game state.
-    i:
-        Traversing player index.
+    tables : CFRTables
+        CFR tables being trained.  Only ``tables.strategy[r]`` is
+        modified; regret tables are read-only in this traversal.
+    state : PokerState
+        Starting game state for this strategy-sampling pass.
+    i : int
+        Traversing player whose average strategy is being updated.
     """
     if is_terminal(state, i) is not None:
         return

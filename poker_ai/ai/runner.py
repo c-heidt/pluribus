@@ -1,15 +1,27 @@
-"""Script for using multiprocessing to train agent.
+"""Command-line entry point for CFR training.
+
+Defines the ``poker_ai train`` Click command group and its ``start``
+subcommand.  The command parses hyperparameters, writes them to a
+``config.yaml`` alongside the save directory, and dispatches to
+either the single-process :func:`simple_search` or the multi-process
+:class:`Server` depending on the ``--single_process/--multi_process``
+flag.
 
 All cycle-based options are counted in sync cycles (= ``sync_interval``
 raw iterations): ``strategy_interval``, ``discount_interval``,
 ``checkpoint_interval``, ``discount_duration_cycles``, and
 ``update_threshold``.  Only ``prune_threshold`` stays in raw
-iterations, because pruning is a per-CFR-call decision.
+iterations because pruning is a per-CFR-call decision.
 
-Resume: a run auto-resumes if ``save_path`` already contains a valid
-checkpoint.  The ``CheckpointManager`` validates that the saved config
-matches the current config and refuses to restore on structural
-mismatches.  There is no separate ``resume`` command.
+Resume behaviour
+----------------
+A run auto-resumes whenever the resolved save directory already
+contains a valid checkpoint.  The
+:class:`~poker_ai.ai.checkpoint.CheckpointManager` compares the saved
+structural hyperparameters against the current ones and refuses to
+restore on mismatches, so simply re-invoking ``poker_ai train start``
+with the same ``--nickname`` continues an interrupted run.  There is
+no separate ``resume`` command.
 """
 import logging
 from pathlib import Path
@@ -27,7 +39,26 @@ log = logging.getLogger("poker_ai.ai.runner")
 
 
 def _safe_search(server: Server):
-    """Safely run the server, and allow user to control c."""
+    """Run :meth:`Server.search` inside a resilient try/except/terminate.
+
+    Wraps the server's main loop with three exit paths:
+
+    - **Clean return.**  Call :meth:`Server.terminate` for an
+      orderly worker shutdown.
+    - **Worker error.**  :class:`WorkerError` is raised from inside
+      the loop when a worker has set the shared error event.  The
+      queue may be in an inconsistent state, so call
+      :meth:`Server.terminate(safe=False) <Server.terminate>` to
+      kill every worker without going through the queue.
+    - **User interrupt.**  :class:`KeyboardInterrupt` or
+      :class:`SystemExit`.  Fall through to a safe termination so
+      the interactive user sees their workers exit cleanly.
+
+    Parameters
+    ----------
+    server : Server
+        Already-constructed training server.
+    """
     try:
         server.search()
     except WorkerError as exc:
@@ -46,7 +77,7 @@ def _safe_search(server: Server):
 
 @click.group()
 def train():
-    """Train a poker AI."""
+    """Click group registering the training subcommands."""
     pass
 
 
@@ -177,7 +208,15 @@ def start(
     n_processes,
     nickname: str,
 ):
-    """Train agent from scratch — auto-resumes if a valid checkpoint exists."""
+    """Train a CFR agent, auto-resuming if a valid checkpoint exists.
+
+    Resolves the save directory from the ``--nickname`` option,
+    persists the full hyperparameter dict to ``config.yaml`` for
+    provenance, and hands off to either the single-process or
+    multi-process entry point.  When the resolved save directory
+    already contains a valid checkpoint the training run continues
+    from it; when not, it starts fresh.
+    """
     config: Dict[str, int] = {**locals()}
     save_path: Path = utils.io.create_dir(nickname)
     with open(save_path / "config.yaml", "w") as steam:

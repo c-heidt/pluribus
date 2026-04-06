@@ -1,11 +1,40 @@
-"""Infoset data access layer.
+"""Per-infoset array access layer for CFR regret and strategy tables.
 
-Composes a ``ChunkStore`` (shared-memory file management) with an
-``InfosetIndex`` (persistent string → row mapping) to provide
-per-infoset array access for CFR training.
+A :class:`ChunkedTable` is the data-access facade that CFR code uses
+to read and write per-infoset integer arrays.  It composes two lower
+layers:
 
-Concurrency is handled via stripe locks — workers acquire the stripe
-lock for a chunk during delta merges to prevent races.
+- :class:`~poker_ai.ai.index.InfosetIndex` — persistent string → row
+  mapping (LMDB-backed).
+- :class:`~poker_ai.ai.chunk_store.ChunkStore` — shared-memory chunk
+  files holding the actual integer arrays.
+
+Higher-level code (CFR traversals, strategy updates) never sees the
+chunk IDs, the mmap, or the LMDB keys.  It just calls
+:meth:`get_row`, :meth:`update_row`, or :meth:`merge_delta_row` on
+the table.
+
+Concurrency model
+-----------------
+The same table is accessed by many worker processes simultaneously.
+Two race classes are handled separately:
+
+- **Row allocation** — an information set seen for the first time
+  must be assigned a unique flat row number.  This is serialised by
+  the LMDB write transaction inside
+  :meth:`InfosetIndex.get_or_create`; see its docstring for why the
+  one-shot transaction is race-free.
+- **Row updates** — concurrent writers to the same chunk would race
+  on the shared-memory view.  :class:`ChunkedTable` mitigates this
+  with a set of stripe locks (``N_STRIPE_LOCKS``); every
+  :meth:`update_row` and :meth:`merge_delta_row` acquires the lock
+  corresponding to ``chunk_id % N_STRIPE_LOCKS`` before touching the
+  array.  Different chunks therefore rarely contend, while writes to
+  the same chunk are fully serialised.
+
+Must be instantiated in the **parent process before workers are
+forked** so that the stripe locks (POSIX semaphores) and the per-table
+row counter (a :class:`multiprocessing.Value`) are inherited.
 """
 
 import logging
@@ -21,12 +50,31 @@ from poker_ai.ai.index import InfosetIndex
 log = logging.getLogger("poker_ai.ai.chunked_table")
 
 N_STRIPE_LOCKS: int = 256
-"""Number of stripe locks.  With 64 workers the expected per-stripe
-contention ratio is 64/256 = 0.25."""
+"""Number of stripe locks.
+
+With 64 workers the expected per-stripe contention ratio is
+``64 / 256 = 0.25`` — low enough that stripe locks rarely serialise
+meaningful work, while still giving one-lock-per-chunk safety.
+"""
 
 
 def list_orphaned_blocks(shm_dir: str = "/dev/shm") -> List[str]:
-    """Return paths of any leftover ``pluribus_*`` shared memory files."""
+    """Return paths of any leftover ``pluribus_*`` shared-memory files.
+
+    Useful for shutdown cleanup and for diagnostic scripts that want
+    to detect stray chunk files from a crashed run.
+
+    Parameters
+    ----------
+    shm_dir : str, optional
+        Shared-memory directory to inspect.  Defaults to ``/dev/shm``.
+
+    Returns
+    -------
+    list[str]
+        Absolute paths of files whose names start with ``pluribus_``
+        inside ``shm_dir``.  Empty if the directory does not exist.
+    """
     try:
         names = os.listdir(shm_dir)
     except FileNotFoundError:
@@ -39,26 +87,31 @@ def list_orphaned_blocks(shm_dir: str = "/dev/shm") -> List[str]:
 
 
 class ChunkedTable:
-    """Infoset → shared-memory array accessor.
+    """Infoset-keyed accessor over a chunked shared-memory table.
 
-    Each infoset is mapped to a ``(chunk_id, local_row)`` location via
-    the ``InfosetIndex`` and a ``ChunkStore``.  Writes are immediately
-    visible to all processes sharing the same mmap files.
+    One instance represents one logical CFR table (e.g. pre-flop
+    regrets, turn strategy visits).  The instance is built on a
+    shared :class:`~poker_ai.ai.index.InfosetIndex` plus a private
+    :class:`~poker_ai.ai.chunk_store.ChunkStore`.
 
-    Must be instantiated in the **parent process before workers are
-    forked** so that locks are shared across processes.
-
-    Parameters
+    Attributes
     ----------
-    n_actions:
-        Number of actions per infoset row.
-    table_name:
-        Unique prefix for shared-memory file names.
-    index:
-        ``InfosetIndex`` for persistent row allocation.  When ``None``
-        an internal index is created (useful for standalone tests).
-    shm_dir:
-        Directory for shared-memory chunk files.
+    store : ChunkStore
+        The underlying chunk storage.  Exposed so callers that need
+        chunk-level operations (e.g. checkpoint save/restore, row
+        location lookup) can go through a stable public interface
+        instead of reaching into private members.
+    n_chunks : int
+        Number of chunks opened in the current process.
+    n_actions : int
+        Row width — number of action columns per row.
+    n_allocated : int
+        Number of rows allocated by this table (distinct from
+        :attr:`InfosetIndex.n_allocated_rows`, which is per-street and
+        counts every infoset on that street regardless of which
+        table is consuming it).
+    table_name : str
+        Unique prefix for this table's chunk-file names.
     """
 
     def __init__(
@@ -68,6 +121,24 @@ class ChunkedTable:
         index: Optional[InfosetIndex] = None,
         shm_dir: str = "/dev/shm",
     ) -> None:
+        """Create a new :class:`ChunkedTable`.
+
+        Parameters
+        ----------
+        n_actions : int
+            Number of action columns per row.  Must be at least 1.
+        table_name : str
+            Unique prefix for shared-memory file names
+            (``{table_name}_{chunk_id:06d}``).
+        index : InfosetIndex, optional
+            Shared infoset index.  When ``None`` a private index
+            backed by a temporary directory is created — useful for
+            standalone unit tests, not for production training where
+            multiple tables share a single per-street index.
+        shm_dir : str, optional
+            Directory for shared-memory chunk files.  Defaults to
+            ``/dev/shm``.
+        """
         if n_actions < 1:
             raise ValueError(f"n_actions must be >= 1, got {n_actions}")
 
@@ -90,15 +161,16 @@ class ChunkedTable:
         )
 
         # Per-table row counter — tracks how many rows this table has
-        # allocated.  Distinct from index.n_allocated_rows which is global
-        # across all tables sharing the same index.
+        # allocated.  Distinct from index.n_allocated_rows which counts
+        # every infoset registered in the shared index.
         self._n_allocated: mp.Value = mp.Value("l", 0)
 
         self._stripe_locks: List[mp.Lock] = [
             mp.Lock() for _ in range(N_STRIPE_LOCKS)
         ]
 
-        # Pre-open chunks for rows already in the index (resume path).
+        # Pre-open chunks for rows already registered in the index
+        # (resume path).  Workers inherit the open mmaps via fork.
         n_existing = self._index.n_allocated_rows
         if n_existing > 0:
             n_chunks = (n_existing + CHUNK_SIZE - 1) // CHUNK_SIZE
@@ -114,12 +186,46 @@ class ChunkedTable:
     # ------------------------------------------------------------------
 
     def get_row(self, info_set: str) -> np.ndarray:
-        """Return the row for *info_set*, allocating on first visit."""
+        """Return the row for *info_set*, allocating one on first visit.
+
+        The returned array is a view into shared memory; callers can
+        read and write it directly, but any write MUST go through
+        :meth:`update_row` or :meth:`merge_delta_row` to maintain
+        stripe-lock correctness across processes.  ``get_row`` is
+        intended for read-only access or for single-process tests.
+
+        Parameters
+        ----------
+        info_set : str
+            Information-set string.
+
+        Returns
+        -------
+        np.ndarray
+            1-D int32 view of length ``n_actions``.
+        """
         chunk_id, local_row = self._locate_row(info_set)
         return self._store.view(chunk_id)[local_row]
 
     def get_row_if_exists(self, info_set: str) -> Optional[np.ndarray]:
-        """Return the row for *info_set*, or ``None`` if never visited."""
+        """Return the row for *info_set*, or ``None`` if never allocated.
+
+        Unlike :meth:`get_row` this does not allocate a new row on a
+        miss.  Used by CFR traversal to detect unseen infosets so it
+        can fall back to a uniform-strategy zero vector without
+        polluting the index with rows for nodes it never returned to.
+
+        Parameters
+        ----------
+        info_set : str
+            Information-set string.
+
+        Returns
+        -------
+        np.ndarray or None
+            1-D int32 view if the infoset was previously allocated,
+            otherwise ``None``.
+        """
         flat_row = self._index.get(info_set)
         if flat_row is None:
             return None
@@ -127,13 +233,45 @@ class ChunkedTable:
         return self._store.view(chunk_id)[local_row]
 
     def get_row_by_location(self, chunk_id: int, row: int) -> np.ndarray:
-        """Return the row at a known (chunk_id, row) location."""
+        """Return the row at a known ``(chunk_id, row)`` location.
+
+        Used by iteration-style utilities (e.g. checkpoint restore)
+        that already know the physical layout and do not need to
+        consult the index.
+
+        Parameters
+        ----------
+        chunk_id : int
+            Zero-based chunk index.
+        row : int
+            Row index inside the chunk.  Must be ``< CHUNK_SIZE``.
+
+        Returns
+        -------
+        np.ndarray
+            1-D int32 view of length ``n_actions``.
+        """
         if row >= CHUNK_SIZE:
             raise IndexError(f"row {row} out of range for CHUNK_SIZE={CHUNK_SIZE}")
         return self._store.view(chunk_id)[row]
 
     def update_row(self, info_set: str, action_idx: int, amount: int) -> None:
-        """Add *amount* to a single action slot under the stripe lock."""
+        """Add *amount* to a single action slot under the stripe lock.
+
+        Used by the strategy-update traversal to increment one visit
+        count at a time.  The stripe lock serialises concurrent
+        updates to the same chunk so visit counts cannot be lost to
+        race conditions.
+
+        Parameters
+        ----------
+        info_set : str
+            Information-set string.  Allocated if not yet present.
+        action_idx : int
+            Canonical action column to update.
+        amount : int
+            Integer increment (typically ``1``).
+        """
         chunk_id, local_row = self._locate_row(info_set)
         lock = self.get_stripe_lock(chunk_id)
         lock.acquire()
@@ -144,7 +282,21 @@ class ChunkedTable:
             lock.release()
 
     def merge_delta_row(self, info_set: str, delta: np.ndarray) -> None:
-        """Merge *delta* into the row under the stripe lock."""
+        """Add *delta* to the row under the stripe lock.
+
+        Used by :func:`poker_ai.ai.cfr.merge_local_delta` to flush a
+        per-infoset regret increment into the shared table.  The
+        stripe lock guarantees that concurrent merges for the same
+        chunk serialise correctly.
+
+        Parameters
+        ----------
+        info_set : str
+            Information-set string.  Allocated if not yet present.
+        delta : np.ndarray
+            1-D integer array of length ``n_actions`` to add to the
+            row.  Cast to int32 before the add.
+        """
         chunk_id, local_row = self._locate_row(info_set)
         lock = self.get_stripe_lock(chunk_id)
         lock.acquire()
@@ -163,7 +315,13 @@ class ChunkedTable:
     # ------------------------------------------------------------------
 
     def get_stripe_lock(self, chunk_id: int) -> mp.synchronize.Lock:
-        """Return the stripe lock for *chunk_id*."""
+        """Return the stripe lock guarding updates to *chunk_id*.
+
+        The mapping is deterministic: every process computes the
+        same lock for the same ``chunk_id``.  Exposed publicly so
+        tests and low-level code can acquire the lock directly if
+        needed.
+        """
         return self._stripe_locks[chunk_id % N_STRIPE_LOCKS]
 
     # ------------------------------------------------------------------
@@ -172,16 +330,17 @@ class ChunkedTable:
 
     @property
     def store(self) -> ChunkStore:
-        """The underlying chunk storage."""
+        """The underlying :class:`ChunkStore`."""
         return self._store
 
     @property
     def n_chunks(self) -> int:
-        """Number of chunks opened in this process."""
+        """Number of chunks opened in the current process."""
         return self._store.n_open
 
     @property
     def n_actions(self) -> int:
+        """Number of action columns in each row."""
         return self._n_actions
 
     @property
@@ -191,6 +350,7 @@ class ChunkedTable:
 
     @property
     def table_name(self) -> str:
+        """Unique file-name prefix for this table's chunks."""
         return self._table_name
 
     # ------------------------------------------------------------------
@@ -198,16 +358,20 @@ class ChunkedTable:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Close all mmap handles."""
+        """Close the underlying chunk store and, if owned, the index.
+
+        Does not unlink files from disk; see :meth:`unlink_all`.
+        """
         self._store.close()
         if self._owns_index:
             self._index.close()
 
     def unlink_all(self) -> None:
-        """Remove all chunk files from the filesystem."""
+        """Remove all chunk files this table created or attached."""
         self._store.unlink_all()
 
     def __repr__(self) -> str:
+        """Debug representation with table name, chunk and row counts."""
         return (
             f"ChunkedTable("
             f"table_name={self._table_name!r}, "
@@ -217,9 +381,11 @@ class ChunkedTable:
         )
 
     def __enter__(self) -> "ChunkedTable":
+        """Enter a context-manager scope; returns ``self``."""
         return self
 
     def __exit__(self, *_) -> None:
+        """Exit the context manager, closing and unlinking the table."""
         self.close()
         self.unlink_all()
 
@@ -228,7 +394,14 @@ class ChunkedTable:
     # ------------------------------------------------------------------
 
     def _locate_row(self, info_set: str) -> tuple:
-        """Look up or allocate *info_set* and return (chunk_id, local_row)."""
+        """Resolve *info_set* to a ``(chunk_id, local_row)`` pair.
+
+        Looks up or allocates the flat row number via the
+        :class:`InfosetIndex`, increments the per-table allocation
+        counter if the row is freshly allocated, then decomposes the
+        flat number into chunk coordinates and ensures the chunk is
+        mapped in the current process.
+        """
         flat_row, is_new = self._index.get_or_create(info_set)
         if is_new:
             with self._n_allocated.get_lock():

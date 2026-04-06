@@ -1,14 +1,32 @@
-"""CFR training algorithms: standard CFR and CFR with pruning (CFR-P).
+"""Counterfactual regret minimisation traversals for training.
 
-Both variants are implemented via a single ``_traverse()`` function
-parameterised by an ``explore_fn`` callback that decides whether to
-descend into a given action at a traversing-player node.  This keeps the
-game-tree skeleton in one place and makes it trivial to add new search
-variants by supplying a different ``explore_fn``.
+This module implements the two CFR variants used during training:
 
-External sampling is used for opponent nodes: the traversing player
-explores all (un-pruned) actions while each opponent node samples a
-single action from the current strategy.
+- :func:`cfr` — Monte Carlo CFR with external sampling.
+- :func:`cfrp` — CFR with pruning (CFR-P), which skips subtrees whose
+  cumulative regret has fallen below a user-supplied threshold.
+
+Both variants share a single recursive traversal
+(:func:`_traverse`) parameterised by an *exploration predicate*.  The
+predicate decides, at each traversing-player node and for each legal
+action, whether the action should be explored this iteration.  Passing
+``lambda *_: True`` recovers standard CFR; passing a regret-threshold
+check recovers CFR-P.  Any future variant (e.g. abstraction-aware
+pruning, regret bounding, action-space restriction) can be expressed
+as a new predicate without touching the tree-walking code.
+
+External sampling is used at opponent nodes: instead of recursing into
+every opponent action, the traversal draws a single action
+proportional to the current strategy.  This reduces the per-traversal
+branching factor from ``O(B^depth)`` to ``O(B^(depth/2))`` in a
+two-player setting, which is the efficiency win that makes
+self-play CFR practical.
+
+Regret updates are written into a caller-owned ``local_delta``
+dictionary so workers can accumulate across many traversals and flush
+to the shared tables at a later sync barrier.  If the caller does not
+supply a ``local_delta``, the wrappers create a temporary one and
+merge it immediately.
 """
 
 import logging
@@ -16,7 +34,6 @@ from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 
-from poker_ai.ai.action_space import ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
 from poker_ai.ai.cfr_tables import CFRTables
 from poker_ai.ai.tree_utils import (
     accumulate_regrets,
@@ -29,31 +46,43 @@ from poker_ai.environment.poker_env import PokerEnv as PokerState
 
 log = logging.getLogger("poker_ai.ai.cfr")
 
-# Type alias for the exploration predicate passed to _traverse.
-# Signature: (action, regret_row, action_to_idx, state) -> bool
 ExploreFn = Callable[[str, np.ndarray, Dict[str, int], PokerState], bool]
+"""Signature of the exploration predicate passed to :func:`_traverse`.
+
+Called at every traversing-player node with arguments
+``(action, regret_row, a_to_i, state)`` and must return ``True`` if the
+action should be explored (and its regret updated) and ``False`` if the
+action should be pruned this iteration.
+"""
 
 _EXPLORE_ALL: ExploreFn = lambda a, row, idx, s: True
-"""Exploration predicate for standard CFR: always explore every action."""
+"""Predicate used by :func:`cfr`: explore every action unconditionally."""
 
 
 def merge_local_delta(
     tables: CFRTables,
     local_delta: Dict[Tuple[int, str], np.ndarray],
 ) -> None:
-    """Merge a local CFR regret accumulator into the shared regret tables.
+    """Flush a local regret accumulator into the shared regret tables.
 
-    For each ``(betting_round, info_set)`` key, the corresponding numpy
-    delta array is added to the row in ``tables.regret[betting_round]``
-    under the chunk's stripe lock.
+    Walks the per-infoset deltas accumulated during one or more CFR
+    traversals and adds each one into the corresponding row of
+    ``tables.regret[betting_round]``.  The underlying
+    :meth:`~poker_ai.ai.chunked_table.ChunkedTable.merge_delta_row` call
+    acquires the chunk's stripe lock, so this function is safe to call
+    concurrently from multiple workers.
+
+    After this call the caller is expected to clear or discard
+    ``local_delta``; this function does not do so itself.
 
     Parameters
     ----------
-    tables:
-        Tables whose regret arrays will be updated in-place.
-    local_delta:
-        Per-infoset regret increments keyed by ``(betting_round, info_set)``.
-        Values are int64 delta arrays (may be positive or negative).
+    tables : CFRTables
+        Shared regret and strategy tables.
+    local_delta : dict[tuple[int, str], np.ndarray]
+        Per-infoset regret increments keyed by ``(betting_round,
+        info_set)``.  Values are int64 delta arrays (positive or
+        negative) produced by :func:`cfr` / :func:`cfrp`.
     """
     for (r, info_set), delta in local_delta.items():
         tables.regret[r].merge_delta_row(info_set, delta)
@@ -66,27 +95,40 @@ def cfr(
     t: int,
     local_delta: Optional[Dict[Tuple[int, str], np.ndarray]] = None,
 ) -> float:
-    """Counterfactual regret minimisation with external sampling.
+    """Run one CFR traversal from *state* for player *i*.
 
-    The traversing player explores all legal actions; each opponent node
-    samples a single action from the current strategy.  This gives
-    O(B^{depth/2}) cost per traversal instead of O(B^depth) for vanilla CFR.
+    Uses Monte Carlo CFR with external sampling: the traversing player
+    recurses into every legal action while each opponent node samples
+    a single action from the current strategy.
 
     Parameters
     ----------
-    tables:
+    tables : CFRTables
         CFR tables being trained.
-    state:
-        Current game state.
-    i:
-        Traversing player index.
-    t:
-        Training iteration (used for Linear MCCFR weighting).
-    local_delta:
-        Per-infoset regret accumulator keyed by ``(betting_round, info_set)``.
-        When provided, regret updates are written here lock-free; the caller
-        must call :func:`merge_local_delta` when the traversal batch is done.
-        When ``None``, a temporary buffer is created and merged before returning.
+    state : PokerState
+        Root game state for this traversal (one full hand).
+    i : int
+        Traversing player index.  Only this player's regrets are
+        updated by this call.
+    t : int
+        Current training iteration.  Passed through to the recursive
+        body for logging; the regret increments themselves are
+        unweighted — linear CFR weighting is produced by the periodic
+        LCFR discount applied by
+        :meth:`~poker_ai.ai.cfr_tables.CFRTables.apply_discount`.
+    local_delta : dict, optional
+        Caller-owned regret accumulator.  When supplied, regret
+        updates are written here lock-free and the caller is
+        responsible for calling :func:`merge_local_delta` later to
+        flush into the shared tables.  When ``None`` a temporary
+        accumulator is created and merged immediately before the
+        function returns.
+
+    Returns
+    -------
+    float
+        The counterfactual value of *state* under the current strategy
+        — useful for diagnostics; most callers discard this.
     """
     _own_delta = local_delta is None
     if _own_delta:
@@ -106,28 +148,38 @@ def cfrp(
     c: int,
     local_delta: Optional[Dict[Tuple[int, str], np.ndarray]] = None,
 ) -> float:
-    """CFR with pruning (CFR-P) using external sampling.
+    """Run one CFR-P traversal from *state* for player *i*.
 
-    Actions whose cumulative regret is at or below the pruning threshold *c*
-    are skipped, except on the river where all actions are always explored.
-    Pruning actions that have been consistently bad speeds up convergence
-    without losing theoretical guarantees.
+    CFR with pruning skips actions whose cumulative regret has already
+    fallen to or below the threshold *c*, on the assumption that such
+    actions are unlikely to become optimal in the near future.  The
+    river is always explored in full because its regrets contribute
+    directly to the terminal payout and are not worth pruning.
 
     Parameters
     ----------
-    tables:
+    tables : CFRTables
         CFR tables being trained.
-    state:
-        Current game state.
-    i:
+    state : PokerState
+        Root game state for this traversal.
+    i : int
         Traversing player index.
-    t:
-        Training iteration.
-    c:
-        Pruning threshold.  Actions with ``regret <= c`` are skipped
-        (unless on the river).
-    local_delta:
-        Per-infoset regret accumulator.  See :func:`cfr` for details.
+    t : int
+        Current training iteration.
+    c : int
+        Pruning threshold.  An action is explored iff its cumulative
+        regret is strictly greater than *c* or the current betting
+        stage is the river.  The caller is responsible for choosing a
+        value consistent with
+        :data:`~poker_ai.ai.cfr_tables.REGRET_FLOOR` — a threshold
+        below the floor effectively disables pruning.
+    local_delta : dict, optional
+        Caller-owned regret accumulator.  See :func:`cfr` for details.
+
+    Returns
+    -------
+    float
+        Counterfactual value of *state* under the current strategy.
     """
     _own_delta = local_delta is None
     if _own_delta:
@@ -139,6 +191,7 @@ def cfrp(
         a_to_i: Dict[str, int],
         state: PokerState,
     ) -> bool:
+        """Explore *action* iff past the river or its regret exceeds *c*."""
         if state._betting_stage == "river":
             return True
         return int(regret_row[a_to_i[action]]) > c
@@ -154,6 +207,7 @@ def cfrp(
 # Internal
 # ---------------------------------------------------------------------------
 
+
 def _traverse(
     tables: CFRTables,
     state: PokerState,
@@ -162,27 +216,45 @@ def _traverse(
     local_delta: Dict[Tuple[int, str], np.ndarray],
     explore_fn: ExploreFn,
 ) -> float:
-    """Generic game-tree traversal used by both ``cfr`` and ``cfrp``.
+    """Generic recursive CFR traversal shared by :func:`cfr` and :func:`cfrp`.
 
-    At traversing-player nodes, iterates over all actions for which
-    ``explore_fn`` returns ``True`` and accumulates regret updates.
-    At opponent nodes, samples a single action (external sampling).
+    The structure mirrors the textbook external-sampling CFR pseudocode:
+
+    1. If the node is terminal for player *i*, return the locked-in
+       payout.
+    2. Otherwise compute the current strategy via regret matching.
+    3. At a traversing-player node, recurse into every action for
+       which ``explore_fn`` returns ``True``, record per-action
+       counterfactual values, and accumulate regret updates into
+       ``local_delta``.
+    4. At an opponent node, draw a single action proportional to the
+       current strategy (external sampling) and recurse.
+
+    ``vo`` — the node value returned to the parent — is the
+    strategy-weighted sum of the counterfactual values of the
+    *explored* actions only.  Pruned actions do not contribute to
+    ``vo`` and do not receive regret updates.
 
     Parameters
     ----------
-    tables:
-        CFR tables.
-    state:
+    tables : CFRTables
+        CFR tables being trained.
+    state : PokerState
         Current game state.
-    i:
+    i : int
         Traversing player index.
-    t:
-        Training iteration.
-    local_delta:
-        Lock-free regret accumulator.
-    explore_fn:
-        ``(action, regret_row, a_to_i, state) -> bool`` — returns ``True``
-        if the action should be explored at this node.
+    t : int
+        Current training iteration (for logging).
+    local_delta : dict[tuple[int, str], np.ndarray]
+        Caller-owned regret accumulator written in place.
+    explore_fn : ExploreFn
+        Predicate deciding which actions to explore at traversing-player
+        nodes.
+
+    Returns
+    -------
+    float
+        Counterfactual value of *state* for player *i*.
     """
     _debug = log.isEnabledFor(logging.DEBUG)
 

@@ -1,31 +1,50 @@
-"""CheckpointManager — full-sweep checkpointing with atomic writes.
+"""Full-sweep checkpointing with atomic writes and auto-resume.
 
-Architecture
-------------
-Signal handling
-    SIGTERM and SIGINT are intercepted in the *parent (server) process* before
-    any workers are spawned.  The handler only sets a ``threading.Event``; all
-    actual I/O happens from the server's main thread after the loop notices the
-    event and breaks cleanly.
+A :class:`CheckpointManager` lives inside the training server and
+handles three responsibilities:
+
+1. **Periodic checkpoint writes.**  Invoked from the server loop at
+   sync barriers that satisfy the checkpoint schedule.  Each
+   checkpoint is a self-contained directory on disk that holds the
+   dirty chunk files plus a ``server_state.pkl`` snapshot of the
+   server's configuration and iteration counter.
+2. **Signal-driven emergency checkpoints.**  ``SIGTERM`` and
+   ``SIGINT`` are intercepted in the parent (server) process.  The
+   handler merely sets a :class:`threading.Event` so the main loop
+   can finish the current iteration cleanly and then write one final
+   checkpoint before exiting — critical on SLURM where the job
+   scheduler gives only a brief window between ``SIGTERM`` and
+   ``SIGKILL``.
+3. **Auto-resume on construction.**  If the save directory already
+   contains a valid checkpoint the manager loads it back into shared
+   memory before workers are spawned, updates the server's start
+   iteration, and verifies that structural hyperparameters have not
+   changed — a resume with a different action set or sync interval
+   would silently corrupt training, so we refuse it.
 
 Checkpoint write flow
-    1. Flush all workers (broadcast sync + barrier join).
-    2. Delegate chunk writing to ``CFRTables.save_chunks()`` which writes all
-       allocated chunks for all 8 tables to a temporary directory.
-    3. Flush per-street LMDB indexes to disk.
-    4. Persist the server state dict (includes current iteration ``t`` and
-       per-street chunk counts for resume validation).
-    5. Atomically rename the temp directory to the final checkpoint directory.
-    6. Remove the previous checkpoint (only one generation is kept).
-
-Resume flow
-    On construction, the most recent valid checkpoint is found and restored
-    before any workers are spawned.  ``server._start_t`` is advanced past the
-    last checkpointed iteration so training resumes without replaying work.
+---------------------
+1. Broadcast a sync job to every worker and wait until all pending
+   regret deltas have been merged into the shared tables
+   (skipped for emergency checkpoints that cannot afford the wait).
+2. Create a temporary directory next to the final target and hand
+   control to :meth:`CFRTables.save_chunks
+   <poker_ai.ai.cfr_tables.CFRTables.save_chunks>`, which writes
+   every dirty chunk as an atomic ``.npy`` file.
+3. Hardlink the unchanged chunk files from the previous checkpoint
+   into the temp directory so every checkpoint remains
+   self-contained with no extra I/O (same-inode hardlinks are
+   near-free on every POSIX filesystem).
+4. Flush the per-street LMDB indexes and persist the server state.
+5. Atomically rename the temp directory to its final name and
+   delete the previous checkpoint (we keep exactly one generation
+   on disk).
 
 Shutdown window
-    SLURM jobs should be submitted with ``--signal=SIGTERM@300`` to give five
-    minutes for the checkpoint to complete.
+---------------
+When running under SLURM, submit jobs with
+``--signal=SIGTERM@300`` so the manager has five minutes between
+``SIGTERM`` and ``SIGKILL`` to write the final checkpoint.
 """
 
 import logging
@@ -48,11 +67,24 @@ log = logging.getLogger("poker_ai.ai.checkpoint")
 
 
 def _extract_n_chunks_per_street(state_dict: dict) -> Dict[int, int]:
-    """Extract per-street chunk counts from new or old format state dicts.
+    """Extract per-street chunk counts from a checkpoint state dict.
 
-    New format stores a single ``n_chunks_per_street`` dict.
-    Old format stored separate ``n_chunks_per_street`` (regret) and
-    ``n_strategy_chunks_per_street`` dicts — we take the max per street.
+    The current format stores a single ``n_chunks_per_street`` dict.
+    A legacy format split the count into separate
+    ``n_chunks_per_street`` (regret) and
+    ``n_strategy_chunks_per_street`` dicts; for backward
+    compatibility we take the maximum of the two on each street so
+    the restore path never misses a chunk.
+
+    Parameters
+    ----------
+    state_dict : dict
+        Deserialised ``server_state.pkl`` contents.
+
+    Returns
+    -------
+    dict[int, int]
+        Street index → number of chunks expected in the checkpoint.
     """
     ncs = state_dict.get("n_chunks_per_street", {})
     old_strategy = state_dict.get("n_strategy_chunks_per_street", {})
@@ -67,23 +99,35 @@ def _extract_n_chunks_per_street(state_dict: dict) -> Dict[int, int]:
 
 
 class CheckpointManager:
-    """Manages periodic and emergency checkpointing for the training server.
+    """Periodic and emergency checkpointing for the training server.
 
-    Must be instantiated in the **parent process before workers are spawned**
-    so that SIGTERM/SIGINT handlers are registered with the correct PID and
-    that ``_load_checkpoint_if_exists`` runs before any shared-memory tables
-    are populated by workers.
+    Instantiated in the **parent process before workers are spawned**
+    for two reasons: signal handlers must bind to the correct PID
+    (the server's, not a worker's), and
+    :meth:`_load_checkpoint_if_exists` must run before workers attach
+    to the shared-memory tables so they observe the restored state.
 
-    Parameters
+    Attributes
     ----------
-    server:
-        The ``Server`` instance that owns the tables and job queue.
-    save_path:
-        Root directory for checkpoints.  Each checkpoint is written to a
-        timestamped subdirectory (``checkpoint_<unix_ts>``).
+    sigterm_event : threading.Event
+        Set by the ``SIGTERM``/``SIGINT`` handler.  The server loop
+        checks this event at every iteration and breaks out cleanly
+        when it is set, giving the manager a chance to write one
+        final checkpoint before the process exits.
     """
 
     def __init__(self, server: "Server", save_path: Path) -> None:
+        """Register signal handlers and auto-resume from *save_path* if possible.
+
+        Parameters
+        ----------
+        server : Server
+            Parent training server.  The manager reaches into the
+            server for its tables, configuration, and state dict.
+        save_path : Path
+            Root directory for checkpoint subdirectories.  Created
+            implicitly when the first checkpoint is written.
+        """
         self._server = server
         self._save_path = Path(save_path)
         self._last_checkpoint_path: Optional[Path] = None
@@ -101,18 +145,28 @@ class CheckpointManager:
 
     @property
     def sigterm_event(self) -> threading.Event:
-        """Event set by the SIGTERM/SIGINT handler."""
+        """Event set by the ``SIGTERM``/``SIGINT`` handler."""
         return self._sigterm_event
 
     def checkpoint(self, t: int, emergency: bool = False) -> None:
         """Write a full checkpoint at iteration *t*.
 
+        The write is performed atomically by building the checkpoint
+        in a temporary directory next to the save root and then
+        renaming it to its final name.  If any step fails the temp
+        directory is removed and the previous checkpoint is left
+        untouched.
+
         Parameters
         ----------
-        t:
-            Current training iteration.
-        emergency:
-            When ``True`` skip the worker-flush step.
+        t : int
+            Current training iteration.  Embedded in the saved state
+            dict so the next run can resume at ``t + 1``.
+        emergency : bool, optional
+            When ``True`` skip the worker-flush step.  Used in the
+            error-handling path when the server believes at least one
+            worker has crashed — waiting on such a worker would
+            deadlock the shutdown.
         """
         label = "emergency" if emergency else "scheduled"
         log.info(f"[t={t}] Checkpoint ({label}) starting")
@@ -129,8 +183,8 @@ class CheckpointManager:
 
             # Carry forward unchanged chunk files from the previous checkpoint
             # via hardlinks (instant, no I/O — same filesystem).  This ensures
-            # every checkpoint directory is self-contained even when only dirty
-            # chunks were written above.
+            # every checkpoint directory is self-contained even when only
+            # dirty chunks were written above.
             if self._last_checkpoint_path and self._last_checkpoint_path.exists():
                 for old_file in self._last_checkpoint_path.glob("*.npy"):
                     new_file = tmp_path / old_file.name
@@ -168,6 +222,14 @@ class CheckpointManager:
     # -----------------------------------------------------------------------
 
     def _handle_sigterm(self, signum: int, frame) -> None:
+        """Signal handler: set the sigterm event and return.
+
+        The server's main loop polls :attr:`sigterm_event` at every
+        iteration and breaks out cleanly, so the handler itself does
+        no I/O.  Running I/O inside a signal handler would be unsafe
+        — any lock held by the interrupted code would deadlock on
+        re-entry.
+        """
         sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
         log.warning(f"{sig_name} received — signalling server loop to checkpoint and exit")
         self._sigterm_event.set()
@@ -177,7 +239,13 @@ class CheckpointManager:
     # -----------------------------------------------------------------------
 
     def _load_checkpoint_if_exists(self, save_path: Path) -> None:
-        """Find the most recent valid checkpoint and restore from it."""
+        """Find and restore the most recent valid checkpoint, if any.
+
+        Called once at construction time.  Walks the checkpoint
+        directories in reverse time order so that a partial write
+        (e.g. from a crash mid-checkpoint) is skipped in favour of
+        the previous, known-good checkpoint.
+        """
         checkpoints = sorted(save_path.glob("checkpoint_[0-9]*"))
         for cp in reversed(checkpoints):
             if self._checkpoint_is_valid(cp):
@@ -188,7 +256,15 @@ class CheckpointManager:
         log.info("No valid checkpoint found — starting fresh")
 
     def _checkpoint_is_valid(self, path: Path) -> bool:
-        """Return ``True`` only if the checkpoint directory is structurally complete."""
+        """Return ``True`` iff *path* holds a structurally complete checkpoint.
+
+        A checkpoint is valid when the ``server_state.pkl`` file
+        exists, the shared LMDB index directory exists, the state
+        dict is loadable, and every chunk file it lists is present
+        on disk.  We do not verify content checksums — a partial
+        write would have left the temp directory under a different
+        name and been cleaned up.
+        """
         if not (path / "server_state.pkl").exists():
             return False
         if not (self._save_path / "lmdb_index").exists():
@@ -201,8 +277,6 @@ class CheckpointManager:
         ncs = _extract_n_chunks_per_street(state_dict)
         return self._server._tables.validate_chunks(path, ncs)
 
-    # Structural parameters that must match between the saved state and the
-    # current Server for a resume to be safe.  Mismatches raise.
     _STRUCTURAL_KEYS = (
         "n_players",
         "sync_interval",
@@ -213,16 +287,33 @@ class CheckpointManager:
         "prune_threshold",
         "c",
     )
+    """Hyperparameters whose values must match between the saved state
+    and the current :class:`Server` for a resume to be safe.  Changing
+    any of these would silently corrupt training, so we refuse the
+    resume and ask the user to either revert the change or start a
+    fresh run.  Operational parameters (runtime budget, checkpoint
+    interval, worker count, nickname) are intentionally *not*
+    included — they are allowed to differ between runs.
+    """
 
     def _validate_config_compatibility(self, state_dict: dict) -> None:
-        """Refuse to resume if structural hyperparameters have changed.
+        """Raise if any structural hyperparameter has changed since the save.
 
-        ``max_runtime_hours``, ``checkpoint_interval``, ``n_processes``,
-        and ``nickname`` are intentionally *not* checked — they are
-        allowed to differ between runs.
+        Parameters
+        ----------
+        state_dict : dict
+            Deserialised ``server_state.pkl`` contents from the
+            candidate checkpoint.
+
+        Raises
+        ------
+        RuntimeError
+            If the saved value of any key in :attr:`_STRUCTURAL_KEYS`
+            differs from the current server's value.
         """
         def _current(key: str):
-            # discount_duration_cycles now lives on Server._discount_state.
+            # discount_duration_cycles lives on Server._discount_state; the
+            # rest are plain Server attributes.
             if key == "discount_duration_cycles":
                 return self._server._discount_state.duration_cycles
             return getattr(self._server, "_" + key)
@@ -245,7 +336,13 @@ class CheckpointManager:
             )
 
     def _restore_from_checkpoint(self, path: Path) -> None:
-        """Reload shared-memory tables from a checkpoint directory."""
+        """Reload shared-memory tables and server state from *path*.
+
+        Runs before workers are spawned so the restored state is
+        visible to every worker as soon as it starts.  Advances
+        ``server._start_t`` past the checkpointed iteration so the
+        resumed run does not replay work.
+        """
         state_dict = joblib.load(path / "server_state.pkl")
 
         self._validate_config_compatibility(state_dict)
