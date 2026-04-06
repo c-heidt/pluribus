@@ -141,6 +141,10 @@ class CFRTables:
         """Apply LCFR discount to all regret and strategy tables.
 
         Must only be called when all workers are idle (sync boundary).
+
+        Regret values are clamped to ``REGRET_FLOOR`` after discounting
+        to prevent int32 underflow and allow pruned actions to recover.
+        Strategy values are non-negative visit counts; no floor is applied.
         """
         if not (0.0 < factor <= 1.0):
             raise ValueError(f"Discount factor must be in (0, 1], got {factor}")
@@ -151,17 +155,22 @@ class CFRTables:
             n_entries = self._indexes[r].n_allocated_rows
             n_chunks = math.ceil(n_entries / CHUNK_SIZE) if n_entries > 0 else 0
 
-            for table in (self.regret[r], self.strategy[r]):
-                for chunk_id in range(n_chunks):
-                    chunk = table.store.view(chunk_id)
-                    valid_rows = min(
-                        n_entries - chunk_id * CHUNK_SIZE, CHUNK_SIZE
-                    )
-                    view = chunk[:valid_rows]
-                    result = (view.astype(np.float32) * factor32).astype(np.int32)
-                    np.maximum(result, REGRET_FLOOR, out=result)
-                    view[:] = result
-                    table.store.mark_dirty(chunk_id)
+            for chunk_id in range(n_chunks):
+                valid_rows = min(
+                    n_entries - chunk_id * CHUNK_SIZE, CHUNK_SIZE
+                )
+
+                # Regret: discount + floor clamp
+                rview = self.regret[r].store.view(chunk_id)[:valid_rows]
+                rresult = (rview.astype(np.float32) * factor32).astype(np.int32)
+                np.maximum(rresult, REGRET_FLOOR, out=rresult)
+                rview[:] = rresult
+                self.regret[r].store.mark_dirty(chunk_id)
+
+                # Strategy: discount only (non-negative visit counts)
+                sview = self.strategy[r].store.view(chunk_id)[:valid_rows]
+                sview[:] = (sview.astype(np.float32) * factor32).astype(np.int32)
+                self.strategy[r].store.mark_dirty(chunk_id)
 
     # ------------------------------------------------------------------
     # Lifecycle

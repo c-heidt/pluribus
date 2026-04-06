@@ -201,9 +201,58 @@ class CheckpointManager:
         ncs = _extract_n_chunks_per_street(state_dict)
         return self._server._tables.validate_chunks(path, ncs)
 
+    # Structural parameters that must match between the saved state and the
+    # current Server for a resume to be safe.  Mismatches raise.
+    _STRUCTURAL_KEYS = (
+        "n_players",
+        "sync_interval",
+        "discount_interval",
+        "discount_duration_cycles",
+        "strategy_interval",
+        "update_threshold",
+        "prune_threshold",
+        "c",
+    )
+
+    def _validate_config_compatibility(self, state_dict: dict) -> None:
+        """Refuse to resume if structural hyperparameters have changed.
+
+        ``max_runtime_hours``, ``checkpoint_interval``, ``n_processes``,
+        and ``nickname`` are intentionally *not* checked — they are
+        allowed to differ between runs.
+        """
+        attr_map = {
+            "n_players": "_n_players",
+            "sync_interval": "_sync_interval",
+            "discount_interval": "_discount_interval",
+            "discount_duration_cycles": "_discount_duration_cycles",
+            "strategy_interval": "_strategy_interval",
+            "update_threshold": "_update_threshold",
+            "prune_threshold": "_prune_threshold",
+            "c": "_c",
+        }
+        mismatches = []
+        for key in self._STRUCTURAL_KEYS:
+            if key not in state_dict:
+                continue  # old checkpoint format — skip silently
+            saved = state_dict[key]
+            current = getattr(self._server, attr_map[key])
+            if saved != current:
+                mismatches.append(f"{key}: saved={saved!r} current={current!r}")
+        if mismatches:
+            details = "\n  - ".join(mismatches)
+            raise RuntimeError(
+                "Cannot resume: structural config has changed since the "
+                f"checkpoint was written:\n  - {details}\n"
+                "Either revert these options or start a fresh run in a new "
+                "save_path."
+            )
+
     def _restore_from_checkpoint(self, path: Path) -> None:
         """Reload shared-memory tables from a checkpoint directory."""
         state_dict = joblib.load(path / "server_state.pkl")
+
+        self._validate_config_compatibility(state_dict)
 
         self._server._start_t = state_dict["t"] + 1
         self._server._discounting_active = state_dict.get("discount_active", True)

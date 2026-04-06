@@ -528,7 +528,7 @@ class TestUpdateStrategy:
         tables = _fresh_tables()
         # Run update_strategy 10 times — visit counts should grow
         for _ in range(10):
-            update_strategy(tables, root, i=0, t=1)
+            update_strategy(tables, root, i=0)
         row = tables.strategy[0].get_row_if_exists("root")
         assert row is not None
         total = int(row.sum())
@@ -537,7 +537,7 @@ class TestUpdateStrategy:
     def test_update_strategy_skips_terminal(self):
         terminal = MockTerminal(payout={0: 100, 1: -100})
         tables = _fresh_tables()
-        update_strategy(tables, terminal, i=0, t=1)
+        update_strategy(tables, terminal, i=0)
         # No strategy entry created for terminal
         for r in range(4):
             assert tables.strategy[r].get_row_if_exists("terminal") is None
@@ -565,7 +565,7 @@ class TestUpdateStrategy:
             },
         )
         tables = _fresh_tables()
-        update_strategy(tables, postflop_root, i=0, t=1)
+        update_strategy(tables, postflop_root, i=0)
         # Strategy table for street 1 must have been written.
         assert tables.strategy[1].get_row_if_exists("postflop_root") is not None
 
@@ -588,7 +588,7 @@ class TestBugRegressions:
         """CFRTables.apply_discount must discount both regret and strategy."""
         tables = _fresh_tables()
         merge_local_delta(tables, {(0, "IS1"): _make_delta(0, fold=1000)})
-        update_strategy(tables, _make_two_node_game()[0], i=0, t=1)
+        update_strategy(tables, _make_two_node_game()[0], i=0)
 
         regret_before = tables.regret[0].get_row_if_exists("IS1")
         regret_copy = regret_before.copy() if regret_before is not None else None
@@ -681,7 +681,7 @@ def test_cfr_1000_iterations_small_game():
             card_info_lut = state.card_info_lut
 
             if t > update_threshold and t % strategy_interval == 0:
-                update_strategy(tables, state, i=i, t=t)
+                update_strategy(tables, state, i=i)
 
             local_delta: Dict = {}
             cfr(tables, state, i=i, t=t, local_delta=local_delta)

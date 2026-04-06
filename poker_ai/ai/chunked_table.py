@@ -133,10 +133,15 @@ class ChunkedTable:
         return self._store.view(chunk_id)[row]
 
     def update_row(self, info_set: str, action_idx: int, amount: int) -> None:
-        """Add *amount* to a single action slot and mark dirty."""
+        """Add *amount* to a single action slot under the stripe lock."""
         chunk_id, local_row = self._locate_row(info_set)
-        self._store.view(chunk_id)[local_row, action_idx] += amount
-        self._store.mark_dirty(chunk_id)
+        lock = self.get_stripe_lock(chunk_id)
+        lock.acquire()
+        try:
+            self._store.view(chunk_id)[local_row, action_idx] += amount
+            self._store.mark_dirty(chunk_id)
+        finally:
+            lock.release()
 
     def merge_delta_row(self, info_set: str, delta: np.ndarray) -> None:
         """Merge *delta* into the row under the stripe lock."""

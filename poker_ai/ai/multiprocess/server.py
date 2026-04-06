@@ -32,7 +32,7 @@ class Server:
         self,
         strategy_interval: int,
         max_runtime_hours: float,
-        discount_duration_iters: int,
+        discount_duration_cycles: int,
         prune_threshold: int,
         c: int,
         n_players: int,
@@ -42,11 +42,19 @@ class Server:
         pickle_dir: bool = False,
         sync_interval: int = 10,
         discount_interval: int = 1,
-        checkpoint_interval: int = 1000,
+        checkpoint_interval: int = 1,
         start_timestep: int = 1,
         n_processes: Optional[int] = None,
     ):
-        """Set up the optimisation server."""
+        """Set up the optimisation server.
+
+        All interval/threshold parameters (``strategy_interval``,
+        ``discount_interval``, ``checkpoint_interval``,
+        ``discount_duration_cycles``, ``update_threshold``) are counted
+        in **sync cycles** (= ``sync_interval`` iterations).  The only
+        exception is ``prune_threshold``, which is checked per CFR call
+        and therefore stays in raw iterations.
+        """
         # Determine number of processes to use
         if n_processes is None:
             # Check if running under Slurm
@@ -60,7 +68,7 @@ class Server:
 
         self._strategy_interval = strategy_interval
         self._max_runtime_hours = max_runtime_hours
-        self._discount_duration_iters = discount_duration_iters
+        self._discount_duration_cycles = discount_duration_cycles
         self._discounting_active = True
         self._prune_threshold = prune_threshold
         self._c = c
@@ -139,19 +147,23 @@ class Server:
                     if sigterm.is_set():
                         break
 
-                    if t > self._update_threshold and t % self._strategy_interval == 0:
+                    sync_step = t // self._sync_interval
+
+                    if (
+                        sync_step > self._update_threshold
+                        and sync_step % self._strategy_interval == 0
+                    ):
                         for i in range(self._n_players):
-                            self._send_job("update_strategy", t=t, i=i)
+                            self._send_job("update_strategy", i=i)
                         self._join_queue()
                         if sigterm.is_set():
                             break
 
-                    sync_step = t // self._sync_interval
                     if sync_step % self._discount_interval == 0:
-                        self._apply_discount(t)
+                        self._apply_discount(sync_step)
 
-                if t % self._checkpoint_interval == 0:
-                    self._checkpoint_manager.checkpoint(t=t)
+                    if sync_step % self._checkpoint_interval == 0:
+                        self._checkpoint_manager.checkpoint(t=t)
 
                 progress_bar.update()
                 t += 1
@@ -235,7 +247,7 @@ class Server:
             t=t_val,
             strategy_interval=self._strategy_interval,
             max_runtime_hours=self._max_runtime_hours,
-            discount_duration_iters=self._discount_duration_iters,
+            discount_duration_cycles=self._discount_duration_cycles,
             discount_active=self._discounting_active,
             prune_threshold=self._prune_threshold,
             c=self._c,
@@ -254,11 +266,6 @@ class Server:
             k: os.path.abspath(str(v)) if isinstance(v, Path) else v
             for k, v in sorted(config.items())
         }
-
-    @staticmethod
-    def from_dict(config):
-        """Load serialised server and return instance."""
-        return Server(**config)
 
     def _join_queue(self):
         """Block until the job queue drains, raising WorkerError if a worker dies."""
@@ -295,23 +302,29 @@ class Server:
         self._broadcast_job("sync")
         self._join_queue()
 
-    def _apply_discount(self, t: int) -> None:
+    def _apply_discount(self, sync_step: int) -> None:
         """Apply LCFR discount directly to all shared-memory tables.
 
-        Called by the server after every sync barrier while the discount window
-        is active.  Running in the server process (not a worker job) guarantees
-        the discount is applied exactly once per sync with no concurrency.
+        Called by the server after every sync barrier while the discount
+        window is active.  Running in the server process (not a worker
+        job) guarantees the discount is applied exactly once per sync
+        cycle with no concurrency.
+
+        Parameters
+        ----------
+        sync_step:
+            Current sync-cycle counter (``t // sync_interval``).
         """
         if not self._discounting_active:
             return
-        if t >= self._discount_duration_iters:
-            log.info(f"Discount window closed after {t} iters")
+        if sync_step >= self._discount_duration_cycles:
+            log.info(f"Discount window closed after {sync_step} sync cycles")
             self._discounting_active = False
             return
-        discount_step = t // (self._sync_interval * self._discount_interval)
+        discount_step = sync_step // self._discount_interval
         discount_factor = discount_step / (discount_step + 1)
         log.info(
-            f"[t={t}] Discounting regrets and strategy "
+            f"[sync_step={sync_step}] Discounting regrets and strategy "
             f"(step={discount_step}, factor={discount_factor:.4f})"
         )
         self._tables.apply_discount(discount_factor)

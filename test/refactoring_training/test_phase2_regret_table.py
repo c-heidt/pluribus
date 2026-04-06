@@ -275,9 +275,16 @@ class TestCoreAccessMethods:
         assert local_row == 0
 
     @pytest.mark.slow
-    def test_500k_infosets_correct_retrieval(self, tmp_path, n_actions, table_name):
-        """Allocate 500K infosets across 5+ chunks and verify retrieval."""
-        n = 500_000
+    def test_multi_chunk_allocation_correct_retrieval(
+        self, tmp_path, n_actions, table_name
+    ):
+        """Allocate infosets across multiple chunks and verify retrieval.
+
+        Scales with ``CHUNK_SIZE`` so the test exercises the chunk-boundary
+        path regardless of how that constant is tuned.
+        """
+        # Span at least 3 chunks (2 * CHUNK_SIZE + small overflow).
+        n = 2 * CHUNK_SIZE + 5
         idx = InfosetIndex(tmp_path / "big_idx")
         shm_dir = str(tmp_path / "big_shm")
         os.makedirs(shm_dir)
@@ -287,10 +294,12 @@ class TestCoreAccessMethods:
             row = tbl.get_row(f"big_is_{k}")
             row[0] = k % (2 ** 31 - 1)
 
-        assert tbl.n_chunks >= 5
+        assert tbl.n_chunks >= 3
 
+        # Sample every ~0.1% of entries across all chunks.
+        step = max(1, n // 1000)
         mismatches = 0
-        for k in range(0, n, 1000):
+        for k in range(0, n, step):
             row = tbl.get_row_if_exists(f"big_is_{k}")
             expected = k % (2 ** 31 - 1)
             if row is None or row[0] != expected:
@@ -352,7 +361,7 @@ class TestApplyDiscount:
 
     @pytest.fixture
     def cfr(self, tmp_path):
-        from poker_ai.ai.ai import MAX_ACTIONS_PER_STREET
+        from poker_ai.ai.action_space import MAX_ACTIONS_PER_STREET
         shm_dir = str(tmp_path / "shm_disc")
         os.makedirs(shm_dir)
         tables = CFRTables(

@@ -139,10 +139,10 @@ class Worker(mp.Process):
         # Delta is flushed on explicit "sync" jobs dispatched by the server,
         # not after every traversal (Phase 5 decoupling).
 
-    def _update_strategy(self, t, i):
+    def _update_strategy(self, i):
         """Update strategy visit counts for all streets."""
         self._setup_new_game()
-        update_strategy(self._tables, self._state, i, t)
+        update_strategy(self._tables, self._state, i)
 
     def _setup_new_game(self):
         """Setup up new poker game."""

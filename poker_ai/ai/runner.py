@@ -1,61 +1,21 @@
 """Script for using multiprocessing to train agent.
 
-CLI Use
--------
+All cycle-based options are counted in sync cycles (= ``sync_interval``
+raw iterations): ``strategy_interval``, ``discount_interval``,
+``checkpoint_interval``, ``discount_duration_cycles``, and
+``update_threshold``.  Only ``prune_threshold`` stays in raw
+iterations, because pruning is a per-CFR-call decision.
 
-Below you can run `poker_ai train start --help` to see available options::
-
-    Usage: poker_ai train start [OPTIONS]
-
-      Train agent from scratch.
-
-    Options:
-      --strategy_interval INTEGER     Update the current strategy whenever the
-                                      iteration % strategy_interval == 0.
-      --max_runtime_hours FLOAT       Wall-clock budget for this run in hours.
-                                      Training stops when elapsed time reaches
-                                      this limit.
-      --discount_duration_iters INTEGER
-                                      Total number of iterations for which the
-                                      LCFR discount window is active.
-      --prune_threshold INTEGER       When a uniform random number is less than
-                                      95%, and the iteration > prune_threshold,
-                                      use CFR with pruning.
-      --c INTEGER                     Pruning threshold for regret below which
-                                      subtrees are not recursively visited
-                                      during CFR with pruning.
-      --n_players INTEGER             The number of players in the game.
-      --dump_iteration INTEGER        Compute and accumulate a new strategy
-                                      snapshot every dump_iteration iterations.
-      --update_threshold INTEGER      Start updating the strategy after this
-                                      many iterations.
-      --lut_path TEXT                 Path to the clustering infoset files.
-      --pickle_dir                    Whether the LUT files are pickle files
-                                      (deprecated).
-      --single_process / --multi_process
-                                      Either use or don't use multiple
-                                      processes.
-      --sync_interval INTEGER         Iterations between worker sync barriers.
-                                      Higher values keep workers busier but
-                                      delay delta merges.
-      --discount_interval INTEGER     Apply LCFR discounting every N sync
-                                      barriers (i.e. every sync_interval * N
-                                      iterations). Default 1 discounts at
-                                      every sync.
-      --checkpoint_interval INTEGER   Write a training checkpoint every N
-                                      iterations.
-      --n_processes INTEGER           Number of worker processes to spawn.
-                                      Defaults to cpu_count-1 (or
-                                      SLURM_CPUS_PER_TASK-1 under Slurm).
-      --nickname TEXT                 The nickname of the study.
-      --help                          Show this message and exit.
+Resume: a run auto-resumes if ``save_path`` already contains a valid
+checkpoint.  The ``CheckpointManager`` validates that the saved config
+matches the current config and refuses to restore on structural
+mismatches.  There is no separate ``resume`` command.
 """
 import logging
 from pathlib import Path
 from typing import Dict
 
 import click
-import joblib
 import yaml
 
 from poker_ai import utils
@@ -92,37 +52,9 @@ def train():
 
 @train.command()
 @click.option(
-    "--server_config_path",
-    default="./server.gz",
-    help="The path to the previous server.gz file from a previous study.",
-)
-def resume(server_config_path: str):
-    """
-    Continue training agent from config loaded from file.
-
-    ...
-
-    Parameters
-    ----------
-    server_config_path : str
-        Path to server configurations.
-    """
-    try:
-        config = joblib.load(server_config_path)
-    except FileNotFoundError:
-        raise FileNotFoundError(
-            f"Server config file not found at the path: {server_config_path}\n "
-            f"Please set the path to a valid file dumped by a previous session."
-        )
-    server = Server.from_dict(config)
-    _safe_search(server)
-
-
-@train.command()
-@click.option(
     "--strategy_interval",
-    default=5000,
-    help="Update the current strategy whenever the iteration % strategy_interval == 0.",
+    default=20,
+    help="Update the current strategy every N sync cycles (= N * sync_interval iterations).",
 )
 @click.option(
     "--max_runtime_hours",
@@ -131,9 +63,9 @@ def resume(server_config_path: str):
     help="Wall-clock budget for this run in hours. Training stops when elapsed time reaches this limit.",
 )
 @click.option(
-    "--discount_duration_iters",
-    default=10000,
-    help="Total number of iterations for which the discount window is active.",
+    "--discount_duration_cycles",
+    default=40,
+    help="Close the LCFR discount window after this many sync cycles (= N * sync_interval iterations).",
 )
 @click.option(
     "--n_iterations",
@@ -146,7 +78,8 @@ def resume(server_config_path: str):
     default=5000,
     help=(
         "When a uniform random number is less than 95%, and the iteration > "
-        "prune_threshold, use CFR with pruning."
+        "prune_threshold, use CFR with pruning.  Counted in raw iterations "
+        "because pruning is a per-CFR-call decision."
     ),
 )
 @click.option(
@@ -164,20 +97,11 @@ def resume(server_config_path: str):
     help="The number of players in the game."
 )
 @click.option(
-    "--dump_iteration",
-    default=1000,
-    help=(
-        "When the iteration % dump_iteration == 0, we will compute a new strategy "
-        "and write that to the accumlated strategy, which gets normalised at a "
-        "later time."
-    ),
-)
-@click.option(
     "--update_threshold",
-    default=1000,
+    default=4,
     help=(
-        "When the iteration is greater than update_threshold we can start "
-        "updating the strategy."
+        "Start updating the strategy after this many sync cycles "
+        "(= N * sync_interval iterations)."
     ),
 )
 @click.option(
@@ -204,24 +128,25 @@ def resume(server_config_path: str):
     "--sync_interval",
     default=250,
     help=(
-        "How many iterations between worker sync barriers. Higher values keep "
-        "workers busier but delay delta merges."
+        "How many iterations between worker sync barriers.  This is the base "
+        "unit for all cycle-based options.  Higher values keep workers busier "
+        "but delay delta merges."
     ),
 )
 @click.option(
     "--discount_interval",
     default=10,
     help=(
-        "Apply LCFR discounting every N sync barriers (i.e. every "
-        "sync_interval * discount_interval iterations). Default 1 discounts "
-        "at every sync."
+        "Apply LCFR discounting every N sync cycles "
+        "(= N * sync_interval iterations).  Default 1 discounts every sync cycle."
     ),
 )
 @click.option(
     "--checkpoint_interval",
-    default=10000,
+    default=40,
     help=(
-        "Write a training checkpoint every N iterations. "
+        "Write a training checkpoint every N sync cycles "
+        "(= N * sync_interval iterations)."
     ),
 )
 @click.option(
@@ -237,12 +162,11 @@ def resume(server_config_path: str):
 def start(
     strategy_interval: int,
     max_runtime_hours: float,
-    discount_duration_iters: int,
+    discount_duration_cycles: int,
     n_iterations: int,
     prune_threshold: int,
     c: int,
     n_players: int,
-    dump_iteration: int,
     update_threshold: int,
     lut_path: str,
     pickle_dir: bool,
@@ -253,8 +177,7 @@ def start(
     n_processes,
     nickname: str,
 ):
-    """Train agent from scratch."""
-    # Write config to file, and create directory to save results in.
+    """Train agent from scratch — auto-resumes if a valid checkpoint exists."""
     config: Dict[str, int] = {**locals()}
     save_path: Path = utils.io.create_dir(nickname)
     with open(save_path / "config.yaml", "w") as steam:
@@ -264,8 +187,6 @@ def start(
             "Only one process specified so using poker_ai.ai.singleprocess."
             "simple_search for the optimisation."
         )
-        # simple_search is the validation baseline — it keeps its own
-        # iteration-based parameters and is not affected by Phase 7.
         simple_search(
             config=config,
             save_path=save_path,
@@ -273,22 +194,23 @@ def start(
             pickle_dir=pickle_dir,
             strategy_interval=strategy_interval,
             n_iterations=n_iterations,
-            lcfr_threshold=discount_duration_iters,
+            discount_duration_cycles=discount_duration_cycles,
+            prune_threshold=prune_threshold,
             c=c,
             n_players=n_players,
-            dump_iteration=dump_iteration,
             update_threshold=update_threshold,
+            sync_interval=sync_interval,
+            discount_interval=discount_interval,
         )
     else:
         log.info(
             "Mulitple processes specifed so using poker_ai.ai.multiprocess."
             "server.Server for the optimisation."
         )
-        # Create the server that controls/coordinates the workers.
         server = Server(
             strategy_interval=strategy_interval,
             max_runtime_hours=max_runtime_hours,
-            discount_duration_iters=discount_duration_iters,
+            discount_duration_cycles=discount_duration_cycles,
             prune_threshold=prune_threshold,
             c=c,
             n_players=n_players,
