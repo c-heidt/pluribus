@@ -248,14 +248,13 @@ class Worker(mp.Process):
 
         No-op when the accumulator is empty — this is the common
         case for ``terminate`` jobs that arrive right after a sync
-        barrier.
+        barrier.  The flush count is emitted at ``DEBUG`` level; at
+        ``INFO`` or above only the server's periodic progress line
+        is visible, keeping HPC cluster logs readable.
         """
         if not self._local_delta:
             return
         n_infosets = len(self._local_delta)
         merge_local_delta(self._tables, self._local_delta)
         self._local_delta.clear()
-        self._logging_queue.put(
-            f"[worker={self.name}] Synced {n_infosets:,} infosets to master",
-            block=True,
-        )
+        log.debug(f"[worker={self.name}] Flushed {n_infosets:,} infosets to shared tables")

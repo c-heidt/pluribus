@@ -37,8 +37,6 @@ import time
 from pathlib import Path
 from typing import Dict, Optional, Union
 
-import enlighten
-
 from poker_ai.ai.checkpoint import CheckpointManager
 from poker_ai.ai.cfr_tables import CFRTables
 from poker_ai.ai.multiprocess.worker import Worker
@@ -216,6 +214,9 @@ class Server:
     # Main training loop
     # ------------------------------------------------------------------
 
+    # How often (in seconds) to emit a progress log line during training.
+    _LOG_INTERVAL_SECS: float = 60.0
+
     def search(self):
         """Run the CFR training loop until time or signal stops it.
 
@@ -237,26 +238,31 @@ class Server:
         when the checkpoint manager's sigterm event is set.  After
         the loop exits, one final checkpoint is written so no work
         is lost.
+
+        Progress is logged at most once every :attr:`_LOG_INTERVAL_SECS`
+        seconds at sync barriers, showing elapsed time, estimated
+        remaining time, and the current iteration count.  This produces
+        structured, infrequent log lines that are easy to scan in HPC
+        cluster log files without the noise of a live progress bar.
         """
         self._training_start = time.monotonic()
-        progress_bar = enlighten.get_manager().counter(
-            desc="Optimisation iterations", unit="iter"
-        )
+        max_runtime_secs = self._max_runtime_hours * 3600.0
         sigterm = self._checkpoint_manager.sigterm_event
         t = self._start_t
+        _last_log_time = self._training_start
         try:
             while True:
-                elapsed_hours = (time.monotonic() - self._training_start) / 3600.0
-                if elapsed_hours >= self._max_runtime_hours:
+                elapsed = time.monotonic() - self._training_start
+                if elapsed >= max_runtime_secs:
                     log.info(
-                        f"Time limit reached after {elapsed_hours:.2f}h — {t - 1} iterations"
+                        f"Time limit reached after {elapsed / 3600:.2f}h — "
+                        f"{t - 1} iterations completed"
                     )
                     break
                 if sigterm.is_set():
                     break
 
                 self._current_t = t
-                self._drain_logging_queue()
 
                 for i in range(self._n_players):
                     self._send_job("cfr", t=t, i=i)
@@ -287,7 +293,17 @@ class Server:
                     if should_checkpoint(sync_step, self._checkpoint_interval):
                         self._checkpoint_manager.checkpoint(t=t)
 
-                progress_bar.update()
+                    now = time.monotonic()
+                    if now - _last_log_time >= self._LOG_INTERVAL_SECS:
+                        elapsed = now - self._training_start
+                        remaining = max_runtime_secs - elapsed
+                        log.info(
+                            f"[t={t}  sync_step={sync_step}]  "
+                            f"elapsed={elapsed / 3600:.2f}h  "
+                            f"remaining≈{max(remaining, 0) / 3600:.2f}h"
+                        )
+                        _last_log_time = now
+
                 t += 1
 
             # Drain any jobs still in the queue, then write the final
@@ -298,7 +314,8 @@ class Server:
                 log.info("Signal received — writing final checkpoint before shutdown")
             else:
                 log.info(
-                    f"Training complete — {self._current_t} iters, {elapsed_total:.2f}h elapsed"
+                    f"Training complete — {self._current_t} iters, "
+                    f"{elapsed_total:.2f}h elapsed"
                 )
             self._checkpoint_manager.checkpoint(t=self._current_t)
         except WorkerError:
@@ -531,11 +548,13 @@ class Server:
     def _drain_logging_queue(self, nowait: bool = False) -> None:
         """Emit any pending worker log messages via the server logger.
 
-        Workers push human-readable status strings onto the shared
-        logging queue; this helper drains them into the server's
-        logger so they appear in the normal run log.  Uses the
-        non-blocking variant during shutdown, where we do not want
-        to block on an empty queue.
+        Workers may push human-readable status strings onto the shared
+        logging queue for exceptional events; this helper drains them
+        into the server's logger so they appear in the normal run log.
+        During normal operation the queue is empty because per-flush
+        messages are only emitted at ``DEBUG`` level from the workers.
+        The method is still called during :meth:`terminate` to flush
+        any late-arriving messages before the process exits.
 
         Parameters
         ----------

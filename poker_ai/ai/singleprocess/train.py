@@ -16,11 +16,11 @@ noise than value.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Dict, Tuple, Union
 
 import numpy as np
-from tqdm import tqdm, trange
 
 from poker_ai import utils
 from poker_ai.ai.action_space import MAX_ACTIONS_PER_STREET
@@ -56,9 +56,9 @@ def print_strategy(strategy: Dict[str, Dict[str, int]]):
     """
     for info_set, action_to_probabilities in sorted(strategy.items()):
         norm = sum(list(action_to_probabilities.values()))
-        tqdm.write(f"{info_set}")
+        log.info(info_set)
         for action, probability in action_to_probabilities.items():
-            tqdm.write(f"  - {action}: {probability / norm:.2f}")
+            log.info(f"  - {action}: {probability / norm:.2f}")
 
 
 def simple_search(
@@ -128,6 +128,8 @@ def simple_search(
     """
     from poker_ai.ai.index import lmdb_map_size_for_players
 
+    _LOG_INTERVAL_SECS = 60.0
+
     utils.random.seed(42)
     tables = CFRTables(
         index_path=save_path / "lmdb_index",
@@ -140,10 +142,13 @@ def simple_search(
     )
     card_info_lut: Dict = {}
 
-    for t in trange(1, n_iterations + 1, desc="train iter"):
+    _start_time = time.monotonic()
+    _last_log_time = _start_time
+    log.info(f"Training started — {n_iterations} iterations, {n_players} players")
+
+    for t in range(1, n_iterations + 1):
         if t == 2:
-            # Silence DEBUG-level CFR traces after the first iteration so the
-            # interactive progress bar stays readable.
+            # Silence DEBUG-level CFR traces after the first iteration.
             logging.disable(logging.DEBUG)
 
         for i in range(n_players):
@@ -176,3 +181,19 @@ def simple_search(
 
             if should_discount(sync_step, discount_interval):
                 discount_state.apply(tables, sync_step)
+
+            now = time.monotonic()
+            if now - _last_log_time >= _LOG_INTERVAL_SECS:
+                elapsed = now - _start_time
+                iters_per_sec = t / elapsed if elapsed > 0 else 0.0
+                remaining_iters = n_iterations - t
+                remaining_secs = (
+                    remaining_iters / iters_per_sec if iters_per_sec > 0 else float("inf")
+                )
+                log.info(
+                    f"[t={t}/{n_iterations}  sync_step={sync_step}]  "
+                    f"elapsed={elapsed:.0f}s  "
+                    f"remaining≈{remaining_secs:.0f}s  "
+                    f"({iters_per_sec:.1f} iter/s)"
+                )
+                _last_log_time = now
