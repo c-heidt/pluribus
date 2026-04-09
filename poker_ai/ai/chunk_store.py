@@ -113,10 +113,10 @@ class ChunkStore:
         self._chunks: List[np.ndarray] = []
         self._shm_paths: List[str] = []
 
-        self._alloc_lock: mp.Lock = mp.Lock()
+        self._alloc_lock: mp.Lock = mp.Lock() # type: ignore
 
         # Dirty tracking — shared byte array visible from all processes.
-        self._dirty: mp.Array = mp.Array("b", _MAX_DIRTY_CHUNKS, lock=False)
+        self._dirty: mp.Array = mp.Array("b", _MAX_DIRTY_CHUNKS, lock=False) # type: ignore
 
     # ------------------------------------------------------------------
     # Chunk lifecycle

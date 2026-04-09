@@ -1,11 +1,14 @@
-"""Unit tests for the shared training primitives in ``poker_ai.ai.training``.
+"""Unit tests for the shared training primitives in ``poker_ai/ai/training.py``.
 
 Covers:
 - Sync-cycle schedule predicates (pure logic, table-driven).
-- ``DiscountState`` window and factor formula.
-- ``cfr_step`` pruning decision (monkey-patched cfr/cfrp dispatch).
-- ``strategy_step`` delegates to ``update_strategy``.
+- :class:`~poker_ai.ai.training.DiscountState` discount window and factor formula.
+- :func:`~poker_ai.ai.training.cfr_step` pruning-dispatch decisions.
+- :func:`~poker_ai.ai.training.strategy_step` delegation to ``update_strategy``.
+- Bug regression checks for the historical bugs fixed during the refactor.
 """
+
+import inspect
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,6 +23,9 @@ from poker_ai.ai.training import (
     should_update_strategy,
     strategy_step,
 )
+from poker_ai.ai.cfr import cfr, cfrp, merge_local_delta
+from poker_ai.ai.strategy import update_strategy
+from poker_ai.ai.tree_utils import calculate_strategy_from_row
 
 
 # ---------------------------------------------------------------------------
@@ -46,26 +52,23 @@ class TestSchedulePredicates:
     @pytest.mark.parametrize(
         "sync_step, strategy_interval, update_threshold, expected",
         [
-            # Below threshold: never
             (3, 20, 4, False),
             (4, 20, 4, False),
-            # Above threshold but not divisible by interval
             (5, 20, 4, False),
             (19, 20, 4, False),
-            # Above threshold AND divisible
             (20, 20, 4, True),
             (40, 20, 4, True),
-            # threshold=0: any positive divisible sync_step triggers
             (10, 10, 0, True),
             (10, 3, 0, False),
         ],
     )
     def test_should_update_strategy(
-        self, sync_step, strategy_interval, update_threshold, expected,
+        self, sync_step, strategy_interval, update_threshold, expected
     ):
-        assert should_update_strategy(
-            sync_step, strategy_interval, update_threshold,
-        ) is expected
+        assert (
+            should_update_strategy(sync_step, strategy_interval, update_threshold)
+            is expected
+        )
 
     @pytest.mark.parametrize(
         "sync_step, discount_interval, expected",
@@ -131,12 +134,12 @@ class TestDiscountState:
         assert tables.apply_discount.called
 
         tables.apply_discount.reset_mock()
-        ds.apply(tables, sync_step=5)  # at boundary → closes window
+        ds.apply(tables, sync_step=5)
         assert not ds.active
         tables.apply_discount.assert_not_called()
 
         tables.apply_discount.reset_mock()
-        ds.apply(tables, sync_step=6)  # already closed
+        ds.apply(tables, sync_step=6)
         tables.apply_discount.assert_not_called()
 
     def test_inactive_state_is_noop(self):
@@ -152,7 +155,7 @@ class TestDiscountState:
 
 
 # ---------------------------------------------------------------------------
-# cfr_step (pruning dispatch)
+# cfr_step — pruning dispatch
 # ---------------------------------------------------------------------------
 
 
@@ -165,35 +168,33 @@ class TestCfrStep:
         monkeypatch.setattr(training, "cfrp", cfrp_mock)
 
         tables, state, local_delta = MagicMock(), MagicMock(), {}
-        cfr_step(tables, state, i=0, t=10, prune_threshold=100, c=-3_000_000_00, local_delta=local_delta)
+        cfr_step(tables, state, i=0, t=10, prune_threshold=100, c=-300_000_000, local_delta=local_delta)
         cfr_mock.assert_called_once()
         cfrp_mock.assert_not_called()
 
     def test_past_prune_threshold_uses_cfrp_when_pruning(self, monkeypatch):
-        """Past the threshold and with pruning draw <0.95, use CFR-P."""
+        """Past the threshold and with pruning draw < PRUNE_PROBABILITY, use CFR-P."""
         cfr_mock = MagicMock()
         cfrp_mock = MagicMock()
         monkeypatch.setattr(training, "cfr", cfr_mock)
         monkeypatch.setattr(training, "cfrp", cfrp_mock)
-        # Force the pruning draw to favor CFR-P.
         monkeypatch.setattr(training.np.random, "uniform", lambda: 0.5)
 
         tables, state, local_delta = MagicMock(), MagicMock(), {}
-        cfr_step(tables, state, i=0, t=101, prune_threshold=100, c=-3_000_000_00, local_delta=local_delta)
+        cfr_step(tables, state, i=0, t=101, prune_threshold=100, c=-300_000_000, local_delta=local_delta)
         cfrp_mock.assert_called_once()
         cfr_mock.assert_not_called()
 
     def test_past_prune_threshold_uses_cfr_on_5_percent_draw(self, monkeypatch):
-        """5% of the time past the threshold we still use standard CFR."""
+        """5 % of the time past the threshold we still use standard CFR."""
         cfr_mock = MagicMock()
         cfrp_mock = MagicMock()
         monkeypatch.setattr(training, "cfr", cfr_mock)
         monkeypatch.setattr(training, "cfrp", cfrp_mock)
-        # Force the pruning draw above PRUNE_PROBABILITY.
         monkeypatch.setattr(training.np.random, "uniform", lambda: 0.99)
 
         tables, state, local_delta = MagicMock(), MagicMock(), {}
-        cfr_step(tables, state, i=0, t=101, prune_threshold=100, c=-3_000_000_00, local_delta=local_delta)
+        cfr_step(tables, state, i=0, t=101, prune_threshold=100, c=-300_000_000, local_delta=local_delta)
         cfr_mock.assert_called_once()
         cfrp_mock.assert_not_called()
 
@@ -211,3 +212,33 @@ class TestStrategyStep:
         tables, state = MagicMock(), MagicMock()
         strategy_step(tables, state, i=2)
         update_strategy_mock.assert_called_once_with(tables, state, 2)
+
+
+# ---------------------------------------------------------------------------
+# Bug regressions
+# ---------------------------------------------------------------------------
+
+
+class TestBugRegressions:
+    def test_cfr_signature_no_locks_param(self):
+        assert "locks" not in inspect.signature(cfr).parameters
+
+    def test_cfrp_signature_no_locks_param(self):
+        assert "locks" not in inspect.signature(cfrp).parameters
+
+    def test_cfr_has_local_delta_param(self):
+        assert "local_delta" in inspect.signature(cfr).parameters
+
+    def test_cfrp_has_local_delta_param(self):
+        assert "local_delta" in inspect.signature(cfrp).parameters
+
+    def test_update_strategy_has_no_locks_param(self):
+        assert "locks" not in inspect.signature(update_strategy).parameters
+
+    def test_calculate_strategy_from_row_importable(self):
+        from poker_ai.ai.tree_utils import calculate_strategy_from_row as f
+        assert callable(f)
+
+    def test_merge_local_delta_importable(self):
+        from poker_ai.ai.cfr import merge_local_delta as f
+        assert callable(f)

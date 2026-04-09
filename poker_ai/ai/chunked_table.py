@@ -163,9 +163,9 @@ class ChunkedTable:
         # Per-table row counter — tracks how many rows this table has
         # allocated.  Distinct from index.n_allocated_rows which counts
         # every infoset registered in the shared index.
-        self._n_allocated: mp.Value = mp.Value("l", 0)
+        self._n_allocated: mp.Value = mp.Value("l", 0) # type: ignore
 
-        self._stripe_locks: List[mp.Lock] = [
+        self._stripe_locks: List[mp.Lock] = [ # type: ignore
             mp.Lock() for _ in range(N_STRIPE_LOCKS)
         ]
 
@@ -180,6 +180,7 @@ class ChunkedTable:
             )
             for chunk_id in range(n_chunks):
                 self._store.ensure_open(chunk_id)
+            self._n_allocated.value = n_existing
 
     # ------------------------------------------------------------------
     # Data access

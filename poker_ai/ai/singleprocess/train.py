@@ -131,8 +131,11 @@ def simple_search(
     _LOG_INTERVAL_SECS = 60.0
 
     utils.random.seed(42)
+    shm_dir = save_path / "shm"
+    shm_dir.mkdir(parents=True, exist_ok=True)
     tables = CFRTables(
         index_path=save_path / "lmdb_index",
+        shm_dir=str(shm_dir),
         lmdb_map_size=lmdb_map_size_for_players(n_players),
         actions_per_street=MAX_ACTIONS_PER_STREET,
     )
@@ -140,17 +143,13 @@ def simple_search(
         duration_cycles=discount_duration_cycles,
         discount_interval=discount_interval,
     )
-    card_info_lut: Dict = {}
+    card_info_lut = None
 
     _start_time = time.monotonic()
     _last_log_time = _start_time
     log.info(f"Training started — {n_iterations} iterations, {n_players} players")
 
     for t in range(1, n_iterations + 1):
-        if t == 2:
-            # Silence DEBUG-level CFR traces after the first iteration.
-            logging.disable(logging.DEBUG)
-
         for i in range(n_players):
             state: PokerState = new_game(
                 n_players,

@@ -164,7 +164,7 @@ class InfosetIndex:
         # (pre-fork, safe to read LMDB) so any process can query the row
         # count without an LMDB transaction (which triggers MDB_BAD_RSLOT
         # post-fork).
-        self._n_allocated_mp: mp.Value = mp.Value("Q", self._read_next_row())
+        self._n_allocated_mp: mp.Value = mp.Value("Q", self._read_next_row()) # type: ignore
 
         log.info(
             "InfosetIndex opened at %s (debug=%s, map_size=%d GiB, n_entries=%d). "

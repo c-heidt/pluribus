@@ -98,6 +98,12 @@ def new_game(
     PokerEnv
         Initial game state with the deck matching the supplied LUT.
     """
+    if card_info_lut is None:
+        # Pre-load from disk so deck bounds can be derived before construction.
+        lut_path = kwargs.get("lut_path", ".")
+        pickle_dir_flag = kwargs.get("pickle_dir", False)
+        card_info_lut = PokerEnv.load_card_lut(lut_path, pickle_dir_flag)
+
     low_card_rank, high_card_rank = 2, 14  # default: full deck
     if card_info_lut:
         from poker_ai.environment.utils import card_rank_int as _rank
@@ -116,11 +122,10 @@ def new_game(
         high_card_rank=high_card_rank,
         small_blind=small_blind,
         big_blind=big_blind,
-        load_card_lut=(card_info_lut is None),
+        load_card_lut=False,  # already loaded above
         **kwargs,
     )
-    if card_info_lut is not None:
-        env.card_info_lut = card_info_lut
+    env.card_info_lut = card_info_lut
     return env
 
 
