@@ -2,9 +2,9 @@
 
 Covers:
 - Sync-cycle schedule predicates (pure logic, table-driven).
-- :class:`~poker_ai.ai.training.DiscountState` discount window and factor formula.
-- :func:`~poker_ai.ai.training.cfr_step` pruning-dispatch decisions.
-- :func:`~poker_ai.ai.training.strategy_step` delegation to ``update_strategy``.
+- :class:`~poker_ai.blueprint.training.DiscountState` discount window and factor formula.
+- :func:`~poker_ai.blueprint.training.cfr_step` pruning-dispatch decisions.
+- :func:`~poker_ai.blueprint.training.strategy_step` delegation to ``update_strategy``.
 - Bug regression checks for the historical bugs fixed during the refactor.
 """
 
@@ -13,8 +13,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from poker_ai.ai import training
-from poker_ai.ai.training import (
+from poker_ai.blueprint import training
+from poker_ai.blueprint.training import (
     DiscountState,
     at_sync_barrier,
     cfr_step,
@@ -23,9 +23,9 @@ from poker_ai.ai.training import (
     should_update_strategy,
     strategy_step,
 )
-from poker_ai.ai.cfr import cfr, cfrp, merge_local_delta
-from poker_ai.ai.strategy import update_strategy
-from poker_ai.ai.tree_utils import calculate_strategy_from_row
+from poker_ai.blueprint.cfr import cfr, cfrp, merge_local_delta
+from poker_ai.blueprint.strategy import update_strategy
+from poker_ai.blueprint.tree_utils import calculate_strategy_from_row
 
 
 # ---------------------------------------------------------------------------
@@ -236,9 +236,9 @@ class TestBugRegressions:
         assert "locks" not in inspect.signature(update_strategy).parameters
 
     def test_calculate_strategy_from_row_importable(self):
-        from poker_ai.ai.tree_utils import calculate_strategy_from_row as f
+        from poker_ai.blueprint.tree_utils import calculate_strategy_from_row as f
         assert callable(f)
 
     def test_merge_local_delta_importable(self):
-        from poker_ai.ai.cfr import merge_local_delta as f
+        from poker_ai.blueprint.cfr import merge_local_delta as f
         assert callable(f)

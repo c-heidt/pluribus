@@ -1,11 +1,11 @@
 """Unit tests for the shared-memory table stack.
 
 Covers:
-- :class:`~poker_ai.ai.chunk_store.ChunkStore` — mmap lifecycle, dirty tracking,
+- :class:`~poker_ai.tables.chunk_store.ChunkStore` — mmap lifecycle, dirty tracking,
   save and restore.
-- :class:`~poker_ai.ai.chunked_table.ChunkedTable` — row allocation, data access,
+- :class:`~poker_ai.tables.chunked_table.ChunkedTable` — row allocation, data access,
   stripe locking, discount, naming, and orphan detection.
-- :class:`~poker_ai.ai.cfr_tables.CFRTables` — per-street discount with correct
+- :class:`~poker_ai.tables.cfr_tables.CFRTables` — per-street discount with correct
   REGRET_FLOOR clamping on regret tables and no clamping on strategy tables.
 - Atomic I/O helpers from ``poker_ai/utils/io.py`` used by the checkpointing path.
 """
@@ -15,11 +15,11 @@ import os
 import numpy as np
 import pytest
 
-from poker_ai.ai.chunk_store import CHUNK_SIZE, ChunkStore, _MAX_DIRTY_CHUNKS
-from poker_ai.ai.cfr_tables import CFRTables, REGRET_FLOOR
-from poker_ai.ai.index import InfosetIndex
-from poker_ai.ai.action_space import MAX_ACTIONS_PER_STREET
-from poker_ai.ai.chunked_table import (
+from poker_ai.tables.chunk_store import CHUNK_SIZE, ChunkStore, _MAX_DIRTY_CHUNKS
+from poker_ai.tables.cfr_tables import CFRTables, REGRET_FLOOR
+from poker_ai.tables.index import InfosetIndex
+from poker_ai.environment.action_space import MAX_ACTIONS_PER_STREET
+from poker_ai.tables.chunked_table import (
     N_STRIPE_LOCKS,
     ChunkedTable,
     list_orphaned_blocks,

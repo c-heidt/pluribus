@@ -1,9 +1,9 @@
 """Unit tests for ``poker_ai/ai/strategy.py``.
 
 Covers:
-- :func:`~poker_ai.ai.strategy.update_strategy` — visit-count accumulation,
+- :func:`~poker_ai.blueprint.strategy.update_strategy` — visit-count accumulation,
   terminal skipping, postflop traversal.
-- :func:`~poker_ai.ai.training.strategy_step` delegation.
+- :func:`~poker_ai.blueprint.training.strategy_step` delegation.
 
 All tests use hand-crafted mock states so no LUT file is required.
 """
@@ -14,9 +14,9 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from poker_ai.ai import training
-from poker_ai.ai.strategy import update_strategy
-from poker_ai.ai.training import strategy_step
+from poker_ai.blueprint import training
+from poker_ai.blueprint.strategy import update_strategy
+from poker_ai.blueprint.training import strategy_step
 
 
 # ---------------------------------------------------------------------------

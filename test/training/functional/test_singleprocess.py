@@ -1,6 +1,6 @@
 """Functional tests for ``poker_ai/ai/singleprocess/train.py``.
 
-Exercises :func:`~poker_ai.ai.singleprocess.train.simple_search` end-to-end
+Exercises :func:`~poker_ai.blueprint.singleprocess.train.simple_search` end-to-end
 in a single process.  These tests require the 20-card LUT to be present at
 ``data/clustering/20cards_exact``; they are automatically skipped via the
 ``requires_lut`` marker when the LUT is absent.
@@ -17,8 +17,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from poker_ai.ai.singleprocess.train import simple_search
-from poker_ai.ai.training import DiscountState
+from poker_ai.blueprint.singleprocess.train import simple_search
+from poker_ai.blueprint.training import DiscountState
 
 _LUT_PATH = Path("data/clustering/20cards_exact")
 
@@ -65,9 +65,9 @@ class TestSimpleSearch:
 
     def test_tables_populated_after_iterations(self, tmp_path):
         """After a short run, at least one regret infoset must be allocated."""
-        from poker_ai.ai.action_space import MAX_ACTIONS_PER_STREET
-        from poker_ai.ai.cfr_tables import CFRTables
-        from poker_ai.ai.index import lmdb_map_size_for_players
+        from poker_ai.environment.action_space import MAX_ACTIONS_PER_STREET
+        from poker_ai.tables.cfr_tables import CFRTables
+        from poker_ai.tables.index import lmdb_map_size_for_players
 
         _minimal_search(tmp_path, n_iterations=20)
         # simple_search writes chunks to save_path/shm — reopen from there
@@ -83,9 +83,9 @@ class TestSimpleSearch:
 
     def test_sync_schedule_respected(self, tmp_path):
         """With update_threshold=0, strategy tables must be written."""
-        from poker_ai.ai.cfr_tables import CFRTables
-        from poker_ai.ai.action_space import MAX_ACTIONS_PER_STREET
-        from poker_ai.ai.index import lmdb_map_size_for_players
+        from poker_ai.tables.cfr_tables import CFRTables
+        from poker_ai.environment.action_space import MAX_ACTIONS_PER_STREET
+        from poker_ai.tables.index import lmdb_map_size_for_players
 
         _minimal_search(
             tmp_path,
@@ -134,7 +134,7 @@ class TestSimpleSearch:
 class TestProgressLogging:
     def test_progress_log_emitted_after_interval(self, tmp_path, monkeypatch, caplog):
         """A progress log containing 'elapsed' must appear when time advances."""
-        import poker_ai.ai.singleprocess.train as train_module
+        import poker_ai.blueprint.singleprocess.train as train_module
 
         _call_count = [0]
         _base = time.monotonic()
@@ -145,7 +145,7 @@ class TestProgressLogging:
 
         monkeypatch.setattr(train_module.time, "monotonic", fake_monotonic)
 
-        with caplog.at_level(logging.INFO, logger="poker_ai.ai.singleprocess"):
+        with caplog.at_level(logging.INFO, logger="poker_ai.blueprint.singleprocess"):
             _minimal_search(tmp_path, n_iterations=10, sync_interval=5)
 
         progress_records = [r for r in caplog.records if "elapsed" in r.message]
@@ -155,6 +155,6 @@ class TestProgressLogging:
 class TestModuleInspection:
     def test_no_trange_import(self):
         """tqdm must not be imported by the singleprocess training module."""
-        import poker_ai.ai.singleprocess.train as train_module
+        import poker_ai.blueprint.singleprocess.train as train_module
         assert "trange" not in dir(train_module)
         assert "tqdm" not in dir(train_module)

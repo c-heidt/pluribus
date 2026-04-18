@@ -1,10 +1,10 @@
 """Unit tests for ``poker_ai/ai/tree_utils.py``.
 
 Covers:
-- :func:`~poker_ai.ai.tree_utils.calculate_strategy_from_row` — pure numpy regret matching.
-- :func:`~poker_ai.ai.tree_utils.is_terminal` — terminal detection and payout return.
-- :func:`~poker_ai.ai.tree_utils.get_legal_actions` — legal action filtering.
-- :func:`~poker_ai.ai.tree_utils.get_node_strategy` — regret-matching strategy lookup.
+- :func:`~poker_ai.blueprint.tree_utils.calculate_strategy_from_row` — pure numpy regret matching.
+- :func:`~poker_ai.blueprint.tree_utils.is_terminal` — terminal detection and payout return.
+- :func:`~poker_ai.blueprint.tree_utils.get_legal_actions` — legal action filtering.
+- :func:`~poker_ai.blueprint.tree_utils.get_node_strategy` — regret-matching strategy lookup.
 
 All tests use hand-crafted mock states so no LUT file is required.
 """
@@ -12,7 +12,7 @@ All tests use hand-crafted mock states so no LUT file is required.
 import numpy as np
 import pytest
 
-from poker_ai.ai.tree_utils import (
+from poker_ai.blueprint.tree_utils import (
     calculate_strategy_from_row,
     get_legal_actions,
     get_node_strategy,
@@ -231,7 +231,7 @@ class TestGetNodeStrategy:
         state = _MockState(player_i=0, info_set="biased_IS", actions=["fold", "call"])
         # Write large positive regret for "call"
         row = tmp_tables.regret[0].get_row("biased_IS")
-        from poker_ai.ai.action_space import ACTION_TO_IDX
+        from poker_ai.environment.action_space import ACTION_TO_IDX
         row[ACTION_TO_IDX[0]["call"]] = 10_000
         row[ACTION_TO_IDX[0]["fold"]] = 0
         sigma, _, a_to_i, _ = get_node_strategy(tmp_tables, state)

@@ -10,7 +10,7 @@ and regression-guard the bugs fixed during the refactor:
 - Concurrent ``update_row``: stripe locking prevents lost writes under concurrent
   access.
 - Singleprocess / multiprocess discount schedule equivalence: both modes call
-  :meth:`~poker_ai.ai.training.DiscountState.apply` with the same ``sync_step``
+  :meth:`~poker_ai.blueprint.training.DiscountState.apply` with the same ``sync_step``
   values.
 
 Multi-process tests that start real worker processes are marked ``@pytest.mark.slow``
@@ -24,13 +24,13 @@ from typing import Dict
 import numpy as np
 import pytest
 
-from poker_ai.ai.action_space import ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
-from poker_ai.ai.cfr import cfr, merge_local_delta
-from poker_ai.ai.cfr_tables import CFRTables, REGRET_FLOOR
-from poker_ai.ai.index import lmdb_map_size_for_players
-from poker_ai.ai.singleprocess.train import simple_search
-from poker_ai.ai.strategy import update_strategy
-from poker_ai.ai.training import (
+from poker_ai.environment.action_space import ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
+from poker_ai.blueprint.cfr import cfr, merge_local_delta
+from poker_ai.tables.cfr_tables import CFRTables, REGRET_FLOOR
+from poker_ai.tables.index import lmdb_map_size_for_players
+from poker_ai.blueprint.singleprocess.train import simple_search
+from poker_ai.blueprint.strategy import update_strategy
+from poker_ai.blueprint.training import (
     DiscountState,
     at_sync_barrier,
     should_discount,
@@ -153,7 +153,7 @@ class TestRegressions:
         N times on the same root must yield row sums that scale linearly with N.
         """
         import numpy as np
-        from poker_ai.ai.strategy import update_strategy
+        from poker_ai.blueprint.strategy import update_strategy
 
         # Minimal mock game (reused from test_strategy.py / test_cfr.py)
         class _FP:
@@ -336,7 +336,7 @@ class TestMultiProcessIntegration:
         """Start a Server with 2 workers, run briefly, verify tables are non-empty."""
         import os
         import time
-        from poker_ai.ai.multiprocess.server import Server
+        from poker_ai.blueprint.multiprocess.server import Server
 
         lut_path = Path("data/clustering/20cards_exact")
         if not lut_path.exists():
@@ -370,7 +370,7 @@ class TestMultiProcessIntegration:
         """A real worker processing cfr + sync jobs must write to shared tables."""
         import multiprocessing as mp
         import os
-        from poker_ai.ai.multiprocess.worker import Worker
+        from poker_ai.blueprint.multiprocess.worker import Worker
 
         lut_path = Path("data/clustering/20cards_exact")
         if not lut_path.exists():

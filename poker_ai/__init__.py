@@ -9,10 +9,11 @@ logging.basicConfig(
     format=FORMAT, datefmt="[%X] ", handlers=[RichHandler()], level=logging.INFO,
 )
 
-from . import ai
+from . import blueprint
 from . import cli
-from . import clustering
 from . import environment
+from . import information_abstraction
+from . import tables
 from . import terminal
 from . import utils
 

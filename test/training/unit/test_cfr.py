@@ -1,9 +1,9 @@
 """Unit tests for ``poker_ai/ai/cfr.py``.
 
 Covers:
-- :func:`~poker_ai.ai.cfr.cfr` — external sampling, local delta accumulation.
-- :func:`~poker_ai.ai.cfr.cfrp` — CFR with pruning (CFR-P).
-- :func:`~poker_ai.ai.cfr.merge_local_delta` — delta flush into shared tables.
+- :func:`~poker_ai.blueprint.cfr.cfr` — external sampling, local delta accumulation.
+- :func:`~poker_ai.blueprint.cfr.cfrp` — CFR with pruning (CFR-P).
+- :func:`~poker_ai.blueprint.cfr.merge_local_delta` — delta flush into shared tables.
 
 All tests use hand-crafted mock game trees so no LUT file is required.
 """
@@ -16,9 +16,9 @@ from typing import Dict
 import numpy as np
 import pytest
 
-from poker_ai.ai.action_space import ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
-from poker_ai.ai.cfr import cfr, cfrp, merge_local_delta
-from poker_ai.ai.cfr_tables import CFRTables
+from poker_ai.environment.action_space import ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
+from poker_ai.blueprint.cfr import cfr, cfrp, merge_local_delta
+from poker_ai.tables.cfr_tables import CFRTables
 
 
 # ---------------------------------------------------------------------------

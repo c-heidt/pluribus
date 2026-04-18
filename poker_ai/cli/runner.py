@@ -1,7 +1,7 @@
 import click
 
-from poker_ai.ai.runner import train
-from poker_ai.clustering.runner import cluster
+from poker_ai.blueprint.runner import train
+from poker_ai.information_abstraction.build.runner import build_abstraction
 from poker_ai.terminal.runner import run_terminal_app
 
 
@@ -12,12 +12,12 @@ def cli():
     The root command will allow you to do the following. The "train" option
     builds a model and manages the search for the offline strategy. The "play"
     option allows you to play against the strategy you have trained. The
-    "cluster" option runs the abstraction clustering required as a
-    pre-requisite for training.
+    "build-abstraction" option runs the card-information abstraction build
+    required as a pre-requisite for training.
     """
     pass
 
 
 cli.add_command(train, name="train")
-cli.add_command(cluster, name="cluster")
+cli.add_command(build_abstraction, name="build-abstraction")
 cli.add_command(run_terminal_app, name="play")

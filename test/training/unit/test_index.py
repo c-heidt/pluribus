@@ -1,9 +1,9 @@
 """Unit tests for ``poker_ai/ai/index.py``.
 
 Covers:
-- SipHash-128 used internally by :class:`~poker_ai.ai.index.InfosetIndex`:
+- SipHash-128 used internally by :class:`~poker_ai.tables.index.InfosetIndex`:
   determinism, collision resistance, byte encoding.
-- :class:`~poker_ai.ai.index.InfosetIndex` LMDB-backed string→row mapping:
+- :class:`~poker_ai.tables.index.InfosetIndex` LMDB-backed string→row mapping:
   allocation, persistence, fork safety.
 """
 
@@ -11,8 +11,8 @@ import struct
 
 import pytest
 
-from poker_ai.ai.chunk_store import CHUNK_SIZE
-from poker_ai.ai.index import InfosetIndex
+from poker_ai.tables.chunk_store import CHUNK_SIZE
+from poker_ai.tables.index import InfosetIndex
 from poker_ai.utils.io import hash_info_set_128, hash_info_set_bytes
 
 

@@ -154,7 +154,8 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
+/build/
+!poker_ai/information_abstraction/build/
 develop-eggs/
 dist/
 downloads/

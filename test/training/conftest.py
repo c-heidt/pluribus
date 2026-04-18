@@ -1,6 +1,6 @@
 """Shared pytest fixtures for the training test suite.
 
-Provides lightweight :class:`~poker_ai.ai.cfr_tables.CFRTables` instances
+Provides lightweight :class:`~poker_ai.tables.cfr_tables.CFRTables` instances
 and starter game states used across ``test/training/unit/`` and
 ``test/training/functional/``.  All I/O lands in pytest's ``tmp_path`` so
 there is no cross-test contamination and no need to touch ``/dev/shm``.
@@ -10,9 +10,9 @@ import os
 
 import pytest
 
-from poker_ai.ai.action_space import MAX_ACTIONS_PER_STREET
-from poker_ai.ai.cfr_tables import CFRTables
-from poker_ai.ai.index import InfosetIndex
+from poker_ai.environment.action_space import MAX_ACTIONS_PER_STREET
+from poker_ai.tables.cfr_tables import CFRTables
+from poker_ai.tables.index import InfosetIndex
 from poker_ai.environment.poker_env import new_game
 
 
@@ -37,7 +37,7 @@ def tmp_tables(tmp_path):
 
 @pytest.fixture
 def tmp_index(tmp_path):
-    """A temporary :class:`~poker_ai.ai.index.InfosetIndex`."""
+    """A temporary :class:`~poker_ai.tables.index.InfosetIndex`."""
     idx = InfosetIndex(tmp_path / "idx", lmdb_map_size=10 * 1024 ** 3)
     yield idx
     idx.close()

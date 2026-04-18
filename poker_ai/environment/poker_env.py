@@ -16,10 +16,8 @@ import copy
 import json
 import logging
 import math
-import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import joblib
 import numpy as np
 
 from poker_ai import utils
@@ -27,10 +25,9 @@ from poker_ai.environment import dynamics
 from poker_ai.environment.chance import Deck
 from poker_ai.environment.player import Player
 from poker_ai.environment.pot import Pot
+from poker_ai.information_abstraction import InfoSetLut, load_info_set_lut
 
 logger = logging.getLogger("poker_ai.environment.poker_env")
-
-InfoSetLookupTable = Dict[str, Dict[Tuple[int, ...], str]]
 
 # ---------------------------------------------------------------------------
 # Action abstraction configuration
@@ -66,7 +63,7 @@ MAX_RAISES_PER_ROUND: int = 3
 
 def new_game(
     n_players: int,
-    card_info_lut: InfoSetLookupTable = None,
+    card_info_lut: InfoSetLut = None,
     small_blind: int = 50,
     big_blind: int = 100,
     initial_chips: int = 10000,
@@ -83,7 +80,7 @@ def new_game(
     ----------
     n_players : int
         Number of players.
-    card_info_lut : InfoSetLookupTable, optional
+    card_info_lut : InfoSetLut, optional
         Pre-loaded card cluster lookup table.  When provided, both the disk
         load and the deck configuration are derived from it automatically.
     small_blind : int
@@ -102,7 +99,7 @@ def new_game(
         # Pre-load from disk so deck bounds can be derived before construction.
         lut_path = kwargs.get("lut_path", ".")
         pickle_dir_flag = kwargs.get("pickle_dir", False)
-        card_info_lut = PokerEnv.load_card_lut(lut_path, pickle_dir_flag)
+        card_info_lut = load_info_set_lut(lut_path, pickle_dir_flag)
 
     low_card_rank, high_card_rank = 2, 14  # default: full deck
     if card_info_lut:
@@ -234,7 +231,7 @@ class PokerEnv:
 
         # LUT (also excluded from deep-copy)
         if load_card_lut:
-            self.card_info_lut = self.load_card_lut(lut_path, pickle_dir)
+            self.card_info_lut = load_info_set_lut(lut_path, pickle_dir)
         else:
             self.card_info_lut = {}
 
@@ -848,62 +845,3 @@ class PokerEnv:
         legal_set = {a for a in self.legal_actions if a is not None}
         return np.array([a in legal_set for a in canonical], dtype=bool)
 
-    # ------------------------------------------------------------------
-    # LUT loading
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def load_card_lut(
-        lut_path: str = ".",
-        pickle_dir: bool = False,
-    ) -> Dict[str, Dict[Tuple[int, ...], str]]:
-        """Load the card information cluster lookup table from disk.
-
-        Parameters
-        ----------
-        lut_path : str
-            Path to the directory or file containing the LUT.  When
-            ``pickle_dir=False`` (default), expects a single
-            ``card_info_lut.joblib`` file inside this directory.
-            When ``pickle_dir=True``, expects four per-stage pickle
-            files (``preflop_lossless.pkl``, etc.).
-        pickle_dir : bool
-            If ``True``, load from legacy per-stage pickle files.
-            Default ``False``.
-
-        Returns
-        -------
-        dict[str, dict[tuple[int, ...], str]]
-            Mapping from betting stage name to a dict of
-            ``card_tuple → cluster_id``.
-
-        Raises
-        ------
-        ValueError
-            If a required file is not found at ``lut_path``.
-        """
-        if pickle_dir:
-            logger.info("Loading card LUT (legacy pickle-dir format)")
-            file_names = [
-                "preflop_lossless.pkl",
-                "flop_lossy_2.pkl",
-                "turn_lossy_2.pkl",
-                "river_lossy_2.pkl",
-            ]
-            betting_stages = ["pre_flop", "flop", "turn", "river"]
-            card_info_lut: Dict = {}
-            for file_name, stage in zip(file_names, betting_stages):
-                file_path = os.path.join(lut_path, file_name)
-                if not os.path.isfile(file_path):
-                    raise ValueError(
-                        f"File not found: {file_path}. "
-                        "Ensure lut_path contains the pickle files."
-                    )
-                with open(file_path, "rb") as fp:
-                    card_info_lut[stage] = joblib.load(fp)
-        elif lut_path:
-            logger.info("Loading card LUT from %s", lut_path)
-            card_info_lut = joblib.load(lut_path + "/card_info_lut.joblib")
-        else:
-            card_info_lut = {}
-        return card_info_lut

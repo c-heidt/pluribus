@@ -1,10 +1,10 @@
 """Unit tests for ``poker_ai/ai/multiprocess/worker.py``.
 
 Covers:
-- :meth:`~poker_ai.ai.multiprocess.worker.Worker._flush_delta` — delta merge,
+- :meth:`~poker_ai.blueprint.multiprocess.worker.Worker._flush_delta` — delta merge,
   clear, and logging level.
 - Local delta lifecycle: starts empty, cleared after each flush.
-- LUT is not loaded until :meth:`~poker_ai.ai.multiprocess.worker.Worker.run`
+- LUT is not loaded until :meth:`~poker_ai.blueprint.multiprocess.worker.Worker.run`
   is called (post-fork).
 - Integration: worker processes cfr jobs and flushes tables on terminate (slow).
 """
@@ -17,9 +17,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from poker_ai.ai.action_space import ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
-from poker_ai.ai.cfr_tables import CFRTables
-from poker_ai.ai.multiprocess.worker import Worker
+from poker_ai.environment.action_space import ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
+from poker_ai.tables.cfr_tables import CFRTables
+from poker_ai.blueprint.multiprocess.worker import Worker
 
 
 # ---------------------------------------------------------------------------
