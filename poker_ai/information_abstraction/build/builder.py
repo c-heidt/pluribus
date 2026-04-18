@@ -36,7 +36,7 @@ from poker_ai.information_abstraction.lookup import MemmapLookup
 from poker_ai.information_abstraction.preflop import (
     compute_preflop_lossless_abstraction,
 )
-from poker_ai.utils.io import atomic_joblib_dump
+from poker_ai.tables.checkpoint import atomic_joblib_dump
 
 log = logging.getLogger("poker_ai.information_abstraction.build.builder")
 

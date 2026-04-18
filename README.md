@@ -265,14 +265,14 @@ The reason the poker engine is implemented is because it is useful to have a wel
 The following code is how one might program a round of poker that is deterministic using the engine. This engine is now the first pass that will be used support self play.
 
 ```python
-from poker_ai import utils
 from poker_ai.ai.dummy import RandomPlayer
 from poker_ai.poker.table import PokerTable
 from poker_ai.poker.engine import PokerEngine
 from poker_ai.poker.pot import Pot
+from poker_ai.blueprint.training import seed
 
 # Seed so things are deterministic.
-utils.random.seed(42)
+seed(42)
 
 # Some settings for the amount of chips.
 initial_chips_amount = 10000

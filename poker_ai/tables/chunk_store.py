@@ -34,14 +34,36 @@ import math
 import mmap
 import multiprocessing as mp
 import os
+import shutil
+import tempfile
 from pathlib import Path
-from typing import List
+from typing import List, Union
 
 import numpy as np
 
-from poker_ai.utils.io import atomic_numpy_save
-
 log = logging.getLogger("poker_ai.tables.chunk_store")
+
+
+def _atomic_save(arr: np.ndarray, path: Union[str, Path]) -> None:
+    """Save a numpy array atomically to *path* (``.npy`` format).
+
+    Writes to a temp file in the same directory, then renames so the
+    target is either the previous contents or the complete new array —
+    never a partial write.
+    """
+    path = Path(path)
+    tmp_fd, tmp_str = tempfile.mkstemp(
+        dir=path.parent, suffix=".tmp.npy", prefix=path.stem + "_"
+    )
+    tmp_path = Path(tmp_str)
+    try:
+        os.close(tmp_fd)
+        np.save(tmp_path, arr, allow_pickle=False)
+        shutil.move(str(tmp_path), str(path))
+    except Exception as exc:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise RuntimeError(f"_atomic_save failed for {path}: {exc}") from exc
 
 CHUNK_SIZE: int = 1_000_000
 """Number of rows in a single chunk.
@@ -251,7 +273,7 @@ class ChunkStore:
         (``chunk_id < ceil(n_entries / CHUNK_SIZE)``), optionally
         skipping the ones whose dirty flag is clear.  Each chunk is
         trimmed to its valid prefix before being atomically written to
-        disk via :func:`poker_ai.utils.io.atomic_numpy_save`.
+        disk via :func:`_atomic_save`.
         """
         n_chunks = math.ceil(n_entries / CHUNK_SIZE) if n_entries > 0 else 0
         written = 0
@@ -260,7 +282,7 @@ class ChunkStore:
                 continue
             self.ensure_open(chunk_id)
             valid_rows = min(n_entries - chunk_id * CHUNK_SIZE, CHUNK_SIZE)
-            atomic_numpy_save(
+            _atomic_save(
                 self._chunks[chunk_id][:valid_rows].copy(),
                 dir_path / f"{prefix}_chunk_{chunk_id:06d}.npy",
             )

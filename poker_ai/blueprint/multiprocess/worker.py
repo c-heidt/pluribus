@@ -44,11 +44,11 @@ from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 
-from poker_ai import utils
 from poker_ai.blueprint.cfr import merge_local_delta
 from poker_ai.tables.cfr_tables import CFRTables
 from poker_ai.blueprint.training import (
     cfr_step,
+    seed,
     strategy_step,
 )
 from poker_ai.information_abstraction import load_info_set_lut
@@ -233,7 +233,7 @@ class Worker(mp.Process):
         explicitly from :func:`os.urandom`.
         """
         random_seed: int = int.from_bytes(os.urandom(4), byteorder="little")
-        utils.random.seed(random_seed)
+        seed(random_seed)
 
     def _flush_delta(self) -> None:
         """Flush :attr:`_local_delta` into the shared regret tables.

@@ -12,8 +12,7 @@ import struct
 import pytest
 
 from poker_ai.tables.chunk_store import CHUNK_SIZE
-from poker_ai.tables.index import InfosetIndex
-from poker_ai.utils.io import hash_info_set_128, hash_info_set_bytes
+from poker_ai.tables.index import InfosetIndex, hash_info_set_128, hash_info_set_bytes
 
 
 # ---------------------------------------------------------------------------

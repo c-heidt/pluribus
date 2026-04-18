@@ -11,7 +11,6 @@ Subpackages
    poker_ai.games
    poker_ai.poker
    poker_ai.terminal
-   poker_ai.utils
 
 Module contents
 ---------------

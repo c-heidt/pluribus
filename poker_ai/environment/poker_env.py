@@ -20,7 +20,6 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from poker_ai import utils
 from poker_ai.environment import dynamics
 from poker_ai.environment.chance import Deck
 from poker_ai.environment.player import Player
@@ -28,6 +27,20 @@ from poker_ai.environment.pot import Pot
 from poker_ai.information_abstraction import InfoSetLut, load_info_set_lut
 
 logger = logging.getLogger("poker_ai.environment.poker_env")
+
+
+class _NumpyJSONEncoder(json.JSONEncoder):
+    """Handle those pesky numpy arrays on serialisation."""
+
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        else:
+            return super().default(obj)
 
 # ---------------------------------------------------------------------------
 # Action abstraction configuration
@@ -652,7 +665,7 @@ class PokerEnv:
             ],
         }
         return json.dumps(
-            info_set_dict, separators=(",", ":"), cls=utils.io.NumpyJSONEncoder
+            info_set_dict, separators=(",", ":"), cls=_NumpyJSONEncoder
         )
 
     @property

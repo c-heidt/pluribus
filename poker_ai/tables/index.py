@@ -9,9 +9,9 @@ where the ``infoset → row`` relation lives.
 
 The mapping is persistent: opening an existing LMDB directory
 resumes training with every previously-allocated row intact.  Keys
-are 16-byte raw digests produced by
-:func:`poker_ai.utils.io.hash_info_set_bytes` so the on-disk format
-is insensitive to the length of the original infoset string.  Values
+are 16-byte raw digests produced by :func:`hash_info_set_bytes` so
+the on-disk format is insensitive to the length of the original
+infoset string.  Values
 are packed little-endian uint64s.  A reserved metadata key
 ``b"\\x00__next_row__"`` stores the next-row watermark that drives
 row allocation.
@@ -38,16 +38,15 @@ post-fork readers never need to open a transaction to learn the
 current row count.
 """
 
+import hashlib
 import logging
 import multiprocessing as mp
 import os
 import struct
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import lmdb
-
-from poker_ai.utils.io import hash_info_set_bytes
 
 log = logging.getLogger("poker_ai.tables.index")
 
@@ -56,6 +55,35 @@ _MAP_SIZE: int = int(os.environ.get("PLURIBUS_LMDB_MAP_SIZE", _DEFAULT_MAP_SIZE)
 
 _NEXT_ROW_KEY: bytes = b"\x00__next_row__"
 _STR_PREFIX: bytes = b"\x00__str__"
+
+
+def hash_info_set_128(info_set: str) -> Tuple[int, int]:
+    """Return a 128-bit hash of *info_set* as a pair of unsigned 64-bit ints.
+
+    Uses xxhash.xxh3_128 when available (fast path, ~10x faster than blake2b)
+    and falls back to hashlib.blake2b (16-byte digest) otherwise.
+    """
+    try:
+        import xxhash
+        digest_int: int = xxhash.xxh3_128(info_set).intdigest()
+        high = digest_int >> 64
+        low = digest_int & 0xFFFF_FFFF_FFFF_FFFF
+        return high, low
+    except ImportError:
+        digest: bytes = hashlib.blake2b(
+            info_set.encode("utf-8"), digest_size=16
+        ).digest()
+        high, low = struct.unpack("<QQ", digest)
+        return high, low
+
+
+def hash_info_set_bytes(info_set: str) -> bytes:
+    """Return the 16-byte (128-bit) raw digest for *info_set*.
+
+    This is the canonical key format used when storing hashes in LMDB.
+    """
+    high, low = hash_info_set_128(info_set)
+    return struct.pack("<QQ", high, low)
 
 
 def lmdb_map_size_for_players(n_players: int) -> int:
@@ -253,13 +281,26 @@ class InfosetIndex:
             self._env.close()
         except Exception:
             pass
+        # Use the size the parent actually opened with — the parent may have
+        # grown the map (`_reopen`) so the module-level default is stale.
+        # max_spare_txns=0 disables the per-thread cached-read-txn pool;
+        # cached txns inherited across fork point at a parent reader slot
+        # and would trip `mdb_txn_renew: MDB_BAD_RSLOT` on the first get().
         self._env = _open_lmdb(
             str(self._path),
-            map_size=_MAP_SIZE,
+            map_size=self._map_size,
             writemap=True,
             map_async=True,
             max_readers=256,
+            max_spare_txns=0,
         )
+        # Purge any reader slots left behind by the parent — the child's new
+        # env starts fresh but the lock table on disk can still carry stale
+        # entries from the parent's read transactions (e.g. `_read_next_row`).
+        try:
+            self._env.reader_check()
+        except Exception as e:
+            log.debug("reader_check skipped: %s", e)
         log.debug("InfosetIndex reopened after fork (pid=%d)", os.getpid())
 
     # ------------------------------------------------------------------

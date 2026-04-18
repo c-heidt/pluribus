@@ -30,7 +30,6 @@ from typing import Dict
 import click
 import yaml
 
-from poker_ai import utils
 from poker_ai.blueprint.multiprocess.server import Server, WorkerError
 from poker_ai.blueprint.singleprocess.train import simple_search
 
@@ -218,7 +217,8 @@ def start(
     from it; when not, it starts fresh.
     """
     config: Dict[str, int] = {**locals()}
-    save_path: Path = utils.io.create_dir(nickname)
+    save_path: Path = Path(f"./{nickname}")
+    save_path.mkdir(parents=True, exist_ok=True)
     with open(save_path / "config.yaml", "w") as steam:
         yaml.dump(config, steam)
     if single_process:

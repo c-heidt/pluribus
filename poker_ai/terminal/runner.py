@@ -13,7 +13,12 @@ from poker_ai.terminal.ascii_objects.player import AsciiPlayer
 from poker_ai.terminal.ascii_objects.logger import AsciiLogger
 from poker_ai.terminal.render import print_footer, print_header, print_log, print_table
 from poker_ai.terminal.results import UserResults
-from poker_ai.utils.algos import rotate_list
+
+
+def _rotate_players(players, n):
+    if n > len(players):
+        raise ValueError
+    return players[n:] + players[:n]
 
 
 @click.command()
@@ -83,7 +88,7 @@ def run_terminal_app(
         while True:
             # Construct ascii objects to be rendered later.
             ascii_players: Dict[str, AsciiPlayer] = {}
-            state_players = rotate_list(state.players[::-1], n_table_rotations)
+            state_players = _rotate_players(state.players[::-1], n_table_rotations)
             og_name_to_position = {}
             og_name_to_name = {}
             for player_i, player in enumerate(state_players):

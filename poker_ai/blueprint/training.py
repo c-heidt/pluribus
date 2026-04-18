@@ -38,6 +38,7 @@ Invariants preserved by the primitives
 """
 
 import logging
+import random as _py_random
 from typing import Dict, Tuple
 
 import numpy as np
@@ -48,6 +49,13 @@ from poker_ai.blueprint.strategy import update_strategy
 from poker_ai.environment.poker_env import PokerEnv as PokerState
 
 log = logging.getLogger("poker_ai.blueprint.training")
+
+
+def seed(seed: int = 42) -> None:
+    """Seed numpy and Python RNGs so CFR runs are reproducible."""
+    np.random.seed(seed)
+    _py_random.seed(seed)
+
 
 PRUNE_PROBABILITY: float = 0.95
 """Probability of selecting CFR-P over standard CFR once past ``prune_threshold``.

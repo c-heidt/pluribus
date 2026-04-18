@@ -153,7 +153,7 @@ class CFRTables:
         table, then clears the dirty flags so the next checkpoint
         only has to write chunks touched after this point.  Chunk
         files are written atomically via
-        :func:`poker_ai.utils.io.atomic_numpy_save`.
+        :func:`poker_ai.tables.chunk_store._atomic_save`.
 
         Parameters
         ----------

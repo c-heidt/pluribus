@@ -22,7 +22,6 @@ from typing import Dict, Tuple, Union
 
 import numpy as np
 
-from poker_ai import utils
 from poker_ai.environment.action_space import MAX_ACTIONS_PER_STREET
 from poker_ai.blueprint.cfr import merge_local_delta
 from poker_ai.tables.cfr_tables import CFRTables
@@ -30,6 +29,7 @@ from poker_ai.blueprint.training import (
     DiscountState,
     at_sync_barrier,
     cfr_step,
+    seed,
     should_discount,
     should_update_strategy,
     strategy_step,
@@ -130,7 +130,7 @@ def simple_search(
 
     _LOG_INTERVAL_SECS = 60.0
 
-    utils.random.seed(42)
+    seed(42)
     shm_dir = save_path / "shm"
     shm_dir.mkdir(parents=True, exist_ok=True)
     tables = CFRTables(

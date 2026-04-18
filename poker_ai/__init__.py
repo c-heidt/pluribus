@@ -15,6 +15,5 @@ from . import environment
 from . import information_abstraction
 from . import tables
 from . import terminal
-from . import utils
 
 __version__ = "1.0.0rc3"

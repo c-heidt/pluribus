@@ -84,7 +84,7 @@ def cfr_tables(tmp_path):
 class TestAtomicIO:
     def test_atomic_joblib_roundtrip_dict(self, tmp_path):
         import joblib
-        from poker_ai.utils.io import atomic_joblib_dump
+        from poker_ai.tables.checkpoint import atomic_joblib_dump
         obj = {"a": 1, "b": [1, 2, 3], "c": {"nested": True}}
         path = tmp_path / "test.joblib"
         atomic_joblib_dump(obj, path)
@@ -92,7 +92,7 @@ class TestAtomicIO:
 
     def test_atomic_joblib_roundtrip_numpy(self, tmp_path):
         import joblib
-        from poker_ai.utils.io import atomic_joblib_dump
+        from poker_ai.tables.checkpoint import atomic_joblib_dump
         arr = np.arange(1000, dtype=np.float64).reshape(20, 50)
         path = tmp_path / "arr.joblib"
         atomic_joblib_dump(arr, path)
@@ -100,7 +100,7 @@ class TestAtomicIO:
 
     def test_atomic_joblib_no_partial_write_on_error(self, tmp_path):
         import joblib
-        from poker_ai.utils.io import atomic_joblib_dump
+        from poker_ai.tables.checkpoint import atomic_joblib_dump
         original = {"original": True}
         path = tmp_path / "safe.joblib"
         joblib.dump(original, path)
@@ -120,40 +120,11 @@ class TestAtomicIO:
         ],
     )
     def test_atomic_numpy_roundtrip(self, tmp_path, shape, dtype):
-        from poker_ai.utils.io import atomic_numpy_load, atomic_numpy_save
+        from poker_ai.tables.chunk_store import _atomic_save
         arr = np.random.randint(0, 1000, size=shape).astype(dtype)
         path = tmp_path / "arr.npy"
-        atomic_numpy_save(arr, path)
-        np.testing.assert_array_equal(arr, atomic_numpy_load(path))
-
-    def test_atomic_numpy_integrity_check_shape(self, tmp_path):
-        from poker_ai.utils.io import atomic_numpy_load, atomic_numpy_save
-        arr = np.zeros((5, 3), dtype=np.float32)
-        path = tmp_path / "arr.npy"
-        atomic_numpy_save(arr, path)
-        with pytest.raises(ValueError, match="Shape mismatch"):
-            atomic_numpy_load(path, expected_shape=(5, 4))
-
-    def test_atomic_numpy_integrity_check_dtype(self, tmp_path):
-        from poker_ai.utils.io import atomic_numpy_load, atomic_numpy_save
-        arr = np.zeros(10, dtype=np.float32)
-        path = tmp_path / "arr.npy"
-        atomic_numpy_save(arr, path)
-        with pytest.raises(ValueError, match="dtype mismatch"):
-            atomic_numpy_load(path, expected_dtype=np.int32)
-
-    def test_atomic_numpy_wildcard_shape_dimension(self, tmp_path):
-        from poker_ai.utils.io import atomic_numpy_load, atomic_numpy_save
-        arr = np.ones((7, 5), dtype=np.int32)
-        path = tmp_path / "arr.npy"
-        atomic_numpy_save(arr, path)
-        loaded = atomic_numpy_load(path, expected_shape=(-1, 5), expected_dtype=np.int32)
-        assert loaded.shape == (7, 5)
-
-    def test_atomic_numpy_file_not_found(self, tmp_path):
-        from poker_ai.utils.io import atomic_numpy_load
-        with pytest.raises(FileNotFoundError):
-            atomic_numpy_load(tmp_path / "nonexistent.npy")
+        _atomic_save(arr, path)
+        np.testing.assert_array_equal(arr, np.load(path))
 
 
 # ---------------------------------------------------------------------------
