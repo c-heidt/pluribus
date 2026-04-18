@@ -2,7 +2,7 @@
 # Auto-resubmitting Slurm script for long-running clustering jobs.
 # The job will automatically resubmit itself every 72 hours until clustering is complete.
 # Usage:
-#   sbatch cluster_auto_resub.sh
+#   sbatch abstraction_auto_resub.sh
 #SBATCH --job-name=pluribus-cluster
 #SBATCH --output=logs/cluster-%j.out
 #SBATCH --error=logs/cluster-%j_error.out
