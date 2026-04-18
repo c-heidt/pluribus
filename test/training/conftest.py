@@ -10,10 +10,10 @@ import os
 
 import pytest
 
-from poker_ai.environment.action_space import MAX_ACTIONS_PER_STREET
+from environment.action_space import MAX_ACTIONS_PER_STREET
 from poker_ai.tables.cfr_tables import CFRTables
 from poker_ai.tables.index import InfosetIndex
-from poker_ai.environment.poker_env import new_game
+from environment.poker_env import new_game
 
 
 @pytest.fixture

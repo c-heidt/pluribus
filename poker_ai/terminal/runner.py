@@ -7,7 +7,7 @@ import joblib
 import numpy as np
 from blessed import Terminal
 
-from poker_ai.environment.poker_env import new_game, PokerEnv as PokerState
+from environment.poker_env import new_game, PokerEnv as PokerState
 from poker_ai.terminal.ascii_objects.card_collection import AsciiCardCollection
 from poker_ai.terminal.ascii_objects.player import AsciiPlayer
 from poker_ai.terminal.ascii_objects.logger import AsciiLogger
@@ -47,9 +47,9 @@ def run_terminal_app(
 
     ```bash
     python -m poker_ai.terminal.runner                                       \
-        --lut_path ./research/blueprint_algo                               \
+        --lut_path ./data/20cards_exact                                      \
         --agent offline                                                      \
-        --pickle_dir ./research/blueprint_algo                               \
+        --pickle_dir ./data/20cards_exact                                    \
         --strategy_path ./agent.joblib                                       \
         --n_players 3                                                        \
         --no_debug_quick_start

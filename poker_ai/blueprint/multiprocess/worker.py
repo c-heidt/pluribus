@@ -51,8 +51,8 @@ from poker_ai.blueprint.training import (
     seed,
     strategy_step,
 )
-from poker_ai.information_abstraction import load_info_set_lut
-from poker_ai.environment import poker_env as state
+from information_abstraction import load_info_set_lut
+from environment import poker_env as state
 
 log = logging.getLogger("sync.worker")
 

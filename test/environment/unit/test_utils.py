@@ -7,7 +7,7 @@ deck array construction, prime product helpers, and error conditions.
 import numpy as np
 import pytest
 
-from poker_ai.environment.utils import (
+from environment.utils import (
     INT_RANKS,
     CARD_PRIMES,
     SUITS,
@@ -317,20 +317,20 @@ class TestHandToBinary:
 
 class TestCardIntToBinaryStr:
     def test_returns_string(self):
-        from poker_ai.environment.utils import card_int_to_binary_str
+        from environment.utils import card_int_to_binary_str
         c = make_card(14, "spades")
         result = card_int_to_binary_str(c)
         assert isinstance(result, str)
 
     def test_length(self):
-        from poker_ai.environment.utils import card_int_to_binary_str
+        from environment.utils import card_int_to_binary_str
         c = make_card(14, "spades")
         # 7 groups of 4 bits + 7 tabs = 35 chars
         result = card_int_to_binary_str(c)
         assert len(result) > 0
 
     def test_contains_only_valid_chars(self):
-        from poker_ai.environment.utils import card_int_to_binary_str
+        from environment.utils import card_int_to_binary_str
         c = make_card(2, "clubs")
         result = card_int_to_binary_str(c)
         assert all(ch in "01\t" for ch in result)

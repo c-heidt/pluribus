@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from poker_ai.environment.action_space import ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
+from environment.action_space import ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
 from poker_ai.tables.cfr_tables import CFRTables
 from poker_ai.blueprint.multiprocess.worker import Worker
 
@@ -172,7 +172,7 @@ def _worker_target(job_queue, logging_queue, locks, tables, lut_path):
 @pytest.mark.slow
 def test_terminate_flushes_before_exit(tmp_path):
     """The terminate job must call _flush_delta() so tables are non-empty."""
-    lut_path = Path("data/clustering/20cards_exact")
+    lut_path = Path("data/20cards_exact")
     if not lut_path.exists():
         pytest.skip("20cards_exact LUT not available")
 

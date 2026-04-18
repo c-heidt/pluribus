@@ -6,11 +6,11 @@ Provides game objects (players, decks, pots, game states) used across
 
 import pytest
 
-from poker_ai.environment.player import Player
-from poker_ai.environment.pot import Pot
-from poker_ai.environment.chance import Deck
-from poker_ai.environment.evaluator import Evaluator
-from poker_ai.environment.poker_env import new_game
+from environment.player import Player
+from environment.pot import Pot
+from environment.chance import Deck
+from environment.evaluator import Evaluator
+from environment.poker_env import new_game
 
 
 @pytest.fixture

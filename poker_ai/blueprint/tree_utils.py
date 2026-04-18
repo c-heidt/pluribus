@@ -27,13 +27,13 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from poker_ai.environment.action_space import (
+from environment.action_space import (
     ACTION_TO_IDX,
     CANONICAL_ACTIONS,
     MAX_ACTIONS_PER_STREET,
 )
 from poker_ai.tables.cfr_tables import CFRTables
-from poker_ai.environment.poker_env import PokerEnv as PokerState
+from environment.poker_env import PokerEnv as PokerState
 
 
 def is_terminal(state: PokerState, i: int) -> Optional[float]:
@@ -75,7 +75,7 @@ def is_terminal(state: PokerState, i: int) -> Optional[float]:
 def get_legal_actions(state: PokerState) -> List[str]:
     """Return the legal action strings at *state*, filtering ``None`` entries.
 
-    :attr:`PokerState.legal_actions <poker_ai.environment.poker_env.PokerEnv.legal_actions>`
+    :attr:`PokerState.legal_actions <environment.poker_env.PokerEnv.legal_actions>`
     may contain ``None`` placeholders for slots that do not apply at
     the current node (e.g. inactive players).  Callers always want a
     clean list of action strings, so this helper strips the placeholders.

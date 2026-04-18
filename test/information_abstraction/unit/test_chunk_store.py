@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from poker_ai.information_abstraction.build.chunk_store import (
+from information_abstraction.build.chunk_store import (
     ChunkStore,
     CorruptChunkError,
 )

@@ -6,9 +6,9 @@ and Evaluator hand ranking for known hand types.
 
 import pytest
 
-from poker_ai.environment.lookup import LookupTable
-from poker_ai.environment.evaluator import Evaluator
-from poker_ai.environment.utils import new_card, make_card
+from environment.lookup import LookupTable
+from environment.evaluator import Evaluator
+from environment.utils import new_card, make_card
 
 
 # ---------------------------------------------------------------------------

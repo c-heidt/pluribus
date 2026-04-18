@@ -2,8 +2,8 @@
 import numpy as np
 import pytest
 
-from poker_ai.information_abstraction._combinatorics import comb
-from poker_ai.information_abstraction.build.ehs import (
+from information_abstraction._combinatorics import comb
+from information_abstraction.build.ehs import (
     FlopEHS,
     RiverEHS,
     TurnEHS,

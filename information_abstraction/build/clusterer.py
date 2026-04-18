@@ -18,7 +18,7 @@ from sklearn.cluster import KMeans, MiniBatchKMeans
 from tqdm import tqdm
 
 log = logging.getLogger(
-    "poker_ai.information_abstraction.build.clusterer",
+    "information_abstraction.build.clusterer",
 )
 
 

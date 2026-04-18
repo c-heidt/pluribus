@@ -1,8 +1,8 @@
 """Shared fixtures for the information_abstraction test suite."""
 import pytest
 
-from poker_ai.environment.evaluator import Evaluator
-from poker_ai.information_abstraction.build.card_combos import CardCombos
+from environment.evaluator import Evaluator
+from information_abstraction.build.card_combos import CardCombos
 
 
 @pytest.fixture

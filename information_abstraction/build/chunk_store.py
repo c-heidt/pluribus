@@ -27,11 +27,11 @@ from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
-from poker_ai.information_abstraction.build.checkpoint import (
+from information_abstraction.build.checkpoint import (
     CheckpointManager,
 )
 
-log = logging.getLogger("poker_ai.information_abstraction.build.chunk_store")
+log = logging.getLogger("information_abstraction.build.chunk_store")
 
 
 # ---------------------------------------------------------------------------

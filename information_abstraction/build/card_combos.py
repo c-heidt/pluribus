@@ -4,7 +4,7 @@ Produces the per-street (hole, board) combo arrays consumed by the feature
 extractors and the chunked dispatcher.  Combos are laid out in the exact
 lexicographic order required by the O(1) combinadic index, so downstream
 code can look up any combo's row with
-:func:`poker_ai.information_abstraction._combinatorics.lex_rank`.
+:func:`information_abstraction._combinatorics.lex_rank`.
 """
 import logging
 import multiprocessing as mp
@@ -14,11 +14,11 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from tqdm import tqdm
 
-from poker_ai.environment.utils import make_deck_arr
-from poker_ai.information_abstraction._combinatorics import comb, lex_rank
+from environment.utils import make_deck_arr
+from information_abstraction._combinatorics import comb, lex_rank
 
 log = logging.getLogger(
-    "poker_ai.information_abstraction.build.card_combos",
+    "information_abstraction.build.card_combos",
 )
 
 
@@ -64,7 +64,7 @@ class CardCombos:
     """Per-street card-combination arrays.
 
     Deterministic ascending order matches the combinadic index used by
-    :class:`poker_ai.information_abstraction.lookup.MemmapLookup`.
+    :class:`information_abstraction.lookup.MemmapLookup`.
 
     Attributes
     ----------

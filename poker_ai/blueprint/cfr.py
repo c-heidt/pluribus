@@ -42,7 +42,7 @@ from poker_ai.blueprint.tree_utils import (
     is_terminal,
     sample_action,
 )
-from poker_ai.environment.poker_env import PokerEnv as PokerState
+from environment.poker_env import PokerEnv as PokerState
 
 log = logging.getLogger("poker_ai.blueprint.cfr")
 

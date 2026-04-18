@@ -47,7 +47,7 @@ from poker_ai.blueprint.training import (
     should_discount,
     should_update_strategy,
 )
-from poker_ai.information_abstraction import load_info_set_lut
+from information_abstraction import load_info_set_lut
 
 log = logging.getLogger("sync.server")
 
@@ -182,7 +182,7 @@ class Server:
         # overridden from the environment for very large runs.
         shm_dir = os.environ.get("PLURIBUS_SHM_DIR", "/dev/shm")
         from poker_ai.tables.index import lmdb_map_size_for_players
-        from poker_ai.environment.action_space import MAX_ACTIONS_PER_STREET
+        from environment.action_space import MAX_ACTIONS_PER_STREET
         lmdb_map_size = int(
             os.environ.get(
                 "PLURIBUS_LMDB_MAP_SIZE",

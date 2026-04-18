@@ -10,11 +10,11 @@ import joblib
 import numpy as np
 import pytest
 
-from poker_ai.information_abstraction import (
+from information_abstraction import (
     MemmapLookup,
     load_info_set_lut,
 )
-from poker_ai.information_abstraction.build.builder import (
+from information_abstraction.build.builder import (
     AbstractionBuilder,
 )
 

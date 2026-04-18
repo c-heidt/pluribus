@@ -46,7 +46,7 @@ import numpy as np
 from poker_ai.blueprint.cfr import cfr, cfrp
 from poker_ai.tables.cfr_tables import CFRTables
 from poker_ai.blueprint.strategy import update_strategy
-from poker_ai.environment.poker_env import PokerEnv as PokerState
+from environment.poker_env import PokerEnv as PokerState
 
 log = logging.getLogger("poker_ai.blueprint.training")
 

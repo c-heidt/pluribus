@@ -6,7 +6,7 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from poker_ai.environment.pot import Pot
+    from environment.pot import Pot
 
 logger = logging.getLogger(__name__)
 

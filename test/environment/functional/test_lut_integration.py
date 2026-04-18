@@ -10,13 +10,13 @@ To exclude them:
     pytest -m "not requires_lut"
 
 The LUT directory is resolved from the environment variable
-``PLURIBUS_LUT_PATH`` (default: ``data/clustering/20cards_exact``).
+``PLURIBUS_LUT_PATH`` (default: ``data/20cards_exact``).
 """
 
 import pytest
 
-from poker_ai.environment.poker_env import new_game
-from poker_ai.environment.utils import card_rank_int
+from environment.poker_env import new_game
+from environment.utils import card_rank_int
 
 
 pytestmark = pytest.mark.requires_lut

@@ -16,7 +16,7 @@ from typing import Dict
 import numpy as np
 import pytest
 
-from poker_ai.environment.action_space import ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
+from environment.action_space import ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
 from poker_ai.blueprint.cfr import cfr, cfrp, merge_local_delta
 from poker_ai.tables.cfr_tables import CFRTables
 
@@ -96,7 +96,7 @@ class MockState:
         return 0
 
     def get_valid_mask(self):
-        from poker_ai.environment.poker_env import PokerEnv
+        from environment.poker_env import PokerEnv
         canonical = PokerEnv.get_canonical_actions(self.betting_round)
         legal_set = set(self._actions)
         return np.array([a in legal_set for a in canonical], dtype=bool)
@@ -117,7 +117,7 @@ class MockRiverState(MockState):
         return 3
 
     def get_valid_mask(self):
-        from poker_ai.environment.poker_env import PokerEnv
+        from environment.poker_env import PokerEnv
         canonical = PokerEnv.get_canonical_actions(3)
         legal_set = set(self._actions)
         return np.array([a in legal_set for a in canonical], dtype=bool)

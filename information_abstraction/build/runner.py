@@ -8,7 +8,7 @@ from typing import Optional
 
 import click
 
-from poker_ai.information_abstraction.build.builder import AbstractionBuilder
+from information_abstraction.build.builder import AbstractionBuilder
 
 
 @click.command(name="build-abstraction")

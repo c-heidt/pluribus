@@ -6,8 +6,8 @@ chip conservation, and edge cases including all-in scenarios.
 
 import pytest
 
-from poker_ai.environment.player import Player
-from poker_ai.environment.pot import Pot
+from environment.player import Player
+from environment.pot import Pot
 
 
 def _player(i, chips=10000):

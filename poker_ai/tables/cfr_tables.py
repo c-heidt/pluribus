@@ -95,7 +95,7 @@ class CFRTables:
         actions_per_street : dict[int, int]
             Mandatory mapping from street index to number of abstract
             actions.  Supplied by
-            :data:`poker_ai.environment.action_space.MAX_ACTIONS_PER_STREET`.
+            :data:`environment.action_space.MAX_ACTIONS_PER_STREET`.
         """
         if actions_per_street is None:
             raise ValueError("actions_per_street is required")

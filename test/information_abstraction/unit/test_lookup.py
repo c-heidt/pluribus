@@ -5,8 +5,8 @@ import joblib
 import numpy as np
 import pytest
 
-from poker_ai.information_abstraction import load_info_set_lut
-from poker_ai.information_abstraction.lookup import MemmapLookup
+from information_abstraction import load_info_set_lut
+from information_abstraction.lookup import MemmapLookup
 
 
 def _make_memmap_lookup(tmp_path, combos, cluster_ids_by_row):

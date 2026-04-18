@@ -7,8 +7,8 @@ is the worst (7-high).
 
 import itertools
 
-from poker_ai.environment.utils import prime_product_from_hand, prime_product_from_rankbits
-from poker_ai.environment.lookup import LookupTable
+from environment.utils import prime_product_from_hand, prime_product_from_rankbits
+from environment.lookup import LookupTable
 
 
 class Evaluator(object):

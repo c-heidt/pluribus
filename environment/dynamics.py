@@ -11,11 +11,11 @@ import collections
 import logging
 from typing import TYPE_CHECKING
 
-from poker_ai.environment.evaluator import Evaluator
+from environment.evaluator import Evaluator
 
 if TYPE_CHECKING:
-    from poker_ai.environment.poker_env import PokerEnv
-    from poker_ai.environment.player import Player
+    from environment.poker_env import PokerEnv
+    from environment.player import Player
 
 logger = logging.getLogger(__name__)
 

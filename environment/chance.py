@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from poker_ai.environment.utils import make_deck_arr
+from environment.utils import make_deck_arr
 
 
 class Deck:

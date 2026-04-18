@@ -7,11 +7,11 @@ hand ranking, and winner computation with chip conservation.
 
 import pytest
 
-from poker_ai.environment import dynamics
-from poker_ai.environment.player import Player
-from poker_ai.environment.pot import Pot
-from poker_ai.environment.poker_env import new_game
-from poker_ai.environment.utils import make_card
+from environment import dynamics
+from environment.player import Player
+from environment.pot import Pot
+from environment.poker_env import new_game
+from environment.utils import make_card
 
 
 # ---------------------------------------------------------------------------

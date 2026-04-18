@@ -6,8 +6,8 @@ apply_action semantics, stage progression, terminal states, and CFR helpers.
 
 import pytest
 
-from poker_ai.environment.player import Player
-from poker_ai.environment.poker_env import PokerEnv, new_game, MAX_RAISES_PER_ROUND
+from environment.player import Player
+from environment.poker_env import PokerEnv, new_game, MAX_RAISES_PER_ROUND
 
 
 # ---------------------------------------------------------------------------
@@ -46,11 +46,11 @@ class TestConstruction:
         assert len(fresh_game.players) == 3
 
     def test_pot_is_pot_instance(self, fresh_game):
-        from poker_ai.environment.pot import Pot
+        from environment.pot import Pot
         assert isinstance(fresh_game.pot, Pot)
 
     def test_deck_is_deck_instance(self, fresh_game):
-        from poker_ai.environment.chance import Deck
+        from environment.chance import Deck
         assert isinstance(fresh_game.deck, Deck)
 
 
@@ -154,7 +154,7 @@ class TestInitialState:
         env.players[env.player_i].fold()
         env.players[env.player_i]._is_active = False
         # Access legal_actions from inactive player's perspective directly
-        from poker_ai.environment.player import Player
+        from environment.player import Player
         p = Player(99, 0)
         p._is_active = False
         # Simulate inactive player: override current player temporarily

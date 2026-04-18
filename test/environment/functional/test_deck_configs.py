@@ -8,9 +8,9 @@ new_game derives the deck from the LUT automatically.
 
 import pytest
 
-from poker_ai.environment.player import Player
-from poker_ai.environment.poker_env import PokerEnv, new_game
-from poker_ai.environment.utils import card_rank_int
+from environment.player import Player
+from environment.poker_env import PokerEnv, new_game
+from environment.utils import card_rank_int
 
 
 # ---------------------------------------------------------------------------

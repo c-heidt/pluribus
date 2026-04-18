@@ -6,7 +6,7 @@ agnostic: ``n_ranks`` pair buckets plus ``C(n_ranks, 2)`` suited and
 """
 from typing import Dict, List, Tuple
 
-from poker_ai.environment.utils import card_rank_int, card_suit_str
+from environment.utils import card_rank_int, card_suit_str
 
 
 def make_starting_hand_bucket(

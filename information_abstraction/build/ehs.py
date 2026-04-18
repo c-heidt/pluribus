@@ -24,9 +24,9 @@ from typing import Dict
 
 import numpy as np
 
-from poker_ai.information_abstraction._combinatorics import comb, lex_rank
+from information_abstraction._combinatorics import comb, lex_rank
 
-log = logging.getLogger("poker_ai.information_abstraction.build.ehs")
+log = logging.getLogger("information_abstraction.build.ehs")
 
 
 # ---------------------------------------------------------------------------

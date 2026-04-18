@@ -22,7 +22,7 @@ from typing import Dict, Tuple, Union
 
 import numpy as np
 
-from poker_ai.environment.action_space import MAX_ACTIONS_PER_STREET
+from environment.action_space import MAX_ACTIONS_PER_STREET
 from poker_ai.blueprint.cfr import merge_local_delta
 from poker_ai.tables.cfr_tables import CFRTables
 from poker_ai.blueprint.training import (
@@ -34,7 +34,7 @@ from poker_ai.blueprint.training import (
     should_update_strategy,
     strategy_step,
 )
-from poker_ai.environment.poker_env import new_game, PokerEnv as PokerState
+from environment.poker_env import new_game, PokerEnv as PokerState
 
 
 log = logging.getLogger("poker_ai.blueprint.singleprocess")

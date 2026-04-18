@@ -6,9 +6,9 @@ and all properties and flags.
 
 import pytest
 
-from poker_ai.environment.player import Player
-from poker_ai.environment.pot import Pot
-from poker_ai.environment.utils import make_card
+from environment.player import Player
+from environment.pot import Pot
+from environment.utils import make_card
 
 
 @pytest.fixture
@@ -198,8 +198,8 @@ class TestPositionalFlags:
         assert p.order == 0
 
     def test_order_set_by_game(self):
-        from poker_ai.environment import dynamics
-        from poker_ai.environment.poker_env import new_game
+        from environment import dynamics
+        from environment.poker_env import new_game
         env = new_game(n_players=3, card_info_lut={})
         for i, player in enumerate(env.players):
             assert player.order == i

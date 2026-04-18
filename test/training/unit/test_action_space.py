@@ -6,7 +6,7 @@ indices are dense, unique, and align across the three lookup structures.
 
 import pytest
 
-from poker_ai.environment.action_space import (
+from environment.action_space import (
     ACTION_TO_IDX,
     CANONICAL_ACTIONS,
     MAX_ACTIONS_PER_STREET,

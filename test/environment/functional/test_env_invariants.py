@@ -15,7 +15,7 @@ fast-path, so ALL terminal states have exactly 5 community cards.
 
 import pytest
 
-from poker_ai.environment.poker_env import new_game
+from environment.poker_env import new_game
 
 
 # ---------------------------------------------------------------------------

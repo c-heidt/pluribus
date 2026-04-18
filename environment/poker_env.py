@@ -20,13 +20,13 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from poker_ai.environment import dynamics
-from poker_ai.environment.chance import Deck
-from poker_ai.environment.player import Player
-from poker_ai.environment.pot import Pot
-from poker_ai.information_abstraction import InfoSetLut, load_info_set_lut
+from environment import dynamics
+from environment.chance import Deck
+from environment.player import Player
+from environment.pot import Pot
+from information_abstraction import InfoSetLut, load_info_set_lut
 
-logger = logging.getLogger("poker_ai.environment.poker_env")
+logger = logging.getLogger("environment.poker_env")
 
 
 class _NumpyJSONEncoder(json.JSONEncoder):
@@ -116,7 +116,7 @@ def new_game(
 
     low_card_rank, high_card_rank = 2, 14  # default: full deck
     if card_info_lut:
-        from poker_ai.environment.utils import card_rank_int as _rank
+        from environment.utils import card_rank_int as _rank
         preflop = card_info_lut.get("pre_flop", {})
         if isinstance(preflop, dict) and preflop:
             all_ranks = [_rank(int(c)) for combo in preflop for c in combo]

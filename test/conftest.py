@@ -18,7 +18,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).parent.parent
-_DEFAULT_LUT_DIR = _REPO_ROOT / "data" / "clustering" / "20cards_exact"
+_DEFAULT_LUT_DIR = _REPO_ROOT / "data" / "20cards_exact"
 _LUT_PATH = Path(os.environ.get("PLURIBUS_LUT_PATH", str(_DEFAULT_LUT_DIR)))
 _LUT_FILE = _LUT_PATH / "card_info_lut.joblib"
 

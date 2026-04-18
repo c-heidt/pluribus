@@ -1,7 +1,7 @@
 """Unit tests for Clusterer."""
 import numpy as np
 
-from poker_ai.information_abstraction.build.clusterer import Clusterer
+from information_abstraction.build.clusterer import Clusterer
 
 
 class TestDispatch:

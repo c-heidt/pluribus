@@ -127,7 +127,7 @@ echo "  Chunk size: $CHUNK_SIZE"
 echo "  Save directory: $SAVE_DIR"
 
 # Run clustering in background so the USR1 trap can fire while it is running.
-poker_ai cluster \
+poker_ai build-abstraction \
   --save_dir "$SAVE_DIR" \
   --workers "$WORKERS" \
   --low_card_rank "$LOW_CARD_RANK" \

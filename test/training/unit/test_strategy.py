@@ -90,7 +90,7 @@ class MockState:
         return 0
 
     def get_valid_mask(self):
-        from poker_ai.environment.poker_env import PokerEnv
+        from environment.poker_env import PokerEnv
         canonical = PokerEnv.get_canonical_actions(self.betting_round)
         legal_set = set(self._actions)
         return np.array([a in legal_set for a in canonical], dtype=bool)
@@ -150,7 +150,7 @@ class TestUpdateStrategy:
                 return 1
 
             def get_valid_mask(self):
-                from poker_ai.environment.poker_env import PokerEnv
+                from environment.poker_env import PokerEnv
                 canonical = PokerEnv.get_canonical_actions(1)
                 legal_set = set(self._actions)
                 return np.array([a in legal_set for a in canonical], dtype=bool)

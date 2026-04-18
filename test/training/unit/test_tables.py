@@ -18,7 +18,7 @@ import pytest
 from poker_ai.tables.chunk_store import CHUNK_SIZE, ChunkStore, _MAX_DIRTY_CHUNKS
 from poker_ai.tables.cfr_tables import CFRTables, REGRET_FLOOR
 from poker_ai.tables.index import InfosetIndex
-from poker_ai.environment.action_space import MAX_ACTIONS_PER_STREET
+from environment.action_space import MAX_ACTIONS_PER_STREET
 from poker_ai.tables.chunked_table import (
     N_STRIPE_LOCKS,
     ChunkedTable,

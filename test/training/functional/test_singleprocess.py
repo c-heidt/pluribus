@@ -2,7 +2,7 @@
 
 Exercises :func:`~poker_ai.blueprint.singleprocess.train.simple_search` end-to-end
 in a single process.  These tests require the 20-card LUT to be present at
-``data/clustering/20cards_exact``; they are automatically skipped via the
+``data/20cards_exact``; they are automatically skipped via the
 ``requires_lut`` marker when the LUT is absent.
 
 Tests that only inspect module-level behaviour (imports, logging helpers) do
@@ -20,7 +20,7 @@ import pytest
 from poker_ai.blueprint.singleprocess.train import simple_search
 from poker_ai.blueprint.training import DiscountState
 
-_LUT_PATH = Path("data/clustering/20cards_exact")
+_LUT_PATH = Path("data/20cards_exact")
 
 
 def _lut_available():
@@ -65,7 +65,7 @@ class TestSimpleSearch:
 
     def test_tables_populated_after_iterations(self, tmp_path):
         """After a short run, at least one regret infoset must be allocated."""
-        from poker_ai.environment.action_space import MAX_ACTIONS_PER_STREET
+        from environment.action_space import MAX_ACTIONS_PER_STREET
         from poker_ai.tables.cfr_tables import CFRTables
         from poker_ai.tables.index import lmdb_map_size_for_players
 
@@ -84,7 +84,7 @@ class TestSimpleSearch:
     def test_sync_schedule_respected(self, tmp_path):
         """With update_threshold=0, strategy tables must be written."""
         from poker_ai.tables.cfr_tables import CFRTables
-        from poker_ai.environment.action_space import MAX_ACTIONS_PER_STREET
+        from environment.action_space import MAX_ACTIONS_PER_STREET
         from poker_ai.tables.index import lmdb_map_size_for_players
 
         _minimal_search(

@@ -6,9 +6,9 @@ and the remaining-card tracking property.
 
 import pytest
 
-from poker_ai.environment.chance import Deck
-from poker_ai.environment.player import Player
-from poker_ai.environment.utils import card_rank_int
+from environment.chance import Deck
+from environment.player import Player
+from environment.utils import card_rank_int
 
 
 class TestDeckConstruction:

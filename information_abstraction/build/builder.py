@@ -1,11 +1,11 @@
 """Orchestrator for the card-information abstraction build pipeline.
 
 :class:`AbstractionBuilder` composes
-:class:`poker_ai.information_abstraction.build.card_combos.CardCombos`,
-:class:`poker_ai.information_abstraction.build.chunk_store.ChunkStore`,
-:class:`poker_ai.information_abstraction.build.clusterer.Clusterer`, and the
+:class:`information_abstraction.build.card_combos.CardCombos`,
+:class:`information_abstraction.build.chunk_store.ChunkStore`,
+:class:`information_abstraction.build.clusterer.Clusterer`, and the
 per-street feature extractors in
-:mod:`poker_ai.information_abstraction.build.ehs`.  Its :meth:`compute`
+:mod:`information_abstraction.build.ehs`.  Its :meth:`compute`
 method drives the preflop → river → turn → flop pipeline and writes
 ``card_info_lut.joblib`` + ``centroids.joblib`` to ``save_dir``.
 """
@@ -18,27 +18,27 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import joblib
 import numpy as np
 
-from poker_ai.information_abstraction._combinatorics import comb
-from poker_ai.information_abstraction.build.card_combos import CardCombos
-from poker_ai.information_abstraction.build.chunk_store import (
+from information_abstraction._combinatorics import comb
+from information_abstraction.build.card_combos import CardCombos
+from information_abstraction.build.chunk_store import (
     ChunkStore,
     CorruptChunkError,
 )
-from poker_ai.information_abstraction.build.clusterer import Clusterer
-from poker_ai.information_abstraction.build.ehs import (
+from information_abstraction.build.clusterer import Clusterer
+from information_abstraction.build.ehs import (
     FlopEHS,
     RiverEHS,
     TurnEHS,
     _PROCESS_CACHE,
     get_cluster_id_cache,
 )
-from poker_ai.information_abstraction.lookup import MemmapLookup
-from poker_ai.information_abstraction.preflop import (
+from information_abstraction.lookup import MemmapLookup
+from information_abstraction.preflop import (
     compute_preflop_lossless_abstraction,
 )
 from poker_ai.tables.checkpoint import atomic_joblib_dump
 
-log = logging.getLogger("poker_ai.information_abstraction.build.builder")
+log = logging.getLogger("information_abstraction.build.builder")
 
 
 _STAGE_LABELS = {"river": "1/3", "turn": "2/3", "flop": "3/3"}
@@ -100,7 +100,7 @@ class AbstractionBuilder:
         )
 
         # Evaluator.
-        from poker_ai.environment.evaluator import Evaluator
+        from environment.evaluator import Evaluator
         self._evaluator = Evaluator()
 
         # Paths + persistence.

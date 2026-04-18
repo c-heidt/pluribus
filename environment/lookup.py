@@ -25,7 +25,7 @@ Total           7462
 
 import itertools
 
-from poker_ai.environment.utils import INT_RANKS, CARD_PRIMES, prime_product_from_rankbits
+from environment.utils import INT_RANKS, CARD_PRIMES, prime_product_from_rankbits
 
 
 class LookupTable(object):

@@ -1,7 +1,7 @@
 """Unit tests for CheckpointManager."""
 import json
 
-from poker_ai.information_abstraction.build.checkpoint import (
+from information_abstraction.build.checkpoint import (
     CheckpointManager,
 )
 

@@ -8,7 +8,7 @@ mixing up the ordering between writer and reader would silently corrupt
 regrets.
 
 This module builds three lookup tables once at import time from
-:meth:`PokerEnv.get_canonical_actions <poker_ai.environment.poker_env.PokerEnv.get_canonical_actions>`
+:meth:`PokerEnv.get_canonical_actions <environment.poker_env.PokerEnv.get_canonical_actions>`
 so every downstream module (``tree_utils``, ``cfr``, ``strategy``, the
 server and the training loop) can import a single source of truth.
 
@@ -34,7 +34,7 @@ MAX_ACTIONS_PER_STREET : dict[int, int]
 
 from typing import Dict, List
 
-from poker_ai.environment.poker_env import PokerEnv as PokerState
+from environment.poker_env import PokerEnv as PokerState
 
 CANONICAL_ACTIONS: Dict[int, List[str]] = {
     r: PokerState.get_canonical_actions(r) for r in range(4)

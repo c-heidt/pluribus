@@ -1,5 +1,5 @@
 """Unit tests for compute_preflop_lossless_abstraction."""
-from poker_ai.information_abstraction.preflop import (
+from information_abstraction.preflop import (
     compute_preflop_lossless_abstraction,
 )
 

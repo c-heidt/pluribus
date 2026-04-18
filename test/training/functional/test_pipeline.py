@@ -24,7 +24,7 @@ from typing import Dict
 import numpy as np
 import pytest
 
-from poker_ai.environment.action_space import ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
+from environment.action_space import ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
 from poker_ai.blueprint.cfr import cfr, merge_local_delta
 from poker_ai.tables.cfr_tables import CFRTables, REGRET_FLOOR
 from poker_ai.tables.index import lmdb_map_size_for_players
@@ -35,9 +35,9 @@ from poker_ai.blueprint.training import (
     at_sync_barrier,
     should_discount,
 )
-from poker_ai.environment.poker_env import new_game
+from environment.poker_env import new_game
 
-_LUT_PATH = Path("data/clustering/20cards_exact")
+_LUT_PATH = Path("data/20cards_exact")
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +220,7 @@ class TestRegressions:
                 return 0
 
             def get_valid_mask(self):
-                from poker_ai.environment.poker_env import PokerEnv
+                from environment.poker_env import PokerEnv
                 canonical = PokerEnv.get_canonical_actions(0)
                 legal_set = set(self._actions)
                 return np.array([a in legal_set for a in canonical], dtype=bool)
@@ -338,7 +338,7 @@ class TestMultiProcessIntegration:
         import time
         from poker_ai.blueprint.multiprocess.server import Server
 
-        lut_path = Path("data/clustering/20cards_exact")
+        lut_path = Path("data/20cards_exact")
         if not lut_path.exists():
             pytest.skip("20cards_exact LUT not available")
 
@@ -372,7 +372,7 @@ class TestMultiProcessIntegration:
         import os
         from poker_ai.blueprint.multiprocess.worker import Worker
 
-        lut_path = Path("data/clustering/20cards_exact")
+        lut_path = Path("data/20cards_exact")
         if not lut_path.exists():
             pytest.skip("20cards_exact LUT not available")
 

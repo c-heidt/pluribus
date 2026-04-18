@@ -1,6 +1,6 @@
 """Card-information lookup table: consumption-side API.
 
-The build pipeline in :mod:`poker_ai.information_abstraction.build` writes
+The build pipeline in :mod:`information_abstraction.build` writes
 ``card_info_lut.joblib`` to disk; this module loads it and exposes the
 ``MemmapLookup`` class that replaces a multi-billion-entry Python dict for the
 river street.
@@ -17,9 +17,9 @@ from typing import Any, Dict, Optional, Tuple, Union
 import joblib
 import numpy as np
 
-from poker_ai.information_abstraction._combinatorics import comb, lex_rank
+from information_abstraction._combinatorics import comb, lex_rank
 
-log = logging.getLogger("poker_ai.information_abstraction.lookup")
+log = logging.getLogger("information_abstraction.lookup")
 
 
 InfoSetLut = Dict[str, Any]

@@ -16,7 +16,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
 
-log = logging.getLogger("poker_ai.information_abstraction.build.checkpoint")
+log = logging.getLogger("information_abstraction.build.checkpoint")
 
 
 STREETS = ("river", "turn", "flop")

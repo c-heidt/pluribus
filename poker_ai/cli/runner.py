@@ -1,7 +1,7 @@
 import click
 
 from poker_ai.blueprint.runner import train
-from poker_ai.information_abstraction.build.runner import build_abstraction
+from information_abstraction.build.runner import build_abstraction
 from poker_ai.terminal.runner import run_terminal_app
 
 
