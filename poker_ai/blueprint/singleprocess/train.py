@@ -127,6 +127,7 @@ def simple_search(
         Period (in sync cycles) between LCFR discount applications.
     """
     from poker_ai.tables.index import lmdb_map_size_for_players
+    from information_abstraction import load_info_set_lut
 
     _LOG_INTERVAL_SECS = 60.0
 
@@ -143,7 +144,7 @@ def simple_search(
         duration_cycles=discount_duration_cycles,
         discount_interval=discount_interval,
     )
-    card_info_lut = None
+    card_info_lut = load_info_set_lut(lut_path, pickle_dir)
 
     _start_time = time.monotonic()
     _last_log_time = _start_time
@@ -151,15 +152,7 @@ def simple_search(
 
     for t in range(1, n_iterations + 1):
         for i in range(n_players):
-            state: PokerState = new_game(
-                n_players,
-                card_info_lut,
-                lut_path=lut_path,
-                pickle_dir=pickle_dir,
-            )
-            # ``new_game`` caches the LUT on the returned state so we
-            # can reuse it on subsequent calls without re-loading.
-            card_info_lut = state.card_info_lut
+            state: PokerState = new_game(n_players, card_info_lut)
             local_delta: Dict[Tuple[int, str], np.ndarray] = {}
             cfr_step(tables, state, i, t, prune_threshold, c, local_delta)
             merge_local_delta(tables, local_delta)
@@ -169,13 +162,7 @@ def simple_search(
 
             if should_update_strategy(sync_step, strategy_interval, update_threshold):
                 for i in range(n_players):
-                    state = new_game(
-                        n_players,
-                        card_info_lut,
-                        lut_path=lut_path,
-                        pickle_dir=pickle_dir,
-                    )
-                    card_info_lut = state.card_info_lut
+                    state = new_game(n_players, card_info_lut)
                     strategy_step(tables, state, i)
 
             if should_discount(sync_step, discount_interval):

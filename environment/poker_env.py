@@ -24,7 +24,6 @@ from environment import dynamics
 from environment.chance import Deck
 from environment.player import Player
 from environment.pot import Pot
-from information_abstraction import InfoSetLut, load_info_set_lut
 
 logger = logging.getLogger("environment.poker_env")
 
@@ -76,11 +75,10 @@ MAX_RAISES_PER_ROUND: int = 3
 
 def new_game(
     n_players: int,
-    card_info_lut: InfoSetLut = None,
+    card_info_lut: Optional[dict] = None,
     small_blind: int = 50,
     big_blind: int = 100,
     initial_chips: int = 10000,
-    **kwargs,
 ) -> PokerEnv:
     """Create a new poker game.
 
@@ -89,13 +87,17 @@ def new_game(
     card set the LUT was built for.  When no LUT is provided (e.g. in tests),
     a full 52-card deck is used.
 
+    Loading a LUT from disk is the caller's responsibility — use
+    :func:`information_abstraction.load_info_set_lut` and pass the result
+    via ``card_info_lut``.
+
     Parameters
     ----------
     n_players : int
         Number of players.
-    card_info_lut : InfoSetLut, optional
-        Pre-loaded card cluster lookup table.  When provided, both the disk
-        load and the deck configuration are derived from it automatically.
+    card_info_lut : dict, optional
+        Pre-loaded card cluster lookup table.  When ``None`` or empty,
+        a full 52-card deck is used.
     small_blind : int
         Small blind amount.
     big_blind : int
@@ -109,10 +111,7 @@ def new_game(
         Initial game state with the deck matching the supplied LUT.
     """
     if card_info_lut is None:
-        # Pre-load from disk so deck bounds can be derived before construction.
-        lut_path = kwargs.get("lut_path", ".")
-        pickle_dir_flag = kwargs.get("pickle_dir", False)
-        card_info_lut = load_info_set_lut(lut_path, pickle_dir_flag)
+        card_info_lut = {}
 
     low_card_rank, high_card_rank = 2, 14  # default: full deck
     if card_info_lut:
@@ -132,8 +131,6 @@ def new_game(
         high_card_rank=high_card_rank,
         small_blind=small_blind,
         big_blind=big_blind,
-        load_card_lut=False,  # already loaded above
-        **kwargs,
     )
     env.card_info_lut = card_info_lut
     return env
@@ -178,13 +175,13 @@ class PokerEnv:
         players: List[Player],
         small_blind: int = 50,
         big_blind: int = 100,
-        lut_path: str = ".",
-        pickle_dir: bool = False,
-        load_card_lut: bool = True,
         low_card_rank: int = 2,
         high_card_rank: int = 14,
     ):
         """Initialise the environment and deal the first hand.
+
+        The caller owns LUT loading — assign ``env.card_info_lut`` after
+        construction (or use :func:`new_game` as the factory).
 
         Parameters
         ----------
@@ -194,12 +191,6 @@ class PokerEnv:
             Small blind amount.
         big_blind : int
             Big blind amount.
-        lut_path : str
-            Path to the card information LUT file/directory.
-        pickle_dir : bool
-            Legacy: whether lut_path is a directory of pickle files.
-        load_card_lut : bool
-            Whether to load the card clustering LUT from disk.
         low_card_rank : int
             Lowest rank in the deck (2=Two, ..., 14=Ace).
         high_card_rank : int
@@ -233,7 +224,6 @@ class PokerEnv:
         # Config (immutable after init — skipped in __deepcopy__)
         self._low_card_rank: int = low_card_rank
         self._high_card_rank: int = high_card_rank
-        self._pickle_dir: bool = pickle_dir
         self._initial_n_chips: int = players[0].n_chips
         self.small_blind: int = small_blind
         self.big_blind: int = big_blind
@@ -242,11 +232,9 @@ class PokerEnv:
             "river": 3, "show_down": 4,
         }
 
-        # LUT (also excluded from deep-copy)
-        if load_card_lut:
-            self.card_info_lut = load_info_set_lut(lut_path, pickle_dir)
-        else:
-            self.card_info_lut = {}
+        # LUT is populated by the caller (see `new_game`); default empty
+        # for tests that don't need cluster-id lookups.
+        self.card_info_lut: dict = {}
 
         # Live game state (deep-copied in apply_action)
         self.players: List[Player] = players
@@ -323,7 +311,7 @@ class PokerEnv:
         # Immutable config — share references, no copy needed
         for attr in (
             "small_blind", "big_blind", "_low_card_rank", "_high_card_rank",
-            "_initial_n_chips", "_pickle_dir",
+            "_initial_n_chips",
             "_betting_stage_to_round", "_player_i_lut",
         ):
             object.__setattr__(new, attr, getattr(self, attr))

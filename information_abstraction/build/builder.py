@@ -18,7 +18,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import joblib
 import numpy as np
 
-from information_abstraction._combinatorics import comb
 from information_abstraction.build.card_combos import CardCombos
 from information_abstraction.build.chunk_store import (
     ChunkStore,
@@ -32,11 +31,11 @@ from information_abstraction.build.ehs import (
     _PROCESS_CACHE,
     get_cluster_id_cache,
 )
-from information_abstraction.lookup import MemmapLookup
+from information_abstraction.lookup import MemmapLookup, comb
 from information_abstraction.preflop import (
     compute_preflop_lossless_abstraction,
 )
-from poker_ai.tables.checkpoint import atomic_joblib_dump
+from utils.io import atomic_joblib_dump
 
 log = logging.getLogger("information_abstraction.build.builder")
 

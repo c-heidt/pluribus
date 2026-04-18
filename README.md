@@ -20,20 +20,20 @@ Planned next:
 ## Repository layout
 
 ```
-poker_ai/                   Blueprint trainer, CLI, tables, terminal client
+poker_ai/                   Blueprint trainer, tables, terminal client
 ├── blueprint/              CFR traversal, training schedule, single- and multi-process runners
 ├── tables/                 LMDB-backed sparse regret / strategy storage with checkpointing
-├── cli/                    `poker_ai` Click entry point
 └── terminal/               Text-mode client for playing against a trained agent
 
-environment/                Poker game state, action space, hand evaluator, deck / pot / player
+cli/                        `poker_ai` Click entry point (composes blueprint + build + terminal)
+environment/                Poker game state, action space, hand evaluator + rank table, deck / pot / player
 information_abstraction/    Card-info LUT build pipeline (`build/`) and runtime load API
+utils/                      Shared atomic-IO primitives (no domain dependencies)
 data/                       Generated artifacts (e.g. `data/20cards_exact/card_info_lut.joblib`)
 scripts/                    Slurm submission scripts and one-off helpers (LUT rebinding)
 test/                       Pytest suite mirroring the package layout
 ```
 
-`environment/` and `information_abstraction/` are top-level packages, sibling to `poker_ai/`, not nested under it.
 
 ## Installation
 

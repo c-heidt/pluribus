@@ -3,9 +3,9 @@
 # The job will automatically resubmit itself every 72 hours until clustering is complete.
 # Usage:
 #   sbatch abstraction_auto_resub.sh
-#SBATCH --job-name=pluribus-cluster
-#SBATCH --output=logs/cluster-%j.out
-#SBATCH --error=logs/cluster-%j_error.out
+#SBATCH --job-name=pluribus-abstraction
+#SBATCH --output=logs/abstraction-%j.out
+#SBATCH --error=logs/abstraction-%j_error.out
 #SBATCH --partition=highmem
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -14,7 +14,6 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=1000000mb
 #SBATCH --mail-type=ALL
-#SBATCH --mail-user=uvizo@student.kit.edu
 
 
 set -euo pipefail
@@ -58,7 +57,7 @@ resubmit_on_timeout() {
     NEW_COUNT=$((RESUBMIT_COUNT + 1))
     echo "$NEW_COUNT" > "$COUNTER_FILE"
     echo "⟳ Resubmitting job ($NEW_COUNT/$MAX_RESUBMISSIONS)..."
-    sbatch "$PROJECT_DIR/cluster_auto_resub.sh"
+    sbatch "$PROJECT_DIR/abstraction_auto_resub.sh"
   else
     echo "⊗ Maximum resubmissions ($MAX_RESUBMISSIONS) reached. Not resubmitting."
   fi
@@ -175,7 +174,7 @@ if [ "$RESUBMIT_COUNT" -lt "$MAX_RESUBMISSIONS" ]; then
   NEW_COUNT=$((RESUBMIT_COUNT + 1))
   echo "$NEW_COUNT" > "$COUNTER_FILE"
   echo "⟳ Clustering not complete after run. Resubmitting job ($NEW_COUNT/$MAX_RESUBMISSIONS)..."
-  sbatch "$PROJECT_DIR/cluster_auto_resub.sh"
+  sbatch "$PROJECT_DIR/abstraction_auto_resub.sh"
 else
   echo "⊗ Maximum resubmissions ($MAX_RESUBMISSIONS) reached."
   echo "⊗ Please check intermediate results and manually resubmit if needed."

@@ -120,10 +120,10 @@ class TestAtomicIO:
         ],
     )
     def test_atomic_numpy_roundtrip(self, tmp_path, shape, dtype):
-        from poker_ai.tables.chunk_store import _atomic_save
+        from utils.io import atomic_numpy_save
         arr = np.random.randint(0, 1000, size=shape).astype(dtype)
         path = tmp_path / "arr.npy"
-        _atomic_save(arr, path)
+        atomic_numpy_save(arr, path)
         np.testing.assert_array_equal(arr, np.load(path))
 
 

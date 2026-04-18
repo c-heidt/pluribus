@@ -51,41 +51,19 @@ import logging
 import os
 import shutil
 import signal
-import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, TYPE_CHECKING, Union
+from typing import Dict, Optional, TYPE_CHECKING
 
 import joblib
+
+from utils.io import atomic_joblib_dump
 
 if TYPE_CHECKING:
     from poker_ai.blueprint.multiprocess.server import Server
 
 log = logging.getLogger("poker_ai.tables.checkpoint")
-
-
-def atomic_joblib_dump(obj: Any, path: Union[str, Path]) -> None:
-    """Save *obj* with joblib atomically via a temp file then rename.
-
-    Using a temp file in the same directory guarantees the rename is
-    atomic on POSIX (rename syscall) even across NFS when the tmp and
-    target are on the same mount point.  On failure the temp file is
-    cleaned up and the original path is left untouched.
-    """
-    path = Path(path)
-    tmp_fd, tmp_str = tempfile.mkstemp(
-        dir=path.parent, suffix=".tmp.joblib", prefix=path.stem + "_"
-    )
-    tmp_path = Path(tmp_str)
-    try:
-        os.close(tmp_fd)
-        joblib.dump(obj, tmp_path)
-        shutil.move(str(tmp_path), str(path))
-    except Exception as exc:
-        if tmp_path.exists():
-            tmp_path.unlink()
-        raise RuntimeError(f"atomic_joblib_dump failed for {path}: {exc}") from exc
 
 
 def _extract_n_chunks_per_street(state_dict: dict) -> Dict[int, int]:

@@ -65,20 +65,20 @@ class TestConstructionErrors:
 
     def test_low_card_rank_below_2_raises(self):
         with pytest.raises(ValueError):
-            PokerEnv([Player(i, 10000) for i in range(2)], low_card_rank=1, load_card_lut=False)
+            PokerEnv([Player(i, 10000) for i in range(2)], low_card_rank=1)
 
     def test_high_card_rank_above_14_raises(self):
         with pytest.raises(ValueError):
-            PokerEnv([Player(i, 10000) for i in range(2)], high_card_rank=15, load_card_lut=False)
+            PokerEnv([Player(i, 10000) for i in range(2)], high_card_rank=15)
 
     def test_low_above_high_raises(self):
         with pytest.raises(ValueError):
-            PokerEnv([Player(i, 10000) for i in range(2)], low_card_rank=10, high_card_rank=9, load_card_lut=False)
+            PokerEnv([Player(i, 10000) for i in range(2)], low_card_rank=10, high_card_rank=9)
 
     def test_deck_too_small_for_players_raises(self):
         # ranks 13–14 = 8 cards; need at least 4*2+5=13 for 4 players
         with pytest.raises(ValueError):
-            PokerEnv([Player(i, 10000) for i in range(4)], low_card_rank=13, high_card_rank=14, load_card_lut=False)
+            PokerEnv([Player(i, 10000) for i in range(4)], low_card_rank=13, high_card_rank=14)
 
     def test_player_i_setter_raises(self, fresh_game):
         with pytest.raises(ValueError):

@@ -3,7 +3,7 @@ from .player import Player
 from .pot import Pot
 from .chance import Deck
 from .evaluator import Evaluator
-from .lookup import LookupTable
+from .hand_rank_table import HandRankTable
 from .dynamics import (
     assign_blinds,
     assign_order,

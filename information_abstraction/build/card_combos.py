@@ -4,7 +4,7 @@ Produces the per-street (hole, board) combo arrays consumed by the feature
 extractors and the chunked dispatcher.  Combos are laid out in the exact
 lexicographic order required by the O(1) combinadic index, so downstream
 code can look up any combo's row with
-:func:`information_abstraction._combinatorics.lex_rank`.
+:func:`information_abstraction.lookup.lex_rank`.
 """
 import logging
 import multiprocessing as mp
@@ -15,7 +15,7 @@ import numpy as np
 from tqdm import tqdm
 
 from environment.utils import make_deck_arr
-from information_abstraction._combinatorics import comb, lex_rank
+from information_abstraction.lookup import comb, lex_rank
 
 log = logging.getLogger(
     "information_abstraction.build.card_combos",

@@ -20,7 +20,7 @@ from environment.utils import card_rank_int
 def _env(low: int, high: int, n_players: int = 2, chips: int = 10000) -> PokerEnv:
     """Create a PokerEnv with explicit deck bounds (no LUT)."""
     players = [Player(i, chips) for i in range(n_players)]
-    return PokerEnv(players=players, low_card_rank=low, high_card_rank=high, load_card_lut=False)
+    return PokerEnv(players=players, low_card_rank=low, high_card_rank=high)
 
 
 def _play_to_terminal(env, max_steps=300):

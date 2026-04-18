@@ -6,7 +6,7 @@ from typing import List
 import pytest
 from click.testing import CliRunner
 
-from poker_ai.cli.runner import cli
+from cli.runner import cli
 
 os.environ["TESTING_SUITE"] = "1"
 pickle_dir = os.environ.get("LUT_DIR", os.path.abspath("data/20cards_exact/"))

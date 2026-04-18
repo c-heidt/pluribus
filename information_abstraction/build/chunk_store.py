@@ -30,6 +30,7 @@ import numpy as np
 from information_abstraction.build.checkpoint import (
     CheckpointManager,
 )
+from utils.io import atomic_numpy_save
 
 log = logging.getLogger("information_abstraction.build.chunk_store")
 
@@ -599,7 +600,7 @@ class ChunkStore:
 
     def save_centroids(self, street: str, centroids: np.ndarray) -> None:
         path = self.get_street_dir(street) / "centroids.npy"
-        self._atomic_np_save(centroids, path)
+        atomic_numpy_save(centroids, path)
 
     def load_centroids(self, street: str) -> np.ndarray:
         return np.load(
@@ -609,24 +610,13 @@ class ChunkStore:
 
     def save_clusters(self, street: str, clusters: np.ndarray) -> None:
         path = self.get_street_dir(street) / "clusters.npy"
-        self._atomic_np_save(clusters, path)
+        atomic_numpy_save(clusters, path)
 
     def load_clusters(self, street: str) -> np.ndarray:
         return np.load(
             self.get_street_dir(street) / "clusters.npy",
             allow_pickle=True,
         )
-
-    @staticmethod
-    def _atomic_np_save(arr: np.ndarray, path: Path) -> None:
-        temp_path = path.with_suffix(".tmp.npy")
-        try:
-            np.save(temp_path, arr)
-            shutil.move(str(temp_path), str(path))
-        except Exception as e:
-            if temp_path.exists():
-                temp_path.unlink()
-            raise RuntimeError(f"Failed to save {path}: {e}")
 
     # ------------------------------------------------------------------
     # Cleanup

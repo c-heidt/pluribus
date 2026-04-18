@@ -46,10 +46,10 @@ def tmp_index(tmp_path):
 @pytest.fixture
 def two_player_state():
     """A fresh two-player game with an empty card-info LUT."""
-    return new_game(n_players=2, card_info_lut={}, lut_path=".", pickle_dir=False)
+    return new_game(n_players=2, card_info_lut={})
 
 
 @pytest.fixture
 def three_player_state():
     """A fresh three-player game with an empty card-info LUT."""
-    return new_game(n_players=3, card_info_lut={}, lut_path=".", pickle_dir=False)
+    return new_game(n_players=3, card_info_lut={})

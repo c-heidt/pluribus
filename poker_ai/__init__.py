@@ -10,7 +10,6 @@ logging.basicConfig(
 )
 
 from . import blueprint
-from . import cli
 from . import tables
 from . import terminal
 

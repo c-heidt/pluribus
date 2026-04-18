@@ -28,7 +28,7 @@ import itertools
 from environment.utils import INT_RANKS, CARD_PRIMES, prime_product_from_rankbits
 
 
-class LookupTable(object):
+class HandRankTable(object):
     """Lookup tables mapping prime products of 5-card hands to hand ranks.
 
     Ranks are integers in [1, 7462] where lower is stronger. Two
@@ -195,7 +195,7 @@ class LookupTable(object):
         # we start the counting for flushes on max full house, which
         # is the worst rank that a full house can have (2,2,2,3,3)
         self._fill_in_lookup_table(
-            rank_init=LookupTable.MAX_FULL_HOUSE + 1,
+            rank_init=HandRankTable.MAX_FULL_HOUSE + 1,
             rankbits_list=flushes,
             lookup_table=self.flush_lookup)
         # we can reuse these bit sequences for straights
@@ -245,11 +245,11 @@ class LookupTable(object):
             from strongest to weakest.
         """
         self._fill_in_lookup_table(
-            rank_init=LookupTable.MAX_FLUSH + 1,
+            rank_init=HandRankTable.MAX_FLUSH + 1,
             rankbits_list=straights,
             lookup_table=self.unsuited_lookup)
         self._fill_in_lookup_table(
-            rank_init=LookupTable.MAX_PAIR + 1,
+            rank_init=HandRankTable.MAX_PAIR + 1,
             rankbits_list=highcards,
             lookup_table=self.unsuited_lookup)
 
@@ -264,7 +264,7 @@ class LookupTable(object):
         backwards_ranks = list(range(len(INT_RANKS) - 1, -1, -1))
 
         # 1) Four of a Kind
-        rank = LookupTable.MAX_STRAIGHT_FLUSH + 1
+        rank = HandRankTable.MAX_STRAIGHT_FLUSH + 1
 
         # for each choice of a set of four rank
         for i in backwards_ranks:
@@ -278,7 +278,7 @@ class LookupTable(object):
                 rank += 1
 
         # 2) Full House
-        rank = LookupTable.MAX_FOUR_OF_A_KIND + 1
+        rank = HandRankTable.MAX_FOUR_OF_A_KIND + 1
 
         # for each three of a kind
         for i in backwards_ranks:
@@ -292,7 +292,7 @@ class LookupTable(object):
                 rank += 1
 
         # 3) Three of a Kind
-        rank = LookupTable.MAX_STRAIGHT + 1
+        rank = HandRankTable.MAX_STRAIGHT + 1
 
         # pick three of one rank
         for r in backwards_ranks:
@@ -309,7 +309,7 @@ class LookupTable(object):
                 rank += 1
 
         # 4) Two Pair
-        rank = LookupTable.MAX_THREE_OF_A_KIND + 1
+        rank = HandRankTable.MAX_THREE_OF_A_KIND + 1
 
         tpgen = itertools.combinations(backwards_ranks, 2)
         for tp in tpgen:
@@ -329,7 +329,7 @@ class LookupTable(object):
                 rank += 1
 
         # 5) Pair
-        rank = LookupTable.MAX_TWO_PAIR + 1
+        rank = HandRankTable.MAX_TWO_PAIR + 1
 
         # choose a pair
         for pairrank in backwards_ranks:

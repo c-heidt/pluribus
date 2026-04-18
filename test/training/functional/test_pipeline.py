@@ -78,7 +78,7 @@ def _minimal_search(save_path: Path, **overrides):
 
 
 def _new_game_2p(lut=None):
-    return new_game(n_players=2, card_info_lut=lut, lut_path=str(_LUT_PATH), pickle_dir=False)
+    return new_game(n_players=2, card_info_lut=lut)
 
 
 # ---------------------------------------------------------------------------
@@ -103,11 +103,11 @@ class TestEndToEndSingleProcess:
 
     def test_pipeline_populates_strategy_table(self, tmp_tables):
         """With update_threshold=0, strategy table must receive writes."""
-        card_info_lut = None
+        from information_abstraction import load_info_set_lut
+        card_info_lut = load_info_set_lut(str(_LUT_PATH))
         for t in range(1, 11):
             for i in range(2):
                 state = _new_game_2p(card_info_lut)
-                card_info_lut = state.card_info_lut
                 if t % 5 == 0:
                     update_strategy(tmp_tables, state, i)
         total = sum(tmp_tables.strategy[r].n_allocated for r in range(4))

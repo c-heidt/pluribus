@@ -8,7 +8,7 @@ is the worst (7-high).
 import itertools
 
 from environment.utils import prime_product_from_hand, prime_product_from_rankbits
-from environment.lookup import LookupTable
+from environment.hand_rank_table import HandRankTable
 
 
 class Evaluator(object):
@@ -19,7 +19,7 @@ class Evaluator(object):
 
     Attributes
     ----------
-    table : LookupTable
+    table : HandRankTable
         Precomputed flush and unsuited lookup dictionaries.
     hand_size_map : dict
         Mapping from total card count (5, 6, or 7) to the corresponding
@@ -28,7 +28,7 @@ class Evaluator(object):
 
     def __init__(self):
         """Initialise the evaluator by building the lookup table."""
-        self.table = LookupTable()
+        self.table = HandRankTable()
         self.hand_size_map = {5: self._five, 6: self._six, 7: self._seven}
 
     def evaluate(self, cards, board):
@@ -99,7 +99,7 @@ class Evaluator(object):
         int
             Best hand rank in the range [1, 7462]. Lower values are stronger.
         """
-        minimum = LookupTable.MAX_HIGH_CARD
+        minimum = HandRankTable.MAX_HIGH_CARD
 
         all5cardcombobs = itertools.combinations(cards, 5)
         for combo in all5cardcombobs:
@@ -126,7 +126,7 @@ class Evaluator(object):
         int
             Best hand rank in the range [1, 7462]. Lower values are stronger.
         """
-        minimum = LookupTable.MAX_HIGH_CARD
+        minimum = HandRankTable.MAX_HIGH_CARD
 
         all5cardcombobs = itertools.combinations(cards, 5)
         for combo in all5cardcombobs:
@@ -149,7 +149,7 @@ class Evaluator(object):
         -------
         int
             Hand class in the range [1, 9], where 1 is straight flush and
-            9 is high card. See ``LookupTable.RANK_CLASS_TO_STRING`` for the
+            9 is high card. See ``HandRankTable.RANK_CLASS_TO_STRING`` for the
             full mapping.
 
         Raises
@@ -157,24 +157,24 @@ class Evaluator(object):
         ValueError
             If ``hr`` is outside the valid range [0, 7462].
         """
-        if hr >= 0 and hr <= LookupTable.MAX_STRAIGHT_FLUSH:
-            c = LookupTable.MAX_TO_RANK_CLASS[LookupTable.MAX_STRAIGHT_FLUSH]
-        elif hr <= LookupTable.MAX_FOUR_OF_A_KIND:
-            c = LookupTable.MAX_TO_RANK_CLASS[LookupTable.MAX_FOUR_OF_A_KIND]
-        elif hr <= LookupTable.MAX_FULL_HOUSE:
-            c = LookupTable.MAX_TO_RANK_CLASS[LookupTable.MAX_FULL_HOUSE]
-        elif hr <= LookupTable.MAX_FLUSH:
-            c = LookupTable.MAX_TO_RANK_CLASS[LookupTable.MAX_FLUSH]
-        elif hr <= LookupTable.MAX_STRAIGHT:
-            c = LookupTable.MAX_TO_RANK_CLASS[LookupTable.MAX_STRAIGHT]
-        elif hr <= LookupTable.MAX_THREE_OF_A_KIND:
-            c = LookupTable.MAX_TO_RANK_CLASS[LookupTable.MAX_THREE_OF_A_KIND]
-        elif hr <= LookupTable.MAX_TWO_PAIR:
-            c = LookupTable.MAX_TO_RANK_CLASS[LookupTable.MAX_TWO_PAIR]
-        elif hr <= LookupTable.MAX_PAIR:
-            c = LookupTable.MAX_TO_RANK_CLASS[LookupTable.MAX_PAIR]
-        elif hr <= LookupTable.MAX_HIGH_CARD:
-            c = LookupTable.MAX_TO_RANK_CLASS[LookupTable.MAX_HIGH_CARD]
+        if hr >= 0 and hr <= HandRankTable.MAX_STRAIGHT_FLUSH:
+            c = HandRankTable.MAX_TO_RANK_CLASS[HandRankTable.MAX_STRAIGHT_FLUSH]
+        elif hr <= HandRankTable.MAX_FOUR_OF_A_KIND:
+            c = HandRankTable.MAX_TO_RANK_CLASS[HandRankTable.MAX_FOUR_OF_A_KIND]
+        elif hr <= HandRankTable.MAX_FULL_HOUSE:
+            c = HandRankTable.MAX_TO_RANK_CLASS[HandRankTable.MAX_FULL_HOUSE]
+        elif hr <= HandRankTable.MAX_FLUSH:
+            c = HandRankTable.MAX_TO_RANK_CLASS[HandRankTable.MAX_FLUSH]
+        elif hr <= HandRankTable.MAX_STRAIGHT:
+            c = HandRankTable.MAX_TO_RANK_CLASS[HandRankTable.MAX_STRAIGHT]
+        elif hr <= HandRankTable.MAX_THREE_OF_A_KIND:
+            c = HandRankTable.MAX_TO_RANK_CLASS[HandRankTable.MAX_THREE_OF_A_KIND]
+        elif hr <= HandRankTable.MAX_TWO_PAIR:
+            c = HandRankTable.MAX_TO_RANK_CLASS[HandRankTable.MAX_TWO_PAIR]
+        elif hr <= HandRankTable.MAX_PAIR:
+            c = HandRankTable.MAX_TO_RANK_CLASS[HandRankTable.MAX_PAIR]
+        elif hr <= HandRankTable.MAX_HIGH_CARD:
+            c = HandRankTable.MAX_TO_RANK_CLASS[HandRankTable.MAX_HIGH_CARD]
         else:
             raise ValueError("Invalid hand rank, cannot return rank class")
         return c
@@ -194,7 +194,7 @@ class Evaluator(object):
             Human-readable hand name, e.g. ``"Straight Flush"`` or
             ``"Two Pair"``.
         """
-        return LookupTable.RANK_CLASS_TO_STRING[class_int]
+        return HandRankTable.RANK_CLASS_TO_STRING[class_int]
 
     def get_five_card_rank_percentage(self, hand_rank):
         """Normalise a hand rank to the [0.0, 1.0] range.
@@ -212,7 +212,7 @@ class Evaluator(object):
         float
             Normalised rank between 0.0 (best) and 1.0 (worst).
         """
-        return float(hand_rank) / float(LookupTable.MAX_HIGH_CARD)
+        return float(hand_rank) / float(HandRankTable.MAX_HIGH_CARD)
 
     def hand_summary(self, board, hands):
         """Print a street-by-street summary of hand strengths and winners.

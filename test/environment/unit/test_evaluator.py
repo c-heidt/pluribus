@@ -1,60 +1,60 @@
 """Unit tests for poker_ai/environment/lookup.py and evaluator.py.
 
-Covers LookupTable construction, hand-rank constants, Gosper's hack generator,
+Covers HandRankTable construction, hand-rank constants, Gosper's hack generator,
 and Evaluator hand ranking for known hand types.
 """
 
 import pytest
 
-from environment.lookup import LookupTable
+from environment.hand_rank_table import HandRankTable
 from environment.evaluator import Evaluator
 from environment.utils import new_card, make_card
 
 
 # ---------------------------------------------------------------------------
-# LookupTable
+# HandRankTable
 # ---------------------------------------------------------------------------
 
 class TestLookupTableConstants:
     def test_max_straight_flush(self):
-        assert LookupTable.MAX_STRAIGHT_FLUSH == 10
+        assert HandRankTable.MAX_STRAIGHT_FLUSH == 10
 
     def test_max_four_of_a_kind(self):
-        assert LookupTable.MAX_FOUR_OF_A_KIND == 166
+        assert HandRankTable.MAX_FOUR_OF_A_KIND == 166
 
     def test_max_full_house(self):
-        assert LookupTable.MAX_FULL_HOUSE == 322
+        assert HandRankTable.MAX_FULL_HOUSE == 322
 
     def test_max_flush(self):
-        assert LookupTable.MAX_FLUSH == 1599
+        assert HandRankTable.MAX_FLUSH == 1599
 
     def test_max_straight(self):
-        assert LookupTable.MAX_STRAIGHT == 1609
+        assert HandRankTable.MAX_STRAIGHT == 1609
 
     def test_max_three_of_a_kind(self):
-        assert LookupTable.MAX_THREE_OF_A_KIND == 2467
+        assert HandRankTable.MAX_THREE_OF_A_KIND == 2467
 
     def test_max_two_pair(self):
-        assert LookupTable.MAX_TWO_PAIR == 3325
+        assert HandRankTable.MAX_TWO_PAIR == 3325
 
     def test_max_pair(self):
-        assert LookupTable.MAX_PAIR == 6185
+        assert HandRankTable.MAX_PAIR == 6185
 
     def test_max_high_card(self):
-        assert LookupTable.MAX_HIGH_CARD == 7462
+        assert HandRankTable.MAX_HIGH_CARD == 7462
 
     def test_max_to_rank_class_has_nine_entries(self):
-        assert len(LookupTable.MAX_TO_RANK_CLASS) == 9
+        assert len(HandRankTable.MAX_TO_RANK_CLASS) == 9
 
     def test_max_to_rank_class_values_in_range(self):
-        for v in LookupTable.MAX_TO_RANK_CLASS.values():
+        for v in HandRankTable.MAX_TO_RANK_CLASS.values():
             assert 1 <= v <= 9
 
     def test_rank_class_to_string_has_nine_entries(self):
-        assert len(LookupTable.RANK_CLASS_TO_STRING) == 9
+        assert len(HandRankTable.RANK_CLASS_TO_STRING) == 9
 
     def test_rank_class_to_string_keys(self):
-        assert set(LookupTable.RANK_CLASS_TO_STRING.keys()) == set(range(1, 10))
+        assert set(HandRankTable.RANK_CLASS_TO_STRING.keys()) == set(range(1, 10))
 
 
 class TestLookupTableConstruction:
@@ -71,14 +71,14 @@ class TestLookupTableConstruction:
 
 class TestGospersHack:
     def test_same_popcount(self):
-        table = LookupTable()
+        table = HandRankTable()
         gen = table.get_lexographically_next_bit_sequence(0b11111)
         for _ in range(5):
             val = next(gen)
             assert bin(val).count("1") == 5
 
     def test_ascending_order(self):
-        table = LookupTable()
+        table = HandRankTable()
         gen = table.get_lexographically_next_bit_sequence(0b11111)
         prev = 0b11111
         for _ in range(5):
@@ -108,13 +108,13 @@ class TestEvaluatorHandOrdering:
         # K-high straight flush (not royal)
         hand = [make_card(r, "hearts") for r in [13, 12, 11, 10, 9]]
         rank = evaluator.evaluate(hand, [])
-        assert rank <= LookupTable.MAX_STRAIGHT_FLUSH
+        assert rank <= HandRankTable.MAX_STRAIGHT_FLUSH
 
     def test_four_of_a_kind_range(self, evaluator):
         hand = [make_card(14, s) for s in ["spades", "hearts", "diamonds", "clubs"]]
         hand.append(make_card(2, "spades"))
         rank = evaluator.evaluate(hand, [])
-        assert LookupTable.MAX_STRAIGHT_FLUSH < rank <= LookupTable.MAX_FOUR_OF_A_KIND
+        assert HandRankTable.MAX_STRAIGHT_FLUSH < rank <= HandRankTable.MAX_FOUR_OF_A_KIND
 
     def test_full_house_beats_flush(self, evaluator):
         full_house = [
@@ -198,7 +198,7 @@ class TestFiveCardRoutePaths:
         # A♠ K♠ Q♠ J♠ 9♠ — flush (not straight flush)
         hand = [make_card(r, "spades") for r in [14, 13, 12, 11, 9]]
         rank = evaluator.evaluate(hand, [])
-        assert LookupTable.MAX_FULL_HOUSE < rank <= LookupTable.MAX_FLUSH
+        assert HandRankTable.MAX_FULL_HOUSE < rank <= HandRankTable.MAX_FLUSH
 
     def test_unsuited_hand_uses_unsuited_lookup(self, evaluator):
         # A♠ A♥ A♦ K♠ K♥ — full house
@@ -207,7 +207,7 @@ class TestFiveCardRoutePaths:
             make_card(13, "spades"), make_card(13, "hearts"),
         ]
         rank = evaluator.evaluate(hand, [])
-        assert LookupTable.MAX_FOUR_OF_A_KIND < rank <= LookupTable.MAX_FULL_HOUSE
+        assert HandRankTable.MAX_FOUR_OF_A_KIND < rank <= HandRankTable.MAX_FULL_HOUSE
 
 
 class TestMultiCardBestHandSelection:

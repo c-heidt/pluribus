@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from information_abstraction._combinatorics import comb
+from information_abstraction.lookup import comb
 from information_abstraction.build.ehs import (
     FlopEHS,
     RiverEHS,

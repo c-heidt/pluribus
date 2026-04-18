@@ -13,7 +13,6 @@
 #SBATCH --mem=2300000mb
 #SBATCH --signal=SIGTERM@300
 #SBATCH --mail-type=All
-#SBATCH --mail-user=uvizo@student.kit.edu
 
 
 set -euo pipefail
@@ -23,7 +22,7 @@ CONDA_ENV=${CONDA_ENV:-pluribus}
 PROJECT_DIR=${PROJECT_DIR:-"$HOME/pluribus"}
 WORKSPACE=${WORKSPACE:-/pfs/work9/workspace/scratch/ka_gu4593-clustering_52}
 
-# Training parameters (all correspond to poker_ai train start options)
+# Training parameters
 N_PLAYERS=${N_PLAYERS:-6}
 UPDATE_THRESHOLD=${UPDATE_THRESHOLD:-50000}
 MAX_RUNTIME_HOURS=${MAX_RUNTIME_HOURS:-71.5}

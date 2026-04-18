@@ -58,12 +58,12 @@ def run_terminal_app(
     term = Terminal()
     log = AsciiLogger(term)
     if debug_quick_start:
-        state: PokerState = new_game(n_players, {}, load_card_lut=False)
+        state: PokerState = new_game(n_players, {})
     else:
+        from information_abstraction import load_info_set_lut
         state: PokerState = new_game(
             n_players,
-            lut_path=lut_path,
-            pickle_dir=pickle_dir
+            card_info_lut=load_info_set_lut(lut_path, pickle_dir),
         )
     n_table_rotations: int = 0
     selected_action_i: int = 0
@@ -160,14 +160,9 @@ def run_terminal_app(
                         user_results.add_result(strategy_path, agent, state, og_name_to_name)
                         log.clear()
                         log.info(term.green("new game"))
-                        if debug_quick_start:
-                            state: PokerState = new_game(
-                                n_players, state.card_info_lut, load_card_lut=False,
-                            )
-                        else:
-                            state: PokerState = new_game(
-                                n_players, state.card_info_lut,
-                            )
+                        state: PokerState = new_game(
+                            n_players, state.card_info_lut,
+                        )
                         n_table_rotations -= 1
                         if n_table_rotations < 0:
                             n_table_rotations = n_players - 1

@@ -24,7 +24,7 @@ from typing import Dict
 
 import numpy as np
 
-from information_abstraction._combinatorics import comb, lex_rank
+from information_abstraction.lookup import comb, lex_rank
 
 log = logging.getLogger("information_abstraction.build.ehs")
 
