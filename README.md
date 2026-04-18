@@ -1,351 +1,117 @@
-| code-thing      | status        |
-| --------------- | ------------- |
-| master          | [![Build Status](https://travis-ci.org/fedden/poker_ai.svg?branch=master)](https://travis-ci.org/fedden/poker_ai)  |
-| develop         | [![Build Status](https://travis-ci.org/fedden/poker_ai.svg?branch=develop)](https://travis-ci.org/fedden/poker_ai) |
-| maintainability | [![Maintainability](https://api.codeclimate.com/v1/badges/c5a556dae097b809b4d9/maintainability)](https://codeclimate.com/github/fedden/poker_ai/maintainability) |
-| coverage        | [![Test Coverage](https://api.codeclimate.com/v1/badges/c5a556dae097b809b4d9/test_coverage)](https://codeclimate.com/github/fedden/poker_ai/test_coverage) |
-| license         | [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0) |
+# pluribus
 
-[Read the documentation]()
+A Pluribus-style multiplayer no-limit Texas hold'em poker AI. The codebase is the implementation supporting a master's thesis at KIT.
 
-# 🤖 Poker AI
+It started as a fork of [keithlee96/pluribus-poker-AI](https://github.com/keithlee96/pluribus-poker-AI) and has since been substantially rewritten and restructured. The blueprint trainer, the card-information abstraction pipeline, the storage layer, the test suite, and the package layout are all new.
 
-This repository will contain a best effort open source implementation of a poker AI using the ideas of Counterfactual Regret.
+## Status
 
-<p align="center">
-  <img src="https://github.com/fedden/poker_ai/blob/develop/assets/poker.jpg">
-</p>
+Working today:
+- Card-information abstraction build (Monte Carlo and exact methods, chunked + checkpointed for HPC runs)
+- Blueprint strategy training via Linear MCCFR with regret pruning, in either single-process or multi-process mode
+- LMDB-backed sparse regret/strategy tables that scale beyond RAM
+- Terminal client to play hands against a trained blueprint
+- Pytest suite covering the environment, abstraction, and training pipeline
 
-_Made with love from the developers [Leon](https://www.leonfedden.co.uk) and [Colin](http://www.colinmanko.com/)._
+Planned next:
+- Real-time search on top of the offline blueprint
+- Safe opponent exploitation methods integrated into the real-time search loop
 
-_A special thank you to [worldveil](https://github.com/worldveil) for originally writing [this awesome hand evaluator python2 module](https://github.com/worldveil/deuces), which was ported to python3 and [maintained here](https://github.com/fedden/poker_ai/tree/master/poker_ai/poker/evaluation)._
+## Repository layout
 
-## Join the Community
-[https://thepoker.ai](https://thepoker.ai)
+```
+poker_ai/                   Blueprint trainer, CLI, tables, terminal client
+├── blueprint/              CFR traversal, training schedule, single- and multi-process runners
+├── tables/                 LMDB-backed sparse regret / strategy storage with checkpointing
+├── cli/                    `poker_ai` Click entry point
+└── terminal/               Text-mode client for playing against a trained agent
 
-## Prerequisites
-
-This repository assumes Python 3.7 or newer is used.
-
-## Installing
-
-Either install from pypi:
-```bash
-pip install poker_ai 
+environment/                Poker game state, action space, hand evaluator, deck / pot / player
+information_abstraction/    Card-info LUT build pipeline (`build/`) and runtime load API
+data/                       Generated artifacts (e.g. `data/20cards_exact/card_info_lut.joblib`)
+scripts/                    Slurm submission scripts and one-off helpers (LUT rebinding)
+test/                       Pytest suite mirroring the package layout
 ```
 
-Or if you want to dev on our code, install the Python package from source by cloning this repo and `pip -e` installing it:
-```bash
-git clone https://github.com/fedden/poker_ai.git # Though really we should use ssh here!
-cd /path/to/poker_ai
-pip install .
-```
+`environment/` and `information_abstraction/` are top-level packages, sibling to `poker_ai/`, not nested under it.
 
-## Command Line Interface (CLI)
+## Installation
 
-We have a CLI that will be installed when you pip install the package. To get help on any option, just add the `--help` flag when invoking the CLI.
-
-How to get a list of commands that can be run:
-```bash
-poker_ai --help
-``` 
-
-You will need to produce some lookup tables that cluster the various information sets. Here is more information on that:
-```bash
-poker_ai cluster --help
-```
-
-How to get information on training an agent:
-```bash
-poker_ai train start --help
-```
-
-How to get information on resuming training:
-```bash
-poker_ai train resume --help
-```
-
-Once you have an agent, and want to play against it, you can do the following:
-```bash
-poker_ai play --help
-```
-
-## Build a Bot
-
-### Cluster Hero Information
-
-In poker, the number of card combinations for one player on the river can exceed 56 billion combinations. In order to make this information tractable, we must group together strategically similar situations. We do this with two types of compression: lossy and lossless compression. Currently we only support a 20 card deck without modification.
+Tested under Python 3.7 in a conda environment named `pluribus`.
 
 ```bash
-poker_ai cluster
+conda create -n pluribus python=3.7
+conda activate pluribus
+pip install -e .
 ```
 
-You'll save the combinations of public information in a file called card_info_lut.joblib located in your project directory.
+This installs the `poker_ai` console entry point.
 
-### Train your bot
+## Workflow
 
-We use MCCFR to learn strategies. The MCCFR algorithm uses iterative self-play to adjust strategy based on regret. 
+### 1. Build the card-information abstraction
+
+Clusters all post-flop hand strengths into the buckets the trainer treats as equivalent. Required before training. Output goes to `--save_dir`.
 
 ```bash
-poker_ai train start
+poker_ai build-abstraction \
+  --save_dir data/20cards_exact \
+  --low_card_rank 10 --high_card_rank 14 \
+  --n_river_clusters 200 --n_turn_clusters 200 --n_flop_clusters 200 \
+  --method exact
 ```
 
-You'll create a folder in your project directory with the learned strategy and configuration files, in case you need to resume later.
+For full-deck Monte Carlo runs use `--method monte_carlo`, set `--n_simulations_river`, and submit via `scripts/abstraction_auto_resub.sh` — that Slurm script auto-resumes from the checkpoint when its wall-time expires.
 
-### Play your bot
+> **Before using a LUT built elsewhere (or after moving its directory), rebind it to your local path:**
+>
+> ```bash
+> python scripts/rebind_lut.py data/20cards_exact
+> ```
+>
+> `card_info_lut.joblib` stores the absolute path to its `cluster_ids.dat` memmap internally. Training and play will fail to load the LUT until those paths match the current location.
 
-Finally, you can play your bot with the following command:
+### 2. Train the blueprint
 
 ```bash
-poker_ai play
+poker_ai train start \
+  --multi_process \
+  --n_players 6 \
+  --lut_path data/20cards_exact \
+  --nickname runs/6player_blueprint \
+  --strategy_interval 25000 --sync_interval 1000 \
+  --discount_interval 5 --discount_duration_iters 250000 \
+  --prune_threshold 125000 --c -300000000
 ```
 
-You'll create a results.yaml file in ~/.poker/. So be sure to see how you stack up against your bot.
- 
-## Running tests
+A run auto-resumes when the resolved save directory already contains a valid checkpoint — re-invoke the same command with the same `--nickname` to continue an interrupted run. The cluster counterpart is `scripts/training.sh`.
 
-We are working hard on testing our components, but contributions here are always welcome. You can run the tests by cloning the code, changing directory to this repositories root directory (i.e `poker_ai/`) and call the python test library `pytest`:
-```bash
-cd /path/to/poker_ai
-pip install pytest
-pytest
-```
-
-See below on how to run the tests from the docker image.
-
-## Building the docker image
-
-We use a custom docker image for our testing suite. 
-
-You'll need to have computed the pickled card information lookup tables first (the cluster command for poker_ai). We build the images like below, in this case the luts are in './research/blueprint_algo'. First we build the parent image, with all of the dependancies.
-```bash
-docker build --build-arg LUT_DIR=research/blueprint_algo -f ParentDockerfile -t pokerai .
-```
-
-Then we build the test image.
-```bash
-docker build -t pokeraitest .
-```
-
-We then can run the tests with:
-```bash
-docker run -it pokeraitest pytest 
-```
-
-This is just a note for the developers, but we can push the parent image to the registry with the following (please ensure the version tag that comes after the colon is correct). We want to do this because we need various dependancies for the remote tests, and travis builds the `pokeraitest` image with the current git commit that has just been pushed.
-```bash
-docker tag pokerai pokerai/pokerai:1.0.0rc1
-docker push pokerai/pokerai:1.0.0rc1
-```
-
-## Building documentation
-
-Documentation is hosted, but you can build it yourself if you wish:
-```bash
-# Build the documentation.
-cd /path/to/poker_ai/docs
-make html
-cd ./_build/html 
-# Run a webserver and navigate to localhost and the port (usually 8000) in your browser.
-python -m http.server 
-```
-
-## Repository Structure
-
-Below is a rough structure of the codebase. 
-
-```
-├── applications   # Larger applications like the state visualiser sever.
-├── paper          # Main source of info and documentation :)
-├── poker_ai       # Main Python library.
-│   ├── ai         # Stub functions for ai algorithms.
-│   ├── games      # Implementations of poker games as node based objects that
-│   │              # can be traversed in a depth-first recursive manner.
-│   ├── poker      # WIP general code for managing a hand of poker.
-│   ├── terminal   # Code to play against the AI from your console.
-│   └── utils      # Utility code like seed setting.
-├── research       # A directory for research/development scripts 
-│                  # to help formulate understanding and ideas.
-└── test           # Python tests.
-    ├── functional # Functional tests that test multiple components 
-    │              # together.
-    └── unit       # Individual tests for functions and objects.
-```
-
-## Code Examples
-
-Here are some assorted examples of things that are being built in this repo.
-
-### State based poker traversal
-
-To perform MCCFR, the core algorithm of poker_ai, we need a class that encodes all of the poker rules, that we can apply an action to which then creates a new game state.
-
-```python
-pot = Pot()
-players = [
-    ShortDeckPokerPlayer(player_i=player_i, initial_chips=10000, pot=pot)
-    for player_i in range(n_players)
-]
-state = ShortDeckPokerState(players=players)
-for action in state.legal_actions:
-    new_state: ShortDeckPokerState = state.apply_action(action)
-```
-
-### Playing against AI in your terminal
-
-We also have some code to play a round of poker against the AI agents, inside your terminal.
-
-The characters are a little broken when captured in `asciinema`, but you'll get the idea by watching this video below. Results should be better in your actual terminal!
-
-<p align="center">
-  <a href="https://asciinema.org/a/331234" target="_blank">
-    <img src="https://asciinema.org/a/331234.svg" width="500" />
-  </a>
-</p>
-To invoke the code, either call the `run_terminal_app` method directly from the `poker_ai.terminal.runner` module, or call from python like so:
+### 3. Play against a trained blueprint
 
 ```bash
-cd /path/to/poker_ai/dir
-python -m poker_ai.terminal.runner       \
-  --agent offline                        \ 
-  --pickle_dir ./research/blueprint_algo \
-  --strategy_path ./research/blueprint_algo/offline_strategy_285800.gz 
+python -m poker_ai.terminal.runner \
+  --lut_path ./data/20cards_exact \
+  --pickle_dir ./data/20cards_exact \
+  --strategy_path ./agent.joblib \
+  --agent offline --n_players 3
 ```
 
-### Web visualisation code
+## Tests
 
-We are also working on code to visualise a given instance of the `ShortDeckPokerState`, which looks like this:
-<p align="center">
-  <img src="https://github.com/fedden/poker_ai-poker-AI/blob/develop/assets/visualisation.png">
-</p>
-
-It is so we can visualise the AI as it plays, and also debug particular situations visually. The idea as it stands, is a live web-visualisation server like TensorBoard, so you'll just push your current poker game state, and this will be reflected in the visualisations, so you can see what the agents are doing. 
-
-[_The frontend code is based on this codepen._](https://codepen.io/Rovak/pen/ExYeQar)
-
-Here is an example of how you could plot the poker game state:
-```python
-from plot import PokerPlot
-from poker_ai.games.short_deck.player import ShortDeckPokerPlayer
-from poker_ai.games.short_deck.state import ShortDeckPokerState
-from poker_ai.poker.pot import Pot
-
-
-def get_state() -> ShortDeckPokerState:
-    """Gets a state to visualise"""
-    n_players = 6
-    pot = Pot()
-    players = [
-        ShortDeckPokerPlayer(player_i=player_i, initial_chips=10000, pot=pot)
-        for player_i in range(n_players)
-    ]
-    return ShortDeckPokerState(
-        players=players, 
-        pickle_dir="../../research/blueprint_algo/"
-    )
-
-
-pp: PokerPlot = PokerPlot()
-# If you visit http://localhost:5000/ now you will see an empty table.
-
-# ... later on in the code, as proxy for some code that obtains a new state ...
-# Obtain a new state.
-state: ShortDeckPokerState = get_state()
-# Update the state to be plotted, this is sent via websockets to the frontend.
-pp.update_state(state)
-# http://localhost:5000/ will now display a table with 6 players.
+```bash
+pytest                            # full suite
+pytest -m "not slow"              # skip slow training/abstraction tests
+pytest -m "not requires_lut"      # skip tests that need a built LUT on disk
 ```
 
-### Playing a game of poker
+LUT-dependent tests resolve the LUT directory from `PLURIBUS_LUT_PATH` and default to `data/20cards_exact/`. They self-skip when the file is absent.
 
-There are two parts to this repository, the code to manage a game of poker, and the code to train an AI algorithm to play the game of poker. A low level thing to first to is to implement a poker engine class that can manage a game of poker.
+## Helper scripts
 
-The reason the poker engine is implemented is because it is useful to have a well-integrated poker environment available during the development of the AI algorithm, incase there are tweaks that must be made to accomadate things like the history of state or the replay of a scenario during Monte Carlo Counterfactual Regret Minimisation. 
+- `scripts/training.sh` — Slurm submission wrapper for `poker_ai train start`
+- `scripts/abstraction_auto_resub.sh` — Slurm submission wrapper for `poker_ai build-abstraction` with self-resubmission until all four streets are clustered
+- `scripts/rebind_lut.py` — rewrites the absolute paths a `MemmapLookup` stores when its `save_dir` is moved
 
-The following code is how one might program a round of poker that is deterministic using the engine. This engine is now the first pass that will be used support self play.
+## Attribution
 
-```python
-from poker_ai.ai.dummy import RandomPlayer
-from poker_ai.poker.table import PokerTable
-from poker_ai.poker.engine import PokerEngine
-from poker_ai.poker.pot import Pot
-from poker_ai.blueprint.training import seed
-
-# Seed so things are deterministic.
-seed(42)
-
-# Some settings for the amount of chips.
-initial_chips_amount = 10000
-small_blind_amount = 50
-big_blind_amount = 100
-
-# Create the pot.
-pot = Pot()
-# Instanciate six players that will make random moves, make sure 
-# they can reference the pot so they can add chips to it.
-players = [
-    RandomPlayer(
-        name=f'player {player_i}',
-        initial_chips=initial_chips_amount,
-        pot=pot)
-    for player_i in range(6)
-]
-# Create the table with the players on it.
-table = PokerTable(players=players, pot=pot)
-# Create the engine that will manage the poker game lifecycle.
-engine = PokerEngine(
-    table=table,
-    small_blind=small_blind_amount,
-    big_blind=big_blind_amount)
-# Play a round of Texas Hold'em Poker!
-engine.play_one_round()
-```
-
-## Roadmap
-
-The following todo will change dynamically as my understanding of the algorithms and the poker_ai project evolves. 
-
-At first, the goal is to prototype in Python as iteration will be much easier and quicker. Once there is a working prototype, write in a systems level language like C++ and optimise for performance. 
-
-### 1. Game engine iteration.
-_Implement a multiplayer working heads up no limit poker game engine to support the self-play._
-- [x] Lay down the foundation of game objects (player, card etc).
-- [x] Add poker hand evaluation code to the engine.
-- [x] Support a player going all in during betting.
-- [x] Support a player going all in during payouts.
-- [x] Lots of testing for various scenarios to ensure logic is working as expected.
-
-### 2. AI iteration.
-_Iterate on the AI algorithms and the integration into the poker engine._
-- [x] Integrate the AI strategy to support self-play in the multiplayer poker game engine.
-- [x] In the game-engine, allow the replay of any round the current hand to support MCCFR. 
-- [x] Implement the creation of the blueprint strategy using Monte Carlo CFR miminisation.
-- [x] Add the real-time search for better strategies during the game.
-
-### 3. Game engine iteration.
-_Strengthen the game engine with more tests and allow users to see live visualisation of game state._
-- [x] Start work on a visualisation server to allow a game state to be displayed. 
-- [ ] Triple check that the rules are implemented in the poker engine as described in the supplimentary material.
-- [ ] Work through the coverage, adding more tests, can never have enough.
-
-<p align="center">
-  <img src="https://github.com/fedden/poker_ai/blob/develop/assets/regret.jpeg">
-</p>
-
-## Contributing
-
-This is an open effort and help, criticisms and ideas are all welcome. 
-
-First of all, please check out the [CONTRIBUTING](/CONTRIBUTING.md) guide.
-
-Feel free to start a discussion on the github issues or to reach out to me at leonfedden at gmail dot com. 
-
-## License
-
-The code is provided under the copy-left GPL licence. If you need it under a more permissive license then please contact me at leonfedden at gmail dot com.
-
-## Stargazers over time
-
-We appreciate you getting this far in the README file! If you like what we are doing, please give us a star and share with your friends! 
-
-[![Stargazers over time](https://starchart.cc/fedden/poker_ai.svg)](https://starchart.cc/fedden/poker_ai)
+The original Pluribus algorithm is described in Brown & Sandholm, *Superhuman AI for multiplayer poker* (Science, 2019). This codebase began as a fork of [keithlee96/pluribus-poker-AI](https://github.com/keithlee96/pluribus-poker-AI), which itself derives from earlier work by Leon Fedden and Colin Manko.
