@@ -5,7 +5,7 @@ from typing import Dict, Any
 import numpy as np
 import yaml
 
-from poker_ai.games.short_deck.state import ShortDeckPokerState
+from environment.poker_env import PokerEnv as PokerState
 
 
 class UserResults:
@@ -29,7 +29,7 @@ class UserResults:
         self,
         strategy_path: str,
         agent: str,
-        state: ShortDeckPokerState,
+        state: PokerState,
         og_name_to_name: Dict[str, str],
     ):
         """
@@ -41,7 +41,7 @@ class UserResults:
             Path to the strategy.
         agent : Agent
             Trainable entity that stores regret and unnormalized strategy.
-        state : ShortDeckPokerState
+        state : PokerState
             Current state of the game.
         og_name_to_name : Dict[str, str]
         """

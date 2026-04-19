@@ -9,12 +9,8 @@ logging.basicConfig(
     format=FORMAT, datefmt="[%X] ", handlers=[RichHandler()], level=logging.INFO,
 )
 
-from . import ai
-from . import cli
-from . import clustering
-from . import games
-from . import poker
+from . import blueprint
+from . import tables
 from . import terminal
-from . import utils
 
 __version__ = "1.0.0rc3"

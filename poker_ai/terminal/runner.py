@@ -7,13 +7,18 @@ import joblib
 import numpy as np
 from blessed import Terminal
 
-from poker_ai.games.short_deck.state import new_game, ShortDeckPokerState
+from environment.poker_env import new_game, PokerEnv as PokerState
 from poker_ai.terminal.ascii_objects.card_collection import AsciiCardCollection
 from poker_ai.terminal.ascii_objects.player import AsciiPlayer
 from poker_ai.terminal.ascii_objects.logger import AsciiLogger
 from poker_ai.terminal.render import print_footer, print_header, print_log, print_table
 from poker_ai.terminal.results import UserResults
-from poker_ai.utils.algos import rotate_list
+
+
+def _rotate_players(players, n):
+    if n > len(players):
+        raise ValueError
+    return players[n:] + players[:n]
 
 
 @click.command()
@@ -42,9 +47,9 @@ def run_terminal_app(
 
     ```bash
     python -m poker_ai.terminal.runner                                       \
-        --lut_path ./research/blueprint_algo                               \
+        --lut_path ./data/20cards_exact                                      \
         --agent offline                                                      \
-        --pickle_dir ./research/blueprint_algo                               \
+        --pickle_dir ./data/20cards_exact                                    \
         --strategy_path ./agent.joblib                                       \
         --n_players 3                                                        \
         --no_debug_quick_start
@@ -53,12 +58,12 @@ def run_terminal_app(
     term = Terminal()
     log = AsciiLogger(term)
     if debug_quick_start:
-        state: ShortDeckPokerState = new_game(n_players, {}, load_card_lut=False)
+        state: PokerState = new_game(n_players, {})
     else:
-        state: ShortDeckPokerState = new_game(
+        from information_abstraction import load_info_set_lut
+        state: PokerState = new_game(
             n_players,
-            lut_path=lut_path,
-            pickle_dir=pickle_dir
+            card_info_lut=load_info_set_lut(lut_path, pickle_dir),
         )
     n_table_rotations: int = 0
     selected_action_i: int = 0
@@ -83,7 +88,7 @@ def run_terminal_app(
         while True:
             # Construct ascii objects to be rendered later.
             ascii_players: Dict[str, AsciiPlayer] = {}
-            state_players = rotate_list(state.players[::-1], n_table_rotations)
+            state_players = _rotate_players(state.players[::-1], n_table_rotations)
             og_name_to_position = {}
             og_name_to_name = {}
             for player_i, player in enumerate(state_players):
@@ -155,20 +160,15 @@ def run_terminal_app(
                         user_results.add_result(strategy_path, agent, state, og_name_to_name)
                         log.clear()
                         log.info(term.green("new game"))
-                        if debug_quick_start:
-                            state: ShortDeckPokerState = new_game(
-                                n_players, state.card_info_lut, load_card_lut=False,
-                            )
-                        else:
-                            state: ShortDeckPokerState = new_game(
-                                n_players, state.card_info_lut,
-                            )
+                        state: PokerState = new_game(
+                            n_players, state.card_info_lut,
+                        )
                         n_table_rotations -= 1
                         if n_table_rotations < 0:
                             n_table_rotations = n_players - 1
                     else:
                         log.info(term.green(f"{current_player_name} chose {action}"))
-                        state: ShortDeckPokerState = state.apply_action(action)
+                        state: PokerState = state.apply_action(action)
             else:
                 if agent == "random":
                     action = random.choice(state.legal_actions)
@@ -201,7 +201,7 @@ def run_terminal_app(
                     action = np.random.choice(actions, p=probabilties)
                     time.sleep(0.8)
                 log.info(f"{current_player_name} chose {action}")
-                state: ShortDeckPokerState = state.apply_action(action)
+                state: PokerState = state.apply_action(action)
 
 
 if __name__ == "__main__":
