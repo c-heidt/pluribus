@@ -10,7 +10,7 @@
 #SBATCH --ntasks=1
 #SBATCH --time=72:00:00
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=2300000mb
+#SBATCH --mem=1000000mb
 #SBATCH --signal=SIGTERM@300
 #SBATCH --mail-type=All
 
@@ -19,8 +19,11 @@ set -euo pipefail
 
 # User-configurable
 CONDA_ENV=${CONDA_ENV:-pluribus}
-PROJECT_DIR=${PROJECT_DIR:-"$HOME/pluribus"}
-WORKSPACE=${WORKSPACE:-/pfs/work9/workspace/scratch/ka_gu4593-clustering_52}
+PROJECT_DIR=${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}
+if [ -z "${WORKSPACE:-}" ]; then
+  echo "ERROR: WORKSPACE is not set. Export WORKSPACE=/path/to/workspace before submitting (e.g. sbatch --export=ALL,WORKSPACE=...)." >&2
+  exit 1
+fi
 
 # Training parameters
 N_PLAYERS=${N_PLAYERS:-6}
@@ -42,23 +45,10 @@ NICKNAME=${NICKNAME:-"$WORKSPACE/models/6player_52cards"}
 mkdir -p "$PROJECT_DIR/logs"
 mkdir -p "$(dirname "$NICKNAME")"
 
-# Activate conda (prefer simple `conda activate` since conda is on PATH)
-if command -v conda >/dev/null 2>&1; then
-  # Source conda base explicitly (avoids "Run 'conda init' before 'conda activate'" in non-interactive shells)
-  CONDA_BASE=$(conda info --base 2>/dev/null || true)
-  if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
-    source "$CONDA_BASE/etc/profile.d/conda.sh"
-    conda activate "$CONDA_ENV"
-  else
-    # Fallback: try shell hook then activate
-    source <(conda shell.bash hook)
-    conda activate "$CONDA_ENV"
-  fi
-  echo "Activated conda env: $CONDA_ENV (base: ${CONDA_BASE:-unknown})"
-else
-  echo "Conda not found on PATH; ensure conda is available." >&2
-  exit 1
-fi
+# Activate conda 
+echo "Activating conda environment: $CONDA_ENV"
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate $CONDA_ENV
 
 cd "$PROJECT_DIR"
 
