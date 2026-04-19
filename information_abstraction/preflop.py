@@ -3,6 +3,12 @@
 Maps every starting hand tuple to a bucket id.  Buckets are deck-size
 agnostic: ``n_ranks`` pair buckets plus ``C(n_ranks, 2)`` suited and
 ``C(n_ranks, 2)`` offsuit buckets.
+
+The abstraction is lossless because strategically-equivalent hands share
+a bucket — the specific suits of an offsuit hand (e.g. ``AhKs`` vs.
+``AsKh``) never affect preflop decisions, so collapsing them into a
+single id is safe and keeps the preflop information set count low
+enough that CFR can enumerate it without any sampling.
 """
 from typing import Dict, List, Tuple
 
@@ -20,12 +26,26 @@ def make_starting_hand_bucket(
     - **suited**: next ``C(n_ranks, 2)`` ids
     - **offsuit**: final ``C(n_ranks, 2)`` ids
 
+    The layout orders ranks from highest (index 0) to lowest.  Within the
+    suited and offsuit regions, combos are enumerated in descending
+    (high-rank, low-rank) order so the bucket id of e.g. ``AK`` is always
+    lower than that of ``QJ`` regardless of deck size.
+
+    Used by :func:`compute_preflop_lossless_abstraction` to populate the
+    ``"pre_flop"`` entry of the
+    :data:`~information_abstraction.lookup.InfoSetLut`.
+
     Parameters
     ----------
     starting_hand : List[int]
         Two-card starting hand as eval_card integers.
     rank_to_index : Dict[int, int]
-        Mapping from card rank to 0-indexed position.
+        Mapping from card rank to 0-indexed position (highest rank → 0).
+
+    Returns
+    -------
+    int
+        Bucket id in the range ``[0, n_ranks + 2*C(n_ranks, 2))``.
     """
     ranks = [card_rank_int(c) for c in starting_hand]
     suits = [card_suit_str(c) for c in starting_hand]
@@ -55,11 +75,30 @@ def compute_preflop_lossless_abstraction(
 ) -> Dict[Tuple[int, int], int]:
     """Build the ``{starting_hand_tuple: bucket_id}`` dictionary.
 
+    Iterates over every starting hand exposed by ``builder`` and assigns
+    it a lossless bucket via :func:`make_starting_hand_bucket`.  The
+    builder is taken as a duck-typed handle rather than a concrete type
+    so tests can pass a lightweight stand-in without instantiating the
+    full combo generator.
+
     Parameters
     ----------
     builder
         Any object exposing ``_card_ints`` (iterable of eval_card ints) and
         ``starting_hands`` (iterable of 2-card tuples/arrays of ints).
+
+    Returns
+    -------
+    Dict[Tuple[int, int], int]
+        Mapping from sorted two-card tuples to bucket ids.  Tuples are
+        sorted so callers can look up a hand without worrying about card
+        order at the call site.
+
+    Raises
+    ------
+    ValueError
+        If the deck exposed by ``builder`` contains fewer than two
+        ranks, which would make the pair-vs-non-pair split degenerate.
     """
     found_ranks = sorted({card_rank_int(c) for c in builder._card_ints})
     n_ranks = len(found_ranks)

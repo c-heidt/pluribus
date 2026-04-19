@@ -33,7 +33,24 @@ def _combine_hole_with_publics(
 ) -> np.ndarray:
     """Tile one hole combo against every non-overlapping public combo.
 
-    Shared inner kernel for both the sequential and parallel paths.
+    Shared inner kernel for both the sequential
+    (:meth:`CardCombos._run_sequential`) and parallel
+    (:meth:`CardCombos._run_parallel`) paths.
+
+    Parameters
+    ----------
+    hole_combo : np.ndarray
+        One hole pair, shape ``(2,)``.
+    sorted_publics : np.ndarray
+        All public combos of a given street, shape
+        ``(n_publics, k_public)``.
+
+    Returns
+    -------
+    np.ndarray
+        Shape ``(n_valid, 2 + k_public)`` — the Cartesian join minus
+        any public combo that collides with ``hole_combo``.  Empty when
+        every public combo collides.
     """
     overlap = np.any(np.isin(sorted_publics, hole_combo), axis=1)
     valid_publics = sorted_publics[~overlap]
@@ -48,6 +65,20 @@ def _process_hole_combo_batch(args):
     """Worker entry point for parallel combo generation.
 
     Kept at module scope so ``multiprocessing.Pool`` can pickle it.
+
+    Parameters
+    ----------
+    args : tuple
+        ``(batch_holes, sorted_publics, num_hole, num_public)``.  The
+        tuple shape exists because ``Pool.imap`` passes a single
+        argument per call.
+
+    Returns
+    -------
+    np.ndarray
+        Stacked output of :func:`_combine_hole_with_publics` across the
+        batch, shape ``(n_valid, num_hole + num_public)``.  Empty when
+        every hole in the batch collides with every public combo.
     """
     batch_holes, sorted_publics, num_hole, num_public = args
     pieces = []
@@ -140,6 +171,23 @@ class CardCombos:
         self._flop = value
 
     def _build_street(self, street: str) -> np.ndarray:
+        """Materialise the combo array for ``street`` on demand.
+
+        Called by the ``river`` / ``turn`` / ``flop`` properties the first
+        time they are accessed.  The number of public cards is looked up
+        from ``_PUBLIC_CARDS_PER_STREET`` so adding a new street only
+        requires extending that table.
+
+        Parameters
+        ----------
+        street : str
+            One of ``"flop"``, ``"turn"``, ``"river"``.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(n_combos, 2 + k_public)``.
+        """
         n_public = _PUBLIC_CARDS_PER_STREET[street]
         combos = self._create_int_info_combos(
             self.starting_hands, self._get_int_combos(n_public), street,
@@ -152,6 +200,18 @@ class CardCombos:
     # ------------------------------------------------------------------
 
     def _get_int_combos(self, num_cards: int) -> np.ndarray:
+        """Enumerate all ``num_cards``-sized combinations of the deck.
+
+        Parameters
+        ----------
+        num_cards : int
+            Size of each combination.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(C(n_cards, num_cards), num_cards)``, ``int32``.
+        """
         combos = list(combinations(self._card_ints, num_cards))
         return np.array(combos, dtype=np.int32)
 
@@ -166,6 +226,21 @@ class CardCombos:
         Hole combos form the outer loop so the result matches the
         combinadic row index; public order within each hole matches the
         lexicographic order of ``publics``.
+
+        Parameters
+        ----------
+        start_combos : np.ndarray
+            Hole pairs, shape ``(n_holes, 2)``.
+        publics : np.ndarray
+            Public combos, shape ``(n_publics, k_public)``.
+        betting_stage : str, optional
+            Used only for the ``tqdm`` progress-bar label.
+
+        Returns
+        -------
+        np.ndarray
+            Stacked ``(hole, public)`` rows, shape
+            ``(n_valid, 2 + k_public)``.
         """
         num_hole = start_combos.shape[1]
         num_public = publics.shape[1]
@@ -194,6 +269,22 @@ class CardCombos:
         sorted_publics: np.ndarray,
         betting_stage: str,
     ) -> List[np.ndarray]:
+        """In-process combo generation for small decks.
+
+        Parameters
+        ----------
+        sorted_holes : np.ndarray
+            Pre-sorted hole pairs.
+        sorted_publics : np.ndarray
+            Pre-sorted public combos.
+        betting_stage : str
+            Progress-bar label.
+
+        Returns
+        -------
+        List[np.ndarray]
+            One array per hole pair — concatenated by the caller.
+        """
         pieces: List[np.ndarray] = []
         for hole_combo in tqdm(
             sorted_holes,
@@ -213,6 +304,32 @@ class CardCombos:
         num_public: int,
         betting_stage: str,
     ) -> List[np.ndarray]:
+        """Multiprocess combo generation for large decks.
+
+        Hole pairs are split into batches of roughly
+        ``n_holes // (n_workers * 4)`` each so every worker sees several
+        batches — ``imap`` then interleaves completion order with
+        dispatch and keeps the pool fully loaded.
+
+        Parameters
+        ----------
+        sorted_holes : np.ndarray
+            Pre-sorted hole pairs.
+        sorted_publics : np.ndarray
+            Pre-sorted public combos.
+        num_hole : int
+            Width of a hole combo (always ``2``, propagated for
+            empty-batch shape consistency).
+        num_public : int
+            Width of a public combo.
+        betting_stage : str
+            Progress-bar label.
+
+        Returns
+        -------
+        List[np.ndarray]
+            One array per batch — concatenated by the caller.
+        """
         n_holes = len(sorted_holes)
         batch_size = max(10, n_holes // (self.n_workers * 4))
         batches = [
@@ -237,6 +354,26 @@ class CardCombos:
     # ------------------------------------------------------------------
 
     def get_row_index(self, hole_ints, public_ints) -> int:
+        """Row at which this combo's features live in the merged memmap.
+
+        Duplicated verbatim on
+        :meth:`information_abstraction.lookup.MemmapLookup._get_row_index`
+        so runtime consumers do not need to import the build subpackage.
+        Any change to the layout must be applied in both places.
+
+        Parameters
+        ----------
+        hole_ints : Sequence[int]
+            Two hole cards as eval-card integers, in any order.
+        public_ints : Sequence[int]
+            Public cards as eval-card integers, in any order.
+
+        Returns
+        -------
+        int
+            Row index into the street's ``merged_data.dat`` /
+            ``cluster_ids.dat``.
+        """
         card_to_idx = self._card_to_idx
         n = self._n_cards
         h_idx = sorted(card_to_idx[int(c)] for c in hole_ints)

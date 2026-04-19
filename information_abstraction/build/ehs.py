@@ -46,6 +46,16 @@ _CACHE_LOAD_LOCK = threading.Lock()
 
 
 def clear_process_cache_for_street(street: str) -> None:
+    """Drop the cached cluster-id memmap for ``street``.
+
+    Called when a downstream stage no longer needs an upstream street's
+    ids so the OS can reclaim the pages under memory pressure.
+
+    Parameters
+    ----------
+    street : str
+        Street whose cache slot should be cleared.
+    """
     _PROCESS_CACHE[f"{street}_cluster_ids"] = None
     log.debug("Cleared process cache for %s", street)
 
@@ -53,7 +63,34 @@ def clear_process_cache_for_street(street: str) -> None:
 def get_cluster_id_cache(
     street: str, save_dir: str, n_rows: int,
 ) -> np.memmap:
-    """Return (lazy-loading) the upstream cluster-id memmap for ``street``."""
+    """Return (lazy-loading) the upstream cluster-id memmap for ``street``.
+
+    The cache is keyed on ``save_dir`` so a worker process reused across
+    unrelated runs does not hand back stale pointers.  Double-checked
+    locking keeps the file open cheap under concurrent first-access.
+
+    Parameters
+    ----------
+    street : str
+        Upstream street whose ids are required (``"river"`` for turn
+        features, ``"turn"`` for flop features).
+    save_dir : str
+        Build directory root.
+    n_rows : int
+        Row count for the memmap shape.
+
+    Returns
+    -------
+    np.memmap
+        Read-only ``uint16`` memmap shared across every call from this
+        worker for the same ``save_dir``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``cluster_ids.dat`` is missing, indicating that clustering
+        for the upstream street has not run.
+    """
     if _PROCESS_CACHE["save_dir"] != save_dir:
         _PROCESS_CACHE["save_dir"] = save_dir
         _PROCESS_CACHE["river_cluster_ids"] = None
@@ -87,6 +124,31 @@ def get_cluster_id_cache(
 def _row_index(
     hole_ints, public_ints, card_to_idx: Dict[int, int], n: int,
 ) -> int:
+    """Combinadic row index shared by the turn / flop extractors.
+
+    Mirrors
+    :meth:`information_abstraction.lookup.MemmapLookup._get_row_index`
+    but implemented as a module function so the turn and flop
+    extractors do not need to carry a reference to a
+    :class:`~information_abstraction.lookup.MemmapLookup` instance they
+    do not otherwise use.
+
+    Parameters
+    ----------
+    hole_ints : Sequence[int]
+        Two hole cards as eval-card integers.
+    public_ints : Sequence[int]
+        Public cards as eval-card integers.
+    card_to_idx : Dict[int, int]
+        Shared deck index mapping.
+    n : int
+        Deck size.
+
+    Returns
+    -------
+    int
+        Row index into the upstream street's ``cluster_ids.dat``.
+    """
     h_idx = sorted(card_to_idx[int(c)] for c in hole_ints)
     p_idx = sorted(card_to_idx[int(c)] for c in public_ints)
     hole_rank = lex_rank(tuple(h_idx), n)
@@ -133,6 +195,24 @@ class RiverEHS:
         self.n_simulations = n_simulations
 
     def __call__(self, public: np.ndarray) -> np.ndarray:
+        """Dispatch to exact or Monte-Carlo evaluation.
+
+        ``public`` is ``(hole_0, hole_1, flop_0, flop_1, flop_2, turn,
+        river)`` — the first two entries are our hole cards and the
+        remaining five are the fully-dealt board.
+
+        Parameters
+        ----------
+        public : np.ndarray
+            Seven-card combo, shape ``(7,)``.
+
+        Returns
+        -------
+        np.ndarray
+            ``[win, loss, tie]`` fractions that sum to ``1`` (or all
+            zeros if no opponent hand is possible — only on degenerate
+            decks).
+        """
         our_hand = public[:2]
         board = public[2:7]
         if self.method == "exact":
@@ -144,7 +224,32 @@ class RiverEHS:
     def _precompute_single_best(
         self, available, board_ints, board_only_rank, board_4,
     ):
-        """Pre-compute Category 1 (board + 1 hole card) best rank."""
+        """Pre-compute the best rank each single card can make with the board.
+
+        An opponent's strongest five-card hand falls into one of three
+        categories: the board alone, the board plus one of the opponent's
+        hole cards, or the board plus both.  This helper evaluates the
+        second category once per candidate card so the inner opponent
+        loop only has to handle the third.
+
+        Parameters
+        ----------
+        available : List[int]
+            Cards that could still be dealt to an opponent.
+        board_ints : List[int]
+            Fully-dealt five-card board as Python ints.
+        board_only_rank : int
+            Rank of the board-alone hand (category 1 for the opponent).
+        board_4 : List[Tuple[int, ...]]
+            All 4-card subsets of the board used with a single
+            opponent card.
+
+        Returns
+        -------
+        Dict[int, int]
+            ``{card: best_rank}`` — lower ranks are stronger under the
+            evaluator's convention.
+        """
         _five = self._evaluator._five
         single_best = {}
         for c in available:
@@ -158,6 +263,26 @@ class RiverEHS:
         return single_best
 
     def _setup(self, our_hand, board):
+        """Precompute quantities that do not depend on the opponent draw.
+
+        Shared between the exact and Monte-Carlo paths so the opponent
+        loop stays as tight as possible.
+
+        Parameters
+        ----------
+        our_hand : np.ndarray
+            Our two hole cards.
+        board : np.ndarray
+            Five-card board.
+
+        Returns
+        -------
+        Tuple[List[int], int, List[Tuple[int, ...]], Dict[int, int]]
+            ``(available, our_rank, board_3, single_best)``:
+            cards left for the opponent, our seven-card rank, every
+            3-card board subset, and the per-card best rank from
+            :meth:`_precompute_single_best`.
+        """
         unavailable = set(our_hand.tolist() + board.tolist())
         available = [c for c in self._card_ints if c not in unavailable]
         board_ints = [int(c) for c in board]
@@ -174,6 +299,25 @@ class RiverEHS:
         return available, our_rank, board_3, single_best
 
     def _exact(self, our_hand, board) -> np.ndarray:
+        """Enumerate every opponent pair and tally win / loss / tie.
+
+        The short-circuit ``if opp_rank >= our_rank`` skips the inner
+        3-card loop whenever the opponent's single-card best already
+        beats us, which dominates runtime on strong hands.
+
+        Parameters
+        ----------
+        our_hand : np.ndarray
+            Our two hole cards.
+        board : np.ndarray
+            Five-card board.
+
+        Returns
+        -------
+        np.ndarray
+            ``[win, loss, tie]`` fractions.  All zeros only if the deck
+            leaves fewer than two cards for the opponent.
+        """
         available, our_rank, board_3, single_best = self._setup(
             our_hand, board,
         )
@@ -203,6 +347,24 @@ class RiverEHS:
         return np.array([wins / total, losses / total, ties / total])
 
     def _monte_carlo(self, our_hand, board) -> np.ndarray:
+        """Sample ``n_simulations`` opponent pairs and estimate win / loss / tie.
+
+        Shares its inner loop structure with :meth:`_exact` so that raising
+        ``n_simulations`` to ``C(len(available), 2)`` reproduces the
+        exact result to within sampling noise.
+
+        Parameters
+        ----------
+        our_hand : np.ndarray
+            Our two hole cards.
+        board : np.ndarray
+            Five-card board.
+
+        Returns
+        -------
+        np.ndarray
+            ``[win, loss, tie]`` fractions summing to ``1``.
+        """
         available, our_rank, board_3, single_best = self._setup(
             our_hand, board,
         )
@@ -259,6 +421,26 @@ class TurnEHS:
         self._n_river_clusters = n_river_clusters
 
     def __call__(self, public: np.ndarray) -> np.ndarray:
+        """Normalised histogram over river clusters reached from this turn combo.
+
+        For every remaining card in the deck, deal it as the river,
+        look up the resulting row's river cluster id via
+        :func:`get_cluster_id_cache`, and bump that bucket.  Normalising
+        by the number of future draws keeps the vector comparable
+        across boards of different texture.
+
+        Parameters
+        ----------
+        public : np.ndarray
+            Six-card combo ``(hole_0, hole_1, flop_0, flop_1, flop_2,
+            turn)``.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(n_river_clusters,)`` — probability mass over river
+            clusters.  All zeros iff no river card remains in the deck.
+        """
         our_hand = public[:2]
         board = public[2:6]
 
@@ -310,6 +492,26 @@ class FlopEHS:
         self._n_turn_clusters = n_turn_clusters
 
     def __call__(self, public: np.ndarray) -> np.ndarray:
+        """Normalised histogram over turn clusters reached from this flop combo.
+
+        Directly analogous to :meth:`TurnEHS.__call__`: deal every
+        remaining card as the turn, look up its turn cluster via
+        :func:`get_cluster_id_cache`, and normalise.  Flop features
+        therefore live one level of abstraction above turn, which lives
+        one level above river.
+
+        Parameters
+        ----------
+        public : np.ndarray
+            Five-card combo ``(hole_0, hole_1, flop_0, flop_1,
+            flop_2)``.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(n_turn_clusters,)`` — probability mass over turn
+            clusters.  All zeros iff no turn card remains in the deck.
+        """
         our_hand = public[:2]
         board = public[2:5]
 

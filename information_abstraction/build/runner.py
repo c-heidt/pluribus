@@ -118,7 +118,34 @@ def build_abstraction(
     use_mini_batch: bool,
     method: str,
 ):
-    """Build the card-information abstraction with checkpointing."""
+    """Build the card-information abstraction with checkpointing.
+
+    Thin CLI adapter that constructs an
+    :class:`~information_abstraction.build.builder.AbstractionBuilder`
+    and invokes its
+    :meth:`~information_abstraction.build.builder.AbstractionBuilder.compute`
+    driver.  All options are passed straight through; defaults match
+    the recommended starting values for a small-deck smoke test.
+
+    Parameters
+    ----------
+    low_card_rank, high_card_rank : int
+        Deck rank bounds (2-14).
+    n_river_clusters, n_turn_clusters, n_flop_clusters : int
+        Target cluster counts per street.
+    n_simulations_river : int
+        Opponent samples per river combo (ignored for ``method=exact``).
+    save_dir : str
+        Output directory; see the builder docstring for the layout.
+    workers : int, optional
+        Worker-process count.  ``None`` → ``cpu_count()``.
+    chunk_size : int
+        Combos per chunk.
+    use_mini_batch : bool
+        Use :class:`~sklearn.cluster.MiniBatchKMeans` for large datasets.
+    method : str
+        ``"monte_carlo"`` or ``"exact"``.
+    """
     builder = AbstractionBuilder(
         method=method,
         n_simulations_river=n_simulations_river,

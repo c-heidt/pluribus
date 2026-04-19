@@ -52,6 +52,12 @@ class Clusterer:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Cluster ``X`` and return ``(centroids, labels)``.
 
+        Dispatches to full-batch KMeans or MiniBatchKMeans depending on
+        :attr:`use_mini_batch` and the sample count.  The degenerate
+        ``n_samples == 1`` case short-circuits to a trivial single
+        cluster so the HPC pipeline never hits sklearn's minimum-sample
+        checks on tiny debug decks.
+
         Parameters
         ----------
         X : np.ndarray
@@ -63,6 +69,13 @@ class Clusterer:
         work_dir : Path, optional
             Directory for the resumable minibatch checkpoint files.  Required
             only when ``use_mini_batch`` triggers.
+
+        Returns
+        -------
+        Tuple[np.ndarray, np.ndarray]
+            ``(centroids, labels)`` — centroids have shape
+            ``(num_clusters, feature_dim)``, labels have shape
+            ``(n_samples,)``.
         """
         label = street or "data"
         n_samples = X.shape[0]
@@ -91,6 +104,22 @@ class Clusterer:
     def _fit_predict_full_batch(
         self, X: np.ndarray, num_clusters: int, label: str,
     ) -> Tuple[np.ndarray, np.ndarray]:
+        """Run sklearn's full-batch :class:`~sklearn.cluster.KMeans`.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Feature matrix.
+        num_clusters : int
+            Target cluster count.
+        label : str
+            Log-message label.
+
+        Returns
+        -------
+        Tuple[np.ndarray, np.ndarray]
+            ``(cluster_centers_, labels)``.
+        """
         log.info("Using standard KMeans for %s", label)
         km = KMeans(
             n_clusters=num_clusters,
@@ -110,6 +139,30 @@ class Clusterer:
         label: str,
         work_dir: Optional[Path],
     ) -> Tuple[np.ndarray, np.ndarray]:
+        """Run :class:`~sklearn.cluster.MiniBatchKMeans` with resume support.
+
+        Periodically persists the partial estimator via
+        :meth:`_save_minibatch_checkpoint` so a killed HPC job can pick
+        up where it left off.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Feature matrix (often a memmap).
+        num_clusters : int
+            Target cluster count.
+        label : str
+            Log-message label.
+        work_dir : Path, optional
+            Directory for ``partial_kmeans.joblib`` /
+            ``kmeans_progress.json``.  When ``None``, resume is disabled
+            and the run proceeds without writing checkpoints.
+
+        Returns
+        -------
+        Tuple[np.ndarray, np.ndarray]
+            ``(cluster_centers_, labels)``.
+        """
         log.info("Using MiniBatchKMeans for %s (large dataset)", label)
         n_samples = X.shape[0]
         batch_size = min(_DEFAULT_BATCH_SIZE, n_samples)
@@ -173,6 +226,27 @@ class Clusterer:
         progress_path: Optional[Path],
         label: str,
     ) -> Tuple[int, MiniBatchKMeans]:
+        """Load a checkpointed estimator if one exists, else build a fresh one.
+
+        Parameters
+        ----------
+        num_clusters : int
+            Target cluster count for a fresh estimator.
+        batch_size : int
+            Batch size for a fresh estimator.
+        partial_km_path : Path, optional
+            Location of the pickled partial estimator.
+        progress_path : Path, optional
+            Location of the JSON progress file.
+        label : str
+            Log-message label.
+
+        Returns
+        -------
+        Tuple[int, MiniBatchKMeans]
+            ``(start_batch, estimator)`` — ``start_batch`` is ``0`` for
+            fresh runs.
+        """
         if (
             partial_km_path is not None
             and progress_path is not None
@@ -196,6 +270,20 @@ class Clusterer:
     def _make_minibatch_km(
         self, num_clusters: int, batch_size: int,
     ) -> MiniBatchKMeans:
+        """Construct a fresh MiniBatchKMeans with the project defaults.
+
+        Parameters
+        ----------
+        num_clusters : int
+            Target cluster count.
+        batch_size : int
+            Batch size.
+
+        Returns
+        -------
+        MiniBatchKMeans
+            Freshly-initialised estimator.
+        """
         return MiniBatchKMeans(
             n_clusters=num_clusters,
             init="k-means++",
@@ -214,6 +302,25 @@ class Clusterer:
         partial_km_path: Path,
         progress_path: Path,
     ) -> None:
+        """Atomically persist the partial estimator and its progress file.
+
+        Failures here are logged but not raised — a failed checkpoint
+        only forces a restart from the last successful one, which is
+        strictly better than aborting the whole clustering run.
+
+        Parameters
+        ----------
+        km : MiniBatchKMeans
+            Estimator to snapshot.
+        completed : int
+            Number of batches already consumed.
+        total : int
+            Total batch count for this run.
+        partial_km_path : Path
+            Target path for the pickled estimator.
+        progress_path : Path
+            Target path for the JSON progress file.
+        """
         temp_km = partial_km_path.with_suffix(".tmp.joblib")
         temp_pg = progress_path.with_suffix(".tmp.json")
         try:

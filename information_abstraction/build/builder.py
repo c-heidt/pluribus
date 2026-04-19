@@ -47,6 +47,17 @@ _MAX_MERGE_RETRIES = 3
 class AbstractionBuilder:
     """Build the card-information abstraction and persist it to disk.
 
+    The pipeline composes four collaborators:
+
+    - :class:`~information_abstraction.build.card_combos.CardCombos` —
+      per-street combo generation.
+    - :class:`~information_abstraction.build.chunk_store.ChunkStore` —
+      on-disk chunk and centroid storage.
+    - :class:`~information_abstraction.build.clusterer.Clusterer` —
+      KMeans / MiniBatchKMeans with resume support.
+    - The feature extractors in
+      :mod:`information_abstraction.build.ehs`.
+
     Parameters
     ----------
     method : str
@@ -68,6 +79,11 @@ class AbstractionBuilder:
         Use MiniBatchKMeans for datasets with more than 50 000 samples.
     parallel_combos : bool
         Parallel combo generation (recommended for large decks).
+
+    Raises
+    ------
+    ValueError
+        If ``method`` is neither ``"exact"`` nor ``"monte_carlo"``.
     """
 
     def __init__(
@@ -174,7 +190,22 @@ class AbstractionBuilder:
         n_turn_clusters: int,
         n_flop_clusters: int,
     ) -> None:
-        """Run preflop → river → turn → flop and persist after each street."""
+        """Run preflop → river → turn → flop and persist after each street.
+
+        River is processed first because turn features are histograms
+        over river clusters, and flop features are histograms over turn
+        clusters — the upstream street must exist before the downstream
+        one can start.
+
+        Parameters
+        ----------
+        n_river_clusters : int
+            Target river cluster count.
+        n_turn_clusters : int
+            Target turn cluster count.
+        n_flop_clusters : int
+            Target flop cluster count.
+        """
         log.info(
             f"Starting abstraction build using {self.method.upper()} method "
             f"({self._n_cards} cards).",
@@ -284,6 +315,32 @@ class AbstractionBuilder:
 
         Each street moves through: chunk-dispatch → merge → cluster →
         persist → write ``cluster_ids.dat`` → drop combo memory.
+
+        Parameters
+        ----------
+        street : str
+            Street name.
+        n_clusters : int
+            Target cluster count for this street.
+        combos : np.ndarray
+            Full combos array for the street.
+        feature_extractor : Callable[[np.ndarray], np.ndarray]
+            Per-combo feature extractor from
+            :mod:`information_abstraction.build.ehs`.
+        free_combos : Callable[[], None]
+            Hook that drops the combos array from memory once every
+            downstream consumer of it has run.
+
+        Returns
+        -------
+        MemmapLookup
+            Consumer-facing lookup over the freshly written
+            ``cluster_ids.dat``.
+
+        Raises
+        ------
+        RuntimeError
+            If any chunks still remain incomplete after the retry pass.
         """
         log.info("\n" + "=" * 80)
         log.info(
@@ -361,8 +418,31 @@ class AbstractionBuilder:
 
         Retries the merge a few times if corrupt chunk files are detected
         mid-merge (e.g. a truncated write from a killed HPC job) — the
-        merge raises :class:`CorruptChunkError` after unmarking the bad
-        chunks, so a simple re-dispatch recovers.
+        merge raises
+        :class:`~information_abstraction.build.chunk_store.CorruptChunkError`
+        after unmarking the bad chunks, so a simple re-dispatch recovers.
+
+        Parameters
+        ----------
+        street : str
+            Street name.
+        n_clusters : int
+            Target cluster count.
+        combos : np.ndarray
+            Full combos array — forwarded to the retry dispatch.
+        feature_extractor : Callable[[np.ndarray], np.ndarray]
+            Feature extractor used to recompute corrupt chunks.
+
+        Returns
+        -------
+        Tuple[np.memmap, np.ndarray, np.ndarray]
+            ``(merged_memmap, all_combos, clusters)``.
+
+        Raises
+        ------
+        RuntimeError
+            If corrupt chunks persist after ``_MAX_MERGE_RETRIES``
+            recovery passes.
         """
         for attempt in range(1, _MAX_MERGE_RETRIES + 1):
             try:
@@ -423,7 +503,19 @@ class AbstractionBuilder:
     def _write_cluster_ids(
         self, street: str, clusters: np.ndarray,
     ) -> None:
-        """Persist cluster ids as a uint16 memmap and prime the worker cache."""
+        """Persist cluster ids as a uint16 memmap and prime the worker cache.
+
+        Also seeds ``_PROCESS_CACHE`` in
+        :mod:`information_abstraction.build.ehs` so the downstream
+        street's extractors find the ids without a second open.
+
+        Parameters
+        ----------
+        street : str
+            Street whose ids are being written.
+        clusters : np.ndarray
+            Per-row cluster assignments from the clusterer.
+        """
         save_dir = self._config["save_dir"]
         ids_path = Path(save_dir) / street / "cluster_ids.dat"
         if not ids_path.exists():

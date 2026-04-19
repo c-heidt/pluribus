@@ -35,6 +35,31 @@ test/                       Pytest suite mirroring the package layout
 ```
 
 
+## Architecture
+
+A full-deck six-player build blows past what the upstream codebase assumed. The river alone has ~2.8 billion hand/board combinations on a 52-card deck, and a CFR run over six players touches orders of magnitude more information sets than the toy decks the original implementation targeted. Two subsystems were rewritten from scratch to make this tractable on commodity HPC hardware:
+
+### Card-information abstraction pipeline
+
+Lives in [information_abstraction/build/](information_abstraction/build/). The pipeline produces a `{street: {combo: cluster_id}}` lookup table by extracting an expected-hand-strength feature for every combo and then KMeans-clustering those features per street. Two design choices make this workable at full-deck scale:
+
+- **Chunked, resumable processing.** Each street's combos are sliced into fixed-size chunks ([ChunkStore](information_abstraction/build/chunk_store.py)) and dispatched across a process pool. Every completed chunk is written as an atomic `.npy` file with an fsync + round-trip verification step so that a node crash or quota exhaustion on the parallel filesystem cannot leave a silently-truncated chunk behind. A [CheckpointManager](information_abstraction/build/checkpoint.py) tracks per-street completion in a JSON file guarded by an `fcntl` lock, so a job that runs out of wall time simply resubmits itself and resumes with the missing chunks only. After merge, KMeans itself checkpoints inside [Clusterer](information_abstraction/build/clusterer.py) so the clustering stage is resumable too.
+- **Memory-efficient river lookup.** A Python dict keyed on ~2.8 billion tuples is not feasible — storing the cluster ids alone as a hash table would require close to a terabyte of RAM and a `joblib.dump` would never complete. Instead the build writes a compact `uint16` memmap (`cluster_ids.dat`) whose row layout is the combinadic index of the (hole, board) combo. Runtime access goes through [MemmapLookup](information_abstraction/lookup.py), which computes the row in O(1) from the cards and reads a single `uint16`. The pickled `MemmapLookup` is a few kilobytes; the OS page cache is shared across all worker processes that open the file.
+
+The streets are processed in order `river → turn → flop` because the turn and flop features are histograms over the downstream street's cluster ids — each upstream `cluster_ids.dat` is lazily memmapped into worker processes and cached at module scope ([ehs.py](information_abstraction/build/ehs.py)).
+
+### CFR tables
+
+Lives in [poker_ai/tables/](poker_ai/tables/). The CFR trainer needs per-infoset integer arrays (regret and average-strategy counts) that are shared across many worker processes, persistent across restarts, and resilient to training runs that allocate far more information sets than fit in RAM. The storage layer is built in three layers plus a checkpointer:
+
+- **[InfosetIndex](poker_ai/tables/index.py) — persistent `string → row` mapping.** An LMDB environment per street maps 16-byte hashes of infoset strings to stable 64-bit row numbers. Row allocation happens inside a single LMDB write transaction, which serialises the `get_or_create` path across processes without any explicit lock. Readers never need a transaction to learn the current row count because it is mirrored in a `multiprocessing.Value` the parent initialises before forking. LMDB reader slots do not survive `fork(2)` — workers reopen their environment handles at startup.
+- **[ChunkStore](poker_ai/tables/chunk_store.py) — shared-memory integer arrays.** Rows are grouped into fixed-size chunks, each backed by an mmapped file under `/dev/shm`. Because the files are mapped `MAP_SHARED`, any worker's write is instantly visible to every other worker without IPC. A shared dirty-flag array records which chunks have been modified since the last checkpoint, so only the dirty ones have to be flushed to the (slow) network filesystem.
+- **[ChunkedTable](poker_ai/tables/chunked_table.py) — the facade CFR code sees.** Translates `(infoset_string, action_index)` into a shared-memory row and exposes `get_row` / `update_row` / `merge_delta_row`. Concurrent writers to the same chunk are serialised by a bank of POSIX semaphores (`N_STRIPE_LOCKS`) keyed on `chunk_id % N`; different chunks almost never contend.
+- **[CFRTables](poker_ai/tables/cfr_tables.py)** bundles the four streets × two tables (regret, strategy) plus the shared indexes, and owns bulk operations that must span every table (LCFR discounting, save/restore).
+- **[CheckpointManager](poker_ai/tables/checkpoint.py) — atomic, hardlink-based checkpoints.** Each checkpoint is a self-contained directory. Dirty chunks are written as atomic `.npy` files into a temp directory; clean chunks are **hardlinked** from the previous generation so every checkpoint remains complete without copying unchanged data (same-inode hardlinks are near-free on POSIX). A final `rename` makes the new directory visible atomically, and the previous generation is then deleted — exactly one checkpoint is retained at all times. `SIGTERM` / `SIGINT` are intercepted so SLURM jobs running out of wall time write one final emergency checkpoint before exit. On startup the manager auto-resumes if a valid checkpoint exists and refuses to resume across structural hyperparameter changes that would silently corrupt training.
+
+Together these pieces let a six-player full-deck run train with many workers sharing mutable state at near-zero synchronisation cost, persist only what has changed at each checkpoint, and resume cleanly after a SLURM preemption.
+
 ## Installation
 
 Tested under Python 3.7 in a conda environment named `pluribus`.

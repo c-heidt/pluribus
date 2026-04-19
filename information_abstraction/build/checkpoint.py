@@ -71,6 +71,11 @@ class CheckpointManager:
     def save(self, merge_with_disk: bool = True) -> None:
         """Persist the in-memory checkpoint atomically.
 
+        Writes to a temp file, takes an exclusive ``fcntl`` lock on a
+        sibling lock file, then renames — so another process sharing the
+        directory (e.g. a second worker node) can never observe a
+        half-written checkpoint.
+
         Parameters
         ----------
         merge_with_disk : bool
@@ -80,6 +85,12 @@ class CheckpointManager:
             chunks not have its work clobbered.  Pass ``False`` when the
             caller explicitly wants to overwrite disk state (e.g. after
             :meth:`reset_street`).
+
+        Raises
+        ------
+        IOError
+            If the temp-file write or rename fails.  The temp file is
+            cleaned up before re-raising.
         """
         lock_path = self.checkpoint_path.with_suffix(".lock")
         temp_path = self.checkpoint_path.with_suffix(".tmp")
@@ -122,27 +133,59 @@ class CheckpointManager:
     # ------------------------------------------------------------------
 
     def get_completed_chunks(self, street: str) -> List[int]:
+        """Indices of chunks that have been processed and persisted.
+
+        Parameters
+        ----------
+        street : str
+            Street name.
+
+        Returns
+        -------
+        List[int]
+            Sorted list of completed chunk indices.
+        """
         return list(self._state["streets"][street]["completed_chunks"])
 
     def get_incomplete_chunks(self, street: str) -> List[int]:
+        """Indices of chunks still pending for this street.
+
+        Derived from ``total_chunks - completed_chunks`` rather than stored
+        explicitly, so there is no way for the two sets to disagree.
+
+        Parameters
+        ----------
+        street : str
+            Street name.
+
+        Returns
+        -------
+        List[int]
+            Chunk indices that have not yet been marked complete.
+        """
         street_data = self._state["streets"][street]
         completed: Set[int] = set(street_data["completed_chunks"])
         total = street_data["total_chunks"]
         return [i for i in range(total) if i not in completed]
 
     def get_total_chunks(self, street: str) -> int:
+        """Number of chunks this street was initialised with."""
         return int(self._state["streets"][street]["total_chunks"])
 
     def get_total_combos(self, street: str) -> Optional[int]:
+        """Number of combos this street was initialised with (``None`` for legacy)."""
         return self._state["streets"][street].get("total_combos")
 
     def get_feature_dim(self, street: str) -> Optional[int]:
+        """Per-row feature width recorded at merge time, or ``None`` if unknown."""
         return self._state["streets"][street].get("feature_dim")
 
     def is_merge_done(self, street: str) -> bool:
+        """Whether the chunk merge step has completed for ``street``."""
         return bool(self._state["streets"][street].get("merge_done", False))
 
     def is_clustering_done(self, street: str) -> bool:
+        """Whether KMeans clustering has completed for ``street``."""
         return bool(
             self._state["streets"][street].get("clustering_done", False)
         )
@@ -152,6 +195,11 @@ class CheckpointManager:
     # ------------------------------------------------------------------
 
     def mark_chunk_complete(self, street: str, chunk_idx: int) -> None:
+        """Record a single chunk as complete and flush to disk.
+
+        Preferred for one-off updates; bulk flushes should use
+        :meth:`update_completed_chunks` to avoid one disk write per chunk.
+        """
         completed = self._state["streets"][street]["completed_chunks"]
         if chunk_idx not in completed:
             completed.append(chunk_idx)
@@ -161,29 +209,56 @@ class CheckpointManager:
     def update_completed_chunks(
         self, street: str, completed: Iterable[int], merge_with_disk: bool,
     ) -> None:
-        """Replace ``completed_chunks`` for a street (bulk flush path)."""
+        """Replace ``completed_chunks`` for a street (bulk flush path).
+
+        Used by
+        :meth:`information_abstraction.build.chunk_store.ChunkStore.process_chunks_parallel`
+        to flush many chunk completions in a single disk write.
+
+        Parameters
+        ----------
+        street : str
+            Street name.
+        completed : Iterable[int]
+            Full set of completed chunk indices.  Duplicates are removed
+            and the set is sorted before persisting.
+        merge_with_disk : bool
+            Forwarded to :meth:`save`.  Pass ``False`` when shrinking
+            ``completed_chunks`` (e.g. after a corrupt-chunk retry) so
+            the union with disk does not re-add the stale entries.
+        """
         self._state["streets"][street]["completed_chunks"] = sorted(
             set(completed)
         )
         self.save(merge_with_disk=merge_with_disk)
 
     def mark_merge_done(self, street: str) -> None:
+        """Flag the merge step as complete for ``street``."""
         self._state["streets"][street]["merge_done"] = True
         self.save()
 
     def unmark_merge_done(self, street: str) -> None:
+        """Revert the merge flag — used when a corrupt chunk forces a retry.
+
+        ``merge_with_disk=False`` because the caller is about to shrink
+        ``completed_chunks`` and a union with the disk state would undo
+        that change.
+        """
         self._state["streets"][street]["merge_done"] = False
         self.save(merge_with_disk=False)
 
     def mark_clustering_done(self, street: str) -> None:
+        """Flag KMeans clustering as complete for ``street``."""
         self._state["streets"][street]["clustering_done"] = True
         self.save()
 
     def set_feature_dim(self, street: str, feature_dim: int) -> None:
+        """Record the feature width so later loads can size the memmap."""
         self._state["streets"][street]["feature_dim"] = int(feature_dim)
         self.save()
 
     def set_config(self, config: Dict[str, Any]) -> None:
+        """Attach the build configuration for debugging / resume checks."""
         self._state["config"] = config
 
     def reset_street(
@@ -192,7 +267,18 @@ class CheckpointManager:
         total_chunks: int,
         total_combos: int,
     ) -> None:
-        """Reset a street's checkpoint state (fresh run / config change)."""
+        """Reset a street's checkpoint state (fresh run / config change).
+
+        Parameters
+        ----------
+        street : str
+            Street name.
+        total_chunks : int
+            Chunk count the incoming run will use.
+        total_combos : int
+            Combo count for the incoming run — persisted so downstream
+            merges can size the memmap without re-scanning chunks.
+        """
         self._state["streets"][street] = {
             "completed_chunks": [],
             "total_chunks": total_chunks,
@@ -203,5 +289,13 @@ class CheckpointManager:
         }
 
     def update_total_combos(self, street: str, total_combos: int) -> None:
-        """Keep total_combos in sync (may be absent in old checkpoints)."""
+        """Keep total_combos in sync (may be absent in old checkpoints).
+
+        Parameters
+        ----------
+        street : str
+            Street name.
+        total_combos : int
+            Current combo count — used for sizing memmaps during merge.
+        """
         self._state["streets"][street]["total_combos"] = total_combos

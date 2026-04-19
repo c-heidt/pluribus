@@ -70,9 +70,28 @@ def _process_single_chunk_worker(
 ) -> Tuple[int, np.ndarray]:
     """Per-worker loop that evaluates ``item_processor`` over a chunk.
 
-    Module-level so ``ProcessPoolExecutor`` can pickle it.  Returns
-    ``(chunk_idx, results_array)``; combos are reconstructed upstream
-    from the full ``all_combos`` array.
+    Module-level so ``ProcessPoolExecutor`` can pickle it.  Combos are
+    reconstructed upstream from the full ``all_combos`` array, so only
+    the feature matrix is shipped back across the process boundary.
+
+    Parameters
+    ----------
+    chunk_idx : int
+        Index of this chunk inside the street's chunk list.
+    chunk_combos : np.ndarray
+        Slice of the full combos array that this worker owns.
+    item_processor : Callable[[np.ndarray], np.ndarray]
+        One of the
+        :class:`~information_abstraction.build.ehs.RiverEHS` /
+        :class:`~information_abstraction.build.ehs.TurnEHS` /
+        :class:`~information_abstraction.build.ehs.FlopEHS` feature
+        extractors.
+
+    Returns
+    -------
+    Tuple[int, np.ndarray]
+        ``(chunk_idx, results)`` — results have shape
+        ``(len(chunk_combos), feature_dim)`` and dtype ``float32``.
     """
     first = item_processor(chunk_combos[0])
     results = np.empty((len(chunk_combos), len(first)), dtype=np.float32)
@@ -124,30 +143,40 @@ class ChunkStore:
     # ------------------------------------------------------------------
 
     def get_street_dir(self, street: str) -> Path:
+        """Return (and create) the per-street working directory."""
         street_dir = self.save_dir / street
         street_dir.mkdir(parents=True, exist_ok=True)
         return street_dir
 
     def get_chunks_dir(self, street: str) -> Path:
+        """Return (and create) the ``chunks/`` subdirectory for ``street``."""
         d = self.get_street_dir(street) / "chunks"
         d.mkdir(parents=True, exist_ok=True)
         return d
 
     def get_combos_dir(self, street: str) -> Path:
+        """Return (and create) the legacy ``combos/`` subdirectory for ``street``."""
         d = self.get_street_dir(street) / "combos"
         d.mkdir(parents=True, exist_ok=True)
         return d
 
     def get_chunk_path(self, street: str, chunk_idx: int) -> Path:
+        """Absolute path to the on-disk file for a single chunk."""
         ext = ".npy.gz" if self.use_compression else ".npy"
         return self.get_chunks_dir(street) / f"chunk_{chunk_idx:06d}{ext}"
 
     def get_combos_path(self, street: str, chunk_idx: int) -> Path:
+        """Absolute path to a chunk's legacy per-chunk combo file."""
         return self.get_combos_dir(street) / f"combos_{chunk_idx:06d}.npy"
 
     def get_chunk_indices(
         self, total_combos: int,
     ) -> List[Tuple[int, int, int]]:
+        """``[(chunk_idx, start, end), ...]`` slicing ``total_combos`` evenly.
+
+        The last chunk may be shorter than ``chunk_size``; callers slicing
+        ``all_combos[start:end]`` therefore never run past the array.
+        """
         n_chunks = (total_combos + self.chunk_size - 1) // self.chunk_size
         return [
             (i, i * self.chunk_size, min((i + 1) * self.chunk_size, total_combos))
@@ -169,6 +198,16 @@ class ChunkStore:
         Resets on-disk state and the checkpoint if the chunk count has
         changed (different configuration).  Otherwise leaves existing
         progress intact.
+
+        Parameters
+        ----------
+        street : str
+            Street name.
+        total_combos : int
+            Combo count for the incoming run.
+        config : dict, optional
+            Full build configuration.  Persisted to the checkpoint for
+            debuggability when set.
         """
         n_chunks = (total_combos + self.chunk_size - 1) // self.chunk_size
         if self.checkpoint.get_total_chunks(street) != n_chunks:
@@ -211,6 +250,27 @@ class ChunkStore:
         """Atomically persist ``data`` as chunk ``chunk_idx`` for ``street``.
 
         Writes to a temp file, fsyncs, verifies the round-trip, then renames.
+        The extra verification step is intentional: parallel filesystems
+        on HPC nodes regularly return silently-truncated files after
+        quota exhaustion or an abrupt node crash, and a corrupt chunk
+        discovered at merge time costs much more than re-loading the
+        freshly-written data once.
+
+        Parameters
+        ----------
+        street : str
+            Street name.
+        chunk_idx : int
+            Zero-based chunk index.
+        data : np.ndarray
+            Feature matrix for the chunk.  Cast to ``self.storage_dtype``
+            before being written.
+
+        Raises
+        ------
+        RuntimeError
+            If the write, fsync, round-trip read, or rename fails.  The
+            temp file is removed before re-raising.
         """
         chunk_path = self.get_chunk_path(street, chunk_idx)
         temp_ext = ".tmp.npy.gz" if self.use_compression else ".tmp.npy"
@@ -255,7 +315,27 @@ class ChunkStore:
     def load_chunk(
         self, street: str, chunk_idx: int,
     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        """Load ``(data_float32, combos_or_None)`` for a chunk."""
+        """Load ``(data_float32, combos_or_None)`` for a chunk.
+
+        The feature matrix is re-cast to ``float32`` on the way out so
+        KMeans does not need to deal with the on-disk ``float16``
+        representation.  The combos side-car is present only for
+        legacy runs; newer runs reconstruct combos upstream from the
+        full ``all_combos`` array.
+
+        Parameters
+        ----------
+        street : str
+            Street name.
+        chunk_idx : int
+            Zero-based chunk index.
+
+        Returns
+        -------
+        Tuple[np.ndarray, Optional[np.ndarray]]
+            ``(features_float32, combos)`` — ``combos`` is ``None`` when
+            the side-car file does not exist.
+        """
         chunk_path = self.get_chunk_path(street, chunk_idx)
         combos_path = self.get_combos_path(street, chunk_idx)
 
@@ -289,6 +369,22 @@ class ChunkStore:
         Each worker receives one full chunk; results stream back and are
         persisted + checkpointed incrementally.  Failed chunks stay absent
         from the checkpoint so the next run retries them automatically.
+
+        Parameters
+        ----------
+        street : str
+            Street name.
+        chunk_indices : List[int]
+            Indices to (re)process.  Normally the output of
+            :meth:`CheckpointManager.get_incomplete_chunks`.
+        all_combos : np.ndarray
+            Full combos array — sliced per-chunk before being shipped to
+            workers to avoid pickling the full array once per worker.
+        item_processor : Callable[[np.ndarray], np.ndarray]
+            Feature extractor; one of the classes in
+            :mod:`information_abstraction.build.ehs`.
+        workers : int
+            Worker count passed to ``ProcessPoolExecutor``.
         """
         if not chunk_indices:
             log.info("No chunks to process for %s", street)
@@ -386,9 +482,37 @@ class ChunkStore:
     ) -> Tuple[np.memmap, np.ndarray]:
         """Concatenate every chunk into a single memmap + combos array.
 
-        Raises :class:`CorruptChunkError` if any chunk file is truncated;
-        the bad chunks are removed and unmarked so the next dispatch retries
-        only those.
+        The memmap is what KMeans clusters against; writing it out as a
+        single file lets the clustering stage resume from a process
+        crash without re-running the per-chunk work.
+
+        Parameters
+        ----------
+        street : str
+            Street name.
+        dtype : np.dtype
+            Dtype for the merged memmap.
+        all_combos_full : np.ndarray, optional
+            Full combos array for combo-index reconstruction.  When
+            absent, per-chunk combo side-cars (legacy layout) are used
+            instead.
+
+        Returns
+        -------
+        Tuple[np.memmap, np.ndarray]
+            ``(merged_memmap, all_combos_arr)``.
+
+        Raises
+        ------
+        ValueError
+            If no completed chunks exist, or if any chunks are still
+            incomplete — merge requires a complete set.
+        CorruptChunkError
+            If any chunk file is truncated; the bad chunks are removed
+            and unmarked so the next dispatch retries only those.  The
+            exception carries the list of corrupt indices.
+        RuntimeError
+            If writing the combined combos file fails.
         """
         log.info("Merging chunks for %s...", street)
 
@@ -532,6 +656,32 @@ class ChunkStore:
     def load_merged_data(
         self, street: str, dtype: np.dtype = np.float32,
     ) -> Tuple[np.memmap, np.ndarray]:
+        """Open a previously-merged memmap + combos pair for ``street``.
+
+        Falls back to reading the first surviving chunk to recover
+        ``feature_dim`` if it is absent from the checkpoint.
+
+        Parameters
+        ----------
+        street : str
+            Street name.
+        dtype : np.dtype
+            Dtype to open the memmap with; must match what was written.
+
+        Returns
+        -------
+        Tuple[np.memmap, np.ndarray]
+            ``(merged_memmap, all_combos_arr)``.
+
+        Raises
+        ------
+        FileNotFoundError
+            If either ``merged_data.dat`` or ``all_combos.npy`` is
+            missing.
+        ValueError
+            If ``feature_dim`` is neither in the checkpoint nor
+            recoverable from a surviving chunk.
+        """
         merged_path = self.get_street_dir(street) / "merged_data.dat"
         combos_path = self.get_street_dir(street) / "all_combos.npy"
         if not merged_path.exists() or not combos_path.exists():
@@ -576,6 +726,26 @@ class ChunkStore:
         dtype: np.dtype = np.float32,
         all_combos_full: Optional[np.ndarray] = None,
     ) -> Tuple[np.memmap, np.ndarray]:
+        """Return merged data, re-running the merge only if necessary.
+
+        If the checkpoint flags merge as done, try to load from disk
+        first; only re-merge if those files are missing or corrupt.
+
+        Parameters
+        ----------
+        street : str
+            Street name.
+        dtype : np.dtype
+            Dtype for the merged memmap.
+        all_combos_full : np.ndarray, optional
+            Forwarded to :meth:`merge_chunks_to_memmap` when the merge
+            has to run.
+
+        Returns
+        -------
+        Tuple[np.memmap, np.ndarray]
+            ``(merged_memmap, all_combos_arr)``.
+        """
         if self.checkpoint.is_merge_done(street):
             try:
                 log.info(
@@ -599,20 +769,24 @@ class ChunkStore:
     # ------------------------------------------------------------------
 
     def save_centroids(self, street: str, centroids: np.ndarray) -> None:
+        """Persist KMeans centroids for ``street`` atomically."""
         path = self.get_street_dir(street) / "centroids.npy"
         atomic_numpy_save(centroids, path)
 
     def load_centroids(self, street: str) -> np.ndarray:
+        """Load previously-persisted KMeans centroids for ``street``."""
         return np.load(
             self.get_street_dir(street) / "centroids.npy",
             allow_pickle=True,
         )
 
     def save_clusters(self, street: str, clusters: np.ndarray) -> None:
+        """Persist the per-row cluster assignments for ``street`` atomically."""
         path = self.get_street_dir(street) / "clusters.npy"
         atomic_numpy_save(clusters, path)
 
     def load_clusters(self, street: str) -> np.ndarray:
+        """Load previously-persisted cluster assignments for ``street``."""
         return np.load(
             self.get_street_dir(street) / "clusters.npy",
             allow_pickle=True,
@@ -657,6 +831,11 @@ class ChunkStore:
             )
 
     def cleanup_all_intermediate_files(self) -> None:
+        """Remove every street's intermediate artefacts once clustering is done.
+
+        Skips any street whose clustering is incomplete so a resumed run
+        still has the material it needs.
+        """
         log.info("Cleaning up all intermediate files...")
         total_freed = 0
         for street in ("river", "turn", "flop"):
