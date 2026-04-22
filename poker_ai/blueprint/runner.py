@@ -82,30 +82,62 @@ def train():
 
 @train.command()
 @click.option(
+    "--n_players",
+    default=6,
+    help="The number of players in the game.",
+)
+@click.option(
+    "--max_runtime_hours",
+    default=71.5,
+    type=float,
+    help="Wall-clock budget for this run in hours. Training stops when elapsed time reaches this limit.",
+)
+@click.option(
+    "--sync_interval",
+    default=500,
+    help=(
+        "How many iterations between worker sync barriers.  This is the base "
+        "unit for all cycle-based options.  Higher values keep workers busier "
+        "but delay delta merges."
+    ),
+)
+@click.option(
+    "--discount_interval",
+    default=5,
+    help=(
+        "Apply LCFR discounting every N sync cycles "
+        "(= N * sync_interval iterations)."
+    ),
+)
+@click.option(
+    "--discount_duration_cycles",
+    default=100,
+    help="Close the LCFR discount window after this many sync cycles (= N * sync_interval iterations).",
+)
+@click.option(
+    "--update_threshold",
+    default=60,
+    help=(
+        "Start updating the strategy after this many sync cycles "
+        "(= N * sync_interval iterations)."
+    ),
+)
+@click.option(
     "--strategy_interval",
     default=20,
     help="Update the current strategy every N sync cycles (= N * sync_interval iterations).",
 )
 @click.option(
-    "--max_runtime_hours",
-    default=1.0,
-    type=float,
-    help="Wall-clock budget for this run in hours. Training stops when elapsed time reaches this limit.",
-)
-@click.option(
-    "--discount_duration_cycles",
-    default=40,
-    help="Close the LCFR discount window after this many sync cycles (= N * sync_interval iterations).",
-)
-@click.option(
-    "--n_iterations",
-    default=10000,
-    hidden=True,
-    help="[Single-process only] Number of iterations for the validation baseline.",
+    "--checkpoint_interval",
+    default=60,
+    help=(
+        "Write a training checkpoint every N sync cycles "
+        "(= N * sync_interval iterations)."
+    ),
 )
 @click.option(
     "--prune_threshold",
-    default=5000,
+    default=50000,
     help=(
         "When a uniform random number is less than 95%, and the iteration > "
         "prune_threshold, use CFR with pruning.  Counted in raw iterations "
@@ -122,61 +154,11 @@ def train():
     ),
 )
 @click.option(
-    "--n_players",
-    default=3,
-    help="The number of players in the game."
-)
-@click.option(
-    "--update_threshold",
-    default=4,
-    help=(
-        "Start updating the strategy after this many sync cycles "
-        "(= N * sync_interval iterations)."
-    ),
-)
-@click.option(
-    "--lut_path",
-    default=".",
-    help=(
-        "The path to the files for clustering the infosets."
-    ),
-)
-@click.option(
     "--pickle_dir",
     default=False,
     help=(
         "Whether or not the lut files are pickle files. This lookup "
         "method is deprecated."
-    ),
-)
-@click.option(
-    "--single_process/--multi_process",
-    default=False,
-    help="Either use or don't use multiple processes.",
-)
-@click.option(
-    "--sync_interval",
-    default=250,
-    help=(
-        "How many iterations between worker sync barriers.  This is the base "
-        "unit for all cycle-based options.  Higher values keep workers busier "
-        "but delay delta merges."
-    ),
-)
-@click.option(
-    "--discount_interval",
-    default=10,
-    help=(
-        "Apply LCFR discounting every N sync cycles "
-        "(= N * sync_interval iterations).  Default 1 discounts every sync cycle."
-    ),
-)
-@click.option(
-    "--checkpoint_interval",
-    default=40,
-    help=(
-        "Write a training checkpoint every N sync cycles "
-        "(= N * sync_interval iterations)."
     ),
 )
 @click.option(
@@ -188,7 +170,23 @@ def train():
         "(or SLURM_CPUS_PER_TASK-1 when running under Slurm)."
     ),
 )
+@click.option(
+    "--lut_path",
+    default=".",
+    help="The path to the files for clustering the infosets.",
+)
 @click.option("--nickname", default="", help="The nickname of the study.")
+@click.option(
+    "--n_iterations",
+    default=10000,
+    hidden=True,
+    help="[Single-process only] Number of iterations for the validation baseline.",
+)
+@click.option(
+    "--single_process/--multi_process",
+    default=False,
+    help="Either use or don't use multiple processes.",
+)
 def start(
     strategy_interval: int,
     max_runtime_hours: float,
