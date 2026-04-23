@@ -170,6 +170,7 @@ def train():
         "(or SLURM_CPUS_PER_TASK-1 when running under Slurm)."
     ),
 )
+
 @click.option(
     "--lut_path",
     default=".",
@@ -215,7 +216,7 @@ def start(
     from it; when not, it starts fresh.
     """
     config: Dict[str, int] = {**locals()}
-    save_path: Path = Path(f"./{nickname}")
+    save_path: Path = Path(nickname)
     save_path.mkdir(parents=True, exist_ok=True)
     with open(save_path / "config.yaml", "w") as steam:
         yaml.dump(config, steam)
