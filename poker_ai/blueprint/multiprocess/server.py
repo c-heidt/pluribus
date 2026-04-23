@@ -141,7 +141,9 @@ class Server:
         n_processes : int, optional
             Number of worker processes to spawn.  Defaults to
             ``SLURM_CPUS_PER_TASK - 1`` when running under SLURM or
-            ``cpu_count() - 1`` otherwise.
+            ``cpu_count() - 1`` otherwise.  The number of jobs dispatched
+            per player per iteration is derived as
+            ``max(1, n_processes // n_players)`` to keep the full pool busy.
         """
         if n_processes is None:
             slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
@@ -151,6 +153,12 @@ class Server:
             else:
                 n_processes = mp.cpu_count() - 1
                 log.info(f"Using {n_processes} processes (cpu_count={mp.cpu_count()})")
+
+        self._workers_per_player = max(1, n_processes // n_players)
+        log.info(
+            f"workers_per_player={self._workers_per_player} "
+            f"(n_processes={n_processes}, n_players={n_players})"
+        )
 
         self._strategy_interval = strategy_interval
         self._max_runtime_hours = max_runtime_hours
@@ -265,7 +273,8 @@ class Server:
                 self._current_t = t
 
                 for i in range(self._n_players):
-                    self._send_job("cfr", t=t, i=i)
+                    for _ in range(self._workers_per_player):
+                        self._send_job("cfr", t=t, i=i)
 
                 if at_sync_barrier(t, self._sync_interval):
                     self._join_queue()
