@@ -94,6 +94,7 @@ class Server:
         checkpoint_interval: int = 1,
         start_timestep: int = 0,
         n_processes: Optional[int] = None,
+        batch_size: Optional[int] = None,
     ):
         """Initialise the server and spawn the worker pool.
 
@@ -147,7 +148,18 @@ class Server:
             ``SLURM_CPUS_PER_TASK - 1`` when running under SLURM or
             ``cpu_count() - 1`` otherwise.  The number of jobs dispatched
             per player per iteration is derived as
-            ``max(1, n_processes // n_players)`` to keep the full pool busy.
+            ``max(1, n_processes // n_players)`` to keep every worker
+            busy — batching does not change this because each worker
+            processes one queue item at a time regardless of batch
+            size.  Batching instead reduces the wall-clock *rate*
+            of queue ops (each item now carries ``batch_size``
+            traversals of work).
+        batch_size : int, optional
+            Number of CFR traversals executed per ``cfr`` queue item.
+            Raising this reduces queue IPC traffic and dispatcher
+            pressure at the cost of longer per-job wall time.
+            Defaults to the ``PLURIBUS_CFR_BATCH_SIZE`` environment
+            variable if set, else ``5``.
         """
         if n_processes is None:
             slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
@@ -158,10 +170,31 @@ class Server:
                 n_processes = mp.cpu_count() - 1
                 log.info(f"Using {n_processes} processes (cpu_count={mp.cpu_count()})")
 
+        if batch_size is None:
+            batch_size = int(os.environ.get("PLURIBUS_CFR_BATCH_SIZE", 5))
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        self._batch_size = batch_size
+
+        # workers_per_player saturates the worker pool: every worker
+        # processes one queue item at a time regardless of batch_size,
+        # so the number of outstanding items needed is independent of
+        # how much work each item contains.  batch_size instead
+        # reduces the *rate* at which items flow through the queue
+        # (each item now holds ``batch_size`` traversals' worth of
+        # work) — that is the dispatcher-pressure win, not fewer
+        # outstanding items.
         self._workers_per_player = max(1, n_processes // n_players)
+        traversals_per_loop = (
+            self._workers_per_player * self._batch_size * n_players
+        )
         log.info(
+            f"batch_size={self._batch_size} "
             f"workers_per_player={self._workers_per_player} "
-            f"(n_processes={n_processes}, n_players={n_players})"
+            f"(n_processes={n_processes}, n_players={n_players}) → "
+            f"{self._workers_per_player * n_players} queue items per loop, "
+            f"{traversals_per_loop} traversals per loop, "
+            f"{self._workers_per_player * self._batch_size} per player"
         )
 
         self._strategy_interval = strategy_interval
@@ -260,7 +293,7 @@ class Server:
         self._training_start = time.monotonic()
         max_runtime_secs = self._max_runtime_hours * 3600.0
         sigterm = self._checkpoint_manager.sigterm_event
-        step = self._workers_per_player
+        step = self._workers_per_player * self._batch_size
         t = self._start_t  # traversals-per-player completed so far
         _last_log_time = self._training_start
         try:
@@ -276,8 +309,10 @@ class Server:
                     break
 
                 for i in range(self._n_players):
-                    for _ in range(step):
-                        self._send_job("cfr", t=t, i=i)
+                    for _ in range(self._workers_per_player):
+                        self._send_job(
+                            "cfr", t=t, i=i, batch=self._batch_size
+                        )
                 t += step
                 self._current_t = t
 
