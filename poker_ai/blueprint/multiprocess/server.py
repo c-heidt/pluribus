@@ -39,6 +39,7 @@ from typing import Dict, Optional, Union
 
 from poker_ai.tables.checkpoint import CheckpointManager
 from poker_ai.tables.cfr_tables import CFRTables
+from poker_ai.tables.chunk_store import CHUNK_SIZE as _CHUNK_SIZE
 from poker_ai.blueprint.multiprocess.worker import Worker
 from poker_ai.blueprint.training import (
     DiscountState,
@@ -91,7 +92,7 @@ class Server:
         sync_interval: int = 10,
         discount_interval: int = 1,
         checkpoint_interval: int = 1,
-        start_timestep: int = 1,
+        start_timestep: int = 0,
         n_processes: Optional[int] = None,
     ):
         """Initialise the server and spawn the worker pool.
@@ -129,15 +130,18 @@ class Server:
             Use the legacy pickle-directory LUT layout.  Defaults to
             ``False``.
         sync_interval : int, optional
-            Number of iterations between sync barriers.  The base
-            unit for every other cycle-based parameter.
+            Number of traversals-per-player between sync barriers.  The
+            base unit for every other cycle-based parameter.  Counts
+            traversals (not loop ticks) so the same config produces
+            equivalent training regardless of how many worker
+            processes the hardware supports.
         discount_interval : int, optional
             Period (in sync cycles) between LCFR discount applications.
         checkpoint_interval : int, optional
             Period (in sync cycles) between checkpoint writes.
         start_timestep : int, optional
-            Initial iteration counter.  Overridden on resume by the
-            checkpoint manager.
+            Initial traversals-per-player counter (``0`` on fresh
+            runs).  Overridden on resume by the checkpoint manager.
         n_processes : int, optional
             Number of worker processes to spawn.  Defaults to
             ``SLURM_CPUS_PER_TASK - 1`` when running under SLURM or
@@ -256,7 +260,8 @@ class Server:
         self._training_start = time.monotonic()
         max_runtime_secs = self._max_runtime_hours * 3600.0
         sigterm = self._checkpoint_manager.sigterm_event
-        t = self._start_t
+        step = self._workers_per_player
+        t = self._start_t  # traversals-per-player completed so far
         _last_log_time = self._training_start
         try:
             while True:
@@ -264,19 +269,19 @@ class Server:
                 if elapsed >= max_runtime_secs:
                     log.info(
                         f"Time limit reached after {elapsed / 3600:.2f}h — "
-                        f"{t - 1} iterations completed"
+                        f"{t} traversals-per-player completed"
                     )
                     break
                 if sigterm.is_set():
                     break
 
+                for i in range(self._n_players):
+                    for _ in range(step):
+                        self._send_job("cfr", t=t, i=i)
+                t += step
                 self._current_t = t
 
-                for i in range(self._n_players):
-                    for _ in range(self._workers_per_player):
-                        self._send_job("cfr", t=t, i=i)
-
-                if at_sync_barrier(t, self._sync_interval):
+                if at_sync_barrier(t, self._sync_interval, step=step):
                     self._join_queue()
                     if sigterm.is_set():
                         break
@@ -313,8 +318,6 @@ class Server:
                         )
                         _last_log_time = now
 
-                t += 1
-
             # Drain any jobs still in the queue, then write the final
             # checkpoint so the run can be resumed from its last iteration.
             self._join_queue()
@@ -326,7 +329,8 @@ class Server:
                     f"Training complete — {self._current_t} iters, "
                     f"{elapsed_total:.2f}h elapsed"
                 )
-            self._checkpoint_manager.checkpoint(t=self._current_t)
+            self._checkpoint_manager.checkpoint(t=self._current_t, wait=True)
+            self._checkpoint_manager.shutdown()
         except WorkerError:
             log.error("A worker encountered a fatal error — terminating all workers")
             raise
@@ -396,6 +400,7 @@ class Server:
 
     def _cleanup(self):
         """Close and unlink shared tables after the worker pool exits."""
+        self._checkpoint_manager.shutdown()
         self._tables.close()
 
     def _start_workers(self, n_processes: int):
@@ -473,6 +478,7 @@ class Server:
             checkpoint_interval=self._checkpoint_interval,
             start_timestep=self._start_t,
             n_chunks_per_street=self._tables.n_chunks_per_street(),
+            chunk_size=_CHUNK_SIZE,
         )
         return {
             k: os.path.abspath(str(v)) if isinstance(v, Path) else v
