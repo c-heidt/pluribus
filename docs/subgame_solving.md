@@ -36,7 +36,7 @@ scope of this document.
 ### Non-goals
 
 - No changes to the action abstraction or the card clustering.
-- No multi-GPU or distributed search. Search runs on one machine per decision.
+- No multi-CPU or distributed search. Search runs on one machine per decision.
 - No opponent modelling or exploitation; Pluribus plays the same strategy
   regardless of opponent identity, and this project preserves that.
 - No safety guarantees. Safe subgame-solving theorems do not extend beyond

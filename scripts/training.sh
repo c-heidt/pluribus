@@ -1,7 +1,11 @@
 #!/bin/bash -l
 # Slurm submission script to run training via the package CLI.
 # Usage:
-#   sbatch training.sh
+#   # Base blueprint (default):
+#   sbatch --export=ALL,WORKSPACE=/path/to/ws training.sh
+#
+#   # Biased blueprint warm-started from a finished base run:
+#   sbatch --export=ALL,WORKSPACE=/path/to/ws,BIAS=fold,WARM_START=/path/to/base training.sh
 #SBATCH --job-name=pluribus-train
 #SBATCH --output=logs/training-%j.out
 #SBATCH --error=logs/training-%j_error.out
@@ -39,7 +43,18 @@ C=${C:--300000000}
 PICKLE_DIR=${PICKLE_DIR:-false}
 N_PROCESSES=${N_PROCESSES:-}
 LUT_PATH=${LUT_PATH:-"$WORKSPACE/exact"}
-NICKNAME=${NICKNAME:-"$WORKSPACE/models/${N_PLAYERS}player_52cards"}
+# Bias / warm-start (for biased-blueprint training).  BIAS=none runs the
+# standard base blueprint and ignores BIAS_MAGNITUDE / WARM_START.
+BIAS=${BIAS:-none}
+BIAS_MAGNITUDE=${BIAS_MAGNITUDE:-100}
+WARM_START=${WARM_START:-}
+# Default save dir varies by bias so concurrent biased runs don't
+# collide.  base → ${N}player_52cards; biased → ..._${BIAS}_biased.
+if [ "$BIAS" = "none" ]; then
+  NICKNAME=${NICKNAME:-"$WORKSPACE/models/${N_PLAYERS}player_52cards"}
+else
+  NICKNAME=${NICKNAME:-"$WORKSPACE/models/${N_PLAYERS}player_52cards_${BIAS}_biased"}
+fi
 
 # Efficiency knobs honoured by the trainer (env-driven so they can be
 # overridden per submission without editing code).
@@ -78,6 +93,11 @@ echo "  - Pickle dir:                  $PICKLE_DIR"
 echo "  - N processes:                 ${N_PROCESSES:-(auto)}"
 echo "  - LUT path:                    $LUT_PATH"
 echo "  - Nickname:                    $NICKNAME"
+echo "  - Bias:                        $BIAS"
+if [ "$BIAS" != "none" ]; then
+  echo "  - Bias magnitude:              $BIAS_MAGNITUDE"
+fi
+echo "  - Warm start:                  ${WARM_START:-(none)}"
 echo "  - CPUs:                        $SLURM_CPUS_PER_TASK"
 echo "  - PLURIBUS_CFR_BATCH_SIZE:     $PLURIBUS_CFR_BATCH_SIZE"
 echo "  - PLURIBUS_CHUNK_SIZE:         $PLURIBUS_CHUNK_SIZE"
@@ -86,6 +106,20 @@ echo "  - PLURIBUS_CHUNK_SIZE:         $PLURIBUS_CHUNK_SIZE"
 EXTRA_ARGS=()
 [ -n "$N_PROCESSES" ]      && EXTRA_ARGS+=(--n_processes "$N_PROCESSES")
 [ "$PICKLE_DIR" = "true" ] && EXTRA_ARGS+=(--pickle_dir)
+if [ "$BIAS" != "none" ]; then
+  EXTRA_ARGS+=(--bias "$BIAS" --bias_magnitude "$BIAS_MAGNITUDE")
+  if [ -z "$WARM_START" ]; then
+    echo "ERROR: BIAS=$BIAS requires WARM_START to point at a finished base blueprint." >&2
+    exit 1
+  fi
+fi
+if [ -n "$WARM_START" ]; then
+  if [ ! -d "$WARM_START" ]; then
+    echo "ERROR: WARM_START path not found: $WARM_START" >&2
+    exit 1
+  fi
+  EXTRA_ARGS+=(--warm_start "$WARM_START")
+fi
 
 poker_ai train start \
   --multi_process \

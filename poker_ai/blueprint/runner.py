@@ -188,6 +188,35 @@ def train():
     default=False,
     help="Either use or don't use multiple processes.",
 )
+@click.option(
+    "--bias",
+    type=click.Choice(["none", "fold", "call", "raise"]),
+    default="none",
+    help=(
+        "Bias class for biased-blueprint training.  'none' (default) "
+        "is the standard base blueprint."
+    ),
+)
+@click.option(
+    "--bias_magnitude",
+    type=float,
+    default=100,
+    help=(
+        "Per-occurrence bonus added to terminal payoff for actions in "
+        "the biased class.  Ignored when --bias none."
+    ),
+)
+@click.option(
+    "--warm_start",
+    type=click.Path(exists=True, file_okay=False),
+    default=None,
+    help=(
+        "Path to a base-blueprint save directory whose regret + strategy "
+        "tables seed this run.  Honoured only on a fresh run; if the "
+        "destination already contains a checkpoint the warm-start is "
+        "skipped (resume wins)."
+    ),
+)
 def start(
     strategy_interval: int,
     max_runtime_hours: float,
@@ -205,6 +234,9 @@ def start(
     checkpoint_interval: int,
     n_processes,
     nickname: str,
+    bias: str,
+    bias_magnitude: float,
+    warm_start: str,
 ):
     """Train a CFR agent, auto-resuming if a valid checkpoint exists.
 
@@ -239,6 +271,9 @@ def start(
             update_threshold=update_threshold,
             sync_interval=sync_interval,
             discount_interval=discount_interval,
+            bias=bias,  # type: ignore[arg-type]
+            bias_magnitude=bias_magnitude,
+            warm_start=warm_start,
         )
     else:
         log.info(
@@ -260,6 +295,9 @@ def start(
             discount_interval=discount_interval,
             checkpoint_interval=checkpoint_interval,
             n_processes=n_processes,
+            bias=bias,  # type: ignore[arg-type]
+            bias_magnitude=bias_magnitude,
+            warm_start=warm_start,
         )
         _safe_search(server)
 

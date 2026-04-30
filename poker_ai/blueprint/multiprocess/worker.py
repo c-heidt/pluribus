@@ -46,6 +46,7 @@ from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 
+from poker_ai.blueprint.bias import BiasClass
 from poker_ai.blueprint.cfr import merge_local_delta
 from poker_ai.tables.cfr_tables import CFRTables
 from poker_ai.blueprint.training import (
@@ -83,6 +84,8 @@ class Worker(mp.Process):
         save_path: Path,
         info_set_lut=None,
         error_event: Optional[mp.Event] = None,  # type: ignore
+        bias: BiasClass = "none",
+        bias_magnitude: float = 0.0,
     ):
         """Initialise the worker's fields in the parent process.
 
@@ -138,6 +141,8 @@ class Worker(mp.Process):
         self._lut_path = str(lut_path)
         self._pickle_dir = pickle_dir
         self._error_event: Optional[mp.Event] = error_event  # type: ignore
+        self._bias = bias
+        self._bias_magnitude = bias_magnitude
         if info_set_lut is not None:
             self._info_set_lut = info_set_lut
         # Persistent regret accumulator keyed by (betting_round,
@@ -206,6 +211,8 @@ class Worker(mp.Process):
                             self._prune_threshold,
                             self._c,
                             self._local_delta,
+                            bias=self._bias,
+                            bias_magnitude=self._bias_magnitude,
                         )
                 elif name == "sync":
                     self._flush_delta()

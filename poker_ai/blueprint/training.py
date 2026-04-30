@@ -43,6 +43,7 @@ from typing import Dict, Tuple
 
 import numpy as np
 
+from poker_ai.blueprint.bias import BiasClass
 from poker_ai.blueprint.cfr import cfr, cfrp
 from poker_ai.tables.cfr_tables import CFRTables
 from poker_ai.blueprint.strategy import update_strategy
@@ -80,6 +81,8 @@ def cfr_step(
     prune_threshold: int,
     c: int,
     local_delta: Dict[Tuple[int, str], np.ndarray],
+    bias: BiasClass = "none",
+    bias_magnitude: float = 0.0,
 ) -> None:
     """Execute one CFR traversal for player *i* with stochastic pruning.
 
@@ -112,12 +115,21 @@ def cfr_step(
         or below ``c`` are pruned (unless on the river).
     local_delta : dict[tuple[int, str], np.ndarray]
         Caller-owned regret accumulator.
+    bias : BiasClass, optional
+        Action class for biased-blueprint training.  Forwarded to
+        :func:`cfr` / :func:`cfrp`; ``"none"`` (default) selects the
+        legacy unbiased path.
+    bias_magnitude : float, optional
+        Per-occurrence terminal-payoff bonus applied when
+        ``bias != "none"``.
     """
     use_pruning = np.random.uniform() < PRUNE_PROBABILITY
     if use_pruning and t > prune_threshold:
-        cfrp(tables, state, i, t, c, local_delta)
+        cfrp(tables, state, i, t, c, local_delta,
+             bias=bias, bias_magnitude=bias_magnitude)
     else:
-        cfr(tables, state, i, t, local_delta)
+        cfr(tables, state, i, t, local_delta,
+            bias=bias, bias_magnitude=bias_magnitude)
 
 
 def strategy_step(

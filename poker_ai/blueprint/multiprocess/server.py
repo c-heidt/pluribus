@@ -40,6 +40,8 @@ from typing import Dict, Optional, Union
 from poker_ai.tables.checkpoint import CheckpointManager
 from poker_ai.tables.cfr_tables import CFRTables
 from poker_ai.tables.chunk_store import CHUNK_SIZE as _CHUNK_SIZE
+from poker_ai.tables.warm_start import apply_warm_start
+from poker_ai.blueprint.bias import BiasClass
 from poker_ai.blueprint.multiprocess.worker import Worker
 from poker_ai.blueprint.training import (
     DiscountState,
@@ -95,6 +97,9 @@ class Server:
         start_timestep: int = 0,
         n_processes: Optional[int] = None,
         batch_size: Optional[int] = None,
+        bias: BiasClass = "none",
+        bias_magnitude: float = 0.0,
+        warm_start: Optional[Union[str, Path]] = None,
     ):
         """Initialise the server and spawn the worker pool.
 
@@ -197,6 +202,8 @@ class Server:
             f"{self._workers_per_player * self._batch_size} per player"
         )
 
+        self._bias: BiasClass = bias
+        self._bias_magnitude = float(bias_magnitude)
         self._strategy_interval = strategy_interval
         self._max_runtime_hours = max_runtime_hours
         self._prune_threshold = prune_threshold
@@ -237,6 +244,18 @@ class Server:
         log.info(
             f"LMDB map_size={lmdb_map_size // 1024**3} GiB for {n_players} players"
         )
+
+        # Stage a warm-start checkpoint into the save dir BEFORE
+        # constructing CFRTables so the CheckpointManager finds it on
+        # construction and restores chunks transparently.  No-op when
+        # the save dir already contains a checkpoint (resume wins).
+        if warm_start is not None:
+            apply_warm_start(
+                save_path=self._save_path,
+                warm_start_path=Path(warm_start),
+                expected_n_players=n_players,
+            )
+
         self._tables = CFRTables(
             index_path=self._save_path / "lmdb_index",
             shm_dir=shm_dir,
@@ -461,6 +480,8 @@ class Server:
                 save_path=self._save_path,
                 info_set_lut=self._info_set_lut,
                 error_event=self._error_event,
+                bias=self._bias,
+                bias_magnitude=self._bias_magnitude,
             )
             workers.append(worker)
         for worker in workers:
