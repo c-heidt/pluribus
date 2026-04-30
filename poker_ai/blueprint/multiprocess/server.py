@@ -39,6 +39,7 @@ from typing import Dict, Optional, Union
 
 from poker_ai.tables.checkpoint import CheckpointManager
 from poker_ai.tables.cfr_tables import CFRTables
+from poker_ai.tables.chunk_store import CHUNK_SIZE as _CHUNK_SIZE
 from poker_ai.blueprint.multiprocess.worker import Worker
 from poker_ai.blueprint.training import (
     DiscountState,
@@ -91,8 +92,9 @@ class Server:
         sync_interval: int = 10,
         discount_interval: int = 1,
         checkpoint_interval: int = 1,
-        start_timestep: int = 1,
+        start_timestep: int = 0,
         n_processes: Optional[int] = None,
+        batch_size: Optional[int] = None,
     ):
         """Initialise the server and spawn the worker pool.
 
@@ -129,21 +131,35 @@ class Server:
             Use the legacy pickle-directory LUT layout.  Defaults to
             ``False``.
         sync_interval : int, optional
-            Number of iterations between sync barriers.  The base
-            unit for every other cycle-based parameter.
+            Number of traversals-per-player between sync barriers.  The
+            base unit for every other cycle-based parameter.  Counts
+            traversals (not loop ticks) so the same config produces
+            equivalent training regardless of how many worker
+            processes the hardware supports.
         discount_interval : int, optional
             Period (in sync cycles) between LCFR discount applications.
         checkpoint_interval : int, optional
             Period (in sync cycles) between checkpoint writes.
         start_timestep : int, optional
-            Initial iteration counter.  Overridden on resume by the
-            checkpoint manager.
+            Initial traversals-per-player counter (``0`` on fresh
+            runs).  Overridden on resume by the checkpoint manager.
         n_processes : int, optional
             Number of worker processes to spawn.  Defaults to
             ``SLURM_CPUS_PER_TASK - 1`` when running under SLURM or
             ``cpu_count() - 1`` otherwise.  The number of jobs dispatched
             per player per iteration is derived as
-            ``max(1, n_processes // n_players)`` to keep the full pool busy.
+            ``max(1, n_processes // n_players)`` to keep every worker
+            busy — batching does not change this because each worker
+            processes one queue item at a time regardless of batch
+            size.  Batching instead reduces the wall-clock *rate*
+            of queue ops (each item now carries ``batch_size``
+            traversals of work).
+        batch_size : int, optional
+            Number of CFR traversals executed per ``cfr`` queue item.
+            Raising this reduces queue IPC traffic and dispatcher
+            pressure at the cost of longer per-job wall time.
+            Defaults to the ``PLURIBUS_CFR_BATCH_SIZE`` environment
+            variable if set, else ``5``.
         """
         if n_processes is None:
             slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
@@ -154,10 +170,31 @@ class Server:
                 n_processes = mp.cpu_count() - 1
                 log.info(f"Using {n_processes} processes (cpu_count={mp.cpu_count()})")
 
+        if batch_size is None:
+            batch_size = int(os.environ.get("PLURIBUS_CFR_BATCH_SIZE", 5))
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        self._batch_size = batch_size
+
+        # workers_per_player saturates the worker pool: every worker
+        # processes one queue item at a time regardless of batch_size,
+        # so the number of outstanding items needed is independent of
+        # how much work each item contains.  batch_size instead
+        # reduces the *rate* at which items flow through the queue
+        # (each item now holds ``batch_size`` traversals' worth of
+        # work) — that is the dispatcher-pressure win, not fewer
+        # outstanding items.
         self._workers_per_player = max(1, n_processes // n_players)
+        traversals_per_loop = (
+            self._workers_per_player * self._batch_size * n_players
+        )
         log.info(
+            f"batch_size={self._batch_size} "
             f"workers_per_player={self._workers_per_player} "
-            f"(n_processes={n_processes}, n_players={n_players})"
+            f"(n_processes={n_processes}, n_players={n_players}) → "
+            f"{self._workers_per_player * n_players} queue items per loop, "
+            f"{traversals_per_loop} traversals per loop, "
+            f"{self._workers_per_player * self._batch_size} per player"
         )
 
         self._strategy_interval = strategy_interval
@@ -256,7 +293,8 @@ class Server:
         self._training_start = time.monotonic()
         max_runtime_secs = self._max_runtime_hours * 3600.0
         sigterm = self._checkpoint_manager.sigterm_event
-        t = self._start_t
+        step = self._workers_per_player * self._batch_size
+        t = self._start_t  # traversals-per-player completed so far
         _last_log_time = self._training_start
         try:
             while True:
@@ -264,19 +302,21 @@ class Server:
                 if elapsed >= max_runtime_secs:
                     log.info(
                         f"Time limit reached after {elapsed / 3600:.2f}h — "
-                        f"{t - 1} iterations completed"
+                        f"{t} traversals-per-player completed"
                     )
                     break
                 if sigterm.is_set():
                     break
 
-                self._current_t = t
-
                 for i in range(self._n_players):
                     for _ in range(self._workers_per_player):
-                        self._send_job("cfr", t=t, i=i)
+                        self._send_job(
+                            "cfr", t=t, i=i, batch=self._batch_size
+                        )
+                t += step
+                self._current_t = t
 
-                if at_sync_barrier(t, self._sync_interval):
+                if at_sync_barrier(t, self._sync_interval, step=step):
                     self._join_queue()
                     if sigterm.is_set():
                         break
@@ -313,8 +353,6 @@ class Server:
                         )
                         _last_log_time = now
 
-                t += 1
-
             # Drain any jobs still in the queue, then write the final
             # checkpoint so the run can be resumed from its last iteration.
             self._join_queue()
@@ -326,7 +364,8 @@ class Server:
                     f"Training complete — {self._current_t} iters, "
                     f"{elapsed_total:.2f}h elapsed"
                 )
-            self._checkpoint_manager.checkpoint(t=self._current_t)
+            self._checkpoint_manager.checkpoint(t=self._current_t, wait=True)
+            self._checkpoint_manager.shutdown()
         except WorkerError:
             log.error("A worker encountered a fatal error — terminating all workers")
             raise
@@ -396,6 +435,7 @@ class Server:
 
     def _cleanup(self):
         """Close and unlink shared tables after the worker pool exits."""
+        self._checkpoint_manager.shutdown()
         self._tables.close()
 
     def _start_workers(self, n_processes: int):
@@ -473,6 +513,7 @@ class Server:
             checkpoint_interval=self._checkpoint_interval,
             start_timestep=self._start_t,
             n_chunks_per_street=self._tables.n_chunks_per_street(),
+            chunk_size=_CHUNK_SIZE,
         )
         return {
             k: os.path.abspath(str(v)) if isinstance(v, Path) else v

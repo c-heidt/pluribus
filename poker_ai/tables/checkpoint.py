@@ -24,21 +24,41 @@ handles three responsibilities:
 
 Checkpoint write flow
 ---------------------
+Split into two phases so workers only pay the sync-barrier cost
+and not the full disk-I/O cost on every checkpoint.
+
+*Phase 1 — inline, holds the barrier (RAM-only):*
+
 1. Broadcast a sync job to every worker and wait until all pending
-   regret deltas have been merged into the shared tables
-   (skipped for emergency checkpoints that cannot afford the wait).
-2. Create a temporary directory next to the final target and hand
-   control to :meth:`CFRTables.save_chunks
-   <poker_ai.tables.cfr_tables.CFRTables.save_chunks>`, which writes
-   every dirty chunk as an atomic ``.npy`` file.
-3. Hardlink the unchanged chunk files from the previous checkpoint
+   regret deltas have been merged into the shared tables (skipped
+   for emergency checkpoints that cannot afford the wait).
+2. Memcpy every dirty chunk into a private buffer via
+   :meth:`CFRTables.snapshot_dirty_chunks
+   <poker_ai.tables.cfr_tables.CFRTables.snapshot_dirty_chunks>` and
+   clear the dirty flags.  Any write after this point will be
+   captured by the next snapshot.
+3. Flush the per-street LMDB indexes so the on-disk index state is
+   consistent with the chunk watermarks.
+4. Build the state dict and hand the captured snapshot off to the
+   writer thread (via an internal ``queue.Queue``).
+
+*Phase 2 — background writer thread (disk-bound):*
+
+5. Create a temporary directory next to the save root and write
+   every buffered chunk as an atomic ``.npy`` file.
+6. Hardlink the unchanged chunk files from the previous checkpoint
    into the temp directory so every checkpoint remains
    self-contained with no extra I/O (same-inode hardlinks are
    near-free on every POSIX filesystem).
-4. Flush the per-street LMDB indexes and persist the server state.
-5. Atomically rename the temp directory to its final name and
+7. Persist the server state dict.
+8. Atomically rename the temp directory to its final name and
    delete the previous checkpoint (we keep exactly one generation
    on disk).
+
+Emergency checkpoints (SIGTERM mid-run) and the final
+end-of-training checkpoint drain the writer's queue and run the
+write inline so the process cannot exit before the write reaches
+disk.
 
 Shutdown window
 ---------------
@@ -49,21 +69,43 @@ When running under SLURM, submit jobs with
 
 import logging
 import os
+import queue
 import shutil
 import signal
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import joblib
+import numpy as np
 
+from poker_ai.tables.cfr_tables import CFRTables
 from utils.io import atomic_joblib_dump
 
 if TYPE_CHECKING:
     from poker_ai.blueprint.multiprocess.server import Server
 
 log = logging.getLogger("poker_ai.tables.checkpoint")
+
+
+@dataclass
+class _PendingWrite:
+    """Snapshot handed from the main thread to the background writer.
+
+    Captured inside the sync barrier so the arrays are guaranteed to
+    be a consistent view of the shared tables.  Owned entirely by the
+    writer thread once enqueued — the main thread must not mutate any
+    field after :meth:`CheckpointManager._enqueue_snapshot` returns.
+    """
+
+    t: int
+    label: str
+    buffers: List[Tuple[str, np.ndarray]]
+    state_dict: dict
+    snapshot_ms: float = 0.0
+    created_wall_time: int = field(default_factory=lambda: int(time.time()))
 
 
 def _extract_n_chunks_per_street(state_dict: dict) -> Dict[int, int]:
@@ -137,6 +179,18 @@ class CheckpointManager:
         signal.signal(signal.SIGINT, self._handle_sigterm)
         log.info("CheckpointManager: SIGTERM/SIGINT handlers registered")
 
+        # Background writer infrastructure.  One daemon thread owns
+        # all async disk I/O.  ``maxsize=1`` back-pressures the main
+        # loop if checkpoints are queued faster than they can be
+        # written — a warning is logged but we never drop a snapshot.
+        self._write_queue: "queue.Queue[Optional[_PendingWrite]]" = queue.Queue(maxsize=1)
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            name="CheckpointWriter",
+            daemon=True,
+        )
+        self._writer_thread.start()
+
         self._load_checkpoint_if_exists(self._save_path)
 
     # -----------------------------------------------------------------------
@@ -148,14 +202,21 @@ class CheckpointManager:
         """Event set by the ``SIGTERM``/``SIGINT`` handler."""
         return self._sigterm_event
 
-    def checkpoint(self, t: int, emergency: bool = False) -> None:
-        """Write a full checkpoint at iteration *t*.
+    def checkpoint(
+        self, t: int, emergency: bool = False, wait: bool = False
+    ) -> None:
+        """Capture a consistent snapshot and hand it to the background writer.
 
-        The write is performed atomically by building the checkpoint
-        in a temporary directory next to the save root and then
-        renaming it to its final name.  If any step fails the temp
-        directory is removed and the previous checkpoint is left
-        untouched.
+        Phase 1 (inline, holds the sync barrier) is fast: it flushes
+        pending worker deltas, memcpies every dirty chunk into a
+        private buffer via
+        :meth:`CFRTables.snapshot_dirty_chunks`, flushes the per-street
+        LMDB indexes so the on-disk state is consistent with the
+        snapshotted row watermarks, and builds the state dict.  Phase
+        2 (the actual disk writes — ``atomic_numpy_save`` for every
+        buffer, hardlink carry-forward, ``server_state.pkl``, atomic
+        rename, delete-previous) runs on the background writer
+        thread while workers resume training.
 
         Parameters
         ----------
@@ -166,55 +227,149 @@ class CheckpointManager:
             When ``True`` skip the worker-flush step.  Used in the
             error-handling path when the server believes at least one
             worker has crashed — waiting on such a worker would
-            deadlock the shutdown.
+            deadlock the shutdown.  Implies ``wait=True``.
+        wait : bool, optional
+            When ``True`` block until the write has actually hit disk
+            before returning.  Used for the final end-of-training
+            checkpoint so ``terminate`` cannot race the writer.
         """
         label = "emergency" if emergency else "scheduled"
         log.info(f"[t={t}] Checkpoint ({label}) starting")
-        t_start = time.monotonic()
+        snapshot_start = time.monotonic()
 
         if not emergency:
             self._server.flush_all_workers()
 
-        tmp_path = self._save_path / f"checkpoint_tmp_{int(time.time())}"
+        # Phase 1 — snapshot under the barrier.  Cheap: memcpy + LMDB sync.
+        buffers = self._server._tables.snapshot_dirty_chunks()
+        self._server._tables.flush_indexes()
+        state_dict = self._server.to_dict(t=t)
+        snapshot_ms = (time.monotonic() - snapshot_start) * 1000.0
+
+        pending = _PendingWrite(
+            t=t,
+            label=label,
+            buffers=buffers,
+            state_dict=state_dict,
+            snapshot_ms=snapshot_ms,
+        )
+
+        log.info(
+            f"[t={t}] Snapshot captured in {snapshot_ms:.0f} ms "
+            f"({len(buffers)} dirty chunks) — handing off to writer"
+        )
+
+        if emergency or wait:
+            # Drain any previously-queued write first so the previous
+            # generation is on disk before we start writing this one.
+            self._write_queue.join()
+            self._write_snapshot(pending)
+        else:
+            # put() blocks if the writer is still busy with the prior
+            # snapshot.  Log a warning when that happens so the
+            # operator knows checkpoint_interval is too tight for disk.
+            put_start = time.monotonic()
+            self._write_queue.put(pending)
+            put_wait = time.monotonic() - put_start
+            if put_wait > 1.0:
+                log.warning(
+                    f"[t={t}] Writer thread back-pressured for "
+                    f"{put_wait:.1f}s — consider raising checkpoint_interval"
+                )
+
+    def shutdown(self) -> None:
+        """Flush the background writer and stop its thread.
+
+        Called by the training server during orderly shutdown so the
+        process does not exit with an unfinished disk write.  Safe to
+        call multiple times.
+        """
+        if not self._writer_thread.is_alive():
+            return
+        self._write_queue.join()
+        self._write_queue.put(None)
+        self._writer_thread.join(timeout=30.0)
+        if self._writer_thread.is_alive():
+            log.warning("CheckpointWriter failed to stop within 30s")
+
+    # -----------------------------------------------------------------------
+    # Background writer
+    # -----------------------------------------------------------------------
+
+    def _writer_loop(self) -> None:
+        """Daemon-thread main loop: drain snapshots, write them to disk.
+
+        Exits when a ``None`` sentinel is received on the queue
+        (enqueued by :meth:`shutdown`).  Errors from an individual
+        write are logged but do not terminate the loop — the next
+        queued snapshot is still attempted.
+        """
+        while True:
+            item = self._write_queue.get()
+            try:
+                if item is None:
+                    return
+                self._write_snapshot(item)
+            except Exception:
+                log.exception(
+                    "Background checkpoint write failed — continuing"
+                )
+            finally:
+                self._write_queue.task_done()
+
+    def _write_snapshot(self, pending: _PendingWrite) -> None:
+        """Serialise a captured snapshot to disk atomically.
+
+        Runs on the background writer thread for scheduled
+        checkpoints and inline for emergency / end-of-training
+        writes.  The full on-disk layout of a checkpoint directory is
+        built inside a temp directory next to the save root and
+        atomically renamed on success; on failure the temp directory
+        is removed and the previous checkpoint is left untouched.
+        """
+        t = pending.t
+        write_start = time.monotonic()
+        tmp_path = self._save_path / f"checkpoint_tmp_{pending.created_wall_time}"
         tmp_path.mkdir(parents=True, exist_ok=True)
 
         try:
-            self._server._tables.save_chunks(tmp_path)
+            CFRTables.write_buffers(pending.buffers, tmp_path)
 
-            # Carry forward unchanged chunk files from the previous checkpoint
-            # via hardlinks (instant, no I/O — same filesystem).  This ensures
-            # every checkpoint directory is self-contained even when only
-            # dirty chunks were written above.
+            # Carry forward unchanged chunk files from the previous
+            # checkpoint via hardlinks (instant, no I/O — same
+            # filesystem).  This keeps every checkpoint directory
+            # self-contained even though only dirty chunks are written.
             if self._last_checkpoint_path and self._last_checkpoint_path.exists():
                 for old_file in self._last_checkpoint_path.glob("*.npy"):
                     new_file = tmp_path / old_file.name
                     if not new_file.exists():
                         os.link(str(old_file), str(new_file))
 
-            self._server._tables.flush_indexes()
-
-            state_dict = self._server.to_dict(t=t)
-            atomic_joblib_dump(state_dict, tmp_path / "server_state.pkl")
+            atomic_joblib_dump(pending.state_dict, tmp_path / "server_state.pkl")
 
             final_path = self._save_path / f"checkpoint_{int(time.time())}"
             tmp_path.rename(final_path)
-            tmp_path = None
-
+            tmp_path_to_cleanup = None
         except Exception:
             log.exception("Checkpoint write failed — temp dir preserved for inspection")
-            if tmp_path is not None and tmp_path.exists():
-                shutil.rmtree(tmp_path, ignore_errors=True)
+            tmp_path_to_cleanup = tmp_path
             raise
+        finally:
+            if tmp_path_to_cleanup is not None and tmp_path_to_cleanup.exists():
+                shutil.rmtree(tmp_path_to_cleanup, ignore_errors=True)
 
         if self._last_checkpoint_path and self._last_checkpoint_path.exists():
             shutil.rmtree(self._last_checkpoint_path)
             log.info(f"Deleted previous checkpoint: {self._last_checkpoint_path}")
         self._last_checkpoint_path = final_path
 
-        elapsed = time.monotonic() - t_start
+        writeback_ms = (time.monotonic() - write_start) * 1000.0
         log.info(
-            f"[t={t}] Checkpoint complete in {elapsed:.1f}s — "
-            f"Path: {final_path}"
+            f"[t={t}] Checkpoint complete — "
+            f"snapshot={pending.snapshot_ms:.0f}ms "
+            f"writeback={writeback_ms:.0f}ms "
+            f"chunks={len(pending.buffers)} "
+            f"path={final_path}"
         )
 
     # -----------------------------------------------------------------------
@@ -286,6 +441,7 @@ class CheckpointManager:
         "update_threshold",
         "prune_threshold",
         "c",
+        "chunk_size",
     )
     """Hyperparameters whose values must match between the saved state
     and the current :class:`Server` for a resume to be safe.  Changing
@@ -312,10 +468,14 @@ class CheckpointManager:
             differs from the current server's value.
         """
         def _current(key: str):
-            # discount_duration_cycles lives on Server._discount_state; the
+            # discount_duration_cycles lives on Server._discount_state;
+            # chunk_size is a module-level constant in chunk_store; the
             # rest are plain Server attributes.
             if key == "discount_duration_cycles":
                 return self._server._discount_state.duration_cycles
+            if key == "chunk_size":
+                from poker_ai.tables.chunk_store import CHUNK_SIZE
+                return CHUNK_SIZE
             return getattr(self._server, "_" + key)
 
         mismatches = []
@@ -347,7 +507,7 @@ class CheckpointManager:
 
         self._validate_config_compatibility(state_dict)
 
-        self._server._start_t = state_dict["t"] + 1
+        self._server._start_t = state_dict["t"]
         self._server._discount_state.active = state_dict.get("discount_active", True)
 
         ncs = _extract_n_chunks_per_street(state_dict)
