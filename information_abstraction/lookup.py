@@ -10,6 +10,7 @@ no sklearn / multiprocessing machinery into the environment.
 """
 import logging
 import mmap as _mmap
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -187,6 +188,38 @@ class MemmapLookup:
         public_rank = lex_rank(p_reindexed, n_remaining)
         return hole_rank * comb(n_remaining, k_public) + public_rank
 
+    def prewarm(self) -> int:
+        """Pull ``cluster_ids.dat`` into the OS page cache via a sequential read.
+
+        Random-access lookups during CFR training would otherwise
+        fault one 4 KB page at a time — devastatingly slow when the
+        backing file lives on a network filesystem.  Reading the
+        whole file once at startup amortises the I/O upfront so every
+        subsequent :meth:`__getitem__` is a RAM-speed indexing
+        operation.
+
+        Uses raw ``open()`` / ``read()`` rather than a numpy operation
+        on the memmap because numpy reductions allocate intermediate
+        buffers, which would double peak RAM for a multi-GiB file.
+
+        Returns
+        -------
+        int
+            Number of bytes read (equal to the file size).
+        """
+        n_bytes = 0
+        chunk = 1 << 26  # 64 MiB
+        with open(self._ids_path, "rb") as f:
+            while True:
+                buf = f.read(chunk)
+                if not buf:
+                    break
+                n_bytes += len(buf)
+        # Open the memmap so subsequent __getitem__ calls don't pay
+        # the first-access setup cost in a worker.
+        self._load()
+        return n_bytes
+
     def rebind(self, new_ids_path: Union[str, Path]) -> None:
         """Point this lookup at a new ``cluster_ids.dat`` path.
 
@@ -279,6 +312,7 @@ def load_info_set_lut(
             raise ValueError("pickle_dir=True requires a non-empty lut_path")
         base = Path(lut_path)
         log.info("Loading card LUT (legacy pickle-dir) from %s", base)
+        t0 = time.monotonic()
         out: InfoSetLut = {}
         for stage, file_name in _LEGACY_PICKLE_FILES.items():
             fp = base / file_name
@@ -289,6 +323,7 @@ def load_info_set_lut(
                 )
             with open(fp, "rb") as f:
                 out[stage] = joblib.load(f)
+        log.info("Card LUT loaded in %.1fs", time.monotonic() - t0)
         return out
 
     if not lut_path:
@@ -296,6 +331,53 @@ def load_info_set_lut(
 
     lut_file = Path(lut_path) / "card_info_lut.joblib"
     log.info("Loading card LUT from %s", lut_file)
+    t0 = time.monotonic()
     with open(lut_file, "rb") as f:
         with _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ) as mm:
-            return joblib.load(mm)
+            out = joblib.load(mm)
+    log.info("Card LUT loaded in %.1fs", time.monotonic() - t0)
+    return out
+
+
+def prewarm_lut(lut: InfoSetLut) -> int:
+    """Pre-warm every memmap-backed street in *lut* into the page cache.
+
+    For 52-card decks the river uses :class:`MemmapLookup`, which
+    page-faults each lookup into the kernel page cache on demand.
+    On a network filesystem that becomes a per-lookup network round
+    trip and dominates worker wall time.  Pre-warming reads the
+    whole file once upfront so every subsequent CFR lookup is
+    RAM-speed (assuming enough RAM to keep the pages resident).
+
+    Pre/flop/turn streets are plain Python dicts produced eagerly by
+    ``joblib.load`` and need no further warming — they are already
+    resident in heap memory.
+
+    Parameters
+    ----------
+    lut : InfoSetLut
+        LUT as returned by :func:`load_info_set_lut`.
+
+    Returns
+    -------
+    int
+        Total bytes paged into the OS cache across all
+        :class:`MemmapLookup` entries.  Useful for the caller to log
+        throughput.
+    """
+    total = 0
+    for stage, entry in lut.items():
+        if isinstance(entry, MemmapLookup):
+            log.info("Pre-warming %s LUT (%s)", stage, entry._ids_path)
+            t0 = time.monotonic()
+            n_bytes = entry.prewarm()
+            elapsed = time.monotonic() - t0
+            log.info(
+                "Pre-warmed %s LUT: %.2f GiB in %.1fs (%.0f MiB/s)",
+                stage,
+                n_bytes / 1024 ** 3,
+                elapsed,
+                n_bytes / max(elapsed, 1e-9) / 1024 ** 2,
+            )
+            total += n_bytes
+    return total

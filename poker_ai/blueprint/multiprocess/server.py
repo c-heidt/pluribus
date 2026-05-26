@@ -48,7 +48,7 @@ from poker_ai.blueprint.training import (
     should_discount,
     should_update_strategy,
 )
-from information_abstraction import load_info_set_lut
+from information_abstraction import load_info_set_lut, prewarm_lut
 
 log = logging.getLogger("sync.server")
 
@@ -217,8 +217,11 @@ class Server:
 
         # Load the LUT once in the parent; workers inherit the
         # deserialised object via fork copy-on-write, avoiding one
-        # load per worker.
+        # load per worker.  Memmap-backed streets (the river on
+        # 52-card decks) are eagerly pre-warmed so per-traversal
+        # lookups hit RAM instead of paging from disk.
         self._info_set_lut = load_info_set_lut(lut_path, pickle_dir)
+        prewarm_lut(self._info_set_lut)
 
         self._job_queue: mp.JoinableQueue = mp.JoinableQueue(maxsize=n_processes)
         self._logging_queue: mp.Queue = mp.Queue()

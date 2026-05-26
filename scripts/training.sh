@@ -63,6 +63,25 @@ if [ ! -d "$LUT_PATH" ]; then
   exit 1
 fi
 
+# Stage the LUT to node-local fast scratch.  Without this, every river
+# memmap lookup that misses the page cache becomes a network-FS round
+# trip (the LUT typically lives on shared /pfs storage).  Set
+# STAGE_LUT_LOCALLY=false to disable when local disk is too small.
+STAGE_LUT_LOCALLY=${STAGE_LUT_LOCALLY:-true}
+if [ "$STAGE_LUT_LOCALLY" = "true" ]; then
+  LOCAL_LUT_BASE=${LOCAL_LUT_BASE:-${SLURM_TMPDIR:-${TMPDIR:-/tmp}}}
+  LOCAL_LUT_PATH="$LOCAL_LUT_BASE/lut-${SLURM_JOB_ID:-$$}"
+  echo "Staging LUT from $LUT_PATH to $LOCAL_LUT_PATH ..."
+  mkdir -p "$LOCAL_LUT_PATH"
+  rsync_start=$(date +%s)
+  rsync -a "$LUT_PATH/" "$LOCAL_LUT_PATH/"
+  rsync_end=$(date +%s)
+  echo "LUT staged in $((rsync_end - rsync_start))s ($(du -sh "$LOCAL_LUT_PATH" | cut -f1))"
+  # Clean the local copy on exit so we don't leak disk on shared scratch.
+  trap 'rm -rf "$LOCAL_LUT_PATH"' EXIT
+  LUT_PATH="$LOCAL_LUT_PATH"
+fi
+
 echo "Starting training with:"
 echo "  - Players:                     $N_PLAYERS"
 echo "  - Max runtime (hours):         $MAX_RUNTIME_HOURS"
@@ -81,6 +100,7 @@ echo "  - Nickname:                    $NICKNAME"
 echo "  - CPUs:                        $SLURM_CPUS_PER_TASK"
 echo "  - PLURIBUS_CFR_BATCH_SIZE:     $PLURIBUS_CFR_BATCH_SIZE"
 echo "  - PLURIBUS_CHUNK_SIZE:         $PLURIBUS_CHUNK_SIZE"
+echo "  - STAGE_LUT_LOCALLY:           $STAGE_LUT_LOCALLY"
 
 # Build optional flags
 EXTRA_ARGS=()
