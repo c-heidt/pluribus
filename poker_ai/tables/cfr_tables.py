@@ -359,6 +359,25 @@ class CFRTables:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def close_envs(self) -> None:
+        """Close every per-street LMDB environment in this process.
+
+        Used by the server immediately before forking workers so the
+        child processes inherit *closed* env handles, sidestepping
+        ``MDB_BAD_RSLOT`` errors that can otherwise trip on the first
+        post-fork read transaction.  Workers will open their own
+        envs in :meth:`reopen_after_fork`; the parent reopens its
+        envs via :meth:`open_envs` immediately after spawning the
+        pool so checkpoint-time index flushes keep working.
+        """
+        for idx in self._indexes.values():
+            idx.close_env()
+
+    def open_envs(self) -> None:
+        """(Re-)open every per-street LMDB environment in this process."""
+        for idx in self._indexes.values():
+            idx.open_env()
+
     def reopen_after_fork(self) -> None:
         """Reopen every per-street LMDB index in the current process.
 

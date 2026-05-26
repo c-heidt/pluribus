@@ -278,6 +278,49 @@ class InfosetIndex:
     # Post-fork
     # ------------------------------------------------------------------
 
+    def close_env(self) -> None:
+        """Close just the LMDB environment without touching the shared counter.
+
+        Used by the server immediately before forking workers so the
+        child processes inherit *closed* env handles.  python-lmdb's
+        per-environment transaction state would otherwise survive
+        :meth:`Environment.close` in the worker and trip
+        ``mdb_txn_renew: MDB_BAD_RSLOT`` on the first read transaction
+        after fork — even with ``max_spare_txns=0`` on the new env.
+        The shared ``n_allocated_rows`` counter (a
+        :class:`multiprocessing.Value`) is left intact so workers can
+        still query the row count without an LMDB transaction.
+
+        Safe to call multiple times; subsequent calls are no-ops
+        because LMDB's own ``close`` is idempotent.
+        """
+        try:
+            self.flush()
+        except Exception:
+            log.debug("Skipping flush during close_env (env already closed)")
+        try:
+            self._env.close()
+        except Exception:
+            pass
+
+    def open_env(self) -> None:
+        """(Re-)open the LMDB environment at the current ``map_size``.
+
+        Counterpart of :meth:`close_env`.  Used by the server after
+        worker spawn to restore the parent's own env handle for
+        flushes during checkpointing.  Does not re-read the
+        ``__next_row__`` watermark — that mirror lives in a shared
+        :class:`multiprocessing.Value` and is already populated.
+        """
+        self._env = _open_lmdb(
+            str(self._path),
+            map_size=self._map_size,
+            writemap=True,
+            map_async=True,
+            max_readers=256,
+            max_spare_txns=0,
+        )
+
     def reopen_after_fork(self) -> None:
         """Reopen the LMDB environment in the current (forked) process.
 

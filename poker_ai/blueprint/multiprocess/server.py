@@ -466,9 +466,20 @@ class Server:
                 error_event=self._error_event,
             )
             workers.append(worker)
-        for worker in workers:
-            worker.start()
-            log.info(f"started worker {worker.name}")
+        # Close every LMDB env in the parent immediately before
+        # forking the workers.  python-lmdb (1.3) appears to hold
+        # transaction state that survives env.close() / reopen in the
+        # child — even with max_spare_txns=0 — and triggers
+        # ``MDB_BAD_RSLOT`` on the first read txn after fork.  Forking
+        # while the parent's envs are closed guarantees the child
+        # inherits nothing, then each side reopens its own env.
+        self._tables.close_envs()
+        try:
+            for worker in workers:
+                worker.start()
+                log.info(f"started worker {worker.name}")
+        finally:
+            self._tables.open_envs()
         return workers
 
     # ------------------------------------------------------------------
