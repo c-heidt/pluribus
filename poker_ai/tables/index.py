@@ -179,12 +179,23 @@ class InfosetIndex:
         self._path.mkdir(parents=True, exist_ok=True)
         self._debug: bool = debug or bool(os.environ.get("POKER_AI_DEBUG", False))
         resolved_map_size = map_size if map_size is not None else _MAP_SIZE
+        # max_spare_txns=0: don't cache aborted read txns in the
+        # python-lmdb spare pool.  Without this, the read transaction
+        # used by `_read_next_row` below ends up cached for inheritance
+        # by forked workers.  When a worker then calls
+        # ``env.begin()`` for the first time, python-lmdb tries to
+        # `mdb_txn_renew` the inherited txn — which references a
+        # reader-slot owned by the *parent* — and fails with
+        # ``MDB_BAD_RSLOT``.  Keeping the parent's spare pool empty
+        # avoids the issue at the source; workers also reopen with
+        # max_spare_txns=0 in :meth:`reopen_after_fork`.
         self._env: lmdb.Environment = _open_lmdb(
             str(self._path),
             map_size=resolved_map_size,
             writemap=True,
             map_async=True,
             max_readers=256,
+            max_spare_txns=0,
         )
         self._map_size: int = resolved_map_size
 
@@ -384,6 +395,7 @@ class InfosetIndex:
             writemap=True,
             map_async=True,
             max_readers=256,
+            max_spare_txns=0,
         )
 
     def _get_or_create_once(self, info_set: str) -> tuple:

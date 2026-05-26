@@ -336,6 +336,24 @@ def load_info_set_lut(
         with _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ) as mm:
             out = joblib.load(mm)
     log.info("Card LUT loaded in %.1fs", time.monotonic() - t0)
+
+    # MemmapLookup._ids_path is baked into the joblib at build time as
+    # an absolute path.  When the LUT directory is moved (e.g. rsync'd
+    # to node-local fast scratch), the deserialised lookup still points
+    # at the original location.  Rebind any MemmapLookup whose sibling
+    # cluster_ids.dat exists under the current lut_path so all reads
+    # hit the local copy.
+    lut_root = Path(lut_path)
+    for stage, entry in out.items():
+        if not isinstance(entry, MemmapLookup):
+            continue
+        candidate = lut_root / stage / "cluster_ids.dat"
+        if candidate.is_file() and Path(entry._ids_path) != candidate:
+            log.info(
+                "Rebinding %s LUT memmap: %s → %s",
+                stage, entry._ids_path, candidate,
+            )
+            entry.rebind(candidate)
     return out
 
 
