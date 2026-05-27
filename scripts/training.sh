@@ -107,6 +107,13 @@ EXTRA_ARGS=()
 [ -n "$N_PROCESSES" ]      && EXTRA_ARGS+=(--n_processes "$N_PROCESSES")
 [ "$PICKLE_DIR" = "true" ] && EXTRA_ARGS+=(--pickle_dir)
 
+# Run the trainer in the background so this shell can forward
+# slurm's grace-period SIGTERM to the python process.  When SLURM
+# signals a batch job, the signal goes to the bash wrapper — not to
+# its foreground child.  Without explicit forwarding the trainer
+# keeps running as an orphan, never sees SIGTERM, and gets
+# SIGKILL'd at the wall-clock limit with no chance to write a final
+# checkpoint.
 poker_ai train start \
   --multi_process \
   --n_players "$N_PLAYERS" \
@@ -121,4 +128,27 @@ poker_ai train start \
   --c "$C" \
   --lut_path "$LUT_PATH" \
   --nickname "$NICKNAME" \
-  "${EXTRA_ARGS[@]}"
+  "${EXTRA_ARGS[@]}" &
+TRAINER_PID=$!
+
+_forward_signal() {
+  local sig=$1
+  echo "[batch] received SIG${sig} — forwarding to trainer (pid=${TRAINER_PID})"
+  kill -"${sig}" "${TRAINER_PID}" 2>/dev/null || true
+}
+trap '_forward_signal TERM' TERM
+trap '_forward_signal INT' INT
+
+# `wait` returns when interrupted by a signal (after running the
+# trap), even if the child is still running.  Loop until the child
+# has actually exited so the EXIT trap (which cleans up the local
+# LUT copy) only fires *after* the trainer's final checkpoint
+# has finished.
+set +e
+while true; do
+  wait "${TRAINER_PID}"
+  EXIT_CODE=$?
+  kill -0 "${TRAINER_PID}" 2>/dev/null || break
+done
+set -e
+exit "${EXIT_CODE}"
