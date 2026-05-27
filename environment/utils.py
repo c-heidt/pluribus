@@ -20,6 +20,10 @@ hand evaluator, and visualisation layer.
 
 from __future__ import annotations
 
+import functools
+import itertools
+from typing import Dict, Tuple
+
 import numpy as np
 
 
@@ -335,6 +339,44 @@ def make_deck_arr(low_rank: int = 2, high_rank: int = 14) -> np.ndarray:
         [make_card(r, s) for r in range(low_rank, high_rank + 1) for s in SUITS],
         dtype=np.int32,
     )
+
+
+@functools.lru_cache(maxsize=None)
+def enumerate_combos(
+    low_card_rank: int, high_card_rank: int
+) -> Tuple[np.ndarray, Dict[Tuple[int, int], int]]:
+    """Return all 2-card hole combos for the deck spanning the given ranks.
+
+    Parameters
+    ----------
+    low_card_rank : int
+        Lowest rank in the deck, in [2, 14].
+    high_card_rank : int
+        Highest rank in the deck, in [2, 14].
+
+    Returns
+    -------
+    combo_cards : numpy.ndarray
+        Shape ``(n_combos, 2)``, dtype ``int32``.  Each row is a pair of
+        distinct card integers with ``combo_cards[i, 0] < combo_cards[i, 1]``
+        (ordered by card-int value, matching the ordering used elsewhere
+        in the env).
+    combo_index : dict[tuple[int, int], int]
+        Inverse mapping ``(c0, c1) -> i`` for every row.
+
+    Notes
+    -----
+    Cached per ``(low, high)`` rank tuple — the result depends only on
+    the deck composition, so every env sharing a deck shares the same
+    arrays.
+    """
+    deck = make_deck_arr(low_card_rank, high_card_rank)
+    pairs = list(itertools.combinations(sorted(int(c) for c in deck), 2))
+    combo_cards = np.array(pairs, dtype=np.int32)
+    combo_index: Dict[Tuple[int, int], int] = {
+        (int(c0), int(c1)): i for i, (c0, c1) in enumerate(pairs)
+    }
+    return combo_cards, combo_index
 
 
 def card_rank_int(c: int) -> int:

@@ -24,6 +24,7 @@ from environment import dynamics
 from environment.chance import Deck
 from environment.player import Player
 from environment.pot import Pot
+from environment.utils import enumerate_combos
 
 logger = logging.getLogger("environment.poker_env")
 
@@ -737,6 +738,28 @@ class PokerEnv:
     def deck_size(self) -> int:
         """Total cards in the deck (including dealt cards)."""
         return (self._high_card_rank - self._low_card_rank + 1) * 4
+
+    @property
+    def n_combos(self) -> int:
+        """Number of distinct unordered 2-card hole combos in this deck."""
+        return self.combo_cards.shape[0]
+
+    @property
+    def combo_cards(self) -> np.ndarray:
+        """All hole combos as an ``(n_combos, 2)`` int32 array.
+
+        Rows are ordered by card-int value (``c0 < c1``). Shared across
+        env instances with the same deck (cached in
+        :func:`environment.utils.enumerate_combos`).
+        """
+        cards, _ = enumerate_combos(self._low_card_rank, self._high_card_rank)
+        return cards
+
+    @property
+    def combo_index(self) -> Dict[tuple, int]:
+        """Inverse of :attr:`combo_cards`: ``(c0, c1) -> row index``."""
+        _, index = enumerate_combos(self._low_card_rank, self._high_card_rank)
+        return index
 
     @property
     def low_card_rank(self) -> int:

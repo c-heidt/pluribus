@@ -144,45 +144,108 @@ New top-level package: `poker_ai/search/`.
 
 ```
 poker_ai/search/
-├── types.py          # Shared dataclasses, Protocols, combo indexing
 ├── subgame.py        # Subgame construction from current public state
-├── ranges.py         # Per-opponent range tracking (dense 1326-combo)
+├── ranges.py         # Per-opponent range tracking (dense per-combo)
 ├── translation.py    # Off-tree size mapping + in-tree injection
 ├── leaf.py           # Depth-limit leaf continuation-value evaluation
 ├── solver.py         # Depth-limited MCCFR subgame solver
-├── policy.py         # Unified strategy interface (blueprint / biased / search)
+├── policy.py         # Policy Protocol, Range/BiasClass aliases, implementations
 └── agent.py          # Search-aware play agent
 ```
 
-### 6.0 Shared types and policy interface (`types.py`, `policy.py`)
+### 6.0 Policy interface (`policy.py`)
+
+Card-space dimensions depend on the deck the environment was built for
+(small decks are used in tests and for sub-game LUTs), so they are not
+hard-coded in the search package. The environment exposes them and the
+search package consumes whatever the live `PokerEnv` reports.
+
+**New on `PokerEnv`** (to add in [environment/poker_env.py](../environment/poker_env.py)):
 
 ```python
-N_COMBOS = 1326                                     # 52C2
-COMBO_INDEX: Dict[Tuple[int, int], int]             # (c0, c1) with c0 < c1 → [0, 1326)
-COMBO_CARDS: np.ndarray                             # shape (1326, 2), int8
+@property
+def n_combos(self) -> int:
+    """Number of distinct unordered hole-card combos: C(deck_size, 2)."""
 
-Range = np.ndarray                                  # float32, shape (1326,)
-BiasClass = Literal["none", "fold", "call", "raise"]
+@property
+def combo_cards(self) -> np.ndarray:
+    """Shape (n_combos, 2), int32 card ids; row i = (c0, c1) with c0 < c1.
+    Cached on the class — same for every instance sharing a deck size."""
 
-class Policy(Protocol):
-    """Anything the solver / leaf-EV can query for an action distribution."""
-    def strategy(self, env: PokerEnv, bias: BiasClass = "none") -> np.ndarray:
-        """Float32 vector aligned with `[a for a in env.legal_actions if a is not None]`."""
+@property
+def combo_index(self) -> Dict[Tuple[int, int], int]:
+    """Inverse of `combo_cards`: (c0, c1) → row index. Cached likewise."""
 ```
 
-Three implementations:
+The env already exposes [`deck_size`](../environment/poker_env.py#L736-L739),
+[`low_card_rank` / `high_card_rank`](../environment/poker_env.py#L741-L749),
+and [`n_players`](../environment/poker_env.py#L679-L682), which are the
+inputs `n_combos` / `combo_cards` are derived from; none of the
+combo-indexing helpers exist yet.
 
-- `BlueprintPolicy(tables: CFRTables, bias_magnitude: float = 0.0)` — reads
-  the regret row for `env.info_set` at `env.betting_round`, optionally adds
-  `b · 𝟙[a ∈ biased_class]` before regret matching; falls back to uniform
-  when the row is absent (unseen info set). Action classes are identified
-  via prefix: `"fold"`, `"call"` / `"check"`, anything starting with `"raise"`
-  or `"all_in"`.
-- `BiasedBlueprintPolicy({bias: CFRTables})` — Phase 2 only; dispatches by
-  `bias` to the matching precomputed tables, no additive bias term.
-- `SearchPolicy(in_memory_regret: Dict[str, np.ndarray], ...)` — returned by
-  the solver; same regret-matching as the blueprint policy but reads the
-  subgame-local dict.
+`poker_ai/search/policy.py` owns the policy abstraction and the
+shared aliases the rest of the search package consumes:
+
+```python
+BiasClass = Literal["none", "fold", "call", "raise"]
+
+class Policy(ABC):
+    """Base class for anything the solver / leaf-EV can query for an
+    action distribution. Subclasses implement `strategy`; shared
+    regret-matching and bias-mask construction live here so the three
+    tabular implementations (blueprint / biased-blueprint / search) do
+    not re-derive them."""
+
+    @abstractmethod
+    def strategy(self, env: PokerEnv, bias: BiasClass = "none") -> np.ndarray:
+        """Float32 vector aligned with `[a for a in env.legal_actions if a is not None]`."""
+
+    @staticmethod
+    def _bias_mask(legal_actions: List[str], bias: BiasClass) -> np.ndarray:
+        """Boolean mask over `legal_actions` selecting the biased class.
+        Action-class identification by prefix: `"fold"`, `"call"`/`"check"`,
+        anything starting with `"raise"` or `"all_in"`."""
+
+    @staticmethod
+    def _regret_match(
+        regrets: np.ndarray,
+        bias_mask: np.ndarray,
+        bias_magnitude: float,
+    ) -> np.ndarray:
+        """σ(a) ∝ max(0, R(a) + b · bias_mask). Uniform fallback when all
+        biased regrets are ≤ 0."""
+```
+
+ABC over Protocol because the three implementations share real
+behavior (regret matching + bias-mask construction + uniform fallback),
+not just a signature; the runtime enforcement also catches half-finished
+subclasses before they reach the solver. The cost is a single
+inheritance hierarchy — acceptable given the closed set of tabular
+implementations.
+
+Three implementations, only the first of which is shipped today:
+
+- `BlueprintPolicy(tables: CFRTables, bias_magnitude: float = 0.0)` —
+  **implemented** in [poker_ai/search/policy.py](../poker_ai/search/policy.py).
+  Reads the regret row for `env.info_set` at `env.betting_round`,
+  optionally adds `b · 𝟙[a ∈ biased_class]` before regret matching;
+  falls back to uniform when the row is absent (unseen info set).
+  Action classes are identified via prefix: `"fold"`, `"call"` /
+  `"check"`, anything starting with `"raise"` or `"all_in"`.
+- `BiasedBlueprintPolicy({bias: CFRTables})` — **deferred** until the
+  biased blueprint training in §4 produces the four `CFRTables`
+  artifacts.  Phase 2 only; dispatches by `bias` to the matching
+  precomputed tables, with no additive bias term.  Subclasses `Policy`
+  and reuses the same `_bias_mask` / `_regret_match_with_bias`
+  helpers; only the regret-row source differs from `BlueprintPolicy`.
+- `SearchPolicy(in_memory_regret: Dict[str, np.ndarray], ...)` —
+  **deferred** until the solver in §6.5 lands.  Returned by `solve()`;
+  same regret-matching as `BlueprintPolicy`, but reads the subgame-local
+  dict instead of a `CFRTables`.
+
+Stubbing the two deferred classes now would add code with no callers
+and no way to test against a real regret source; they slot into the
+existing ABC unchanged once their inputs exist.
 
 ### 6.1 Subgame construction (`subgame.py`)
 
@@ -223,6 +286,8 @@ root to avoid per-iteration filtering.
 ### 6.2 Opponent range tracking (`ranges.py`)
 
 ```python
+Range = np.ndarray                                  # float32, shape (env.n_combos,)
+
 class RangeTracker:
     def __init__(self, n_seats: int, my_seat: int, my_hole: Tuple[int, int]): ...
 
@@ -454,17 +519,18 @@ loop, and replaces the inline offline-lookup block with `agent.act(env)`.
 Biased blueprint training is implemented first so those long-running jobs can
 start while the rest is being built.
 
-| # | Component | File(s) | Blocks on |
-|---|---|---|---|
-| 1 | Biased blueprint training | `poker_ai/blueprint/bias.py`, `runner.py`, `cfr.py` | — |
-| 2 | Subgame construction | `poker_ai/search/subgame.py` | — |
-| 3 | Range tracking | `poker_ai/search/ranges.py` | — |
-| 4 | Action translation | `poker_ai/search/translation.py` | — |
-| 5 | Leaf-EV (Phase 1 bias) | `poker_ai/search/leaf.py` | 2, 3 |
-| 6 | Solver | `poker_ai/search/solver.py` | 2, 3, 5 |
-| 7 | Search-aware agent | `poker_ai/search/agent.py`, terminal wiring | 3, 4, 6 |
-| 8 | CLI, config, tests | existing Click runner, `test/search/` | 1–7 |
-| 9 | Phase 2 switch | `leaf.py` (swap bias source) | 1 complete |
+| # | Component | File(s) | Status | Blocks on |
+|---|---|---|---|---|
+| 0 | Combo helpers + `Policy` ABC + `BlueprintPolicy` | `environment/utils.py`, `environment/poker_env.py`, `poker_ai/search/policy.py` | **done** | — |
+| 1 | Biased blueprint training | `poker_ai/blueprint/bias.py`, `runner.py`, `cfr.py` | in progress | — |
+| 2 | Subgame construction | `poker_ai/search/subgame.py` | todo | 0 |
+| 3 | Range tracking | `poker_ai/search/ranges.py` | todo | 0 |
+| 4 | Action translation | `poker_ai/search/translation.py` | todo | — |
+| 5 | Leaf-EV (Phase 1 bias) | `poker_ai/search/leaf.py` | todo | 0, 2, 3 |
+| 6 | Solver + `SearchPolicy` | `poker_ai/search/solver.py`, `policy.py` | todo | 0, 2, 3, 5 |
+| 7 | Search-aware agent | `poker_ai/search/agent.py`, terminal wiring | todo | 3, 4, 6 |
+| 8 | CLI, config, tests | existing Click runner, `test/search/` | partial | 1–7 |
+| 9 | Phase 2 switch + `BiasedBlueprintPolicy` | `leaf.py`, `policy.py` | todo | 1 complete |
 
 Step 1 can run concurrently with 2–8 on a separate machine / process.
 
