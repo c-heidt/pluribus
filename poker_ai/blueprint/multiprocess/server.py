@@ -32,6 +32,8 @@ Process and concurrency model
 import logging
 import multiprocessing as mp
 import os
+import signal
+import sys
 import threading
 import time
 from pathlib import Path
@@ -51,6 +53,31 @@ from poker_ai.blueprint.training import (
 from information_abstraction import load_info_set_lut, prewarm_lut
 
 log = logging.getLogger("sync.server")
+
+
+def _startup_signal_handler(signum: int, frame) -> None:
+    """Exit cleanly when SIGTERM/SIGINT arrives during server startup.
+
+    Server startup includes LUT joblib deserialisation, LUT
+    pre-warming, and LMDB env opens — operations that can run for
+    minutes before :class:`CheckpointManager` is constructed and
+    overrides the signal handlers.  Without this handler the default
+    Python disposition (terminate) applies: SLURM's grace-period
+    SIGTERM lands during startup, Python dies without logging, and
+    after the grace window slurm logs the job as KILLED rather than
+    cleanly TERMINATED.
+
+    No training state has been mutated yet, so there is nothing to
+    checkpoint.  We log the signal and call :func:`sys.exit` so
+    Python unwinds normally (running ``atexit`` hooks and flushing
+    log handlers) before the process exits.
+    """
+    sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+    log.warning(
+        f"{sig_name} received during server startup — exiting cleanly "
+        "before training begins (no checkpoint needed)"
+    )
+    sys.exit(143 if signum == signal.SIGTERM else 130)
 
 
 class WorkerError(RuntimeError):
@@ -161,6 +188,22 @@ class Server:
             Defaults to the ``PLURIBUS_CFR_BATCH_SIZE`` environment
             variable if set, else ``5``.
         """
+        # Install a minimal SIGTERM/SIGINT handler immediately so a
+        # signal that arrives during the slow startup phases (LUT
+        # rsync from the LUT loader's perspective is already done,
+        # but joblib deserialise + prewarm + LMDB env open can still
+        # take minutes) causes a clean exit rather than the default
+        # process-terminate.  No training state has been mutated at
+        # this point, so there is nothing to checkpoint — we just
+        # exit promptly so slurm logs the job as terminated rather
+        # than waiting out the grace period and SIGKILL'ing us.
+        # CheckpointManager installs the full "set event, drain
+        # final checkpoint" handler later in this constructor,
+        # overriding this one.
+        signal.signal(signal.SIGTERM, _startup_signal_handler)
+        signal.signal(signal.SIGINT, _startup_signal_handler)
+        log.info("Early SIGTERM/SIGINT handler installed (startup phase)")
+
         if n_processes is None:
             slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
             if slurm_cpus is not None:
