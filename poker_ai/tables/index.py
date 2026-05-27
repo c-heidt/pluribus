@@ -444,19 +444,32 @@ class InfosetIndex:
     def _get_or_create_once(self, info_set: str) -> tuple:
         """Single-shot get-or-create, wrapped by the retry loop.
 
-        Runs the entire get-or-allocate logic inside one LMDB write
-        transaction so concurrent allocators for the same infoset
-        cannot race and create duplicate rows — LMDB blocks the
-        second writer until the first commits, at which point the
-        second sees the freshly-inserted row on ``txn.get``.
+        Uses a read-first / double-checked-write pattern: try a
+        concurrent read transaction first (LMDB allows unlimited
+        concurrent readers), and only escalate to a serialised write
+        transaction when the row is genuinely missing.  Once the
+        table has warmed up, the vast majority of calls take the
+        read path and never contend on LMDB's single-writer mutex.
+
+        The write path re-checks for the row inside the write txn
+        because another writer may have created it between our read
+        and our write — LMDB only serialises writers, so a second
+        writer must always assume the data may have changed since it
+        saw the read-side snapshot.
         """
         key = hash_info_set_bytes(info_set)
 
+        # Read path — concurrent across workers, no writer-lock contention.
+        with self._env.begin() as txn:
+            val = txn.get(key)
+        if val is not None:
+            return struct.unpack("<Q", val)[0], False
+
+        # Write path — serialised at env level; re-check inside the txn.
         with self._env.begin(write=True) as txn:
             val = txn.get(key)
             if val is not None:
-                row = struct.unpack("<Q", val)[0]
-                return row, False
+                return struct.unpack("<Q", val)[0], False
 
             # Allocate a new row.
             meta = txn.get(_NEXT_ROW_KEY)
