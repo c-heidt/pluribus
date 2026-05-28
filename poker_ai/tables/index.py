@@ -107,7 +107,13 @@ def lmdb_map_size_for_players(n_players: int) -> int:
     """
     if n_players <= 2:
         return 1 * 1024 ** 3   # 1 GiB
-    return 50 * 1024 ** 3      # 50 GiB
+    # 20 GiB comfortably fits the index at saturation: 200 buckets per
+    # street × the bounded betting-history space yields perhaps tens
+    # of millions of infosets per street; each entry costs ~50 bytes
+    # including B-tree overhead.  If the assumption ever breaks,
+    # :meth:`_reopen` doubles the map_size automatically on
+    # :class:`~lmdb.MapFullError`.
+    return 20 * 1024 ** 3      # 20 GiB
 
 
 def _open_lmdb(path: str, **kwargs):
@@ -277,6 +283,36 @@ class InfosetIndex:
     # ------------------------------------------------------------------
     # Post-fork
     # ------------------------------------------------------------------
+
+    def copy_to(self, dst_path: Union[str, Path]) -> None:
+        """Write a transactionally consistent snapshot of this index to *dst_path*.
+
+        Wraps :meth:`lmdb.Environment.copy`, which uses LMDB's MVCC
+        to produce a coherent on-disk image of the index even while
+        other readers and writers are active in the live env.  The
+        destination directory is created if missing.  After this
+        returns, *dst_path* contains a complete LMDB env that can be
+        opened by :class:`InfosetIndex` exactly like an original.
+
+        Used by :class:`~poker_ai.tables.checkpoint.CheckpointManager`
+        when the index runtime path lives on node-local fast scratch
+        and must be mirrored to a persistent shared filesystem at
+        each checkpoint.
+
+        Parameters
+        ----------
+        dst_path : str or Path
+            Target directory.  Must be on a writable filesystem and
+            must not already contain an LMDB env (LMDB refuses to
+            overwrite).
+        """
+        dst = Path(dst_path)
+        dst.mkdir(parents=True, exist_ok=True)
+        # compact=True repacks the B-tree, dropping the free-list and
+        # any unused pages; the snapshot is consequently smaller than
+        # the live env, which speeds up the subsequent rsync to
+        # network storage and keeps the on-disk checkpoint tidy.
+        self._env.copy(str(dst), compact=True)
 
     def close_env(self) -> None:
         """Close just the LMDB environment without touching the shared counter.

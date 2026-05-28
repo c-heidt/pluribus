@@ -10,7 +10,7 @@
 #SBATCH --ntasks=1
 #SBATCH --time=72:00:00
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=1000000mb
+#SBATCH --mem=250000mb
 #SBATCH --signal=SIGTERM@300
 #SBATCH --mail-type=All
 
@@ -63,24 +63,64 @@ if [ ! -d "$LUT_PATH" ]; then
   exit 1
 fi
 
+# Per-job private working directory under TMPDIR.  Cluster doc says
+# always use TMPDIR; whether TMPDIR is per-job or shared across
+# concurrent users on the same node is implementation-defined, so we
+# isolate our staged data under a job-specific subdirectory and
+# tear the whole thing down on exit.  Everything below (LUT, LMDB,
+# any future local artefacts) hangs off WORK_DIR.
+WORK_DIR="${TMPDIR:?cluster requires TMPDIR to be set (do not fall back to /tmp)}/pluribus-${SLURM_JOB_ID:-$$}"
+mkdir -p "$WORK_DIR"
+
 # Stage the LUT to node-local fast scratch.  Without this, every river
 # memmap lookup that misses the page cache becomes a network-FS round
 # trip (the LUT typically lives on shared /pfs storage).  Set
 # STAGE_LUT_LOCALLY=false to disable when local disk is too small.
 STAGE_LUT_LOCALLY=${STAGE_LUT_LOCALLY:-true}
 if [ "$STAGE_LUT_LOCALLY" = "true" ]; then
-  LOCAL_LUT_BASE=${LOCAL_LUT_BASE:-${SLURM_TMPDIR:-${TMPDIR:-/tmp}}}
-  LOCAL_LUT_PATH="$LOCAL_LUT_BASE/lut-${SLURM_JOB_ID:-$$}"
+  LOCAL_LUT_PATH="$WORK_DIR/lut"
   echo "Staging LUT from $LUT_PATH to $LOCAL_LUT_PATH ..."
   mkdir -p "$LOCAL_LUT_PATH"
   rsync_start=$(date +%s)
   rsync -a "$LUT_PATH/" "$LOCAL_LUT_PATH/"
   rsync_end=$(date +%s)
   echo "LUT staged in $((rsync_end - rsync_start))s ($(du -sh "$LOCAL_LUT_PATH" | cut -f1))"
-  # Clean the local copy on exit so we don't leak disk on shared scratch.
-  trap 'rm -rf "$LOCAL_LUT_PATH"' EXIT
   LUT_PATH="$LOCAL_LUT_PATH"
 fi
+
+# Stage the LMDB indexes to node-local fast scratch.  Every CFR
+# infoset lookup goes through ``InfosetIndex.get`` which opens an
+# LMDB read transaction; on network FS the per-txn ``fcntl`` lock
+# acquisition under 31 concurrent workers becomes a meaningful
+# fraction of wall time.  The python-side ``CheckpointManager``
+# mirrors the local LMDB back to ${NICKNAME}/lmdb_index at every
+# checkpoint using ``env.copy`` + rsync, so a crash can never lose
+# more than the most recent ``CHECKPOINT_INTERVAL`` of index data.
+STAGE_LMDB_LOCALLY=${STAGE_LMDB_LOCALLY:-true}
+if [ "$STAGE_LMDB_LOCALLY" = "true" ]; then
+  LOCAL_LMDB_PATH="$WORK_DIR/lmdb"
+  PERSISTENT_LMDB_PATH="$NICKNAME/lmdb_index"
+  mkdir -p "$LOCAL_LMDB_PATH"
+  if [ -d "$PERSISTENT_LMDB_PATH" ]; then
+    echo "Staging LMDB from $PERSISTENT_LMDB_PATH to $LOCAL_LMDB_PATH ..."
+    rsync_start=$(date +%s)
+    rsync -a "$PERSISTENT_LMDB_PATH/" "$LOCAL_LMDB_PATH/"
+    echo "LMDB staged in $(($(date +%s) - rsync_start))s ($(du -sh "$LOCAL_LMDB_PATH" 2>/dev/null | cut -f1))"
+  else
+    echo "No existing LMDB at $PERSISTENT_LMDB_PATH — starting fresh in $LOCAL_LMDB_PATH"
+  fi
+  export PLURIBUS_LMDB_LOCAL_DIR="$LOCAL_LMDB_PATH"
+fi
+
+# Cleanup: runs on any exit (clean or signalled).  Just removes the
+# job-private working directory.  No safety-net rsync to persistent
+# storage — the python ``CheckpointManager`` mirrors the LMDB at
+# every checkpoint while the run is alive, so the persistent state
+# after any crash is exactly the most recent successful checkpoint
+# (chunks + LMDB together).  Anything since that checkpoint is at
+# most ``CHECKPOINT_INTERVAL`` of training and is preferable to lose
+# rather than risk a divergence between persistent LMDB and chunks.
+trap 'rm -rf "$WORK_DIR"' EXIT
 
 echo "Starting training with:"
 echo "  - Players:                     $N_PLAYERS"
@@ -101,6 +141,8 @@ echo "  - CPUs:                        $SLURM_CPUS_PER_TASK"
 echo "  - PLURIBUS_CFR_BATCH_SIZE:     $PLURIBUS_CFR_BATCH_SIZE"
 echo "  - PLURIBUS_CHUNK_SIZE:         $PLURIBUS_CHUNK_SIZE"
 echo "  - STAGE_LUT_LOCALLY:           $STAGE_LUT_LOCALLY"
+echo "  - STAGE_LMDB_LOCALLY:          $STAGE_LMDB_LOCALLY"
+echo "  - PLURIBUS_LMDB_LOCAL_DIR:     ${PLURIBUS_LMDB_LOCAL_DIR:-(unset)}"
 
 # Build optional flags
 EXTRA_ARGS=()

@@ -283,8 +283,30 @@ class Server:
         log.info(
             f"LMDB map_size={lmdb_map_size // 1024**3} GiB for {n_players} players"
         )
+
+        # Optional node-local LMDB staging.  When PLURIBUS_LMDB_LOCAL_DIR
+        # is set the runtime LMDB lives on fast scratch (avoids per-
+        # lookup NFS lock-table latency), and CheckpointManager
+        # mirrors it back to ``save_path/lmdb_index`` at every
+        # checkpoint so the persistent copy stays current and the
+        # job can resume from /pfs if the local scratch is lost.
+        lmdb_persistent_dir = self._save_path / "lmdb_index"
+        lmdb_local_env = os.environ.get("PLURIBUS_LMDB_LOCAL_DIR")
+        if lmdb_local_env:
+            lmdb_runtime_dir = Path(lmdb_local_env)
+            lmdb_runtime_dir.mkdir(parents=True, exist_ok=True)
+            log.info(
+                f"LMDB runtime dir: {lmdb_runtime_dir} (local staging); "
+                f"persistent mirror: {lmdb_persistent_dir}"
+            )
+        else:
+            lmdb_runtime_dir = lmdb_persistent_dir
+            log.info(f"LMDB runtime dir: {lmdb_runtime_dir} (no local staging)")
+        self._lmdb_runtime_dir = lmdb_runtime_dir
+        self._lmdb_persistent_dir = lmdb_persistent_dir
+
         self._tables = CFRTables(
-            index_path=self._save_path / "lmdb_index",
+            index_path=lmdb_runtime_dir,
             shm_dir=shm_dir,
             lmdb_map_size=lmdb_map_size,
             actions_per_street=MAX_ACTIONS_PER_STREET,
@@ -296,7 +318,12 @@ class Server:
         # CheckpointManager registers signal handlers and restores
         # from an existing checkpoint before any worker is spawned so
         # workers observe the restored state.
-        self._checkpoint_manager = CheckpointManager(self, self._save_path)
+        self._checkpoint_manager = CheckpointManager(
+            self,
+            self._save_path,
+            lmdb_runtime_dir=lmdb_runtime_dir,
+            lmdb_persistent_dir=lmdb_persistent_dir,
+        )
         if os.environ.get("TESTING_SUITE"):
             n_processes = 4
         self._workers = self._start_workers(n_processes)
