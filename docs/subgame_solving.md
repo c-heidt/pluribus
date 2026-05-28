@@ -267,50 +267,47 @@ Two pieces are added instead:
 #### Env extensions ([environment/poker_env.py](../environment/poker_env.py))
 
 ```python
-@property
-def public_key(self) -> Tuple[str, Tuple[str, ...]]:
-    """Identifier for the current public game-tree node.
+def inject_action(self, action: str) -> None:
+    """Add `action` to the legal set at the env's current public state.
 
-    Pure function of state visible to every seat: the betting stage
-    and the action history within it.  Used as the lookup key for
-    off-tree action injection (§6.3) so the augmentation is
-    actor-independent, unlike `info_set` which embeds the actor's
-    card cluster.
-    """
-    return (self._betting_stage, tuple(self._history[self._betting_stage]))
-
-extra_legal_actions: Dict[PublicKey, FrozenSet[str]]
-"""Overlay of injected actions, keyed by public_key.  Default `{}`.
-
-Treated like `card_info_lut`: shared by reference in `__deepcopy__`
-(callers mutate via :meth:`inject_action`, which copies-on-write).
-Only `poker_ai/search/translation.py` writes to it; everything else
-just observes the result through `legal_actions`."""
-
-def inject_action(self, public_key: PublicKey, action: str) -> None:
-    """Add `action` to `extra_legal_actions[public_key]`, idempotent."""
+    Idempotent.  The injection persists across deepcopies (the overlay
+    dict is shared by reference and mutated in place), so a search
+    rooted at any descendant env sees the augmented game tree at the
+    matching public state."""
 
 def reset_overlay(self) -> None:
-    """Clear `extra_legal_actions`.  Called by `SearchAgent.on_hand_start`
-    so injections from a previous hand don't leak into this hand's
-    tree at a matching `public_key`."""
+    """Clear all injections.  Called by `SearchAgent.on_hand_start`
+    so off-tree actions recorded during one hand don't leak into
+    the next hand's tree."""
+
+@property
+def has_overlay_at_current_node(self) -> bool:
+    """True iff at least one injected action exists at this public state."""
 
 def with_hole_cards(self, seat: int, cards: Tuple[int, int]) -> PokerEnv:
     """Return a deepcopy with `seat`'s hole cards replaced.
 
     Used by opponent-response modelling (`RangeTracker`'s
     `sigma_for_combo` closure, §6.2) to evaluate "what would seat
-    have done with hand X?" without reaching into player internals."""
+    have done with hand X?" without reaching into player internals.
+    Does NOT call `inject_action`."""
 ```
 
-`legal_actions` is extended to union `extra_legal_actions.get(self.public_key, ())`
-with the canonical set, deduping. `apply_action` already accepts arbitrary
-`"raise:<fraction>"` strings — no other change required.
+`legal_actions` is extended to union the overlay for the current
+public state with the canonical set, deduping. `apply_action` already
+accepts arbitrary `"raise:<fraction>"` strings — no other change required.
 
-This makes off-tree injection a property of the *state*, fixing the
-correctness bug in the original design where the overlay was keyed by
-`env.info_set` (which differs per actor, so opponent traversals in the
-solver wouldn't see the injection).
+**Why "public state", not info_set, as the internal overlay key.**
+The overlay describes the *game tree* (a property of public nodes),
+not strategy at an information set. Two seats arriving at the same
+public node — same `(betting_stage, history)` — have different
+`info_set` values because `info_set` embeds the actor's card cluster.
+The solver's opponent traversal and the range tracker's Bayes update
+both need to see the injection regardless of which seat is "viewing"
+the node, so the overlay must be keyed by what they share (public
+history), not what differs (card cluster). This is an *internal*
+implementation detail — callers never see the key; they call
+`env.inject_action(s)` and `env.legal_actions` does the right thing.
 
 #### `SubgameContext` ([poker_ai/search/context.py](../poker_ai/search/context.py))
 
@@ -469,9 +466,10 @@ def abstract_to_chips(env: PokerEnv, action: str) -> int:
 - Tolerance is relative pot-fraction distance: `|f_obs − f_near| / f_near`.
   Default `0.15`; CLI flag `--off-tree-tol`.
 - Fold / call / all-in are always on-tree — only raise sizes can deviate.
-- `OFF_TREE` injection calls `env_before.inject_action(env_before.public_key,
-  action_str)` (§6.1). The env's own `legal_actions` then reports the
-  injected action at every visit to that public node, regardless of which
+- `OFF_TREE` injection calls `env_before.inject_action(action_str)`
+  (§6.1). The env records the injection against its own current public
+  state internally; `env.legal_actions` then reports the injected
+  action at every visit to that public state, regardless of which
   seat is acting. Solver, leaf, and tree-walk code see it transparently
   through `env.legal_actions` and need no special-case branch.
 
@@ -660,21 +658,18 @@ Per-hand state held on the agent:
   `env.players[my_seat].cards` on demand — env owns player state)
 - `last_search: Optional[SearchResult]` — warm-start source for re-search
 
-Off-tree action overlays live on the env itself
-(`env.extra_legal_actions`, §6.1), not on the agent. The runtime env
-and any deepcopy made for search both observe the same overlay through
-`env.legal_actions`.
+Off-tree action overlays live on the env itself (§6.1), not on the
+agent. The runtime env and any deepcopy made for search both observe
+the same injections through `env.legal_actions`.
 
-**Overlay lifecycle.** `on_hand_start` calls `env.reset_overlay()`
-(a thin `env.extra_legal_actions = {}` helper) so injections from
-previous hands don't leak into this hand's tree at matching
-`public_key`s.
+**Overlay lifecycle.** `on_hand_start` calls `env.reset_overlay()` so
+injections from previous hands don't leak into this hand's tree.
 
 `act` decision flow:
 
 1. If `env.betting_round == 0` **and** `self.last_search is None` **and**
-   `env.public_key not in env.extra_legal_actions` → return the
-   blueprint-sampled action directly via `tree_utils.sample_action` on
+   `not env.has_overlay_at_current_node` → return the blueprint-sampled
+   action directly via `tree_utils.sample_action` on
    `self.blueprint_policy`.
 2. Else build the context and solve:
    ```python
@@ -696,9 +691,10 @@ previous hands don't leak into this hand's tree at matching
 
 1. `classification, action_str = classify_observed(env_before, chips,
    off_tree_tol)`.
-2. If `OFF_TREE`: `env_before.inject_action(env_before.public_key,
-   action_str)`. The mutation propagates to every future deepcopy of
-   the env (overlay is carried by reference and copy-on-write).
+2. If `OFF_TREE`: `env_before.inject_action(action_str)`. The overlay
+   dict is shared by reference across the deepcopy lineage and mutated
+   in place, so the injection is visible to the runtime env and to
+   every future search-time deepcopy at the matching public state.
 3. Pick the policy used to model that seat's decision: the cached
    `last_search.policy` if search ran at least once this hand, else
    `self.opponent_response_policy`.
@@ -719,7 +715,7 @@ start while the rest is being built.
 |---|---|---|---|---|
 | 0 | Combo helpers + `Policy` ABC + `BlueprintPolicy` | `environment/utils.py`, `environment/poker_env.py`, `poker_ai/search/policy.py` | **done** | — |
 | 1 | Biased blueprint training | `poker_ai/blueprint/bias.py`, `runner.py`, `cfr.py` | in progress | — |
-| 2 | Env: `public_key`, `extra_legal_actions` overlay, `inject_action`, `reset_overlay`, `with_hole_cards` + `SubgameContext` | `environment/poker_env.py`, `poker_ai/search/context.py` | todo | 0 |
+| 2 | Env overlay (`inject_action`, `reset_overlay`, `has_overlay_at_current_node`) + `with_hole_cards` + `SubgameContext` | `environment/poker_env.py`, `poker_ai/search/context.py` | **done** | 0 |
 | 3 | Range tracking | `poker_ai/search/ranges.py` | todo | 0 |
 | 4 | Action translation | `poker_ai/search/translation.py` | todo | — |
 | 5 | Leaf-EV (Phase 1 bias) | `poker_ai/search/leaf.py` | todo | 0, 2, 3 |
@@ -766,12 +762,14 @@ poker_ai play \
     off-tree actions into the subgame tree when the deviation exceeds the
     tolerance; round-trip chip → abstract → chip preservation where the
     input is already in-abstraction.
-  - `environment/poker_env.py` (additions): `public_key` is identical
-    across actors at the same node; `inject_action` is idempotent and
-    survives `deepcopy`; `legal_actions` reports injected actions at
-    the matching public_key and only there; `reset_overlay` clears all
-    injections; `with_hole_cards` returns a deepcopy with the named
-    seat's cards replaced and leaves the original untouched.
+  - `environment/poker_env.py` (additions): `inject_action` is
+    idempotent and persists across deepcopies; `legal_actions`
+    reports injected actions at the matching public state and nowhere
+    else (verified by stepping the env past the injection point);
+    `has_overlay_at_current_node` flips correctly across
+    inject/reset; `reset_overlay` clears all injections;
+    `with_hole_cards` returns a deepcopy with the named seat's cards
+    replaced and leaves the original untouched.
   - `context.py`: `SubgameContext.from_runtime` produces
     `board_compatible` matching `env.community_cards`; `street_at_root`
     equals `env.betting_round`; opponent_ranges contains only live
@@ -788,8 +786,8 @@ poker_ai play \
   - `agent.py`: no `Optional` branch on biased-vs-not (DI test:
     construct the agent with both Phase 1 and Phase 2 `leaf_policies`
     dicts and verify identical control flow); `on_hand_start` calls
-    `env.reset_overlay`; round-1 fast path skipped when the current
-    public_key has an injected action.
+    `env.reset_overlay`; round-1 fast path skipped when
+    `env.has_overlay_at_current_node` is True.
 - **Biased training regression**: with `b = 0` the biased training path is
   numerically identical to the base path; with large `b`, on a small toy
   game, the biased action class dominates.

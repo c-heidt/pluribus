@@ -16,7 +16,7 @@ import copy
 import json
 import logging
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 import numpy as np
 
@@ -237,6 +237,14 @@ class PokerEnv:
         # for tests that don't need cluster-id lookups.
         self.card_info_lut: dict = {}
 
+        # Off-tree action injections (private — callers use inject_action /
+        # reset_overlay / legal_actions). Keyed by public state
+        # (betting_stage, history-tuple) so the overlay is the same for
+        # every actor that reaches a given public node.
+        self._extra_legal_actions: Dict[
+            Tuple[str, Tuple[str, ...]], FrozenSet[str]
+        ] = {}
+
         # Live game state (deep-copied in apply_action)
         self.players: List[Player] = players
         self.pot: Pot = Pot(n_players)
@@ -309,11 +317,14 @@ class PokerEnv:
         """
         new = self.__class__.__new__(self.__class__)
         memo[id(self)] = new
-        # Immutable config — share references, no copy needed
+        # Immutable config + shared overlay — share references, no copy needed.
+        # `_extra_legal_actions` is mutated in place by inject_action, so
+        # every env in a deepcopy lineage sees the same augmented game tree.
         for attr in (
             "small_blind", "big_blind", "_low_card_rank", "_high_card_rank",
             "_initial_n_chips",
             "_betting_stage_to_round", "_player_i_lut",
+            "_extra_legal_actions",
         ):
             object.__setattr__(new, attr, getattr(self, attr))
         # Mutable game state — deep copy
@@ -595,12 +606,98 @@ class PokerEnv:
         return raise_actions
 
     # ------------------------------------------------------------------
+    # Off-tree action overlay
+    # ------------------------------------------------------------------
+
+    def _current_public_state(self) -> Tuple[str, Tuple[str, ...]]:
+        """Identifier for the current public game-tree node.
+
+        Pure function of state visible to every seat: the betting
+        stage and the action history within it.  Used as the overlay
+        lookup key so injected actions are visible to every actor
+        that reaches the same public node, not just the seat that
+        was acting when the injection was recorded.
+        """
+        return (self._betting_stage, tuple(self._history[self._betting_stage]))
+
+    def inject_action(self, action: str) -> None:
+        """Inject `action` into the legal set at the current public state.
+
+        Idempotent.  The injection is recorded in a dict shared by every
+        env in this deepcopy lineage, so subgame searches rooted at any
+        descendant env see the augmented game tree at the matching
+        public state.
+
+        Parameters
+        ----------
+        action : str
+            Action string accepted by :meth:`apply_action`, e.g.
+            ``"raise:0.42"``.  Typically used by the search package's
+            translation module when an opponent's bet falls outside
+            the action abstraction.
+        """
+        key = self._current_public_state()
+        existing = self._extra_legal_actions.get(key, frozenset())
+        if action not in existing:
+            self._extra_legal_actions[key] = existing | {action}
+
+    def reset_overlay(self) -> None:
+        """Clear all injected actions across every public state.
+
+        Called at the start of every new hand so off-tree actions
+        recorded during one hand do not leak into the next hand's
+        tree at matching public states.
+        """
+        self._extra_legal_actions.clear()
+
+    @property
+    def has_overlay_at_current_node(self) -> bool:
+        """True iff at least one injected action exists at this public state."""
+        return bool(self._extra_legal_actions.get(self._current_public_state()))
+
+    def with_hole_cards(
+        self, seat: int, cards: Tuple[int, int]
+    ) -> "PokerEnv":
+        """Return a deepcopy with ``seat``'s hole cards replaced.
+
+        Used by opponent-response modelling (the range tracker's
+        per-combo strategy query) to evaluate "what would seat have
+        done with hand X?" without reaching into player internals.
+
+        The returned env shares ``card_info_lut`` and the off-tree
+        overlay with the original by reference; only the named seat's
+        hole cards differ.  Does NOT call :meth:`inject_action`.
+
+        Parameters
+        ----------
+        seat : int
+            Index into ``self.players`` whose hole cards will be replaced.
+        cards : tuple[int, int]
+            Two card integers (see :mod:`environment.utils`).
+
+        Returns
+        -------
+        PokerEnv
+            Independent copy of the env with the named seat's cards
+            replaced.
+        """
+        new = copy.deepcopy(self)
+        new.card_info_lut = self.card_info_lut
+        new.players[seat]._cards = tuple(cards)
+        return new
+
+    # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
 
     @property
     def legal_actions(self) -> List[Optional[str]]:
-        """Legal actions for the current player."""
+        """Legal actions for the current player.
+
+        Includes any actions injected at the current public state via
+        :meth:`inject_action` (off-tree size handling for subgame search).
+        Injected actions are appended after the canonical set, deduped.
+        """
         if not self.current_player.is_active:
             return [None]
         biggest_bet = max(p.n_bet_chips for p in self.players)
@@ -614,6 +711,10 @@ class PokerEnv:
             actions.append("call")
             if self._n_raises < MAX_RAISES_PER_ROUND:
                 actions += self._get_available_raise_sizes()
+        overlay = self._extra_legal_actions.get(self._current_public_state())
+        if overlay:
+            seen = {a for a in actions if a is not None}
+            actions += [a for a in overlay if a not in seen]
         return actions
 
     @property
