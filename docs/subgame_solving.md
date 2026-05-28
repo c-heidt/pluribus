@@ -144,12 +144,12 @@ New top-level package: `poker_ai/search/`.
 
 ```
 poker_ai/search/
-├── subgame.py        # Subgame construction from current public state
+├── context.py        # SubgameContext: per-search inputs static for one solve()
 ├── ranges.py         # Per-opponent range tracking (dense per-combo)
-├── translation.py    # Off-tree size mapping + in-tree injection
+├── translation.py    # Off-tree size mapping + injection into env overlay
 ├── leaf.py           # Depth-limit leaf continuation-value evaluation
 ├── solver.py         # Depth-limited MCCFR subgame solver
-├── policy.py         # Policy Protocol, Range/BiasClass aliases, implementations
+├── policy.py         # Policy ABC, BiasClass, implementations
 └── agent.py          # Search-aware play agent
 ```
 
@@ -247,41 +247,131 @@ Stubbing the two deferred classes now would add code with no callers
 and no way to test against a real regret source; they slot into the
 existing ABC unchanged once their inputs exist.
 
-### 6.1 Subgame construction (`subgame.py`)
+### 6.1 Subgame state and context (`context.py`, env additions)
+
+A subgame is **not** a new object type — it is a deepcopied `PokerEnv`
+at the bot's decision point. The env already owns game dynamics, the
+action abstraction, history, and the LUT, and `apply_action` already
+returns a new env via internal deepcopy. Wrapping it in a `SubgameRoot`
+peer object would force every downstream module (solver, leaf, range
+tracker) to know about the wrapper.
+
+Two pieces are added instead:
+
+1. **Two small env extensions** that move off-tree action injection
+   into the only object that knows the public game tree.
+2. **A frozen `SubgameContext` dataclass** that carries the
+   *static-for-one-search* inputs the solver needs (ranges, my_seat,
+   etc.). This replaces the rejected `SubgameRoot`.
+
+#### Env extensions ([environment/poker_env.py](../environment/poker_env.py))
 
 ```python
-@dataclass
-class SubgameRoot:
-    env: PokerEnv                           # deepcopy of runtime env at decision point
-    ranges: Dict[int, Range]                # per seat; bot's own range = δ on real hole
-    street_at_root: int                     # 0..3 — halt when env.betting_round > this
-    extra_actions: Dict[str, List[str]]     # info_set → off-tree actions injected (§6.3)
+@property
+def public_key(self) -> Tuple[str, Tuple[str, ...]]:
+    """Identifier for the current public game-tree node.
 
-def build_subgame(
-    runtime_env: PokerEnv,
-    ranges: Dict[int, Range],
-    extra_actions: Optional[Dict[str, List[str]]] = None,
-) -> SubgameRoot: ...
+    Pure function of state visible to every seat: the betting stage
+    and the action history within it.  Used as the lookup key for
+    off-tree action injection (§6.3) so the augmentation is
+    actor-independent, unlike `info_set` which embeds the actor's
+    card cluster.
+    """
+    return (self._betting_stage, tuple(self._history[self._betting_stage]))
 
-def legal_actions_at(root: SubgameRoot, env: PokerEnv) -> List[str]:
-    """env.legal_actions (filtered, None removed) + extra_actions.get(env.info_set, [])."""
+extra_legal_actions: Dict[PublicKey, FrozenSet[str]]
+"""Overlay of injected actions, keyed by public_key.  Default `{}`.
+
+Treated like `card_info_lut`: shared by reference in `__deepcopy__`
+(callers mutate via :meth:`inject_action`, which copies-on-write).
+Only `poker_ai/search/translation.py` writes to it; everything else
+just observes the result through `legal_actions`."""
+
+def inject_action(self, public_key: PublicKey, action: str) -> None:
+    """Add `action` to `extra_legal_actions[public_key]`, idempotent."""
+
+def reset_overlay(self) -> None:
+    """Clear `extra_legal_actions`.  Called by `SearchAgent.on_hand_start`
+    so injections from a previous hand don't leak into this hand's
+    tree at a matching `public_key`."""
+
+def with_hole_cards(self, seat: int, cards: Tuple[int, int]) -> PokerEnv:
+    """Return a deepcopy with `seat`'s hole cards replaced.
+
+    Used by opponent-response modelling (`RangeTracker`'s
+    `sigma_for_combo` closure, §6.2) to evaluate "what would seat
+    have done with hand X?" without reaching into player internals."""
 ```
 
-Traversal uses `copy.deepcopy(env).apply_action(a)` so dynamics remain
-identical to blueprint training. The depth limit is checked by comparing
-`env.betting_round` to `street_at_root` after each `apply_action`; crossing
-the boundary hands control to `leaf.leaf_value` (§6.4) instead of recursing.
+`legal_actions` is extended to union `extra_legal_actions.get(self.public_key, ())`
+with the canonical set, deduping. `apply_action` already accepts arbitrary
+`"raise:<fraction>"` strings — no other change required.
 
-At the root, for each opponent seat the solver will sample hole cards from
-that seat's range, restricted to combos compatible with the current board
-(`COMBO_CARDS[i]` shares no element with `env.community_cards`) and
-non-conflicting across seats. Precompute the board-conflict mask once per
-root to avoid per-iteration filtering.
+This makes off-tree injection a property of the *state*, fixing the
+correctness bug in the original design where the overlay was keyed by
+`env.info_set` (which differs per actor, so opponent traversals in the
+solver wouldn't see the injection).
 
-**Invariants** (asserted in tests): `subgame.env.pot_size`,
-`subgame.env.stacks`, internal history/action log, and
-`subgame.env.current_player` match the runtime values. Every leaf satisfies
-`is_terminal or betting_round > street_at_root`.
+#### `SubgameContext` ([poker_ai/search/context.py](../poker_ai/search/context.py))
+
+```python
+@dataclass(frozen=True)
+class SubgameContext:
+    """Inputs to one `solve()` call that do not change during the CFR walk.
+
+    Lives for the duration of one search; carries everything that
+    would otherwise be threaded through 4 arguments deep.
+    """
+    my_seat: int
+    my_hole: Tuple[int, int]
+    opponent_ranges: Dict[int, Range]     # only seats still in the hand
+    board_compatible: np.ndarray          # shape (env.n_combos,), bool
+    street_at_root: int                   # 0..3 — halt when env.betting_round > this
+    leaf: "LeafConfig"
+    rng: np.random.Generator
+
+    @classmethod
+    def from_runtime(
+        cls,
+        env: PokerEnv,
+        my_seat: int,
+        my_hole: Tuple[int, int],
+        opponent_ranges: Dict[int, Range],
+        leaf: "LeafConfig",
+        rng: np.random.Generator,
+    ) -> "SubgameContext":
+        """Construct a context for a search rooted at `env`.
+
+        Derives `board_compatible` from the env's combo table and the
+        current community cards.  Sets `street_at_root` to
+        `env.betting_round`.  Does not deepcopy the env — the solver's
+        caller (typically `SearchAgent`) is responsible for that.
+        """
+```
+
+The construction logic lives next to the dataclass (rather than on
+`RangeTracker` or inline in `SearchAgent.act`) because most of the
+context's fields come from neither: the board-compatible mask is a pure
+function of the env, my_seat/my_hole come from per-hand state, only
+`opponent_ranges` is a tracker snapshot. A classmethod keeps the dataclass
+and its sole non-trivial constructor in one importable place.
+
+Solver and leaf signatures become `solve(root_env, ctx, cfg)` and
+`leaf_value(env, ctx)`. The "root" is just the env passed in; there is
+no `SubgameRoot`, no `build_subgame`, no `legal_actions_at`.
+
+#### Traversal
+
+Inside the solver, each step is plain `env = env.apply_action(a)` —
+the env's `apply_action` already deepcopies, so wrapping it in an
+extra `copy.deepcopy` would copy twice. The depth limit is the same
+condition as before: stop and call `leaf.leaf_value(env, ctx)` when
+`env.betting_round > ctx.street_at_root`.
+
+**Invariants** (asserted in tests): after `root_env = copy.deepcopy(runtime_env)`,
+`root_env.pot_size`, player chip stacks, the per-stage history, and
+`root_env.current_player` match the runtime values. Every leaf
+satisfies `is_terminal or betting_round > street_at_root`.
 
 ### 6.2 Opponent range tracking (`ranges.py`)
 
@@ -299,30 +389,59 @@ class RangeTracker:
         seat: int,
         env_before: PokerEnv,
         action: str,
-        policy_used: Policy,
+        sigma_for_combo: Callable[[int], np.ndarray],
     ) -> None:
-        """w(h) ← w(h) · σ(env_before | opp hole = h, policy_used)(action); renormalize."""
+        """w(h) ← w(h) · sigma_for_combo(h)[idx_of(action)]; renormalize.
+
+        `sigma_for_combo(h)` returns the strategy vector aligned with
+        `env_before.legal_actions` for the case where seat's hole cards
+        are `COMBO_CARDS[h]`.  The caller (typically `SearchAgent`)
+        constructs this closure so ranges.py never imports policy.py.
+        """
 
     def range_of(self, seat: int) -> Range: ...
-    def snapshot(self) -> Dict[int, Range]: ...   # deep copy for the solver
+    def snapshot(self) -> Dict[int, Range]: ...   # deep copy; only live seats
+```
+
+The tracker has zero search-package imports, takes only env + a
+callable, and can be unit-tested with a hand-written `sigma_for_combo`.
+`SubgameContext.from_runtime` (§6.1) calls `snapshot()` to populate
+`opponent_ranges`; the tracker has no `build_context` method and no
+dependency on `SubgameContext` / `LeafConfig` / RNG / `Policy`.
+
+A new env helper supports the closure side cleanly:
+
+```python
+# environment/poker_env.py
+def with_hole_cards(self, seat: int, cards: Tuple[int, int]) -> PokerEnv:
+    """Return a deepcopy with `seat`'s hole cards replaced.
+
+    Used by opponent-response modelling to evaluate "what would seat
+    have done with hand X?" without reaching into player internals.
+    """
+```
+
+The agent then builds the closure:
+
+```python
+sigma_for_combo = lambda h: opponent_response_policy.strategy(
+    env_before.with_hole_cards(seat, tuple(env.combo_cards[h]))
+)
 ```
 
 Implementation notes:
 
-- `σ(h, I)(a)` for every combo `h` in seat's range: clone `env_before`,
-  patch the opponent's hole cards to `COMBO_CARDS[h]`, read `env.info_set`
-  (which includes the card-cluster from the LUT), call
-  `policy_used.strategy(env_patched)`, pick the index for `action`.
 - Vectorize over the card cluster, not over individual combos: combos that
   map to the same cluster-id on this street have identical `env.info_set`
-  and therefore identical `σ`. Group combos by cluster once per call, query
-  `σ` once per distinct cluster.
+  and therefore identical σ. Group combos by cluster once per call, query
+  σ once per distinct cluster.  This optimisation lives in the agent's
+  closure construction (where the policy is known), not in the tracker.
 - Numerical floor: if `w.sum() < 1e-12` after an update, reset to uniform
   over board-compatible combos and emit a warning (only reachable via
   zero-probability observations, e.g. off-tree bets before injection kicks
   in).
-- A per-decision log `List[Tuple[seat, info_set_before, action, policy_id]]`
-  is retained for debugging and Phase 1↔Phase 2 replay comparisons.
+- A per-decision log `List[Tuple[seat, info_set_before, action]]` is
+  retained for debugging and Phase 1↔Phase 2 replay comparisons.
 
 ### 6.3 Action translation and off-tree action injection (`translation.py`)
 
@@ -350,10 +469,11 @@ def abstract_to_chips(env: PokerEnv, action: str) -> int:
 - Tolerance is relative pot-fraction distance: `|f_obs − f_near| / f_near`.
   Default `0.15`; CLI flag `--off-tree-tol`.
 - Fold / call / all-in are always on-tree — only raise sizes can deviate.
-- `OFF_TREE` injection appends the action string to
-  `SubgameRoot.extra_actions[env_before.info_set]`. Inside the solver,
-  `legal_actions_at(root, env)` makes the injected action a first-class
-  choice with its own regret slot; all other tree machinery is unchanged.
+- `OFF_TREE` injection calls `env_before.inject_action(env_before.public_key,
+  action_str)` (§6.1). The env's own `legal_actions` then reports the
+  injected action at every visit to that public node, regardless of which
+  seat is acting. Solver, leaf, and tree-walk code see it transparently
+  through `env.legal_actions` and need no special-case branch.
 
 ### 6.4 Leaf continuation-value evaluation (`leaf.py`)
 
@@ -365,9 +485,9 @@ class LeafConfig:
     rng: np.random.Generator
 
 def leaf_value(
-    env: PokerEnv,                        # state AT the leaf (betting_round > street_at_root)
-    ranges: Dict[int, Range],             # live ranges conditioned on path taken
-    cfg: LeafConfig,
+    env: PokerEnv,                        # state AT the leaf (betting_round > ctx.street_at_root)
+    live_ranges: Dict[int, Range],        # ranges conditioned on path taken (subset of ctx.opponent_ranges)
+    ctx: SubgameContext,
 ) -> np.ndarray:                          # shape (n_seats,), expected chips won/lost
 ```
 
@@ -379,12 +499,15 @@ Algorithm per call:
    b. Sample each opponent's hole from its range (board-compatible and
       mutually non-conflicting; rejection sample or precomputed joint
       index).
-   c. Roll the hand forward: at every decision node, sample from
+   c. Roll the hand forward via `env = env.apply_action(a)` until
+      `env.is_terminal`: at every decision node, sample from
       `cfg.policies[c_i].strategy(env, bias=c_i)` via
       `tree_utils.sample_action`.
-   d. At the terminal state, compute per-seat payoff with
-      `environment.evaluator.Evaluator().evaluate(hole, board)` to determine
-      the showdown ranking when reached.
+   d. Read per-seat payoff from `env.payout` (terminal envs already
+      have winners computed by `dynamics.compute_winners`, called
+      from `apply_action`).  **Do not** re-implement payoff via
+      `Evaluator().evaluate(...)` — that duplicates env logic and
+      drops side-pot handling, which the env gets right.
 2. Return the per-seat mean across rollouts.
 
 Phase 1 vs Phase 2 differs **only** in `cfg.policies`:
@@ -399,64 +522,103 @@ output for fixed seed.
 ### 6.5 Depth-limited subgame solver (`solver.py`)
 
 ```python
-@dataclass
+@dataclass(frozen=True)
 class SolverConfig:
+    """Static hyperparameters; identical across every search in a session."""
     max_iterations: int = 10_000
     max_wall_seconds: float = 15.0
     discount_interval: int = 1_000         # Linear-CFR discount cadence
     prune_threshold: int = -300_000_000    # CFR-P pruning threshold
-    unsafe_init: bool = True               # True on first search of a hand
     leaf: LeafConfig
 
 @dataclass
 class SearchResult:
-    policy_at_root: np.ndarray             # float32, aligned with legal actions at root
-    policy_full: SearchPolicy              # queryable for range updates later in hand
+    policy: SearchPolicy                   # queryable at any node visited during the walk
     iterations_run: int
     wall_seconds: float
 
-def solve(root: SubgameRoot, cfg: SolverConfig) -> SearchResult: ...
+def solve(
+    root_env: PokerEnv,                    # deepcopied by the caller
+    ctx: SubgameContext,
+    cfg: SolverConfig,
+    warm_start: Optional[SearchPolicy] = None,
+) -> SearchResult: ...
 ```
 
-In-memory tables, keyed by the same JSON `info_set` string as blueprint
-tables:
+`warm_start` replaces the `unsafe_init: bool` config flag.  Passing
+`None` is the unsafe-init regime (first search of a hand, empty
+in-memory dicts).  Passing the previous search's
+`SearchResult.policy` is the paper's linear MCCFR re-search regime
+for the 2nd+ search in a hand — rows are copied lazily from the
+warm-start source on first miss.  This keeps `SolverConfig` purely
+static so the agent never has to `dataclasses.replace` it per call.
+
+`SearchResult` exposes one policy field; the root distribution is
+`result.policy.strategy(root_env)`.  Storing it as a separate array
+introduced an invariant the caller had to maintain by hand.
+
+In-memory tables, keyed by the JSON `info_set` string. Width is
+**per-node** because injected actions (§6.1, §6.3) extend the legal
+set at specific public keys, so canonical-width rows would either
+waste columns or omit injected slots:
 
 ```python
-subgame_regret:   Dict[str, np.ndarray]    # int32, width = len(legal_actions_at(env))
-subgame_strategy: Dict[str, np.ndarray]    # int32 visit counts
+subgame_regret:   Dict[str, np.ndarray]    # int32, width = len(env.legal_actions) at first visit
+subgame_strategy: Dict[str, np.ndarray]    # int32 visit counts, same width
 ```
 
 No lmdb / no disk. Both dicts are discarded when the returned `SearchPolicy`
 goes out of scope at end of hand.
 
-Per-iteration loop (follows the structure of
-[poker_ai/blueprint/cfr.py](../poker_ai/blueprint/cfr.py)):
+#### Reuse from the blueprint code
 
-1. Sample hole cards for all seats from `root.ranges` (board-compatible,
-   non-conflicting).
-2. External-sampling CFR walk rooted at `root.env`:
-   - Opponent node: sample one action from `get_node_strategy` on
-     `subgame_regret`.
-   - Own node: expand all actions; accumulate regrets via
-     [tree_utils.accumulate_regrets](../poker_ai/blueprint/tree_utils.py).
+- **Reuse directly**:
+  [`calculate_strategy_from_row`](../poker_ai/blueprint/tree_utils.py)
+  at every solver node — already shape-agnostic; takes a regret row +
+  valid mask of any length.
+- **Do not reuse**:
+  [`accumulate_regrets`](../poker_ai/blueprint/tree_utils.py),
+  `get_node_strategy`, and the blueprint walker itself. They assume
+  fixed canonical width via `ACTION_TO_IDX`. The subgame uses
+  variable-width rows with a per-node `a_to_i` derived from
+  `env.legal_actions` at first visit. Write a parallel walker in
+  `poker_ai/search/solver.py` that mirrors the blueprint loop's
+  *structure* rather than refactoring `blueprint/cfr.py` to be
+  generic — the two have different lifecycle and persistence semantics.
+
+Resist introducing a `RegretSource` abstraction over `CFRTables` and
+the in-memory dict; the two differ in width semantics, persistence,
+locking, and lifecycle, and a unifying type would leak details both
+ways.
+
+#### Per-iteration loop
+
+1. Sample hole cards for all seats from `ctx.opponent_ranges`
+   (board-compatible via `ctx.board_compatible`, non-conflicting
+   across seats). The bot's hole is fixed at `ctx.my_hole`.
+2. External-sampling CFR walk rooted at `root_env`. Step the env with
+   plain `env = env.apply_action(a)` (no outer `deepcopy` — env's
+   `apply_action` already deepcopies internally).
+   - Opponent node: regret-match the row via
+     `calculate_strategy_from_row`, sample one action.
+   - Own node: expand all actions; accumulate regrets into the row.
    - CFR-P pruning: skip subtrees whose regret < `prune_threshold` with
      probability 0.95 (matches the existing blueprint training schedule).
 3. Leaf handling:
-   - `is_terminal` → `Evaluator`-based payoff.
-   - Depth-limit leaf → `leaf.leaf_value(env, live_ranges, cfg.leaf)`,
-     where `live_ranges` is the solver's conditioning of the input ranges
-     on cards sampled in step 1.
+   - `is_terminal` → read `env.payout` (computed by the env's own
+     `dynamics.compute_winners`).
+   - Depth-limit leaf (`env.betting_round > ctx.street_at_root`) →
+     `leaf.leaf_value(env, live_ranges, ctx)`, where `live_ranges`
+     is the solver's conditioning of `ctx.opponent_ranges` on cards
+     sampled in step 1.
 4. Visit-count accumulation on the acting player's strategy row.
 5. Every `cfg.discount_interval` iterations, apply Linear-CFR discount to
    both subgame dicts (multiplicative factor, regret floor applied).
 6. Break when `iters >= max_iterations` or
    `time.monotonic() - t0 >= max_wall_seconds`.
 
-**Unsafe vs linear re-search.** `unsafe_init=True` starts with empty
-in-memory dicts (first search of a hand). `unsafe_init=False` warm-starts
-both dicts by copying rows from the previous search's `SearchPolicy` where
-the info-set key matches — the paper's "linear MCCFR re-search" regime for
-the 2nd+ search in a hand.
+**Unsafe vs linear re-search.** Controlled by the `warm_start`
+argument, not a config flag — see the `solve()` signature above.
 
 ### 6.6 Search-aware agent (`agent.py`)
 
@@ -464,10 +626,11 @@ the 2nd+ search in a hand.
 class SearchAgent:
     def __init__(
         self,
-        blueprint: BlueprintPolicy,
-        biased: Optional[BiasedBlueprintPolicy],  # None → Phase 1
-        card_info_lut: InfoSetLut,
+        leaf_policies: Dict[BiasClass, Policy],   # k=4 entries
+        opponent_response_policy: Policy,         # for tracker.on_action closures
+        blueprint_policy: Policy,                 # round-1 fast path (no search)
         solver_cfg: SolverConfig,
+        rng: np.random.Generator,
         off_tree_tol: float = 0.15,
     ): ...
 
@@ -478,36 +641,69 @@ class SearchAgent:
         """Returns an abstract action string accepted by PokerEnv.apply_action."""
 ```
 
+Phase 1 vs Phase 2 is pure dependency injection at construction time:
+
+- **Phase 1**: `leaf_policies = {c: BlueprintPolicy(base_tables,
+  bias_magnitude=b_c) for c in (...)}`.
+- **Phase 2**: `leaf_policies = {c: BiasedBlueprintPolicy(c, tables_c)
+  for c in (...)}`.
+
+The agent has no `Optional[BiasedBlueprintPolicy]` branch and no
+phase-awareness; the choice lives in
+[poker_ai/terminal/runner.py](../poker_ai/terminal/runner.py) where the
+`--biased-blueprints` flag is parsed.
+
 Per-hand state held on the agent:
 
 - `tracker: RangeTracker`
-- `extra_actions: Dict[str, List[str]]` — accumulated from off-tree classifications
+- `my_seat: int` (set by `on_hand_start`; `my_hole` read from
+  `env.players[my_seat].cards` on demand — env owns player state)
 - `last_search: Optional[SearchResult]` — warm-start source for re-search
-- `search_used_this_hand: bool` — controls unsafe_init / round-1 gating
+
+Off-tree action overlays live on the env itself
+(`env.extra_legal_actions`, §6.1), not on the agent. The runtime env
+and any deepcopy made for search both observe the same overlay through
+`env.legal_actions`.
+
+**Overlay lifecycle.** `on_hand_start` calls `env.reset_overlay()`
+(a thin `env.extra_legal_actions = {}` helper) so injections from
+previous hands don't leak into this hand's tree at matching
+`public_key`s.
 
 `act` decision flow:
 
-1. If `env.betting_round == 0` **and** `not search_used_this_hand` **and**
-   no `extra_actions` touch this info set → return the blueprint-sampled
-   action directly via `tree_utils.sample_action`.
-2. Else build `SubgameRoot` using `tracker.snapshot()` and `extra_actions`;
-   call `solve(root, cfg)` with `unsafe_init = not search_used_this_hand`;
-   sample the action from `policy_at_root`; store the result for re-search
-   warm-start and as `policy_used` for future range updates.
-3. Return the abstract action (chip translation happens only if the env
-   API requires an integer; current `PokerEnv.apply_action` accepts the
-   abstract string directly).
+1. If `env.betting_round == 0` **and** `self.last_search is None` **and**
+   `env.public_key not in env.extra_legal_actions` → return the
+   blueprint-sampled action directly via `tree_utils.sample_action` on
+   `self.blueprint_policy`.
+2. Else build the context and solve:
+   ```python
+   root_env = copy.deepcopy(env)
+   my_hole = tuple(root_env.players[self.my_seat].cards)
+   ctx = SubgameContext.from_runtime(
+       root_env, self.my_seat, my_hole,
+       self.tracker.snapshot(), self.solver_cfg.leaf, self.rng,
+   )
+   warm = self.last_search.policy if self.last_search is not None else None
+   result = solve(root_env, ctx, self.solver_cfg, warm_start=warm)
+   ```
+   Sample the action from `result.policy.strategy(root_env)`; store
+   `result` for re-search warm-start.
+3. Return the abstract action (`PokerEnv.apply_action` accepts the
+   string directly; no chip translation needed).
 
 `on_observed_action` flow:
 
 1. `classification, action_str = classify_observed(env_before, chips,
    off_tree_tol)`.
-2. If `OFF_TREE`: add `action_str` to
-   `extra_actions[env_before.info_set]`.
-3. Pick `policy_used`: the cached `last_search.policy_full` if search ran at
-   least once this hand, else the blueprint policy (wrapping the
-   appropriate tables).
-4. `tracker.on_action(seat, env_before, action_str, policy_used)`.
+2. If `OFF_TREE`: `env_before.inject_action(env_before.public_key,
+   action_str)`. The mutation propagates to every future deepcopy of
+   the env (overlay is carried by reference and copy-on-write).
+3. Pick the policy used to model that seat's decision: the cached
+   `last_search.policy` if search ran at least once this hand, else
+   `self.opponent_response_policy`.
+4. Build the per-combo σ closure (cluster-vectorised — see §6.2) and
+   call `tracker.on_action(seat, env_before, action_str, sigma_for_combo)`.
 
 Wiring: [poker_ai/terminal/runner.py](../poker_ai/terminal/runner.py) gets a
 new `--agent search` branch that instantiates `SearchAgent`, plumbs
@@ -523,7 +719,7 @@ start while the rest is being built.
 |---|---|---|---|---|
 | 0 | Combo helpers + `Policy` ABC + `BlueprintPolicy` | `environment/utils.py`, `environment/poker_env.py`, `poker_ai/search/policy.py` | **done** | — |
 | 1 | Biased blueprint training | `poker_ai/blueprint/bias.py`, `runner.py`, `cfr.py` | in progress | — |
-| 2 | Subgame construction | `poker_ai/search/subgame.py` | todo | 0 |
+| 2 | Env: `public_key`, `extra_legal_actions` overlay, `inject_action`, `reset_overlay`, `with_hole_cards` + `SubgameContext` | `environment/poker_env.py`, `poker_ai/search/context.py` | todo | 0 |
 | 3 | Range tracking | `poker_ai/search/ranges.py` | todo | 0 |
 | 4 | Action translation | `poker_ai/search/translation.py` | todo | — |
 | 5 | Leaf-EV (Phase 1 bias) | `poker_ai/search/leaf.py` | todo | 0, 2, 3 |
@@ -570,12 +766,30 @@ poker_ai play \
     off-tree actions into the subgame tree when the deviation exceeds the
     tolerance; round-trip chip → abstract → chip preservation where the
     input is already in-abstraction.
-  - `subgame.py`: pot / stack / history invariants after construction;
-    traversal reaches only reachable states.
-  - `leaf.py`: deterministic output under a fixed RNG seed; Phase 1 and
-    Phase 2 sources interchange behind the same interface.
+  - `environment/poker_env.py` (additions): `public_key` is identical
+    across actors at the same node; `inject_action` is idempotent and
+    survives `deepcopy`; `legal_actions` reports injected actions at
+    the matching public_key and only there; `reset_overlay` clears all
+    injections; `with_hole_cards` returns a deepcopy with the named
+    seat's cards replaced and leaves the original untouched.
+  - `context.py`: `SubgameContext.from_runtime` produces
+    `board_compatible` matching `env.community_cards`; `street_at_root`
+    equals `env.betting_round`; opponent_ranges contains only live
+    seats; field set is frozen.
+  - `ranges.py`: `on_action` Bayes-update under a hand-written
+    `sigma_for_combo` callable (no policy.py import needed in the
+    test); board-conflict zeroing; uniform fallback on numerical floor.
+  - `leaf.py`: deterministic output under a fixed RNG seed; payoff at
+    showdown matches `env.payout` (no `Evaluator()` duplication);
+    Phase 1 and Phase 2 sources interchange behind the same interface.
   - `solver.py`: terminates on either stopping criterion; per-hand tables
-    are released.
+    are released; `warm_start=None` and `warm_start=prev_policy` produce
+    consistent in-memory dicts (re-search builds on prior rows).
+  - `agent.py`: no `Optional` branch on biased-vs-not (DI test:
+    construct the agent with both Phase 1 and Phase 2 `leaf_policies`
+    dicts and verify identical control flow); `on_hand_start` calls
+    `env.reset_overlay`; round-1 fast path skipped when the current
+    public_key has an injected action.
 - **Biased training regression**: with `b = 0` the biased training path is
   numerically identical to the base path; with large `b`, on a small toy
   game, the biased action class dominates.
