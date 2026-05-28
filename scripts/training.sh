@@ -5,12 +5,12 @@
 #SBATCH --job-name=pluribus-train
 #SBATCH --output=logs/training-%j.out
 #SBATCH --error=logs/training-%j_error.out
-#SBATCH --partition=highmem
+#SBATCH --partition=cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=72:00:00
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=250000mb
+#SBATCH --mem=50000mb
 #SBATCH --signal=SIGTERM@300
 #SBATCH --mail-type=All
 
