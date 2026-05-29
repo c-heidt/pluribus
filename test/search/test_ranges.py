@@ -1,0 +1,439 @@
+"""Tests for :mod:`poker_ai.search.ranges`."""
+
+import warnings
+from collections import defaultdict
+
+import numpy as np
+import pytest
+
+from environment.player import Player
+from environment.poker_env import PokerEnv
+from poker_ai.search.ranges import (
+    RangeTracker,
+    _initial_uniform,
+    _zero_conflicting,
+)
+
+
+def _env(low: int = 10, high: int = 14, n_players: int = 2):
+    return PokerEnv(
+        players=[Player(i, 10000) for i in range(n_players)],
+        low_card_rank=low,
+        high_card_rank=high,
+    )
+
+
+def _stub_lut(env):
+    """Make ``env.info_set`` resolve for any (hole, board) combination."""
+    env.card_info_lut = defaultdict(lambda: defaultdict(lambda: 0))
+
+
+def _tracker(env=None, my_seat=0, live_seats=(0, 1), stub_lut=False):
+    if env is None:
+        env = _env()
+    if stub_lut:
+        _stub_lut(env)
+    my_hole = tuple(int(c) for c in env.players[my_seat].cards)
+    return env, RangeTracker(env, my_seat, my_hole, live_seats)
+
+
+def _env_with_seat1_acting():
+    """Pre-stub LUT, then advance the env so player 1 is on action.
+    Returned env satisfies ``env.player_i == 1``."""
+    env = _env()
+    _stub_lut(env)
+    env = env.apply_action("call")
+    assert env.player_i == 1
+    return env
+
+
+def _tracker_seat1(live_seats=(0, 1)):
+    """Tracker rooted at an env where seat 1 (the opponent) is to act."""
+    env = _env_with_seat1_acting()
+    my_hole = tuple(int(c) for c in env.players[0].cards)
+    return env, RangeTracker(env, my_seat=0, my_hole=my_hole, live_seats=live_seats)
+
+
+def _uniform_sigma(n_actions):
+    arr = np.full(n_actions, 1.0 / n_actions, dtype=np.float32)
+    return lambda _h: arr
+
+
+class TestInitialUniform:
+
+    def test_excludes_my_hole(self):
+        env, tracker = _tracker()
+        my_hole = set(int(c) for c in env.players[0].cards)
+        r = tracker.range_of(1)
+        cc = env.combo_cards
+        for i in range(env.n_combos):
+            uses_my_hole = int(cc[i, 0]) in my_hole or int(cc[i, 1]) in my_hole
+            if uses_my_hole:
+                assert r[i] == 0.0
+            else:
+                assert r[i] > 0.0
+
+    def test_sums_to_one(self):
+        _env_, tracker = _tracker()
+        np.testing.assert_allclose(tracker.range_of(1).sum(), 1.0, rtol=1e-6)
+
+    def test_excludes_community_cards(self):
+        env = _env()
+        # Pick a board and a disjoint my_hole.
+        board = (int(env.combo_cards[0, 0]), int(env.combo_cards[0, 1]))
+        env.community_cards = board
+        my_hole = None
+        for i in range(env.n_combos):
+            cand = (int(env.combo_cards[i, 0]), int(env.combo_cards[i, 1]))
+            if set(cand).isdisjoint(board):
+                my_hole = cand
+                break
+        assert my_hole is not None
+        tracker = RangeTracker(env, my_seat=0, my_hole=my_hole, live_seats=[0, 1])
+        r = tracker.range_of(1)
+        forbidden = set(env.community_cards) | set(my_hole)
+        for i in range(env.n_combos):
+            uses = int(env.combo_cards[i, 0]) in forbidden or int(
+                env.combo_cards[i, 1]
+            ) in forbidden
+            if uses:
+                assert r[i] == 0.0
+            else:
+                assert r[i] > 0.0
+
+    def test_snapshot_omits_my_seat(self):
+        _env_, tracker = _tracker(my_seat=0, live_seats=[0, 1])
+        snap = tracker.snapshot()
+        assert 0 not in snap
+        assert 1 in snap
+
+    def test_dtype_and_shape(self):
+        env, tracker = _tracker()
+        r = tracker.range_of(1)
+        assert r.dtype == np.float32
+        assert r.shape == (env.n_combos,)
+
+
+class TestOnBoardUpdate:
+
+    def test_zeros_new_cards(self):
+        env, tracker = _tracker()
+        # Pick a board of 3 cards none of which overlap my hole.
+        my_hole = set(int(c) for c in env.players[0].cards)
+        board = []
+        for i in range(env.n_combos):
+            c0, c1 = int(env.combo_cards[i, 0]), int(env.combo_cards[i, 1])
+            for c in (c0, c1):
+                if c not in my_hole and c not in board:
+                    board.append(c)
+                if len(board) == 3:
+                    break
+            if len(board) == 3:
+                break
+        tracker.on_board_update(tuple(board))
+        r = tracker.range_of(1)
+        forbidden = my_hole | set(board)
+        for i in range(env.n_combos):
+            uses = int(env.combo_cards[i, 0]) in forbidden or int(
+                env.combo_cards[i, 1]
+            ) in forbidden
+            if uses:
+                assert r[i] == 0.0
+        np.testing.assert_allclose(r.sum(), 1.0, rtol=1e-6)
+
+    def test_idempotent(self):
+        env, tracker = _tracker()
+        my_hole = set(int(c) for c in env.players[0].cards)
+        board = [
+            int(c) for c in (env.combo_cards[10, 0], env.combo_cards[10, 1])
+            if int(c) not in my_hole
+        ][:1]
+        tracker.on_board_update(tuple(board))
+        first = tracker.range_of(1).copy()
+        tracker.on_board_update(tuple(board))
+        np.testing.assert_array_equal(first, tracker.range_of(1))
+
+
+class TestOnAction:
+
+    def test_uniform_sigma_no_change(self):
+        env, tracker = _tracker_seat1()
+        legal = [a for a in env.legal_actions if a is not None]
+        sigma = _uniform_sigma(len(legal))
+        prior = tracker.range_of(1).copy()
+        tracker.on_action(1, env, legal[0], sigma)
+        np.testing.assert_allclose(tracker.range_of(1), prior, atol=1e-6)
+
+    def test_concentrates_on_consistent_combos(self):
+        env, tracker = _tracker_seat1()
+        legal = [a for a in env.legal_actions if a is not None]
+        n_act = len(legal)
+        # Group A: even combo indices that have nonzero prior weight.
+        prior = tracker.range_of(1).copy()
+        group_a = {h for h in range(env.n_combos) if h % 2 == 0 and prior[h] > 0}
+        likely = np.zeros(n_act, dtype=np.float32)
+        likely[0] = 0.9
+        likely[1:] = 0.1 / (n_act - 1)
+        unlikely = np.zeros(n_act, dtype=np.float32)
+        unlikely[0] = 0.05
+        unlikely[1:] = 0.95 / (n_act - 1)
+
+        def sigma(h):
+            return likely if h in group_a else unlikely
+
+        mass_a_before = sum(prior[h] for h in group_a)
+        tracker.on_action(1, env, legal[0], sigma)
+        post = tracker.range_of(1)
+        mass_a_after = sum(post[h] for h in group_a)
+        assert mass_a_after > mass_a_before
+        np.testing.assert_allclose(post.sum(), 1.0, rtol=1e-6)
+
+    def test_uniform_fallback_on_zero_collapse(self):
+        env, tracker = _tracker_seat1()
+        legal = [a for a in env.legal_actions if a is not None]
+        n_act = len(legal)
+        zero_for_obs = np.zeros(n_act, dtype=np.float32)
+        zero_for_obs[1] = 1.0
+        sigma = lambda _h: zero_for_obs
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            tracker.on_action(1, env, legal[0], sigma)
+        assert any(
+            issubclass(w.category, RuntimeWarning) for w in caught
+        ), [str(w.message) for w in caught]
+        np.testing.assert_allclose(
+            tracker.range_of(1),
+            _initial_uniform(env, tuple(env.players[0].cards)),
+            rtol=1e-6,
+        )
+
+    def test_decision_log_recorded(self):
+        env, tracker = _tracker_seat1()
+        legal = [a for a in env.legal_actions if a is not None]
+        sigma = _uniform_sigma(len(legal))
+        before_info = env.info_set
+        tracker.on_action(1, env, legal[0], sigma)
+        assert tracker._decision_log == [(1, before_info, legal[0])]
+
+    def test_unknown_action_raises_value_error(self):
+        env, tracker = _tracker_seat1()
+        legal = [a for a in env.legal_actions if a is not None]
+        sigma = _uniform_sigma(len(legal))
+        with pytest.raises(ValueError):
+            tracker.on_action(1, env, "raise:99.9", sigma)
+
+    def test_with_overlay_injected_action(self):
+        env, tracker = _tracker_seat1()
+        env.inject_action("raise:1.1")
+        legal = [a for a in env.legal_actions if a is not None]
+        assert "raise:1.1" in legal
+        n_act = len(legal)
+        injected_idx = legal.index("raise:1.1")
+        favouring = np.full(n_act, 0.01, dtype=np.float32)
+        favouring[injected_idx] = 1.0 - 0.01 * (n_act - 1)
+        prior = tracker.range_of(1).copy()
+        tracker.on_action(1, env, "raise:1.1", lambda _h: favouring)
+        post = tracker.range_of(1)
+        # All originally-nonzero entries remain nonzero, and the
+        # distribution stays normalised.
+        np.testing.assert_allclose(post.sum(), 1.0, rtol=1e-6)
+        assert (post[prior > 0] > 0).all()
+
+
+class TestOnActionPreconditions:
+
+    def test_actor_mismatch_asserts(self):
+        # env.player_i == 0 but caller claims seat=1 acted — must raise.
+        env, tracker = _tracker(stub_lut=True)
+        legal = [a for a in env.legal_actions if a is not None]
+        with pytest.raises(AssertionError):
+            tracker.on_action(1, env, legal[0], _uniform_sigma(len(legal)))
+
+    def test_seat_is_my_seat_raises_key_error(self):
+        env, tracker = _tracker_seat1()
+        legal = [a for a in env.legal_actions if a is not None]
+        with pytest.raises(AssertionError):
+            # actor is seat 1, but caller passes my_seat=0 — actor-mismatch
+            # assert fires first.  Test the inverse: an env where seat 0
+            # is on action and caller asks the tracker about seat 0.
+            tracker.on_action(0, env, legal[0], _uniform_sigma(len(legal)))
+        # Now exercise the my-seat KeyError path: env at seat 0's turn,
+        # ask about seat 0 — should be KeyError (my_seat never tracked).
+        env0, tracker0 = _tracker(stub_lut=True, my_seat=0)
+        legal0 = [a for a in env0.legal_actions if a is not None]
+        with pytest.raises(KeyError):
+            tracker0.on_action(0, env0, legal0[0], _uniform_sigma(len(legal0)))
+
+    def test_seat_after_fold_raises_key_error(self):
+        env, tracker = _tracker_seat1()
+        tracker.on_seat_folded(1)
+        legal = [a for a in env.legal_actions if a is not None]
+        with pytest.raises(KeyError):
+            tracker.on_action(1, env, legal[0], _uniform_sigma(len(legal)))
+
+
+class TestOnBoardUpdateExtras:
+
+    def test_empty_new_cards_no_op(self):
+        env, tracker = _tracker()
+        before = tracker.range_of(1).copy()
+        # Capture warnings to assert none fired.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            tracker.on_board_update(())
+        np.testing.assert_array_equal(before, tracker.range_of(1))
+        assert caught == []
+
+    def test_accumulates_across_streets(self):
+        env, tracker = _tracker()
+        my_hole = set(int(c) for c in env.players[0].cards)
+        # Pick three non-overlapping cards: flop subset, then turn.
+        picked = []
+        for i in range(env.n_combos):
+            for c in (int(env.combo_cards[i, 0]), int(env.combo_cards[i, 1])):
+                if c not in my_hole and c not in picked:
+                    picked.append(c)
+                if len(picked) == 4:
+                    break
+            if len(picked) == 4:
+                break
+        flop, turn_card = tuple(picked[:3]), picked[3]
+        tracker.on_board_update(flop)
+        tracker.on_board_update((turn_card,))
+        r = tracker.range_of(1)
+        forbidden = my_hole | set(flop) | {turn_card}
+        for i in range(env.n_combos):
+            uses = int(env.combo_cards[i, 0]) in forbidden or int(
+                env.combo_cards[i, 1]
+            ) in forbidden
+            if uses:
+                assert r[i] == 0.0
+
+    def test_fallback_excludes_full_known_board(self):
+        # B1 regression: force a collapse during on_board_update and
+        # assert the rebuilt uniform still excludes the dealt board.
+        env, tracker = _tracker()
+        my_hole = set(int(c) for c in env.players[0].cards)
+        # Concentrate seat 1's range to a single combo (i*).
+        i_star = next(
+            i for i in range(env.n_combos)
+            if tracker.range_of(1)[i] > 0
+        )
+        w = tracker.range_of(1)
+        w[:] = 0.0
+        w[i_star] = 1.0
+        # Deal a board card that conflicts with i*.
+        board_card = int(env.combo_cards[i_star, 0])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            tracker.on_board_update((board_card,))
+        assert any(issubclass(w_.category, RuntimeWarning) for w_ in caught)
+        # The rebuilt range must NOT include combos using board_card.
+        r = tracker.range_of(1)
+        for i in range(env.n_combos):
+            uses_board = (
+                int(env.combo_cards[i, 0]) == board_card
+                or int(env.combo_cards[i, 1]) == board_card
+            )
+            if uses_board:
+                assert r[i] == 0.0, (
+                    f"combo {i} uses dealt board card {board_card}"
+                )
+
+
+class TestMultipleOpponents:
+
+    def test_independent_ranges_three_seats(self):
+        env = _env(n_players=3)
+        my_hole = tuple(int(c) for c in env.players[0].cards)
+        tracker = RangeTracker(env, my_seat=0, my_hole=my_hole, live_seats=[0, 1, 2])
+        snap = tracker.snapshot()
+        # Both opponents start identical.
+        np.testing.assert_array_equal(snap[1], snap[2])
+        # Mutate seat 1's range in place; seat 2's unchanged.
+        tracker.range_of(1)[:] = 0.0
+        np.testing.assert_allclose(tracker.range_of(2).sum(), 1.0, rtol=1e-6)
+
+
+class TestLiveSeatsFiltering:
+
+    def test_my_seat_silently_excluded(self):
+        env = _env()
+        my_hole = tuple(int(c) for c in env.players[0].cards)
+        tracker = RangeTracker(
+            env, my_seat=0, my_hole=my_hole, live_seats=[0, 1]
+        )
+        assert 0 not in tracker.snapshot()
+        assert 1 in tracker.snapshot()
+
+
+class TestInitialUniformity:
+
+    def test_all_nonzero_entries_equal(self):
+        _env_, tracker = _tracker()
+        r = tracker.range_of(1)
+        nz = r[r > 0]
+        np.testing.assert_allclose(nz, nz[0], rtol=1e-6)
+
+
+class TestRangeOfLive:
+
+    def test_returns_live_reference(self):
+        _env_, tracker = _tracker()
+        r = tracker.range_of(1)
+        r[0] = 0.5
+        # Same call later sees the mutation (tracker is sole writer in
+        # production; this test just documents the contract).
+        assert tracker.range_of(1)[0] == 0.5
+
+
+class TestOnSeatFolded:
+
+    def test_drops_seat_from_snapshot(self):
+        _env_, tracker = _tracker(live_seats=[0, 1])
+        tracker.on_seat_folded(1)
+        assert 1 not in tracker.snapshot()
+
+    def test_range_of_folded_seat_raises(self):
+        _env_, tracker = _tracker(live_seats=[0, 1])
+        tracker.on_seat_folded(1)
+        with pytest.raises(KeyError):
+            tracker.range_of(1)
+
+    def test_double_fold_no_op(self):
+        _env_, tracker = _tracker(live_seats=[0, 1])
+        tracker.on_seat_folded(1)
+        tracker.on_seat_folded(1)  # no error
+
+
+class TestSnapshot:
+
+    def test_is_deep_copy(self):
+        _env_, tracker = _tracker()
+        snap = tracker.snapshot()
+        snap[1][0] = 999.0
+        snap[42] = np.zeros(10, dtype=np.float32)
+        # Tracker state untouched.
+        assert tracker.range_of(1)[0] != 999.0
+        assert 42 not in tracker.snapshot()
+
+
+class TestZeroConflictingHelper:
+
+    def test_empty_cards_no_change(self):
+        env = _env()
+        w = np.ones(env.n_combos, dtype=np.float32)
+        _zero_conflicting(w, env, [])
+        assert (w == 1.0).all()
+
+    def test_zeros_only_conflicting(self):
+        env = _env()
+        w = np.ones(env.n_combos, dtype=np.float32)
+        target_card = int(env.combo_cards[0, 0])
+        _zero_conflicting(w, env, [target_card])
+        for i in range(env.n_combos):
+            uses = (
+                int(env.combo_cards[i, 0]) == target_card
+                or int(env.combo_cards[i, 1]) == target_card
+            )
+            assert (w[i] == 0.0) == uses

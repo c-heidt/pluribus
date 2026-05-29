@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Dict, Mapping, Tuple
 import numpy as np
 
 from environment.poker_env import PokerEnv
+from poker_ai.search.ranges import Range
 
 if TYPE_CHECKING:
     # LeafConfig is introduced in §6.4 (poker_ai/search/leaf.py) which
@@ -33,11 +34,6 @@ if TYPE_CHECKING:
     # importable in the meantime; downstream code passes any object
     # whose duck-typed interface matches what leaf.py will expose.
     from poker_ai.search.leaf import LeafConfig
-
-
-Range = np.ndarray
-"""Float32 vector of shape ``(env.n_combos,)`` representing per-combo
-weights.  Owned by :mod:`poker_ai.search.ranges` (§6.2)."""
 
 
 @dataclass(frozen=True)
