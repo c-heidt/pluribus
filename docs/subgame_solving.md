@@ -716,7 +716,7 @@ start while the rest is being built.
 | 0 | Combo helpers + `Policy` ABC + `BlueprintPolicy` | `environment/utils.py`, `environment/poker_env.py`, `poker_ai/search/policy.py` | **done** | — |
 | 1 | Biased blueprint training | `poker_ai/blueprint/bias.py`, `runner.py`, `cfr.py` | in progress | — |
 | 2 | Env overlay (`inject_action`, `reset_overlay`, `has_overlay_at_current_node`) + `with_hole_cards` + `SubgameContext` | `environment/poker_env.py`, `poker_ai/search/context.py` | **done** | 0 |
-| 3 | Range tracking | `poker_ai/search/ranges.py` | todo | 0 |
+| 3 | Range tracking | `poker_ai/search/ranges.py` | **done** | 0 |
 | 4 | Action translation | `poker_ai/search/translation.py` | todo | — |
 | 5 | Leaf-EV (Phase 1 bias) | `poker_ai/search/leaf.py` | todo | 0, 2, 3 |
 | 6 | Solver + `SearchPolicy` | `poker_ai/search/solver.py`, `policy.py` | todo | 0, 2, 3, 5 |
