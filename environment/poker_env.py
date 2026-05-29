@@ -696,7 +696,19 @@ class PokerEnv:
 
         Includes any actions injected at the current public state via
         :meth:`inject_action` (off-tree size handling for subgame search).
-        Injected actions are appended after the canonical set, deduped.
+        Injected actions are appended after the canonical set in a
+        deterministic order (lexicographic) and deduped.
+
+        **Ordering contract.**  Canonical actions appear first in the
+        canonical order defined by
+        :meth:`get_canonical_actions` — this is the order the blueprint
+        regret tables are indexed by via
+        :data:`environment.action_space.ACTION_TO_IDX`.  Overlay
+        actions follow in :func:`sorted` order so the returned list is
+        reproducible across processes and Python hash-randomisation
+        seeds — important for subgame solver tables that build a
+        per-node ``a_to_i`` mapping from ``env.legal_actions`` and
+        rely on that mapping being stable across iterations and runs.
         """
         if not self.current_player.is_active:
             return [None]
@@ -714,7 +726,11 @@ class PokerEnv:
         overlay = self._extra_legal_actions.get(self._current_public_state())
         if overlay:
             seen = {a for a in actions if a is not None}
-            actions += [a for a in overlay if a not in seen]
+            # `sorted` is critical: `overlay` is a frozenset whose
+            # iteration order depends on hash randomisation and is not
+            # stable across processes.  Sorting makes legal_actions
+            # reproducible run-to-run.
+            actions += sorted(a for a in overlay if a not in seen)
         return actions
 
     @property
