@@ -7,15 +7,21 @@ lives on the dataclass as a classmethod because most fields are derived
 from the env or are simple per-hand state — see §6.1 of
 ``docs/subgame_solving.md`` for the rationale.
 
-The class is frozen; the solver is expected to be a pure function of
-``(root_env, ctx, cfg)``.  All per-iteration state lives on the solver's
-stack, not on the context.
+The class is frozen.  In addition, the constructed instance defends
+against accidental mutation of the *contents* of its container fields:
+``opponent_ranges`` is exposed as a read-only mapping over arrays whose
+``writeable`` flag has been cleared, and ``board_compatible`` is a
+read-only view.  This keeps the solver a pure function of
+``(root_env, ctx, cfg)`` — an inner loop that accidentally writes to
+an opponent range or the board mask fails fast instead of silently
+corrupting the search.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Tuple
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Dict, Mapping, Tuple
 
 import numpy as np
 
@@ -64,7 +70,7 @@ class SubgameContext:
 
     my_seat: int
     my_hole: Tuple[int, int]
-    opponent_ranges: Dict[int, Range]
+    opponent_ranges: Mapping[int, Range]
     board_compatible: np.ndarray
     street_at_root: int
     leaf: "LeafConfig"
@@ -86,12 +92,32 @@ class SubgameContext:
         community cards; sets ``street_at_root`` to ``env.betting_round``.
         Does not deepcopy the env — the solver's caller (typically
         ``SearchAgent``) owns that.
+
+        Container fields are wrapped read-only so the solver cannot
+        accidentally mutate ranges or the board mask mid-search:
+
+        - ``opponent_ranges`` is exposed as a :class:`MappingProxyType`
+          over the input dict.  The arrays themselves have their
+          ``writeable`` flag cleared.
+        - ``board_compatible`` is set to non-writeable.
+
+        The original input dict and arrays are unaffected by the
+        ``writeable=False`` flag in numpy >= 1.17 only for the view
+        the context holds.  We make defensive copies of the input
+        arrays so the caller's mutable copies stay mutable.
         """
+        ranges_frozen: Dict[int, Range] = {}
+        for seat, weights in opponent_ranges.items():
+            ro = np.array(weights, copy=True)
+            ro.flags.writeable = False
+            ranges_frozen[seat] = ro
+        board_mask = _board_compatible_mask(env)
+        board_mask.flags.writeable = False
         return cls(
             my_seat=my_seat,
             my_hole=my_hole,
-            opponent_ranges=opponent_ranges,
-            board_compatible=_board_compatible_mask(env),
+            opponent_ranges=MappingProxyType(ranges_frozen),
+            board_compatible=board_mask,
             street_at_root=env.betting_round,
             leaf=leaf,
             rng=rng,

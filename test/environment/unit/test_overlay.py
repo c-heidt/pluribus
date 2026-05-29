@@ -2,6 +2,8 @@
 
 import copy
 
+import pytest
+
 from environment.action_space import ACTION_TO_IDX, CANONICAL_ACTIONS
 from environment.player import Player
 from environment.poker_env import PokerEnv
@@ -15,15 +17,15 @@ class TestInjectAction:
 
     def test_appears_in_legal_actions(self):
         env = _env()
-        assert "raise:0.42" not in env.legal_actions
-        env.inject_action("raise:0.42")
-        assert env.legal_actions.count("raise:0.42") == 1
+        assert "raise:1.1" not in env.legal_actions
+        env.inject_action("raise:1.1")
+        assert env.legal_actions.count("raise:1.1") == 1
 
     def test_idempotent(self):
         env = _env()
-        env.inject_action("raise:0.42")
+        env.inject_action("raise:1.1")
         before = list(env.legal_actions)
-        env.inject_action("raise:0.42")
+        env.inject_action("raise:1.1")
         assert env.legal_actions == before
 
     def test_dedupes_against_canonical(self):
@@ -36,31 +38,31 @@ class TestOverlayScopedToPublicState:
 
     def test_injection_not_visible_after_action(self):
         env = _env()
-        env.inject_action("raise:0.42")
+        env.inject_action("raise:1.1")
         assert env.has_overlay_at_current_node
         # Step the env — public state (history) changes.
         env_next = env.apply_action("call")
         assert not env_next.has_overlay_at_current_node
-        assert "raise:0.42" not in env_next.legal_actions
+        assert "raise:1.1" not in env_next.legal_actions
 
     def test_original_state_still_sees_injection(self):
         env = _env()
-        env.inject_action("raise:0.42")
+        env.inject_action("raise:1.1")
         # Advance via deepcopy, leaving original env untouched.
         _ = env.apply_action("call")
         assert env.has_overlay_at_current_node
-        assert "raise:0.42" in env.legal_actions
+        assert "raise:1.1" in env.legal_actions
 
 
 class TestResetOverlay:
 
     def test_reset_removes_injections(self):
         env = _env()
-        env.inject_action("raise:0.42")
+        env.inject_action("raise:1.1")
         assert env.has_overlay_at_current_node
         env.reset_overlay()
         assert not env.has_overlay_at_current_node
-        assert "raise:0.42" not in env.legal_actions
+        assert "raise:1.1" not in env.legal_actions
 
     def test_reset_on_fresh_env_noop(self):
         env = _env()
@@ -75,13 +77,24 @@ class TestHasOverlayProperty:
 
     def test_true_after_inject(self):
         env = _env()
-        env.inject_action("raise:0.42")
+        env.inject_action("raise:1.1")
         assert env.has_overlay_at_current_node
 
     def test_false_after_reset(self):
         env = _env()
-        env.inject_action("raise:0.42")
+        env.inject_action("raise:1.1")
         env.reset_overlay()
+        assert not env.has_overlay_at_current_node
+
+    def test_false_when_current_player_inactive(self):
+        # legal_actions short-circuits to [None] for an inactive player
+        # and exposes no overlay; has_overlay_at_current_node must agree
+        # so callers can use either to gate the round-1 fast path.
+        env = _env()
+        env.inject_action("raise:1.1")
+        assert env.has_overlay_at_current_node     # baseline
+        env.current_player._is_active = False
+        assert env.legal_actions == [None]
         assert not env.has_overlay_at_current_node
 
 
@@ -90,10 +103,10 @@ class TestOverlaySharedByReference:
     def test_deepcopy_shares_overlay(self):
         env = _env()
         env_copy = copy.deepcopy(env)
-        env_copy.inject_action("raise:0.42")
+        env_copy.inject_action("raise:1.1")
         # In-place mutation, shared by reference: both envs see it.
         assert env.has_overlay_at_current_node
-        assert "raise:0.42" in env.legal_actions
+        assert "raise:1.1" in env.legal_actions
 
     def test_apply_action_descendant_sees_overlay_at_returning_state(self):
         # Injection on parent should be visible to any descendant env that
@@ -102,10 +115,22 @@ class TestOverlaySharedByReference:
         # property: a deepcopy of a post-inject env preserves the injection
         # at the matching public state.
         env = _env()
-        env.inject_action("raise:0.42")
+        env.inject_action("raise:1.1")
         env_copy = copy.deepcopy(env)
         assert env_copy.has_overlay_at_current_node
-        assert "raise:0.42" in env_copy.legal_actions
+        assert "raise:1.1" in env_copy.legal_actions
+
+    def test_reset_overlay_clears_for_whole_lineage(self):
+        # The overlay is shared by reference across the deepcopy lineage,
+        # so reset_overlay() on ANY env in the lineage clears it for all.
+        # Documented foot-gun: search-time deepcopies that call
+        # reset_overlay would wipe the runtime env's overlay too.
+        env = _env()
+        env.inject_action("raise:1.1")
+        env_copy = copy.deepcopy(env)
+        env_copy.reset_overlay()
+        assert not env.has_overlay_at_current_node
+        assert "raise:1.1" not in env.legal_actions
 
 
 class TestLegalActionsOrdering:
@@ -126,9 +151,9 @@ class TestLegalActionsOrdering:
             a for a in env.legal_actions
             if a is not None and a in ACTION_TO_IDX[env.betting_round]
         ]
-        env.inject_action("raise:0.42")
+        env.inject_action("raise:1.1")
         env.inject_action("raise:9.9")
-        env.inject_action("raise:0.123")
+        env.inject_action("raise:2.3")
         after = [
             a for a in env.legal_actions
             if a is not None and a in ACTION_TO_IDX[env.betting_round]
@@ -140,7 +165,7 @@ class TestLegalActionsOrdering:
 
     def test_overlay_actions_appear_after_canonical(self):
         env = _env()
-        env.inject_action("raise:0.42")
+        env.inject_action("raise:1.1")
         env.inject_action("raise:9.9")
         legal = [a for a in env.legal_actions if a is not None]
         canonical_keys = set(ACTION_TO_IDX[env.betting_round])
@@ -155,7 +180,7 @@ class TestLegalActionsOrdering:
     def test_overlay_actions_sorted_lex(self):
         env = _env()
         # Inject in a non-sorted order to prove the env re-sorts.
-        for a in ("raise:9.9", "raise:0.123", "raise:0.42", "raise:0.07"):
+        for a in ("raise:9.9", "raise:2.3", "raise:1.1", "raise:1.7"):
             env.inject_action(a)
         legal = [a for a in env.legal_actions if a is not None]
         overlay_in_legal = [
@@ -165,7 +190,7 @@ class TestLegalActionsOrdering:
 
     def test_legal_actions_deterministic_across_calls(self):
         env = _env()
-        for a in ("raise:0.42", "raise:9.9", "raise:0.07", "raise:1.23"):
+        for a in ("raise:1.1", "raise:9.9", "raise:1.7", "raise:1.3"):
             env.inject_action(a)
         # Multiple calls on the same env must return identical lists.
         first = env.legal_actions
@@ -175,9 +200,9 @@ class TestLegalActionsOrdering:
     def test_order_independent_of_insertion_order(self):
         env_a = _env()
         env_b = _env()
-        for a in ("raise:0.42", "raise:9.9", "raise:0.07", "raise:1.23"):
+        for a in ("raise:1.1", "raise:9.9", "raise:1.7", "raise:1.3"):
             env_a.inject_action(a)
-        for a in ("raise:1.23", "raise:0.07", "raise:9.9", "raise:0.42"):
+        for a in ("raise:1.3", "raise:1.7", "raise:9.9", "raise:1.1"):
             env_b.inject_action(a)
         assert env_a.legal_actions == env_b.legal_actions
 
@@ -191,7 +216,7 @@ class TestLegalActionsOrdering:
         # the resulting column indices must be unique (no two actions
         # collapse to the same column).
         env = _env()
-        env.inject_action("raise:0.42")
+        env.inject_action("raise:1.1")
         legal = [a for a in env.legal_actions if a is not None]
         a_to_i = ACTION_TO_IDX[env.betting_round]
         canonical_part = [a for a in legal if a in a_to_i]
@@ -202,13 +227,183 @@ class TestLegalActionsOrdering:
             assert a in CANONICAL_ACTIONS[env.betting_round]
 
     def test_apply_action_uses_overlay_action(self):
-        # End-to-end round-trip: an injected action must actually
-        # execute via apply_action.  Without this, the overlay is
-        # decorative.  Use a fraction that wouldn't normally be in
-        # the pre-flop abstraction.
+        # Smoke-only check (full round-trip lives in TestInjectApplyRoundTrip).
         env = _env()
-        env.inject_action("raise:0.42")
-        assert "raise:0.42" in env.legal_actions
-        env_next = env.apply_action("raise:0.42")
-        # Pot grew; the action was real.
+        env.inject_action("raise:1.1")
+        assert "raise:1.1" in env.legal_actions
+        env_next = env.apply_action("raise:1.1")
         assert env_next.pot_size > env.pot_size
+
+
+class TestInjectApplyRoundTrip:
+    """End-to-end: every action that passes inject_action's sanity check
+    must also execute cleanly via apply_action and leave the env in a
+    consistent state.  Without this, the overlay is decorative — a
+    sanity check that admits actions apply_action then mishandles would
+    be a hidden divergence between the search abstraction and the
+    game's actual dynamics.
+    """
+
+    def test_chip_accounting_consistent(self):
+        # Pot, player stack, and player bet must all move by the
+        # expected amount.  At HU pre-flop with pot=150,
+        # raise:1.1 → ceil(150*1.1)=165 chips to add.
+        env = _env()
+        env.inject_action("raise:1.1")
+        player = env.current_player
+        chips_before = player.n_chips
+        bet_before = player.n_bet_chips
+        pot_before = env.pot_size
+
+        env_next = env.apply_action("raise:1.1")
+        new_player = env_next.players[player.player_i]
+
+        added = chips_before - new_player.n_chips
+        assert added == 165
+        assert new_player.n_bet_chips - bet_before == 165
+        assert env_next.pot_size - pot_before == 165
+
+    def test_raise_increments_n_raises(self):
+        env = _env()
+        env.inject_action("raise:1.1")
+        assert env._n_raises == 0
+        env_next = env.apply_action("raise:1.1")
+        assert env_next._n_raises == 1
+
+    def test_action_recorded_in_history(self):
+        env = _env()
+        env.inject_action("raise:1.1")
+        env_next = env.apply_action("raise:1.1")
+        assert env_next._history["pre_flop"][-1] == "raise:1.1"
+
+    def test_next_state_is_terminal_legal(self):
+        # The opponent's response options after an injected raise are
+        # well-formed: at least fold and call/all_in available.
+        env = _env()
+        env.inject_action("raise:1.1")
+        env_next = env.apply_action("raise:1.1")
+        legal = [a for a in env_next.legal_actions if a is not None]
+        assert "fold" in legal
+        assert "call" in legal or "all_in" in legal
+
+    def test_injection_does_not_carry_to_next_state(self):
+        # The injection was at the pre-action public state; after
+        # apply_action the public state changes and the overlay
+        # should not show up.
+        env = _env()
+        env.inject_action("raise:1.1")
+        env_next = env.apply_action("raise:1.1")
+        assert not env_next.has_overlay_at_current_node
+        assert "raise:1.1" not in env_next.legal_actions
+
+    def test_multiple_off_tree_raises_all_executable(self):
+        # Inject several distinct off-tree raises and verify each one
+        # round-trips cleanly from a fresh env.  Catches edge cases
+        # where one fraction works but a neighboring one corrupts state.
+        for action in ("raise:1.1", "raise:1.3", "raise:1.7", "raise:9.9"):
+            env = _env()
+            env.inject_action(action)
+            assert action in env.legal_actions, action
+            env_next = env.apply_action(action)
+            assert env_next.pot_size > env.pot_size, action
+            # Final consistency: next state is well-formed.
+            assert env_next.current_player.player_i != env.current_player.player_i
+
+
+class TestInjectActionReturnValue:
+    """`inject_action` returns True iff the action is in the legal
+    set after the call.  Translation (§6.3) branches on this."""
+
+    def test_returns_true_on_new_valid_injection(self):
+        env = _env()
+        assert env.inject_action("raise:1.1") is True
+        assert "raise:1.1" in env.legal_actions
+
+    def test_returns_true_on_repeat_valid_injection(self):
+        env = _env()
+        env.inject_action("raise:1.1")
+        # Already present — still returns True (the action IS injected).
+        assert env.inject_action("raise:1.1") is True
+
+    def test_returns_true_for_canonical_already_legal(self):
+        # fold / call / all_in are always canonical; inject is a no-op.
+        env = _env()
+        before = list(env.legal_actions)
+        assert env.inject_action("fold") is True
+        # No overlay was actually written.
+        assert not env.has_overlay_at_current_node
+        assert env.legal_actions == before
+
+
+class TestInjectActionSanityChecks:
+    """Game-state rejections return False without mutating the overlay."""
+
+    def test_rejects_below_min_raise(self):
+        # At HU pre-flop, pot=150, last_raise_amount=100.
+        # raise:0.42 → ceil(150*0.42)=63 chips → actual_raise=13 < 100.
+        env = _env()
+        assert env.inject_action("raise:0.42") is False
+        assert "raise:0.42" not in env.legal_actions
+        assert not env.has_overlay_at_current_node
+
+    def test_rejects_at_or_above_stack(self):
+        # Player has 9950 chips available; "raise:99.9" → 14985 chips.
+        env = _env()
+        assert env.inject_action("raise:99.9") is False
+        assert "raise:99.9" not in env.legal_actions
+        assert not env.has_overlay_at_current_node
+
+    def test_rejects_when_max_raises_reached(self):
+        env = _env()
+        # Force three raises into the round.
+        env._n_raises = 3
+        assert env.inject_action("raise:1.5") is False
+        assert not env.has_overlay_at_current_node
+
+    def test_rejection_does_not_taint_subsequent_valid_inject(self):
+        env = _env()
+        assert env.inject_action("raise:0.42") is False
+        # A valid raise after a rejected one still works.
+        assert env.inject_action("raise:1.1") is True
+        assert "raise:1.1" in env.legal_actions
+        assert "raise:0.42" not in env.legal_actions
+
+
+class TestInjectActionMalformedInput:
+    """Programmer-error inputs raise ValueError, not silent rejection."""
+
+    def test_unknown_action_prefix_raises(self):
+        env = _env()
+        with pytest.raises(ValueError):
+            env.inject_action("strange_action")
+
+    def test_unparseable_fraction_raises(self):
+        env = _env()
+        with pytest.raises(ValueError):
+            env.inject_action("raise:abc")
+
+    def test_empty_fraction_raises(self):
+        env = _env()
+        with pytest.raises(ValueError):
+            env.inject_action("raise:")
+
+    def test_zero_fraction_raises(self):
+        env = _env()
+        with pytest.raises(ValueError):
+            env.inject_action("raise:0")
+
+    def test_negative_fraction_raises(self):
+        env = _env()
+        with pytest.raises(ValueError):
+            env.inject_action("raise:-1.5")
+
+    def test_infinite_fraction_raises(self):
+        env = _env()
+        with pytest.raises(ValueError):
+            env.inject_action("raise:inf")
+
+    def test_malformed_input_does_not_mutate_overlay(self):
+        env = _env()
+        with pytest.raises(ValueError):
+            env.inject_action("raise:abc")
+        assert not env.has_overlay_at_current_node

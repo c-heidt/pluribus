@@ -47,7 +47,10 @@ class TestFromRuntime:
         )
         assert ctx.my_seat == 0
         assert ctx.my_hole == my_hole
-        assert ctx.opponent_ranges is opponent_ranges
+        # opponent_ranges is wrapped read-only (not the same object),
+        # but the contents must round-trip exactly.
+        assert set(ctx.opponent_ranges) == set(opponent_ranges)
+        np.testing.assert_array_equal(ctx.opponent_ranges[1], opponent_ranges[1])
         assert ctx.leaf is leaf
         assert ctx.rng is rng
 
@@ -62,6 +65,25 @@ class TestFromRuntime:
         assert ctx.board_compatible.dtype == bool
         assert ctx.board_compatible.shape == (env.n_combos,)
 
+    def test_from_runtime_on_flop_env(self):
+        # Walk HU pre-flop to flop via two calls; assert from_runtime
+        # reports the right street and a non-trivial board mask.
+        env = _env()
+        env = env.apply_action("call")
+        env = env.apply_action("call")
+        assert env.betting_round == 1
+        assert len(env.community_cards) == 3
+        ctx = _ctx_from(env)
+        assert ctx.street_at_root == 1
+        # At least the three board cards exclude some combos.
+        assert ctx.board_compatible.sum() < env.n_combos
+        # And no combo containing a board card survives.
+        board = set(int(c) for c in env.community_cards)
+        for i, (c0, c1) in enumerate(env.combo_cards):
+            uses_board = int(c0) in board or int(c1) in board
+            if uses_board:
+                assert not ctx.board_compatible[i]
+
 
 class TestFrozen:
 
@@ -69,6 +91,47 @@ class TestFrozen:
         ctx = _ctx_from(_env())
         with pytest.raises(dataclasses.FrozenInstanceError):
             ctx.my_seat = 9  # type: ignore[misc]
+
+    def test_cannot_assign_into_opponent_ranges(self):
+        # MappingProxyType blocks __setitem__ — the solver can't add
+        # or replace a seat's range mid-search.
+        ctx = _ctx_from(_env())
+        with pytest.raises(TypeError):
+            ctx.opponent_ranges[2] = np.zeros(10, dtype=np.float32)  # type: ignore[index]
+
+    def test_cannot_pop_from_opponent_ranges(self):
+        ctx = _ctx_from(_env())
+        with pytest.raises(AttributeError):
+            ctx.opponent_ranges.pop(1)  # type: ignore[attr-defined]
+
+    def test_cannot_mutate_a_range_array(self):
+        ctx = _ctx_from(_env())
+        with pytest.raises(ValueError):
+            ctx.opponent_ranges[1][0] = 0.0
+
+    def test_cannot_mutate_board_compatible(self):
+        ctx = _ctx_from(_env())
+        with pytest.raises(ValueError):
+            ctx.board_compatible[0] = False
+
+    def test_input_dict_unchanged_by_construction(self):
+        # Defensive copies inside from_runtime mean the caller's
+        # original dict / arrays stay writable.
+        env = _env()
+        weights = np.full(env.n_combos, 0.5, dtype=np.float32)
+        input_dict = {1: weights}
+        _ = SubgameContext.from_runtime(
+            env=env,
+            my_seat=0,
+            my_hole=tuple(env.players[0].cards),
+            opponent_ranges=input_dict,
+            leaf=object(),
+            rng=np.random.default_rng(0),
+        )
+        # Caller's references remain mutable.
+        weights[0] = 0.0
+        input_dict[2] = np.zeros(env.n_combos, dtype=np.float32)
+        assert weights[0] == 0.0
 
 
 class TestBoardCompatibleMask:

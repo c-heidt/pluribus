@@ -620,26 +620,104 @@ class PokerEnv:
         """
         return (self._betting_stage, tuple(self._history[self._betting_stage]))
 
-    def inject_action(self, action: str) -> None:
+    def inject_action(self, action: str) -> bool:
         """Inject `action` into the legal set at the current public state.
 
-        Idempotent.  The injection is recorded in a dict shared by every
-        env in this deepcopy lineage, so subgame searches rooted at any
-        descendant env see the augmented game tree at the matching
-        public state.
+        Idempotent.  Recorded in a dict shared by every env in this
+        deepcopy lineage, so subgame searches rooted at any descendant
+        env see the augmented game tree at the matching public state.
+
+        Sanity-checked: a raise that would fall below the minimum raise
+        increment, exceed the current player's stack (where canonical
+        code would substitute ``all_in``), or arrive while
+        ``_n_raises >= MAX_RAISES_PER_ROUND`` / at a non-betting stage
+        is rejected.  Rejection is communicated via the return value
+        plus a warning log; the overlay is not mutated.
 
         Parameters
         ----------
         action : str
-            Action string accepted by :meth:`apply_action`, e.g.
-            ``"raise:0.42"``.  Typically used by the search package's
-            translation module when an opponent's bet falls outside
-            the action abstraction.
+            Action string accepted by :meth:`apply_action`.  Only
+            ``"raise:<fraction>"`` is a meaningful injection — canonical
+            ``"fold"`` / ``"call"`` / ``"all_in"`` are always already
+            legal and `inject_action` is a no-op returning ``True`` for
+            them.
+
+        Returns
+        -------
+        bool
+            ``True`` iff ``action`` is in
+            ``[a for a in legal_actions if a is not None]`` after the
+            call.  ``False`` iff the injection was rejected because the
+            action is not legally playable at the current state.
+
+        Raises
+        ------
+        ValueError
+            If ``action`` is malformed (unknown prefix, unparseable
+            fraction, or non-positive fraction).  These indicate caller
+            bugs, not game-state conditions.
         """
+        if action in ("fold", "call", "all_in"):
+            # Already canonical; trivially in legal_actions when legal.
+            return True
+        if not action.startswith("raise:"):
+            raise ValueError(
+                f"inject_action: only 'fold' / 'call' / 'all_in' / "
+                f"'raise:<fraction>' are supported, got {action!r}"
+            )
+        try:
+            fraction = float(action.split(":", 1)[1])
+        except (ValueError, IndexError):
+            raise ValueError(
+                f"inject_action: unparseable raise fraction in {action!r}"
+            )
+        if not math.isfinite(fraction) or fraction <= 0.0:
+            raise ValueError(
+                f"inject_action: raise fraction must be a positive finite "
+                f"float, got {fraction}"
+            )
+        if not self._raise_fraction_is_playable(fraction):
+            logger.warning(
+                "inject_action rejected %r at public state %r — "
+                "not playable (stage %s, n_raises=%d).",
+                action, self._current_public_state(),
+                self._betting_stage, self._n_raises,
+            )
+            return False
         key = self._current_public_state()
         existing = self._extra_legal_actions.get(key, frozenset())
         if action not in existing:
             self._extra_legal_actions[key] = existing | {action}
+        return True
+
+    def _raise_fraction_is_playable(self, fraction: float) -> bool:
+        """Mirror of the canonical raise-validity checks in
+        :meth:`_get_available_raise_sizes`.  Used by :meth:`inject_action`
+        so injected raise sizes obey the same minimum-raise / max-stack
+        / stage / raise-count rules as canonical raises.
+        """
+        if self._betting_stage in {"terminal", "show_down"}:
+            return False
+        if not self.current_player.is_active:
+            return False
+        if self._n_raises >= MAX_RAISES_PER_ROUND:
+            return False
+        biggest_bet = max(p.n_bet_chips for p in self.players)
+        n_chips_to_call = biggest_bet - self.current_player.n_bet_chips
+        chips_available = self.current_player.n_chips
+        chips_raw = self._compute_raise_chip_amount(
+            fraction, enforce_minimum=False
+        )
+        actual_raise = chips_raw - n_chips_to_call
+        if actual_raise < self._last_raise_amount:
+            return False
+        chips = self._compute_raise_chip_amount(
+            fraction, enforce_minimum=True
+        )
+        if chips > chips_available or chips >= chips_available - 1:
+            return False
+        return True
 
     def reset_overlay(self) -> None:
         """Clear all injected actions across every public state.
@@ -652,7 +730,14 @@ class PokerEnv:
 
     @property
     def has_overlay_at_current_node(self) -> bool:
-        """True iff at least one injected action exists at this public state."""
+        """True iff ``legal_actions`` includes any injected (non-canonical) action.
+
+        Returns ``False`` when ``current_player.is_active`` is False —
+        in that case ``legal_actions`` short-circuits to ``[None]``
+        and exposes no overlay, so the two properties stay in sync.
+        """
+        if not self.current_player.is_active:
+            return False
         return bool(self._extra_legal_actions.get(self._current_public_state()))
 
     def with_hole_cards(
@@ -667,6 +752,13 @@ class PokerEnv:
         The returned env shares ``card_info_lut`` and the off-tree
         overlay with the original by reference; only the named seat's
         hole cards differ.  Does NOT call :meth:`inject_action`.
+
+        **Caller's responsibility.** ``cards`` must not duplicate any
+        card already in play (the community cards or another seat's
+        hole).  This method does NOT validate — the typical caller
+        (the range tracker) already restricts candidate combos to a
+        board-compatible, non-conflicting subset before invoking, so
+        an extra check here would be wasted work.
 
         Parameters
         ----------
