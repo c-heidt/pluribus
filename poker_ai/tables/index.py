@@ -308,11 +308,26 @@ class InfosetIndex:
         """
         dst = Path(dst_path)
         dst.mkdir(parents=True, exist_ok=True)
-        # compact=True repacks the B-tree, dropping the free-list and
-        # any unused pages; the snapshot is consequently smaller than
-        # the live env, which speeds up the subsequent rsync to
-        # network storage and keeps the on-disk checkpoint tidy.
-        self._env.copy(str(dst), compact=True)
+        # compact=False: copy the env preserving its page layout rather
+        # than repacking the B-tree.  Two reasons, both about keeping
+        # the per-checkpoint cost O(new data) instead of O(total size):
+        #
+        #   1. ``compact=True`` walks and rewrites the entire tree on
+        #      the CPU every call — cost grows linearly with the total
+        #      number of allocated infosets, so on a multi-day run the
+        #      copy eventually exceeds the checkpoint interval and
+        #      starves the workers.
+        #   2. Repacking reshuffles physical page numbers, which defeats
+        #      rsync's delta algorithm in :meth:`CheckpointManager.
+        #      _mirror_lmdb_to_persistent` — every mirror then ships
+        #      essentially the whole DB over the network.  Preserving the
+        #      page layout (append-mostly for an LMDB that only grows)
+        #      lets rsync transfer just the changed/appended pages.
+        #
+        # The only cost is a larger on-disk file (free pages are not
+        # reclaimed), which is cheap on the persistent filesystem and
+        # bounded by peak index size.
+        self._env.copy(str(dst), compact=False)
 
     def close_env(self) -> None:
         """Close just the LMDB environment without touching the shared counter.

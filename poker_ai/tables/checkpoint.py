@@ -267,6 +267,28 @@ class CheckpointManager:
             checkpoint so ``terminate`` cannot race the writer.
         """
         label = "emergency" if emergency else "scheduled"
+
+        # Non-blocking guard for scheduled checkpoints.  The background
+        # writer owns all disk I/O.  If it has not yet even dequeued the
+        # previously-handed-off snapshot, it is behind, and enqueuing
+        # another would block the main loop on the ``maxsize=1`` queue —
+        # but the main loop is the *only* thread that dispatches CFR
+        # jobs, so blocking it idles every worker (the <1% CPU stall).
+        # Skip this checkpoint instead and let the next one catch up.
+        #
+        # We must bail *before* ``snapshot_dirty_chunks`` runs, because
+        # that call clears the chunk dirty flags.  Bailing here leaves
+        # the flags set, so the chunks dirtied since the last successful
+        # checkpoint stay dirty and are captured by the next one —
+        # checkpoints coalesce under disk pressure, nothing is dropped.
+        if not (emergency or wait) and self._write_queue.full():
+            log.warning(
+                f"[t={t}] Checkpoint skipped — background writer still busy "
+                f"with the previous snapshot (disk slower than the checkpoint "
+                f"cadence); dirty state retained for the next checkpoint"
+            )
+            return
+
         log.info(f"[t={t}] Checkpoint ({label}) starting")
         snapshot_start = time.monotonic()
 
@@ -298,17 +320,10 @@ class CheckpointManager:
             self._write_queue.join()
             self._write_snapshot(pending)
         else:
-            # put() blocks if the writer is still busy with the prior
-            # snapshot.  Log a warning when that happens so the
-            # operator knows checkpoint_interval is too tight for disk.
-            put_start = time.monotonic()
+            # The full() guard at the top returned early if a snapshot
+            # was still queued, and the main loop is the only producer,
+            # so the queue has a free slot and this put() cannot block.
             self._write_queue.put(pending)
-            put_wait = time.monotonic() - put_start
-            if put_wait > 1.0:
-                log.warning(
-                    f"[t={t}] Writer thread back-pressured for "
-                    f"{put_wait:.1f}s — consider raising checkpoint_interval"
-                )
 
     def shutdown(self) -> None:
         """Flush the background writer and stop its thread.
