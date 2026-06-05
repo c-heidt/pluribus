@@ -142,16 +142,27 @@ class TestOnBoardUpdate:
         np.testing.assert_allclose(r.sum(), 1.0, rtol=1e-6)
 
     def test_idempotent(self):
+        # Pick a board card guaranteed not to conflict with my_hole so
+        # the first call actually does work (not the empty-input no-op
+        # path).  Then assert the second call leaves the range
+        # invariant up to float-renormalisation drift — `w /= w.sum()`
+        # can introduce ~1 ULP of jitter even when the input sums
+        # mathematically to 1.0, so bit-exact equality is the wrong
+        # check here.
         env, tracker = _tracker()
         my_hole = set(int(c) for c in env.players[0].cards)
-        board = [
-            int(c) for c in (env.combo_cards[10, 0], env.combo_cards[10, 1])
-            if int(c) not in my_hole
-        ][:1]
-        tracker.on_board_update(tuple(board))
+        card = next(
+            int(env.combo_cards[i, 0])
+            for i in range(env.n_combos)
+            if int(env.combo_cards[i, 0]) not in my_hole
+        )
+        tracker.on_board_update((card,))
         first = tracker.range_of(1).copy()
-        tracker.on_board_update(tuple(board))
-        np.testing.assert_array_equal(first, tracker.range_of(1))
+        tracker.on_board_update((card,))
+        np.testing.assert_allclose(first, tracker.range_of(1), atol=1e-7)
+        # The nonzero pattern must be identical (no drift sneaking
+        # mass into a previously-zero combo).
+        assert ((first == 0) == (tracker.range_of(1) == 0)).all()
 
 
 class TestOnAction:

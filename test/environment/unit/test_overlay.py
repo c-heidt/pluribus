@@ -334,6 +334,29 @@ class TestInjectActionReturnValue:
         assert not env.has_overlay_at_current_node
         assert env.legal_actions == before
 
+    def test_returns_false_for_canonical_when_player_inactive(self):
+        # F2 regression: canonical actions are not unconditionally
+        # legal — an inactive player's legal_actions is [None], so
+        # inject_action("fold") must report False, matching the
+        # documented "True iff in legal_actions" contract.
+        env = _env()
+        env.current_player._is_active = False
+        assert env.inject_action("fold") is False
+        assert env.inject_action("call") is False
+        assert env.inject_action("all_in") is False
+        # And no overlay was written.
+        assert env._extra_legal_actions == {}
+
+    def test_returns_false_for_all_in_when_stack_is_zero(self):
+        # all_in is gated on chips_available > 0 in legal_actions
+        # ([poker_env.py:949-951]); stack-0 means no all_in is legal.
+        env = _env()
+        env.current_player.n_chips = 0
+        # Sanity: legal_actions excludes all_in here.
+        assert "all_in" not in env.legal_actions
+        assert env.inject_action("all_in") is False
+        assert env._extra_legal_actions == {}
+
 
 class TestInjectActionSanityChecks:
     """Game-state rejections return False without mutating the overlay."""

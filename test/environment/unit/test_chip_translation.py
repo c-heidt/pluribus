@@ -1,0 +1,255 @@
+"""Tests for the env's chip <-> action conversion API.
+
+Covers :meth:`PokerEnv.canonical_raise_fractions`,
+:meth:`PokerEnv.chips_to_add`, and :meth:`PokerEnv.string_for_chips`.
+"""
+
+import math
+
+import pytest
+
+from environment.player import Player
+from environment.poker_env import (
+    MAX_RAISES_PER_ROUND,
+    PokerEnv,
+)
+
+
+def _env(low: int = 10, high: int = 14, n_players: int = 2):
+    return PokerEnv(
+        players=[Player(i, 10000) for i in range(n_players)],
+        low_card_rank=low,
+        high_card_rank=high,
+    )
+
+
+class TestCanonicalRaiseFractions:
+
+    def test_pre_flop_matches_env_sizes(self):
+        env = _env()
+        env_strs = env._get_available_raise_sizes()
+        expected = [
+            float(s.split(":", 1)[1]) for s in env_strs if s.startswith("raise:")
+        ]
+        assert env.canonical_raise_fractions() == expected
+
+    def test_empty_when_max_raises_reached(self):
+        env = _env()
+        env._n_raises = MAX_RAISES_PER_ROUND
+        assert env.canonical_raise_fractions() == []
+
+    def test_empty_when_inactive_player(self):
+        env = _env()
+        env.current_player._is_active = False
+        assert env.canonical_raise_fractions() == []
+
+    def test_empty_when_call_meets_stack(self):
+        env = _env()
+        biggest_bet = max(p.n_bet_chips for p in env.players)
+        n_to_call = biggest_bet - env.current_player.n_bet_chips
+        env.current_player.n_chips = n_to_call
+        assert env.canonical_raise_fractions() == []
+
+
+class TestChipsToAdd:
+
+    def test_fold_zero(self):
+        env = _env()
+        assert env.chips_to_add("fold") == 0
+
+    def test_call_matches_engine(self):
+        env = _env()
+        biggest = max(p.n_bet_chips for p in env.players)
+        expected = biggest - env.current_player.n_bet_chips
+        assert env.chips_to_add("call") == expected
+
+    def test_all_in_full_stack(self):
+        env = _env()
+        assert env.chips_to_add("all_in") == env.current_player.n_chips
+
+    def test_raise_round_trip(self):
+        env = _env()
+        for f in env.canonical_raise_fractions():
+            chips = env._compute_raise_chip_amount(f, enforce_minimum=True)
+            assert env.chips_to_add(f"raise:{f}") == chips
+
+    def test_unknown_action_raises(self):
+        env = _env()
+        with pytest.raises(ValueError):
+            env.chips_to_add("shove")
+
+    def test_raise_with_bad_fraction_raises(self):
+        env = _env()
+        with pytest.raises(ValueError):
+            env.chips_to_add("raise:abc")
+
+    def test_raise_with_empty_fraction_raises(self):
+        env = _env()
+        with pytest.raises(ValueError):
+            env.chips_to_add("raise:")
+
+    def test_raise_with_zero_fraction_raises(self):
+        env = _env()
+        with pytest.raises(ValueError, match="positive finite"):
+            env.chips_to_add("raise:0")
+
+    def test_raise_with_negative_fraction_raises(self):
+        env = _env()
+        with pytest.raises(ValueError, match="positive finite"):
+            env.chips_to_add("raise:-2")
+
+    def test_raise_with_infinite_fraction_raises(self):
+        env = _env()
+        with pytest.raises(ValueError, match="positive finite"):
+            env.chips_to_add("raise:inf")
+
+    def test_raise_with_nan_fraction_raises(self):
+        env = _env()
+        with pytest.raises(ValueError, match="positive finite"):
+            env.chips_to_add("raise:nan")
+
+    def test_call_zero_when_actor_is_highest_bettor(self):
+        # If the actor's n_bet_chips already equals biggest_bet, the
+        # call amount is zero (a "check" in poker terms).
+        env = _env()
+        biggest = max(p.n_bet_chips for p in env.players)
+        env.current_player.n_bet_chips = biggest
+        assert env.chips_to_add("call") == 0
+
+
+class TestStringForChips:
+
+    def test_all_in_when_chips_match_stack(self):
+        env = _env()
+        assert env.string_for_chips(env.current_player.n_chips) == "all_in"
+
+    def test_canonical_exact_chip_match(self):
+        env = _env()
+        f = env.canonical_raise_fractions()[0]
+        chips = env._compute_raise_chip_amount(f, enforce_minimum=True)
+        assert env.string_for_chips(chips) == f"raise:{f}"
+
+    def test_all_in_priority_over_canonical_match(self):
+        # If chip_amount happens to equal both stack AND a canonical
+        # clamp, the all-in branch wins (it's tested first).
+        env = _env()
+        f = env.canonical_raise_fractions()[0]
+        chips = env._compute_raise_chip_amount(f, enforce_minimum=True)
+        env.current_player.n_chips = chips
+        assert env.string_for_chips(chips) == "all_in"
+
+    def test_within_default_tolerance_snaps(self):
+        # chip=470 -> f_obs=3.1333, rel-to-3.0 = 0.0444 < 0.10.
+        env = _env()
+        assert env.string_for_chips(470) == "raise:3.0"
+
+    def test_outside_default_tolerance_goes_off_tree(self):
+        # chip=496 -> f_obs=3.3067, rel-to-3.0 = 0.1022 > 0.10.
+        env = _env()
+        s = env.string_for_chips(496)
+        assert s != "raise:3.0"
+        assert s.startswith("raise:")
+        # Off-tree string is *not* in canonical legal_actions until
+        # it has been injected.
+        assert s not in env.legal_actions
+
+    def test_tolerance_boundary_inclusive(self):
+        # Use tol = the actual relative distance; result must snap (<=).
+        env = _env()
+        chips = 494
+        f_obs = chips / env.pot_size
+        dist = abs(f_obs - 3.0) / 3.0
+        assert env.string_for_chips(chips, tol=dist) == "raise:3.0"
+
+    def test_off_tree_string_has_stable_precision(self):
+        env = _env()
+        chips = math.ceil(4.5 * env.pot_size)
+        s = env.string_for_chips(chips)
+        parsed = float(s.split(":", 1)[1])
+        # At most 4 decimals: round-trip through round() is a no-op.
+        assert round(parsed, 4) == parsed
+
+    def test_no_canonical_raises_off_tree(self):
+        env = _env()
+        env._n_raises = MAX_RAISES_PER_ROUND
+        chips = env.current_player.n_chips // 2
+        s = env.string_for_chips(chips)
+        assert s.startswith("raise:")
+        assert s not in env.legal_actions
+
+    def test_zero_chip_amount_raises(self):
+        env = _env()
+        with pytest.raises(ValueError, match="positive"):
+            env.string_for_chips(0)
+
+    def test_negative_chip_amount_raises(self):
+        env = _env()
+        with pytest.raises(ValueError, match="positive"):
+            env.string_for_chips(-50)
+
+    def test_just_inside_default_tolerance(self):
+        # chip=494 -> rel-to-3.0 = 0.0978 < 0.10, snaps.
+        env = _env()
+        assert env.string_for_chips(494) == "raise:3.0"
+
+    def test_just_outside_default_tolerance(self):
+        # chip=496 -> rel-to-3.0 = 0.1022 > 0.10, off-tree.
+        env = _env()
+        assert env.string_for_chips(496) != "raise:3.0"
+
+    def test_picker_uses_relative_metric_with_sparse_canonical(self):
+        # F1 regression: with canonical [0.5, 3.0] and f_obs=2.5 the
+        # absolute-nearest is 0.5 (abs dist 1.0... wait, 2.5 to 0.5 = 2.0,
+        # 2.5 to 3.0 = 0.5 — abs and rel both pick 3.0 here).  Use
+        # f_obs=1.6 between the two canonicals: abs picks 0.5
+        # (dist 1.1) over 3.0 (dist 1.4); rel picks 3.0
+        # (rel 0.47) over 0.5 (rel 2.2).  With the relative
+        # metric the result is OFF_TREE (rel 0.47 > 0.10) and the
+        # off-tree string reflects the OBSERVED fraction, not a
+        # spurious snap to 0.5.
+        env = _env()
+        # Hand-set the canonical grid to a sparse one by monkey-patching.
+        env.canonical_raise_fractions = lambda: [0.5, 3.0]
+        f_obs_target = 1.6
+        chips = int(round(f_obs_target * env.pot_size))
+        s = env.string_for_chips(chips)
+        # OFF_TREE: returned string carries f_obs, not 0.5 or 3.0.
+        assert s.startswith("raise:")
+        f_parsed = float(s.split(":", 1)[1])
+        assert abs(f_parsed - 1.6) < 1e-3, s
+
+    def test_canonical_on_flop_stage(self):
+        # Walk to the flop and verify canonical mapping uses the
+        # flop's raise grid, not pre-flop's.
+        env = _env()
+        env = env.apply_action("call")
+        env = env.apply_action("call")
+        assert env.betting_round == 1
+        fractions = env.canonical_raise_fractions()
+        assert fractions, "expected playable flop fractions"
+        f = fractions[0]
+        chips = env._compute_raise_chip_amount(f, enforce_minimum=True)
+        assert env.string_for_chips(chips) == f"raise:{f}"
+
+
+class TestRuntimeIntegration:
+
+    def test_off_tree_injection_round_trip(self):
+        # The runtime's caller pattern: convert chips to a string,
+        # inject if not in legal_actions, then apply.
+        env = _env()
+        chips = math.ceil(4.5 * env.pot_size)
+        s = env.string_for_chips(chips)
+        assert s not in env.legal_actions
+        assert env.inject_action(s) is True
+        assert s in env.legal_actions
+
+    def test_on_tree_chip_round_trip(self):
+        # Canonical f -> chips -> string (already in legal_actions)
+        # -> chips_to_add returns the original chip count.
+        env = _env()
+        f = env.canonical_raise_fractions()[0]
+        chips = env._compute_raise_chip_amount(f, enforce_minimum=True)
+        s = env.string_for_chips(chips)
+        assert s in env.legal_actions
+        assert env.chips_to_add(s) == chips

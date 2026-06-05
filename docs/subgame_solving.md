@@ -146,7 +146,6 @@ New top-level package: `poker_ai/search/`.
 poker_ai/search/
 ├── context.py        # SubgameContext: per-search inputs static for one solve()
 ├── ranges.py         # Per-opponent range tracking (dense per-combo)
-├── translation.py    # Off-tree size mapping + injection into env overlay
 ├── leaf.py           # Depth-limit leaf continuation-value evaluation
 ├── solver.py         # Depth-limited MCCFR subgame solver
 ├── policy.py         # Policy ABC, BiasClass, implementations
@@ -440,38 +439,51 @@ Implementation notes:
 - A per-decision log `List[Tuple[seat, info_set_before, action]]` is
   retained for debugging and Phase 1↔Phase 2 replay comparisons.
 
-### 6.3 Action translation and off-tree action injection (`translation.py`)
+### 6.3 Action translation (env API, no search-side module)
+
+Chip ↔ action-string conversion is a property of the environment, not
+of search. The runtime translator at the chip-denominated boundary (a
+live table or the terminal loop) consumes the env's public chip-math
+methods; the search package sees only action strings.
 
 ```python
-def canonical_raise_fractions(env: PokerEnv) -> List[float]:
-    """The current street's raise-size abstraction, as fractions of pot."""
+# environment/poker_env.py — public methods
+def canonical_raise_fractions(self) -> List[float]:
+    """Currently-playable raise fractions, mirroring legal_actions' gating."""
 
-class Classification(Enum):
-    ON_TREE   = auto()   # exact match with an abstraction action
-    NEAR_TREE = auto()   # |Δfrac| / f_nearest ≤ tol → snap
-    OFF_TREE  = auto()   # > tol → inject as extra action
+def chips_to_add(self, action: str) -> int:
+    """Inverse of apply_action's chip math.  fold→0, call→biggest_bet−bet,
+    all_in→stack, raise:<f>→_compute_raise_chip_amount(f, enforce_minimum=True)."""
 
-def classify_observed(
-    env_before: PokerEnv,
-    chip_amount: int,
-    tol: float = 0.15,
-) -> Tuple[Classification, str]:
-    """Second return is either the abstraction action string (ON/NEAR_TREE)
-    or the injected action string, e.g. 'raise:0.42' (OFF_TREE)."""
+def string_for_chips(self, chip_amount: int, tol: float = 0.15) -> str:
+    """Map an observed chip raise to the abstraction's action string.
 
-def abstract_to_chips(env: PokerEnv, action: str) -> int:
-    """Inverse mapping used when the bot emits an abstract action."""
+    1. chip_amount == actor.n_chips  →  "all_in"
+    2. exact canonical clamp         →  "raise:<f>"
+    3. |f_obs − f_near| / f_near ≤ tol → snap to "raise:<f_near>"
+    4. else                          →  off-tree "raise:<f_obs>" (4-dp)
+    """
 ```
 
 - Tolerance is relative pot-fraction distance: `|f_obs − f_near| / f_near`.
-  Default `0.15`; CLI flag `--off-tree-tol`.
+  Default `0.15`; CLI flag `--off-tree-tol` plumbs into the runtime.
 - Fold / call / all-in are always on-tree — only raise sizes can deviate.
-- `OFF_TREE` injection calls `env_before.inject_action(action_str)`
-  (§6.1). The env records the injection against its own current public
-  state internally; `env.legal_actions` then reports the injected
-  action at every visit to that public state, regardless of which
-  seat is acting. Solver, leaf, and tree-walk code see it transparently
-  through `env.legal_actions` and need no special-case branch.
+- The runtime's caller pattern (used by `runner.py` and any future
+  table adapter):
+  ```python
+  action_str = env.string_for_chips(observed_chips, tol=cfg.off_tree_tol)
+  if action_str not in env.legal_actions:
+      env.inject_action(action_str)
+  env = env.apply_action(action_str)
+  agent.on_observed_action(seat, env_before, action_str)
+  ```
+  The runtime decides whether to inject by a single membership check
+  against `env.legal_actions`; no enum or classification value flows
+  out of `string_for_chips`. By the time `SearchAgent.on_observed_action`
+  is invoked, the env's history reflects what happened and the overlay
+  has been recorded if needed.
+- The search package has no translation module. `SearchAgent` works in
+  action strings; chips never enter the search code path.
 
 ### 6.4 Leaf continuation-value evaluation (`leaf.py`)
 
@@ -687,19 +699,19 @@ injections from previous hands don't leak into this hand's tree.
 3. Return the abstract action (`PokerEnv.apply_action` accepts the
    string directly; no chip translation needed).
 
-`on_observed_action` flow:
+`on_observed_action` flow. The runtime has already translated the
+chip observation via `env.string_for_chips` and applied the action
+(injecting it via `env.inject_action` first if it was off-tree); the
+agent receives the action string and the pre-action env snapshot:
 
-1. `classification, action_str = classify_observed(env_before, chips,
-   off_tree_tol)`.
-2. If `OFF_TREE`: `env_before.inject_action(action_str)`. The overlay
-   dict is shared by reference across the deepcopy lineage and mutated
-   in place, so the injection is visible to the runtime env and to
-   every future search-time deepcopy at the matching public state.
-3. Pick the policy used to model that seat's decision: the cached
+1. Pick the policy used to model that seat's decision: the cached
    `last_search.policy` if search ran at least once this hand, else
    `self.opponent_response_policy`.
-4. Build the per-combo σ closure (cluster-vectorised — see §6.2) and
+2. Build the per-combo σ closure (cluster-vectorised — see §6.2) and
    call `tracker.on_action(seat, env_before, action_str, sigma_for_combo)`.
+
+The agent never sees chips. Off-tree injection is the runtime's
+concern at the chip→string boundary (§6.3).
 
 Wiring: [poker_ai/terminal/runner.py](../poker_ai/terminal/runner.py) gets a
 new `--agent search` branch that instantiates `SearchAgent`, plumbs
@@ -717,7 +729,7 @@ start while the rest is being built.
 | 1 | Biased blueprint training | `poker_ai/blueprint/bias.py`, `runner.py`, `cfr.py` | in progress | — |
 | 2 | Env overlay (`inject_action`, `reset_overlay`, `has_overlay_at_current_node`) + `with_hole_cards` + `SubgameContext` | `environment/poker_env.py`, `poker_ai/search/context.py` | **done** | 0 |
 | 3 | Range tracking | `poker_ai/search/ranges.py` | **done** | 0 |
-| 4 | Action translation | `poker_ai/search/translation.py` | todo | — |
+| 4 | Chip↔action env API (`canonical_raise_fractions`, `chips_to_add`, `string_for_chips`) | `environment/poker_env.py` | **done** | — |
 | 5 | Leaf-EV (Phase 1 bias) | `poker_ai/search/leaf.py` | todo | 0, 2, 3 |
 | 6 | Solver + `SearchPolicy` | `poker_ai/search/solver.py`, `policy.py` | todo | 0, 2, 3, 5 |
 | 7 | Search-aware agent | `poker_ai/search/agent.py`, terminal wiring | todo | 3, 4, 6 |
@@ -758,10 +770,12 @@ poker_ai play \
   deterministic fixtures and `@pytest.mark.requires_lut` where the card-info
   LUT is needed.
   - `ranges.py`: Bayesian-update math, board-conflict zeroing.
-  - `translation.py`: nearest-size mapping within tolerance; injection of
-    off-tree actions into the subgame tree when the deviation exceeds the
-    tolerance; round-trip chip → abstract → chip preservation where the
-    input is already in-abstraction.
+  - `environment/poker_env.py` chip API: `canonical_raise_fractions`
+    matches `legal_actions` gating; `chips_to_add` round-trips
+    canonical action strings; `string_for_chips` nearest-size mapping
+    within tolerance and off-tree string formation when the deviation
+    exceeds the tolerance (see
+    [test/environment/unit/test_chip_translation.py](../test/environment/unit/test_chip_translation.py)).
   - `environment/poker_env.py` (additions): `inject_action` is
     idempotent and persists across deepcopies; `legal_actions`
     reports injected actions at the matching public state and nowhere

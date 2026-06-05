@@ -398,8 +398,16 @@ class PokerEnv:
             new_env.current_player.raise_to(pot=new_env.pot, n_chips=n_chips_to_add)
         elif action_str.startswith("raise:"):
             pot_fraction = float(action_str.split(":")[1])
+            # Actions reaching this branch are guaranteed in
+            # ``legal_actions``: canonical sizes were filtered to
+            # >= min raise in ``_get_available_raise_sizes`` and
+            # injected sizes were validated by
+            # ``_raise_fraction_is_playable``.  ``enforce_minimum=True``
+            # therefore agrees with ``False`` on every valid input and
+            # keeps the chip math consistent with ``chips_to_add`` /
+            # ``string_for_chips`` / ``_raise_fraction_is_playable``.
             n_chips_to_add = new_env._compute_raise_chip_amount(
-                pot_fraction, enforce_minimum=False
+                pot_fraction, enforce_minimum=True
             )
             biggest_bet = max(p.n_bet_chips for p in new_env.players)
             current_bet = new_env.current_player.n_bet_chips
@@ -606,6 +614,168 @@ class PokerEnv:
         return raise_actions
 
     # ------------------------------------------------------------------
+    # Public chip <-> action conversion
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_raise_fraction(action: str, caller: str) -> float:
+        """Parse and validate the fraction of a ``"raise:<f>"`` action.
+
+        Centralises the shape check used by every public method that
+        consumes a raise action string (``inject_action``,
+        ``chips_to_add``).  A fraction must be parseable, finite, and
+        positive; anything else is a caller bug and raises
+        :class:`ValueError`.
+
+        ``caller`` is the method name; it is interpolated into error
+        messages so the failure site is obvious to the user.
+        """
+        try:
+            fraction = float(action.split(":", 1)[1])
+        except (ValueError, IndexError):
+            raise ValueError(
+                f"{caller}: unparseable raise fraction in {action!r}"
+            )
+        if not math.isfinite(fraction) or fraction <= 0.0:
+            raise ValueError(
+                f"{caller}: raise fraction must be a positive finite "
+                f"float, got {fraction}"
+            )
+        return fraction
+
+    def canonical_raise_fractions(self) -> List[float]:
+        """Currently-playable raise fractions for the actor.
+
+        Mirrors the gating that :meth:`legal_actions` applies before
+        delegating to :meth:`_get_available_raise_sizes`: an inactive
+        player, a call amount that meets or exceeds the stack, or
+        having already hit :data:`MAX_RAISES_PER_ROUND` all yield an
+        empty list.  Stack-clamping and min-raise enforcement come
+        from ``_get_available_raise_sizes`` itself.
+        """
+        if not self.current_player.is_active:
+            return []
+        biggest_bet = max(p.n_bet_chips for p in self.players)
+        n_chips_to_call = biggest_bet - self.current_player.n_bet_chips
+        if n_chips_to_call >= self.current_player.n_chips:
+            return []
+        if self._n_raises >= MAX_RAISES_PER_ROUND:
+            return []
+        raise_strs = self._get_available_raise_sizes()
+        return [
+            float(s.split(":", 1)[1])
+            for s in raise_strs
+            if s.startswith("raise:")
+        ]
+
+    def chips_to_add(self, action: str) -> int:
+        """Chips the actor must add to play ``action``.
+
+        Public inverse of :meth:`apply_action`'s chip math.  Accepts
+        the same action vocabulary as :meth:`apply_action` and
+        :meth:`inject_action` and applies the same shape validation
+        on raise fractions (must be finite and positive).
+
+        Mapping:
+
+        - ``"fold"``      -> ``0``
+        - ``"call"``      -> ``biggest_bet - actor.n_bet_chips`` (``0`` when
+          the actor is already the highest bettor — i.e. a check)
+        - ``"all_in"``    -> ``actor.n_chips`` (full remaining stack)
+        - ``"raise:<f>"`` -> :meth:`_compute_raise_chip_amount` with
+          min-raise enforcement
+
+        Raises
+        ------
+        ValueError
+            On an unknown action prefix, an unparseable ``<f>``, or a
+            non-positive / non-finite ``<f>``.  Same shape and
+            message style as :meth:`inject_action`.
+        """
+        if action == "fold":
+            return 0
+        if action == "call":
+            biggest_bet = max(p.n_bet_chips for p in self.players)
+            return biggest_bet - self.current_player.n_bet_chips
+        if action == "all_in":
+            return self.current_player.n_chips
+        if action.startswith("raise:"):
+            fraction = self._parse_raise_fraction(action, "chips_to_add")
+            return self._compute_raise_chip_amount(fraction, enforce_minimum=True)
+        raise ValueError(f"chips_to_add: unknown action {action!r}")
+
+    def string_for_chips(self, chip_amount: int, tol: float = 0.10) -> str:
+        """Map an observed chip raise to the abstraction's action string.
+
+        ``chip_amount`` is the total chips the actor added to the pot
+        at this decision (matching :meth:`_compute_raise_chip_amount`'s
+        ``n_chips_to_add`` convention).  The caller is responsible for
+        routing fold / call / check separately; this method handles
+        raises (including ``all_in``) and so requires
+        ``chip_amount > 0``.
+
+        Snapping rule:
+
+        1. ``chip_amount == actor.n_chips`` -> ``"all_in"``.
+        2. Exact match against any canonical clamp -> ``"raise:<f>"``.
+        3. Otherwise, the nearest canonical fraction is chosen by
+           **relative distance** ``|f - f_obs| / f``, and the same
+           metric gates the snap: a canonical ``f_near`` is accepted
+           iff ``|f_near - f_obs| / f_near <= tol``.  Same metric for
+           picking and gating: a candidate selected as "nearest" can
+           never be rejected by a stricter metric in a downstream
+           check.
+        4. Else return an off-tree ``"raise:<f_obs>"`` string with
+           ``f_obs`` rounded to 4 decimals (stable overlay key).
+
+        The default ``tol = 0.10`` corresponds to "the observed raise
+        is within 10% of the snapped abstraction size" — so e.g. an
+        observed 0.55× pot snaps to canonical 0.5× (exactly at the
+        boundary, inclusive), but 0.6× does not.  Relative semantics
+        scale evenly across the grid: 2.2× snaps to 2.0× at the same
+        tolerance ratio that 0.55× snaps to 0.5×.
+
+        The runtime then either feeds the result directly to
+        :meth:`apply_action` (if it is already canonical) or first
+        injects it via :meth:`inject_action` (if it is off-tree).
+        Whether to inject is a membership check on
+        :attr:`legal_actions`, not a property of this return value.
+
+        Off-tree returns are not guaranteed to be *playable*: at
+        ``_n_raises >= MAX_RAISES_PER_ROUND`` or otherwise unplayable
+        states, :meth:`inject_action` will reject the string and
+        return ``False``.  That rejection is the env's signal that
+        the abstraction tree cannot represent the observation; the
+        runtime should handle it as an integration-layer condition.
+
+        Raises
+        ------
+        ValueError
+            If ``chip_amount <= 0``.  Fold / call / check have their
+            own dedicated handling upstream and never reach this
+            method.
+        """
+        if chip_amount <= 0:
+            raise ValueError(
+                f"string_for_chips: chip_amount must be positive "
+                f"(fold/call/check are routed separately), got {chip_amount}"
+            )
+        if chip_amount == self.current_player.n_chips:
+            return "all_in"
+        canonical = self.canonical_raise_fractions()
+        for f in canonical:
+            if self._compute_raise_chip_amount(f, enforce_minimum=True) == chip_amount:
+                return f"raise:{f}"
+        f_obs = chip_amount / self.pot_size
+        if canonical:
+            def _rel(f: float) -> float:
+                return abs(f - f_obs) / f
+            f_near = min(canonical, key=_rel)
+            if _rel(f_near) <= tol:
+                return f"raise:{f_near}"
+        return f"raise:{round(f_obs, 4)}"
+
+    # ------------------------------------------------------------------
     # Off-tree action overlay
     # ------------------------------------------------------------------
 
@@ -659,24 +829,17 @@ class PokerEnv:
             bugs, not game-state conditions.
         """
         if action in ("fold", "call", "all_in"):
-            # Already canonical; trivially in legal_actions when legal.
-            return True
+            # Already canonical; nothing to record.  Return value
+            # honours the documented contract — True iff the action
+            # is actually legal at this state (inactive players and
+            # zero-stack actors can render canonical actions illegal).
+            return action in self.legal_actions
         if not action.startswith("raise:"):
             raise ValueError(
                 f"inject_action: only 'fold' / 'call' / 'all_in' / "
                 f"'raise:<fraction>' are supported, got {action!r}"
             )
-        try:
-            fraction = float(action.split(":", 1)[1])
-        except (ValueError, IndexError):
-            raise ValueError(
-                f"inject_action: unparseable raise fraction in {action!r}"
-            )
-        if not math.isfinite(fraction) or fraction <= 0.0:
-            raise ValueError(
-                f"inject_action: raise fraction must be a positive finite "
-                f"float, got {fraction}"
-            )
+        fraction = self._parse_raise_fraction(action, "inject_action")
         if not self._raise_fraction_is_playable(fraction):
             logger.warning(
                 "inject_action rejected %r at public state %r — "
