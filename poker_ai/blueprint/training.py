@@ -148,23 +148,30 @@ def strategy_step(
 # ---------------------------------------------------------------------------
 
 
-def at_sync_barrier(t: int, sync_interval: int) -> bool:
-    """Return ``True`` when *t* is a sync-barrier iteration.
+def at_sync_barrier(t: int, sync_interval: int, step: int = 1) -> bool:
+    """Return ``True`` iff iteration *t* crossed a sync-barrier boundary.
 
-    A sync barrier is any iteration where ``t % sync_interval == 0``.
-    Sync barriers are the points at which workers flush their
-    accumulated regret deltas into the shared tables, and they are
-    also the only iterations at which strategy updates, discounting,
-    and checkpointing may fire.
+    Uses crossing detection so the barrier fires exactly once per
+    ``sync_interval`` traversals-per-player, even when ``t`` advances
+    by more than one per loop pass (as happens in the multi-process
+    server where each loop dispatches ``workers_per_player``
+    traversals per player).
+
+    For ``step == 1`` this is equivalent to the classical
+    ``t % sync_interval == 0`` predicate — so legacy single-process
+    callers see no behavioural change.
 
     Parameters
     ----------
     t : int
-        Current iteration counter.
+        Current traversals-per-player counter (post-increment).
     sync_interval : int
-        Number of iterations between sync barriers.
+        Number of traversals-per-player between sync barriers.
+    step : int, optional
+        Size of the increment applied to ``t`` on the loop pass that
+        produced this value.  Defaults to ``1``.
     """
-    return t % sync_interval == 0
+    return (t - step) // sync_interval < t // sync_interval
 
 
 def should_update_strategy(

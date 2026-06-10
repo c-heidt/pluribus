@@ -30,14 +30,16 @@ shared-memory mmaps, and LMDB environments.
 
 import logging
 import math
+import shutil
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
 from poker_ai.tables.chunk_store import CHUNK_SIZE
 from poker_ai.tables.index import InfosetIndex
 from poker_ai.tables.chunked_table import ChunkedTable
+from utils.io import atomic_numpy_save
 
 log = logging.getLogger("poker_ai.tables.cfr_tables")
 
@@ -178,6 +180,60 @@ class CFRTables:
         log.info("Saved %d dirty chunks to %s", total, dir_path)
         return total
 
+    def snapshot_dirty_chunks(self) -> List[Tuple[str, np.ndarray]]:
+        """Copy every dirty chunk into private buffers, clear dirty flags.
+
+        Counterpart of :meth:`save_chunks` for async checkpointing.
+        Must be called inside the sync barrier (all workers flushed
+        and idle) so the snapshot is transactionally consistent with
+        the per-street index watermarks.  After this returns, workers
+        may resume and begin dirtying chunks again; those new dirty
+        marks will be captured by the *next* snapshot.
+
+        Returns
+        -------
+        list[tuple[str, np.ndarray]]
+            One entry per dirty chunk across all eight tables.  The
+            string is the filename (no directory); the ndarray is a
+            freshly-allocated int32 buffer owned by the caller.
+        """
+        buffers: List[Tuple[str, np.ndarray]] = []
+        for r in range(4):
+            n_entries = self._indexes[r].n_allocated_rows
+            for table, prefix in [
+                (self.regret[r], f"regret_{r}"),
+                (self.strategy[r], f"strategy_{r}"),
+            ]:
+                buffers.extend(table.store.snapshot_dirty(n_entries, prefix))
+        log.info("Snapshotted %d dirty chunks", len(buffers))
+        return buffers
+
+    @staticmethod
+    def write_buffers(
+        buffers: List[Tuple[str, np.ndarray]], dir_path: Path
+    ) -> int:
+        """Serialise pre-copied chunk buffers to *dir_path*.
+
+        Consumes the list produced by :meth:`snapshot_dirty_chunks`.
+        Safe to call from a background thread while workers are
+        running — the buffers are private copies, not shared memory.
+
+        Parameters
+        ----------
+        buffers : list[tuple[str, np.ndarray]]
+            ``(filename, array)`` pairs to write.
+        dir_path : Path
+            Target directory (must exist).
+
+        Returns
+        -------
+        int
+            Number of files written.
+        """
+        for filename, array in buffers:
+            atomic_numpy_save(array, dir_path / filename)
+        return len(buffers)
+
     def validate_chunks(
         self, dir_path: Path, n_chunks: Dict[int, int]
     ) -> bool:
@@ -303,6 +359,54 @@ class CFRTables:
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    def copy_indexes_to(self, dst_dir: Union[str, Path]) -> None:
+        """Write a consistent snapshot of every per-street LMDB index to *dst_dir*.
+
+        Used by :class:`~poker_ai.tables.checkpoint.CheckpointManager`
+        to mirror a node-local runtime LMDB back to the persistent
+        save directory at checkpoint time.  Each street is written
+        as a sub-directory ``street_{r}/`` under *dst_dir*, matching
+        the layout that :class:`CFRTables` consumes on construction
+        and that :func:`_load_checkpoint_if_exists` looks for on
+        resume.
+
+        The destination is created if missing; existing per-street
+        sub-directories are removed first because LMDB refuses to
+        write into a non-empty env directory.
+
+        Parameters
+        ----------
+        dst_dir : str or Path
+            Target directory that will receive
+            ``street_0/.../street_3/`` LMDB environments.
+        """
+        dst = Path(dst_dir)
+        dst.mkdir(parents=True, exist_ok=True)
+        for r, idx in self._indexes.items():
+            street_dst = dst / f"street_{r}"
+            if street_dst.exists():
+                shutil.rmtree(street_dst)
+            idx.copy_to(street_dst)
+
+    def close_envs(self) -> None:
+        """Close every per-street LMDB environment in this process.
+
+        Used by the server immediately before forking workers so the
+        child processes inherit *closed* env handles, sidestepping
+        ``MDB_BAD_RSLOT`` errors that can otherwise trip on the first
+        post-fork read transaction.  Workers will open their own
+        envs in :meth:`reopen_after_fork`; the parent reopens its
+        envs via :meth:`open_envs` immediately after spawning the
+        pool so checkpoint-time index flushes keep working.
+        """
+        for idx in self._indexes.values():
+            idx.close_env()
+
+    def open_envs(self) -> None:
+        """(Re-)open every per-street LMDB environment in this process."""
+        for idx in self._indexes.values():
+            idx.open_env()
 
     def reopen_after_fork(self) -> None:
         """Reopen every per-street LMDB index in the current process.

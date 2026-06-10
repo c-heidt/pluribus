@@ -11,9 +11,11 @@ Job protocol
 ------------
 The worker understands four job names:
 
-- ``"cfr"`` — run one CFR traversal for player ``kwargs["i"]`` at
-  iteration ``kwargs["t"]``.  Regret updates are written to the
-  worker's persistent :attr:`_local_delta` buffer.
+- ``"cfr"`` — run ``kwargs["batch"]`` CFR traversals for player
+  ``kwargs["i"]`` at iteration ``kwargs["t"]`` (defaults to ``1``
+  for backward compatibility with callers that do not batch).
+  Regret updates are written to the worker's persistent
+  :attr:`_local_delta` buffer across the full batch.
 - ``"sync"`` — flush :attr:`_local_delta` into the shared regret
   tables via :meth:`_flush_delta`.
 - ``"update_strategy"`` — run one strategy-update traversal for
@@ -185,18 +187,26 @@ class Worker(mp.Process):
                     self._flush_delta()
                     should_break = True
                 elif name == "cfr":
-                    game_state = state.new_game(
-                        self._n_players, self._info_set_lut,
-                    )
-                    cfr_step(
-                        self._tables,
-                        game_state,
-                        kwargs["i"],
-                        kwargs["t"],
-                        self._prune_threshold,
-                        self._c,
-                        self._local_delta,
-                    )
+                    # A single "cfr" queue item runs ``batch`` traversals
+                    # back-to-back so the queue IPC cost (pickle +
+                    # cross-process put/get) is amortised over many
+                    # CFR calls.  Each traversal starts from a fresh
+                    # game state; regret updates accumulate into the
+                    # persistent :attr:`_local_delta` across the batch.
+                    batch = kwargs.get("batch", 1)
+                    for _ in range(batch):
+                        game_state = state.new_game(
+                            self._n_players, self._info_set_lut,
+                        )
+                        cfr_step(
+                            self._tables,
+                            game_state,
+                            kwargs["i"],
+                            kwargs["t"],
+                            self._prune_threshold,
+                            self._c,
+                            self._local_delta,
+                        )
                 elif name == "sync":
                     self._flush_delta()
                 elif name == "update_strategy":

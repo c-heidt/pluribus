@@ -35,7 +35,7 @@ import mmap
 import multiprocessing as mp
 import os
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 
@@ -44,13 +44,17 @@ from utils.io import atomic_numpy_save
 log = logging.getLogger("poker_ai.tables.chunk_store")
 
 
-CHUNK_SIZE: int = 1_000_000
+CHUNK_SIZE: int = int(os.environ.get("PLURIBUS_CHUNK_SIZE", 4_000_000))
 """Number of rows in a single chunk.
 
 All chunks except the last are full.  Sizing is a trade-off between
 filesystem overhead on checkpoint writes (fewer larger files are
 cheaper on Lustre/GPFS) and the amount of memory that has to be
 re-mmapped when a new infoset row overflows into a new chunk.
+
+Configurable via the ``PLURIBUS_CHUNK_SIZE`` environment variable.
+Changing it between runs that share a save directory is rejected at
+resume time by the checkpoint manager's structural-config check.
 """
 
 _MAX_DIRTY_CHUNKS: int = 1024
@@ -267,6 +271,56 @@ class ChunkStore:
             )
             written += 1
         return written
+
+    def snapshot_dirty(
+        self, n_entries: int, prefix: str
+    ) -> List[Tuple[str, np.ndarray]]:
+        """Memcpy every dirty chunk into a private buffer and clear the flags.
+
+        Counterpart of :meth:`save_dirty` for async checkpointing:
+        instead of writing chunk files to disk inline, returns a list
+        of ``(filename, ndarray)`` pairs that the background writer
+        will later serialise via :func:`utils.io.atomic_numpy_save`.
+        Dirty flags are cleared *after* the copy so a worker that
+        marks a chunk dirty between the copy and the clear is not
+        silently lost — its write will appear in the next snapshot.
+
+        Parameters
+        ----------
+        n_entries : int
+            Total number of valid rows across all chunks, as of the
+            snapshot's barrier.
+        prefix : str
+            File-name prefix for the emitted buffers (e.g.
+            ``regret_0``).  The returned filename is
+            ``{prefix}_chunk_{chunk_id:06d}.npy``.
+
+        Returns
+        -------
+        list[tuple[str, np.ndarray]]
+            One entry per dirty chunk, in ascending chunk-id order.
+            The arrays are freshly-allocated int32 copies owned by
+            the caller — writing to them does not mutate shared
+            memory.
+        """
+        n_chunks = math.ceil(n_entries / CHUNK_SIZE) if n_entries > 0 else 0
+        buffers: List[Tuple[str, np.ndarray]] = []
+        dirty_ids: List[int] = []
+        for chunk_id in range(n_chunks):
+            if chunk_id >= _MAX_DIRTY_CHUNKS or not self._dirty[chunk_id]:
+                continue
+            self.ensure_open(chunk_id)
+            valid_rows = min(n_entries - chunk_id * CHUNK_SIZE, CHUNK_SIZE)
+            buffers.append(
+                (
+                    f"{prefix}_chunk_{chunk_id:06d}.npy",
+                    self._chunks[chunk_id][:valid_rows].copy(),
+                )
+            )
+            dirty_ids.append(chunk_id)
+        for chunk_id in dirty_ids:
+            self._dirty[chunk_id] = 0
+        return buffers
 
     def restore(self, chunk_id: int, data: np.ndarray) -> None:
         """Copy *data* into the shared memory for *chunk_id*.

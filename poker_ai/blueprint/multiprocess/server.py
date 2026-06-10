@@ -32,6 +32,8 @@ Process and concurrency model
 import logging
 import multiprocessing as mp
 import os
+import signal
+import sys
 import threading
 import time
 from pathlib import Path
@@ -39,6 +41,7 @@ from typing import Dict, Optional, Union
 
 from poker_ai.tables.checkpoint import CheckpointManager
 from poker_ai.tables.cfr_tables import CFRTables
+from poker_ai.tables.chunk_store import CHUNK_SIZE as _CHUNK_SIZE
 from poker_ai.blueprint.multiprocess.worker import Worker
 from poker_ai.blueprint.training import (
     DiscountState,
@@ -47,9 +50,34 @@ from poker_ai.blueprint.training import (
     should_discount,
     should_update_strategy,
 )
-from information_abstraction import load_info_set_lut
+from information_abstraction import load_info_set_lut, prewarm_lut
 
 log = logging.getLogger("sync.server")
+
+
+def _startup_signal_handler(signum: int, frame) -> None:
+    """Exit cleanly when SIGTERM/SIGINT arrives during server startup.
+
+    Server startup includes LUT joblib deserialisation, LUT
+    pre-warming, and LMDB env opens — operations that can run for
+    minutes before :class:`CheckpointManager` is constructed and
+    overrides the signal handlers.  Without this handler the default
+    Python disposition (terminate) applies: SLURM's grace-period
+    SIGTERM lands during startup, Python dies without logging, and
+    after the grace window slurm logs the job as KILLED rather than
+    cleanly TERMINATED.
+
+    No training state has been mutated yet, so there is nothing to
+    checkpoint.  We log the signal and call :func:`sys.exit` so
+    Python unwinds normally (running ``atexit`` hooks and flushing
+    log handlers) before the process exits.
+    """
+    sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+    log.warning(
+        f"{sig_name} received during server startup — exiting cleanly "
+        "before training begins (no checkpoint needed)"
+    )
+    sys.exit(143 if signum == signal.SIGTERM else 130)
 
 
 class WorkerError(RuntimeError):
@@ -91,8 +119,9 @@ class Server:
         sync_interval: int = 10,
         discount_interval: int = 1,
         checkpoint_interval: int = 1,
-        start_timestep: int = 1,
+        start_timestep: int = 0,
         n_processes: Optional[int] = None,
+        batch_size: Optional[int] = None,
     ):
         """Initialise the server and spawn the worker pool.
 
@@ -129,22 +158,52 @@ class Server:
             Use the legacy pickle-directory LUT layout.  Defaults to
             ``False``.
         sync_interval : int, optional
-            Number of iterations between sync barriers.  The base
-            unit for every other cycle-based parameter.
+            Number of traversals-per-player between sync barriers.  The
+            base unit for every other cycle-based parameter.  Counts
+            traversals (not loop ticks) so the same config produces
+            equivalent training regardless of how many worker
+            processes the hardware supports.
         discount_interval : int, optional
             Period (in sync cycles) between LCFR discount applications.
         checkpoint_interval : int, optional
             Period (in sync cycles) between checkpoint writes.
         start_timestep : int, optional
-            Initial iteration counter.  Overridden on resume by the
-            checkpoint manager.
+            Initial traversals-per-player counter (``0`` on fresh
+            runs).  Overridden on resume by the checkpoint manager.
         n_processes : int, optional
             Number of worker processes to spawn.  Defaults to
             ``SLURM_CPUS_PER_TASK - 1`` when running under SLURM or
             ``cpu_count() - 1`` otherwise.  The number of jobs dispatched
             per player per iteration is derived as
-            ``max(1, n_processes // n_players)`` to keep the full pool busy.
+            ``max(1, n_processes // n_players)`` to keep every worker
+            busy — batching does not change this because each worker
+            processes one queue item at a time regardless of batch
+            size.  Batching instead reduces the wall-clock *rate*
+            of queue ops (each item now carries ``batch_size``
+            traversals of work).
+        batch_size : int, optional
+            Number of CFR traversals executed per ``cfr`` queue item.
+            Raising this reduces queue IPC traffic and dispatcher
+            pressure at the cost of longer per-job wall time.
+            Defaults to the ``PLURIBUS_CFR_BATCH_SIZE`` environment
+            variable if set, else ``5``.
         """
+        # Install a minimal SIGTERM/SIGINT handler immediately so a
+        # signal that arrives during the slow startup phases (LUT
+        # rsync from the LUT loader's perspective is already done,
+        # but joblib deserialise + prewarm + LMDB env open can still
+        # take minutes) causes a clean exit rather than the default
+        # process-terminate.  No training state has been mutated at
+        # this point, so there is nothing to checkpoint — we just
+        # exit promptly so slurm logs the job as terminated rather
+        # than waiting out the grace period and SIGKILL'ing us.
+        # CheckpointManager installs the full "set event, drain
+        # final checkpoint" handler later in this constructor,
+        # overriding this one.
+        signal.signal(signal.SIGTERM, _startup_signal_handler)
+        signal.signal(signal.SIGINT, _startup_signal_handler)
+        log.info("Early SIGTERM/SIGINT handler installed (startup phase)")
+
         if n_processes is None:
             slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
             if slurm_cpus is not None:
@@ -154,10 +213,31 @@ class Server:
                 n_processes = mp.cpu_count() - 1
                 log.info(f"Using {n_processes} processes (cpu_count={mp.cpu_count()})")
 
+        if batch_size is None:
+            batch_size = int(os.environ.get("PLURIBUS_CFR_BATCH_SIZE", 5))
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        self._batch_size = batch_size
+
+        # workers_per_player saturates the worker pool: every worker
+        # processes one queue item at a time regardless of batch_size,
+        # so the number of outstanding items needed is independent of
+        # how much work each item contains.  batch_size instead
+        # reduces the *rate* at which items flow through the queue
+        # (each item now holds ``batch_size`` traversals' worth of
+        # work) — that is the dispatcher-pressure win, not fewer
+        # outstanding items.
         self._workers_per_player = max(1, n_processes // n_players)
+        traversals_per_loop = (
+            self._workers_per_player * self._batch_size * n_players
+        )
         log.info(
+            f"batch_size={self._batch_size} "
             f"workers_per_player={self._workers_per_player} "
-            f"(n_processes={n_processes}, n_players={n_players})"
+            f"(n_processes={n_processes}, n_players={n_players}) → "
+            f"{self._workers_per_player * n_players} queue items per loop, "
+            f"{traversals_per_loop} traversals per loop, "
+            f"{self._workers_per_player * self._batch_size} per player"
         )
 
         self._strategy_interval = strategy_interval
@@ -180,8 +260,11 @@ class Server:
 
         # Load the LUT once in the parent; workers inherit the
         # deserialised object via fork copy-on-write, avoiding one
-        # load per worker.
+        # load per worker.  Memmap-backed streets (the river on
+        # 52-card decks) are eagerly pre-warmed so per-traversal
+        # lookups hit RAM instead of paging from disk.
         self._info_set_lut = load_info_set_lut(lut_path, pickle_dir)
+        prewarm_lut(self._info_set_lut)
 
         self._job_queue: mp.JoinableQueue = mp.JoinableQueue(maxsize=n_processes)
         self._logging_queue: mp.Queue = mp.Queue()
@@ -200,8 +283,30 @@ class Server:
         log.info(
             f"LMDB map_size={lmdb_map_size // 1024**3} GiB for {n_players} players"
         )
+
+        # Optional node-local LMDB staging.  When PLURIBUS_LMDB_LOCAL_DIR
+        # is set the runtime LMDB lives on fast scratch (avoids per-
+        # lookup NFS lock-table latency), and CheckpointManager
+        # mirrors it back to ``save_path/lmdb_index`` at every
+        # checkpoint so the persistent copy stays current and the
+        # job can resume from /pfs if the local scratch is lost.
+        lmdb_persistent_dir = self._save_path / "lmdb_index"
+        lmdb_local_env = os.environ.get("PLURIBUS_LMDB_LOCAL_DIR")
+        if lmdb_local_env:
+            lmdb_runtime_dir = Path(lmdb_local_env)
+            lmdb_runtime_dir.mkdir(parents=True, exist_ok=True)
+            log.info(
+                f"LMDB runtime dir: {lmdb_runtime_dir} (local staging); "
+                f"persistent mirror: {lmdb_persistent_dir}"
+            )
+        else:
+            lmdb_runtime_dir = lmdb_persistent_dir
+            log.info(f"LMDB runtime dir: {lmdb_runtime_dir} (no local staging)")
+        self._lmdb_runtime_dir = lmdb_runtime_dir
+        self._lmdb_persistent_dir = lmdb_persistent_dir
+
         self._tables = CFRTables(
-            index_path=self._save_path / "lmdb_index",
+            index_path=lmdb_runtime_dir,
             shm_dir=shm_dir,
             lmdb_map_size=lmdb_map_size,
             actions_per_street=MAX_ACTIONS_PER_STREET,
@@ -213,7 +318,12 @@ class Server:
         # CheckpointManager registers signal handlers and restores
         # from an existing checkpoint before any worker is spawned so
         # workers observe the restored state.
-        self._checkpoint_manager = CheckpointManager(self, self._save_path)
+        self._checkpoint_manager = CheckpointManager(
+            self,
+            self._save_path,
+            lmdb_runtime_dir=lmdb_runtime_dir,
+            lmdb_persistent_dir=lmdb_persistent_dir,
+        )
         if os.environ.get("TESTING_SUITE"):
             n_processes = 4
         self._workers = self._start_workers(n_processes)
@@ -256,7 +366,8 @@ class Server:
         self._training_start = time.monotonic()
         max_runtime_secs = self._max_runtime_hours * 3600.0
         sigterm = self._checkpoint_manager.sigterm_event
-        t = self._start_t
+        step = self._workers_per_player * self._batch_size
+        t = self._start_t  # traversals-per-player completed so far
         _last_log_time = self._training_start
         try:
             while True:
@@ -264,19 +375,21 @@ class Server:
                 if elapsed >= max_runtime_secs:
                     log.info(
                         f"Time limit reached after {elapsed / 3600:.2f}h — "
-                        f"{t - 1} iterations completed"
+                        f"{t} traversals-per-player completed"
                     )
                     break
                 if sigterm.is_set():
                     break
 
-                self._current_t = t
-
                 for i in range(self._n_players):
                     for _ in range(self._workers_per_player):
-                        self._send_job("cfr", t=t, i=i)
+                        self._send_job(
+                            "cfr", t=t, i=i, batch=self._batch_size
+                        )
+                t += step
+                self._current_t = t
 
-                if at_sync_barrier(t, self._sync_interval):
+                if at_sync_barrier(t, self._sync_interval, step=step):
                     self._join_queue()
                     if sigterm.is_set():
                         break
@@ -313,8 +426,6 @@ class Server:
                         )
                         _last_log_time = now
 
-                t += 1
-
             # Drain any jobs still in the queue, then write the final
             # checkpoint so the run can be resumed from its last iteration.
             self._join_queue()
@@ -326,7 +437,8 @@ class Server:
                     f"Training complete — {self._current_t} iters, "
                     f"{elapsed_total:.2f}h elapsed"
                 )
-            self._checkpoint_manager.checkpoint(t=self._current_t)
+            self._checkpoint_manager.checkpoint(t=self._current_t, wait=True)
+            self._checkpoint_manager.shutdown()
         except WorkerError:
             log.error("A worker encountered a fatal error — terminating all workers")
             raise
@@ -396,6 +508,7 @@ class Server:
 
     def _cleanup(self):
         """Close and unlink shared tables after the worker pool exits."""
+        self._checkpoint_manager.shutdown()
         self._tables.close()
 
     def _start_workers(self, n_processes: int):
@@ -423,9 +536,20 @@ class Server:
                 error_event=self._error_event,
             )
             workers.append(worker)
-        for worker in workers:
-            worker.start()
-            log.info(f"started worker {worker.name}")
+        # Close every LMDB env in the parent immediately before
+        # forking the workers.  python-lmdb (1.3) appears to hold
+        # transaction state that survives env.close() / reopen in the
+        # child — even with max_spare_txns=0 — and triggers
+        # ``MDB_BAD_RSLOT`` on the first read txn after fork.  Forking
+        # while the parent's envs are closed guarantees the child
+        # inherits nothing, then each side reopens its own env.
+        self._tables.close_envs()
+        try:
+            for worker in workers:
+                worker.start()
+                log.info(f"started worker {worker.name}")
+        finally:
+            self._tables.open_envs()
         return workers
 
     # ------------------------------------------------------------------
@@ -473,6 +597,7 @@ class Server:
             checkpoint_interval=self._checkpoint_interval,
             start_timestep=self._start_t,
             n_chunks_per_street=self._tables.n_chunks_per_street(),
+            chunk_size=_CHUNK_SIZE,
         )
         return {
             k: os.path.abspath(str(v)) if isinstance(v, Path) else v
