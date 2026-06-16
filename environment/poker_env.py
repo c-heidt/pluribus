@@ -828,8 +828,18 @@ class PokerEnv:
         lookup key so injected actions are visible to every actor
         that reaches the same public node, not just the seat that
         was acting when the injection was recorded.
+
+        Reads ``_history`` with ``.get`` rather than indexing: a bare
+        ``self._history[stage]`` on the ``defaultdict`` would *insert*
+        an empty list for an as-yet-unseen stage, and that empty entry
+        would then leak into a later ``_compute_info_set`` (which
+        iterates ``_history.items()``), silently changing the info-set
+        key.  ``.get`` keeps this a true read.
         """
-        return (self._betting_stage, tuple(self._history[self._betting_stage]))
+        return (
+            self._betting_stage,
+            tuple(self._history.get(self._betting_stage, ())),
+        )
 
     def inject_action(self, action: str) -> bool:
         """Inject `action` into the legal set at the current public state.
@@ -1304,6 +1314,39 @@ class PokerEnv:
         """Inverse of :attr:`combo_cards`: ``(c0, c1) -> row index``."""
         _, index = enumerate_combos(self._low_card_rank, self._high_card_rank)
         return index
+
+    @property
+    def public_key(self) -> Tuple[str, Tuple[str, ...]]:
+        """Hashable identifier of the current public state.
+
+        ``(betting_stage, current-stage action history)`` — the key the
+        subgame solver's in-memory tables and the off-tree overlay share.
+        Public alias of :meth:`_current_public_state`; two seats at the
+        same public node see the same key (it embeds no actor cards).
+        """
+        return self._current_public_state()
+
+    @property
+    def n_raises_this_round(self) -> int:
+        """Number of raises made so far in the current betting round.
+
+        Reset to zero at every round boundary; used by the search's
+        depth-limit descriptor for the after-2nd-raise cutoff (§3).
+        """
+        return self._n_raises
+
+    def cluster_for(self, combo: Tuple[int, int]) -> int:
+        """LUT cluster id for ``combo`` on the current street and board.
+
+        Returns exactly the cluster :meth:`_compute_info_set` embeds for
+        ``combo`` — read straight from ``card_info_lut`` without building
+        the JSON info-set string.  ``combo`` is assumed board-compatible
+        (the solver only queries combos that share no card with the
+        community); a conflicting combo has no LUT entry and raises
+        ``KeyError``.
+        """
+        lookup_cards = tuple(sorted(combo) + sorted(self.community_cards))
+        return int(self.card_info_lut[self._betting_stage][lookup_cards])
 
     @property
     def low_card_rank(self) -> int:

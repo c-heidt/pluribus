@@ -761,7 +761,7 @@ the serial result bit-for-bit; multi-worker runs fix per-worker substreams
 | # | Component | File(s) | Status | Blocks on |
 |---|---|---|---|---|
 | 0 | Combo helpers + `Policy` ABC + `BlueprintPolicy` | `environment/utils.py`, `environment/poker_env.py`, `poker_ai/search/policy.py` | **done** — ×5 probability reweighting (`_reweight_bias`, `bias_multiplier=5.0`) | — |
-| 2 | Env overlay + `with_hole_cards` (done) + `SubgameContext` + new env accessors | `environment/poker_env.py`, `poker_ai/search/context.py` | **rework** — `opponent_ranges` → all-seat `ranges`; add `depth_limit` descriptor; add `public_key`, `cluster_for` | 0 |
+| 2 | Env overlay + `with_hole_cards` (done) + `SubgameContext` + new env accessors | `environment/poker_env.py`, `poker_ai/search/context.py` | **done** — all-seat `ranges` + `folded_ranges`; `DepthLimit` descriptor; `public_key`, `cluster_for`, `n_raises_this_round` | 0 |
 | 3 | Range tracking | `poker_ai/search/ranges.py` | **rework** — track the bot's own range; round-boundary update flow | 0 |
 | 4 | Chip↔action env API + search raise-size set | `environment/poker_env.py` | **rework** — pseudo-harmonic translation (randomized + deterministic) + history canonicalization; expose the coarse search raise-size set (≤ 5–6 / node) | — |
 | 5 | Continuation values | `poker_ai/search/leaf.py` | **rework** — `leaf_value` → `continuation_value(profile, ctx)`; fixed profile, per-seat scalar, rollout from concrete hands; hole-sampling helpers move to the solver | 0, 4 |

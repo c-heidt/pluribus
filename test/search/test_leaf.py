@@ -71,12 +71,12 @@ def _build_ctx(
     n_rollouts: int = 10,
     seed=None,
     policies: dict = None,
-    opponent_ranges: dict = None,
+    ranges: dict = None,
 ) -> SubgameContext:
     if policies is None:
         policies = _uniform_policies()
-    if opponent_ranges is None:
-        opponent_ranges = {1: np.ones(env.n_combos, dtype=np.float32)}
+    if ranges is None:
+        ranges = {1: np.ones(env.n_combos, dtype=np.float32)}
     if seed is None:
         # Draw the ctx.rng seed from the global RNG state, which is
         # itself reseeded per trial by the autouse ``_seeded`` fixture
@@ -87,7 +87,8 @@ def _build_ctx(
         env=env,
         my_seat=0,
         my_hole=tuple(int(c) for c in env.players[0].cards),
-        opponent_ranges=opponent_ranges,
+        ranges=ranges,
+        folded_ranges={},
         leaf=LeafConfig(policies=policies, n_rollouts=n_rollouts),
         rng=np.random.default_rng(seed),
     )
@@ -162,10 +163,10 @@ class TestLeafValueDeterminism:
         _stub_lut(env)
         np.random.seed(0)
         ctx_a = _build_ctx(env, seed=42, n_rollouts=8)
-        a = leaf_value(env, {1: ctx_a.opponent_ranges[1]}, {}, ctx_a)
+        a = leaf_value(env, {1: ctx_a.ranges[1]}, {}, ctx_a)
         np.random.seed(0)
         ctx_b = _build_ctx(env, seed=42, n_rollouts=8)
-        b = leaf_value(env, {1: ctx_b.opponent_ranges[1]}, {}, ctx_b)
+        b = leaf_value(env, {1: ctx_b.ranges[1]}, {}, ctx_b)
         np.testing.assert_array_equal(a, b)
 
     def test_different_seeds_diverge(self):
@@ -173,8 +174,8 @@ class TestLeafValueDeterminism:
         _stub_lut(env)
         ctx_a = _build_ctx(env, seed=1, n_rollouts=20)
         ctx_b = _build_ctx(env, seed=2, n_rollouts=20)
-        a = leaf_value(env, {1: ctx_a.opponent_ranges[1]}, {}, ctx_a)
-        b = leaf_value(env, {1: ctx_b.opponent_ranges[1]}, {}, ctx_b)
+        a = leaf_value(env, {1: ctx_a.ranges[1]}, {}, ctx_a)
+        b = leaf_value(env, {1: ctx_b.ranges[1]}, {}, ctx_b)
         assert not np.array_equal(a, b)
 
 
@@ -196,7 +197,7 @@ class TestHoleSampling:
         recorded = _capture_with_hole_cards(monkeypatch)
         policies = {c: FoldOrCallPolicy() for c in ("none", "fold", "call", "raise")}
         ctx = _build_ctx(env, policies=policies, n_rollouts=30)
-        leaf_value(env, {1: ctx.opponent_ranges[1]}, {}, ctx)
+        leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
         assert recorded, "expected at least one with_hole_cards call"
         for holes in recorded:
             opp = set(holes[1])
@@ -216,11 +217,12 @@ class TestHoleSampling:
             env=env,
             my_seat=0,
             my_hole=tuple(int(c) for c in env.players[0].cards),
-            opponent_ranges=ranges,
+            ranges=ranges,
+            folded_ranges={},
             leaf=LeafConfig(policies=policies, n_rollouts=15),
             rng=np.random.default_rng(7),
         )
-        leaf_value(env, dict(ctx.opponent_ranges), {}, ctx)
+        leaf_value(env, dict(ctx.ranges), {}, ctx)
         assert recorded
         for holes in recorded:
             assert set(holes[1]).isdisjoint(set(holes[2])), holes
@@ -231,11 +233,11 @@ class TestHoleSampling:
         zero_range = {1: np.zeros(env.n_combos, dtype=np.float32)}
         policies = {c: FoldOrCallPolicy() for c in ("none", "fold", "call", "raise")}
         ctx = _build_ctx(
-            env, n_rollouts=3, opponent_ranges=zero_range, policies=policies
+            env, n_rollouts=3, ranges=zero_range, policies=policies
         )
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            result = leaf_value(env, {1: ctx.opponent_ranges[1]}, {}, ctx)
+            result = leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
         assert any(issubclass(w.category, RuntimeWarning) for w in caught)
         assert result.shape == (env.n_players,)
         assert np.isfinite(result).all()
@@ -248,7 +250,7 @@ class TestRolloutMechanics:
         _stub_lut(env)
         policies = _uniform_policies()
         ctx = _build_ctx(env, policies=policies, n_rollouts=4)
-        leaf_value(env, {1: ctx.opponent_ranges[1]}, {}, ctx)
+        leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
         observed_biases = set()
         for p in policies.values():
             for _player_i, bias, _legal in p.calls:
@@ -260,7 +262,7 @@ class TestRolloutMechanics:
         _stub_lut(env)
         policies = _uniform_policies()
         ctx = _build_ctx(env, policies=policies, n_rollouts=5)
-        leaf_value(env, {1: ctx.opponent_ranges[1]}, {}, ctx)
+        leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
         for p in policies.values():
             for player_i, _bias, _legal in p.calls:
                 assert player_i in {0, 1}
@@ -281,7 +283,7 @@ class TestRolloutMechanics:
 
         monkeypatch.setattr(np.random, "choice", _explode)
         ctx = _build_ctx(env, n_rollouts=5)
-        result = leaf_value(env, {1: ctx.opponent_ranges[1]}, {}, ctx)
+        result = leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
         assert result.shape == (env.n_players,)
 
     def test_payout_from_env_not_evaluator(self):
@@ -290,7 +292,7 @@ class TestRolloutMechanics:
         _stub_lut(env)
         policies = {c: FoldOrCallPolicy() for c in ("none", "fold", "call", "raise")}
         ctx = _build_ctx(env, policies=policies, n_rollouts=3)
-        result = leaf_value(env, {1: ctx.opponent_ranges[1]}, {}, ctx)
+        result = leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
         assert abs(result.sum()) < 1e-6
         assert result[0] * result[1] < 0
 
@@ -333,7 +335,7 @@ class TestNonTerminalEmptyRanges:
         ctx = _build_ctx(
             env,
             n_rollouts=3,
-            opponent_ranges={
+            ranges={
                 2: np.ones(env.n_combos, dtype=np.float32),
             },
         )
@@ -348,7 +350,7 @@ class TestNRolloutsEdge:
         env = _env()
         _stub_lut(env)
         ctx = _build_ctx(env, n_rollouts=0)
-        result = leaf_value(env, {1: ctx.opponent_ranges[1]}, {}, ctx)
+        result = leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
         np.testing.assert_array_equal(result, np.zeros(env.n_players))
 
 
@@ -361,7 +363,7 @@ class TestBiasDiversity:
         _stub_lut(env)
         policies = _uniform_policies()
         ctx = _build_ctx(env, policies=policies, n_rollouts=50)
-        leaf_value(env, {1: ctx.opponent_ranges[1]}, {}, ctx)
+        leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
         observed = set()
         for p in policies.values():
             for _player_i, bias, _legal in p.calls:
@@ -440,11 +442,12 @@ class TestFoldedHoleSampling:
             env=env,
             my_seat=0,
             my_hole=tuple(int(c) for c in env.players[0].cards),
-            opponent_ranges=live,
+            ranges=live,
+            folded_ranges=folded,
             leaf=LeafConfig(policies=policies, n_rollouts=10),
             rng=np.random.default_rng(3),
         )
-        leaf_value(env, dict(ctx.opponent_ranges), folded, ctx)
+        leaf_value(env, dict(ctx.ranges), folded, ctx)
         assert recorded
         for holes in recorded:
             assert set(holes[2]) == set(expected), (holes[2], expected)
@@ -461,11 +464,12 @@ class TestFoldedHoleSampling:
             env=env,
             my_seat=0,
             my_hole=my_hole,
-            opponent_ranges=live,
+            ranges=live,
+            folded_ranges=folded,
             leaf=LeafConfig(policies=policies, n_rollouts=5),
             rng=np.random.default_rng(5),
         )
-        leaf_value(env, dict(ctx.opponent_ranges), folded, ctx)
+        leaf_value(env, dict(ctx.ranges), folded, ctx)
         assert recorded
         for holes in recorded:
             assert tuple(holes[0]) == my_hole
@@ -482,10 +486,10 @@ class TestRolloutAbort:
             all_cards.add(int(env.combo_cards[i, 1]))
         env.community_cards = tuple(all_cards)
         zero_range = {1: np.zeros(env.n_combos, dtype=np.float32)}
-        ctx = _build_ctx(env, n_rollouts=3, opponent_ranges=zero_range)
+        ctx = _build_ctx(env, n_rollouts=3, ranges=zero_range)
         with warnings.catch_warnings(record=True):
             warnings.simplefilter("always")
-            result = leaf_value(env, {1: ctx.opponent_ranges[1]}, {}, ctx)
+            result = leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
         np.testing.assert_array_equal(result, np.zeros(env.n_players))
 
 
@@ -505,7 +509,7 @@ class TestFloat32Probabilities:
 
         policies = {c: Float32ThirdsPolicy() for c in ("none", "fold", "call", "raise")}
         ctx = _build_ctx(env, policies=policies, n_rollouts=10)
-        result = leaf_value(env, {1: ctx.opponent_ranges[1]}, {}, ctx)
+        result = leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
         assert result.shape == (env.n_players,)
 
 
@@ -515,6 +519,6 @@ class TestLeafConvergence:
         env = _full_deck_env()
         _stub_lut(env)
         ctx = _build_ctx(env, n_rollouts=50, seed=12345)
-        result = leaf_value(env, {1: ctx.opponent_ranges[1]}, {}, ctx)
+        result = leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
         assert np.isfinite(result).all()
         assert abs(result.sum()) < 1e-6
