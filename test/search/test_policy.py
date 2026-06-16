@@ -108,22 +108,20 @@ class _FakeTables:
         self.regret = {r: _FakeTable(row) for r, row in rows_by_round.items()}
 
 
-class _FakeEnv:
-    """Minimal duck-typed PokerEnv for policy.strategy() tests."""
-
-    def __init__(self, betting_round, legal_actions, info_set="X"):
-        self.betting_round = betting_round
-        self.info_set = info_set
-        self._legal = legal_actions
-
-    @property
-    def legal_actions(self):
-        return self._legal
-
-    def get_valid_mask(self):
-        canon = CANONICAL_ACTIONS[self.betting_round]
-        legal_set = {a for a in self._legal if a is not None}
-        return np.array([a in legal_set for a in canon], dtype=bool)
+def _state(betting_round, legal_actions, info_set="X", player_i=0):
+    """Build a :class:`PolicyState` from the legacy ``_FakeEnv`` inputs."""
+    from environment.poker_env import PolicyState
+    canon = CANONICAL_ACTIONS[betting_round]
+    legal_set = {a for a in legal_actions if a is not None}
+    valid_mask = np.array([a in legal_set for a in canon], dtype=bool)
+    legal = tuple(a for a in legal_actions if a is not None)
+    return PolicyState(
+        player_i=player_i,
+        betting_round=betting_round,
+        info_set=info_set,
+        valid_mask=valid_mask,
+        legal_actions=legal,
+    )
 
 
 def _legal_for(r):
@@ -143,22 +141,22 @@ class TestBlueprintPolicy:
     @pytest.mark.parametrize("r", [0, 1, 2, 3])
     def test_uniform_when_info_set_missing(self, r):
         legal = _legal_for(r)
-        env = _FakeEnv(r, legal)
+        state = _state(r, legal)
         tables = _FakeTables({r: None})
         policy = BlueprintPolicy(tables)
-        sigma = policy.strategy(env)
+        sigma = policy.strategy(state)
         assert sigma.shape == (len(legal),)
         np.testing.assert_allclose(sigma, np.full(len(legal), 1.0 / len(legal)))
 
     def test_alignment_matches_legal_actions(self):
         r = 1
         legal = _legal_for(r)
-        env = _FakeEnv(r, legal)
+        state = _state(r, legal)
         # Plant a row that's only positive on the first legal action.
         row = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
         row[ACTION_TO_IDX[r][legal[0]]] = 100
         tables = _FakeTables({r: row})
-        sigma = BlueprintPolicy(tables).strategy(env)
+        sigma = BlueprintPolicy(tables).strategy(state)
         assert sigma.shape == (len(legal),)
         # All mass on the first legal action.
         assert sigma[0] == pytest.approx(1.0)
@@ -167,24 +165,24 @@ class TestBlueprintPolicy:
     def test_sums_to_one(self):
         r = 2
         legal = _legal_for(r)
-        env = _FakeEnv(r, legal)
+        state = _state(r, legal)
         row = np.array(
             [(i * 7) % 13 for i in range(MAX_ACTIONS_PER_STREET[r])],
             dtype=np.int32,
         )
         tables = _FakeTables({r: row})
-        sigma = BlueprintPolicy(tables).strategy(env)
+        sigma = BlueprintPolicy(tables).strategy(state)
         np.testing.assert_allclose(sigma.sum(), 1.0, atol=1e-6)
 
     def test_bias_shifts_mass_to_fold(self):
         r = 0
         legal = _legal_for(r)
-        env = _FakeEnv(r, legal)
+        state = _state(r, legal)
         # Uniform regrets across all canonical actions.
         row = np.full(MAX_ACTIONS_PER_STREET[r], 10, dtype=np.int32)
         tables = _FakeTables({r: row})
-        unbiased = BlueprintPolicy(tables, bias_magnitude=50.0).strategy(env, bias="none")
-        biased = BlueprintPolicy(tables, bias_magnitude=50.0).strategy(env, bias="fold")
+        unbiased = BlueprintPolicy(tables, bias_magnitude=50.0).strategy(state, bias="none")
+        biased = BlueprintPolicy(tables, bias_magnitude=50.0).strategy(state, bias="fold")
         fold_i = legal.index("fold")
         assert biased[fold_i] > unbiased[fold_i]
         np.testing.assert_allclose(biased.sum(), 1.0, atol=1e-6)
@@ -192,11 +190,69 @@ class TestBlueprintPolicy:
     def test_bias_magnitude_zero_ignores_bias_arg(self):
         r = 0
         legal = _legal_for(r)
-        env = _FakeEnv(r, legal)
+        state = _state(r, legal)
         row = np.full(MAX_ACTIONS_PER_STREET[r], 10, dtype=np.int32)
         tables = _FakeTables({r: row})
         policy = BlueprintPolicy(tables, bias_magnitude=0.0)
         np.testing.assert_array_equal(
-            policy.strategy(env, bias="none"),
-            policy.strategy(env, bias="fold"),
+            policy.strategy(state, bias="none"),
+            policy.strategy(state, bias="fold"),
         )
+
+
+class TestBlueprintPolicyOverlay:
+    """F3 regression: overlay-injected actions (§6.1) appear in
+    ``env.legal_actions`` but not in ``ACTION_TO_IDX``.  The
+    blueprint must assign them zero mass and renormalise the
+    canonical share over the full filtered legal set, never
+    raising ``KeyError``."""
+
+    def test_overlay_action_gets_zero_mass(self):
+        r = 0
+        canonical = _legal_for(r)            # fold, call, raise:<f>, all_in
+        overlay = "raise:0.42"               # not in ACTION_TO_IDX[r]
+        legal = canonical + [overlay]
+        state = _state(r, legal)
+        # Uniform regrets across canonical actions.
+        row = np.full(MAX_ACTIONS_PER_STREET[r], 10, dtype=np.int32)
+        tables = _FakeTables({r: row})
+        sigma = BlueprintPolicy(tables).strategy(state)
+        assert sigma.shape == (len(legal),)
+        # Overlay is the last entry — must be exactly zero.
+        assert sigma[-1] == 0.0
+        # Canonical share sums to one (the overlay's zero leaves the
+        # canonical entries to renormalise over the full vector).
+        np.testing.assert_allclose(sigma.sum(), 1.0, atol=1e-6)
+
+    def test_overlay_alone_falls_back_to_uniform(self):
+        r = 0
+        state = _state(r, ["raise:0.42", "raise:0.77"])
+        row = np.full(MAX_ACTIONS_PER_STREET[r], 10, dtype=np.int32)
+        tables = _FakeTables({r: row})
+        sigma = BlueprintPolicy(tables).strategy(state)
+        # Both legal actions are non-canonical → uniform fallback.
+        np.testing.assert_allclose(sigma, np.full(2, 0.5), atol=1e-6)
+
+    def test_inactive_player_returns_empty(self):
+        # legal_actions == [None] → filtered legal is empty.
+        # BlueprintPolicy must return an empty array, not crash on
+        # the all-overlay fallback's division by zero.
+        r = 0
+        state = _state(r, [None])
+        tables = _FakeTables({r: np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)})
+        sigma = BlueprintPolicy(tables).strategy(state)
+        assert sigma.shape == (0,)
+
+    def test_canonical_only_unchanged_by_overlay_path(self):
+        # When no overlay action is present, the canonical-only
+        # result must match what the pre-F3 implementation produced.
+        r = 1
+        legal = _legal_for(r)
+        state = _state(r, legal)
+        # Only one positive regret entry — strategy concentrates there.
+        row = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
+        row[ACTION_TO_IDX[r][legal[1]]] = 100
+        tables = _FakeTables({r: row})
+        sigma = BlueprintPolicy(tables).strategy(state)
+        assert sigma[1] == pytest.approx(1.0)
+        np.testing.assert_allclose(np.delete(sigma, 1), 0.0)

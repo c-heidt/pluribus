@@ -26,7 +26,7 @@ from environment.action_space import (
     CANONICAL_ACTIONS,
     MAX_ACTIONS_PER_STREET,
 )
-from environment.poker_env import PokerEnv
+from environment.poker_env import PolicyState
 from poker_ai.blueprint.tree_utils import calculate_strategy_from_row
 from poker_ai.tables.cfr_tables import CFRTables
 
@@ -45,13 +45,17 @@ class Policy(ABC):
     """
 
     @abstractmethod
-    def strategy(self, env: PokerEnv, bias: BiasClass = "none") -> np.ndarray:
-        """Return the action distribution at ``env``.
+    def strategy(self, state: PolicyState, bias: BiasClass = "none") -> np.ndarray:
+        """Return the action distribution at ``state``.
 
         Parameters
         ----------
-        env : PokerEnv
-            Current state; the current player is the actor.
+        state : PolicyState
+            Decoupled view of the env's public state plus the
+            actor's info-set key; built from :attr:`PokerEnv.policy_state`
+            (current actor as-is) or :meth:`PokerEnv.policy_state_for`
+            (current actor under a hypothetical hole, for leak-free
+            ``sigma_for_combo`` queries).
         bias : BiasClass
             ``"none"`` for the base distribution; ``"fold"`` /
             ``"call"`` / ``"raise"`` add an additive bias to that
@@ -61,9 +65,9 @@ class Policy(ABC):
         -------
         numpy.ndarray
             Float32 probability vector aligned with
-            ``[a for a in env.legal_actions if a is not None]``; sums
-            to 1 (or 0 if no actions are legal, which should not
-            occur in a well-formed game state).
+            ``state.legal_actions``; sums to 1 (or 0 if no actions
+            are legal, which should not occur in a well-formed game
+            state).
         """
 
     @staticmethod
@@ -151,16 +155,35 @@ class BlueprintPolicy(Policy):
         self._tables = tables
         self._bias_magnitude = float(bias_magnitude)
 
-    def strategy(self, env: PokerEnv, bias: BiasClass = "none") -> np.ndarray:
-        r = env.betting_round
-        regret_row = self._tables.regret[r].get_row_if_exists(env.info_set)
+    def strategy(self, state: PolicyState, bias: BiasClass = "none") -> np.ndarray:
+        r = state.betting_round
+        regret_row = self._tables.regret[r].get_row_if_exists(state.info_set)
         if regret_row is None:
             regret_row = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
-        valid_mask = env.get_valid_mask()
+        valid_mask = state.valid_mask
         bias_mask = self._bias_mask(CANONICAL_ACTIONS[r], bias)
         full = self._regret_match_with_bias(
             regret_row, valid_mask, bias_mask, self._bias_magnitude
         )
-        legal = [a for a in env.legal_actions if a is not None]
-        idx = [ACTION_TO_IDX[r][a] for a in legal]
-        return full[idx]
+        legal = state.legal_actions
+        if not legal:
+            return np.array([], dtype=np.float32)
+        # Overlay-injected actions (§6.1) appear in ``legal`` but not
+        # in the canonical ``ACTION_TO_IDX`` map.  The blueprint was
+        # trained on the canonical abstraction and has no opinion on
+        # off-tree sizes, so each such action receives zero mass; the
+        # canonical probabilities are then renormalised over the
+        # filtered legal set.  All-overlay (no canonical action legal)
+        # falls back to uniform-over-legal so the caller never sees
+        # a degenerate distribution.
+        canonical_idx = ACTION_TO_IDX[r]
+        probs = np.zeros(len(legal), dtype=np.float32)
+        for i, a in enumerate(legal):
+            if a in canonical_idx:
+                probs[i] = full[canonical_idx[a]]
+        total = probs.sum()
+        if total > 0:
+            probs /= total
+        else:
+            probs[:] = 1.0 / len(legal)
+        return probs

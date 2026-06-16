@@ -160,3 +160,65 @@ class TestDeckEdgeCases:
         assert isinstance(cards, tuple)
         assert len(cards) == 5
         assert len(deck.remaining) == 52 - 5
+
+
+class TestShuffleUndealt:
+    """``Deck.shuffle_undealt`` re-randomises positions ``>= _idx``.
+
+    Used by :meth:`PokerEnv.with_hole_cards` after
+    :meth:`replace_drawn` so the next community deal is uniform over
+    the undealt set rather than preferring positions that received
+    displaced cards from the swap.
+    """
+
+    def test_preserves_drawn_segment(self):
+        import numpy as np
+        deck = Deck(2, 14)
+        players = [Player(i, 10000) for i in range(3)]
+        deck.deal_private_cards(players)
+        deck.deal_community(3)
+        drawn_before = deck._cards[: deck._idx].copy()
+        deck.shuffle_undealt()
+        np.testing.assert_array_equal(deck._cards[: deck._idx], drawn_before)
+
+    def test_preserves_undealt_set(self):
+        deck = Deck(2, 14)
+        players = [Player(i, 10000) for i in range(3)]
+        deck.deal_private_cards(players)
+        deck.deal_community(3)
+        undealt_before = set(int(c) for c in deck.remaining)
+        deck.shuffle_undealt()
+        undealt_after = set(int(c) for c in deck.remaining)
+        assert undealt_before == undealt_after
+
+    def test_preserves_idx(self):
+        deck = Deck(2, 14)
+        players = [Player(i, 10000) for i in range(3)]
+        deck.deal_private_cards(players)
+        deck.deal_community(3)
+        idx_before = deck._idx
+        deck.shuffle_undealt()
+        assert deck._idx == idx_before
+
+    def test_changes_order_with_high_probability(self):
+        # Two consecutive shuffles of the same undealt segment should
+        # almost never produce identical orderings.
+        import numpy as np
+        deck = Deck(2, 14)
+        players = [Player(i, 10000) for i in range(3)]
+        deck.deal_private_cards(players)
+        deck.deal_community(3)
+        before = deck.remaining.copy()
+        deck.shuffle_undealt()
+        after = deck.remaining.copy()
+        # With ~43 undealt cards, equal-after-shuffle has probability
+        # 1 / 43! - effectively zero.
+        assert not np.array_equal(before, after)
+
+    def test_no_op_on_fully_dealt_deck(self):
+        # If _idx == len(_cards) the undealt view is empty; shuffle
+        # is a no-op and must not raise.
+        deck = Deck(2, 14)
+        deck._idx = len(deck._cards)
+        deck.shuffle_undealt()
+        assert deck._idx == len(deck._cards)

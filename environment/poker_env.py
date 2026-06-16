@@ -16,7 +16,8 @@ import copy
 import json
 import logging
 import math
-from typing import Any, Dict, FrozenSet, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -25,6 +26,46 @@ from environment.chance import Deck
 from environment.player import Player
 from environment.pot import Pot
 from environment.utils import enumerate_combos
+
+
+@dataclass(frozen=True)
+class PolicyState:
+    """Decoupled view of the env fields a :class:`Policy.strategy` needs.
+
+    A :class:`PolicyState` is the value object the search package's
+    :class:`poker_ai.search.policy.Policy` consumes instead of a raw
+    :class:`PokerEnv`.  It carries exactly the public fields a policy
+    or its instrumentation reads — current actor index, betting
+    round, info-set key, canonical-width valid mask, and the
+    legal-action list (non-``None`` entries, including overlay) —
+    none of which depend on opponents' hole cards.
+
+    Constructed by :attr:`PokerEnv.policy_state` (current actor at
+    the current env state) or :meth:`PokerEnv.policy_state_for`
+    (current actor with a hypothetical hole, for leak-free
+    ``sigma_for_combo`` queries).
+
+    Attributes
+    ----------
+    player_i : int
+        Seat index of the current actor (public state; same value
+        as :attr:`PokerEnv.player_i`).
+    betting_round : int
+        0=pre_flop, 1=flop, 2=turn, 3=river.
+    info_set : str
+        JSON-encoded info-set key (cluster + history).
+    valid_mask : numpy.ndarray
+        Boolean mask over the canonical action set; immutable.
+    legal_actions : tuple[str, ...]
+        Legal actions for the current actor, in
+        :attr:`PokerEnv.legal_actions` order, with ``None`` filtered.
+    """
+
+    player_i: int
+    betting_round: int
+    info_set: str
+    valid_mask: np.ndarray
+    legal_actions: Tuple[str, ...]
 
 logger = logging.getLogger("environment.poker_env")
 
@@ -904,41 +945,101 @@ class PokerEnv:
         return bool(self._extra_legal_actions.get(self._current_public_state()))
 
     def with_hole_cards(
-        self, seat: int, cards: Tuple[int, int]
+        self, holes: "Sequence[Tuple[int, int]]"
     ) -> "PokerEnv":
-        """Return a deepcopy with ``seat``'s hole cards replaced.
+        """Return a deepcopy with every seat's hole cards replaced.
 
-        Used by opponent-response modelling (the range tracker's
-        per-combo strategy query) to evaluate "what would seat have
-        done with hand X?" without reaching into player internals.
+        Batched atomic replacement: the caller supplies one
+        ``(c0, c1)`` tuple per seat.  Seats whose new hole equals
+        their current hole are no-ops on the deck; the rest swap as
+        a multiset via a single :meth:`Deck.replace_drawn` call,
+        followed by :meth:`Deck.shuffle_undealt` so the next
+        community deal samples uniformly over the undealt set.
 
-        The returned env shares ``card_info_lut`` and the off-tree
-        overlay with the original by reference; only the named seat's
-        hole cards differ.  Does NOT call :meth:`inject_action`.
+        Used by the leaf evaluator's hole-resampling step: live and
+        folded opponents are sampled from their respective ranges
+        and the bot's seat is filled with ``ctx.my_hole``, then this
+        single call applies them all.  The returned env is
+        indistinguishable from a regular state that was dealt these
+        cards from the start: future community deals via
+        :meth:`apply_action` will not collide with the new holes.
 
-        **Caller's responsibility.** ``cards`` must not duplicate any
-        card already in play (the community cards or another seat's
-        hole).  This method does NOT validate — the typical caller
-        (the range tracker) already restricts candidate combos to a
-        board-compatible, non-conflicting subset before invoking, so
-        an extra check here would be wasted work.
+        Validation (all raise :class:`ValueError`):
+
+        - ``len(holes) == self.n_players``.
+        - Each ``holes[i]`` has ``c0 != c1`` — no duplicate within a hole.
+        - No card appears in more than one hole — pairwise disjoint
+          across seats.
+        - No card overlaps ``self.community_cards``.
+
+        There is no per-seat "collides with another seat's current
+        hole" check: because the caller specifies every seat's new
+        hole at once, no seat retains any "old" card the batch
+        needs to honour.  Two seats may swap holes
+        (``new[A] == old[B]`` and ``new[B] == old[A]``) and the
+        deck still ends up consistent.
 
         Parameters
         ----------
-        seat : int
-            Index into ``self.players`` whose hole cards will be replaced.
-        cards : tuple[int, int]
-            Two card integers (see :mod:`environment.utils`).
+        holes : Sequence[tuple[int, int]]
+            One ``(c0, c1)`` tuple per seat, indexed by seat position
+            (``holes[i]`` is seat ``i``'s new hole).  Length must
+            equal ``self.n_players``.
 
         Returns
         -------
         PokerEnv
-            Independent copy of the env with the named seat's cards
-            replaced.
+            Independent copy of the env with every seat's cards
+            replaced and the deck synced and reshuffled.
+
+        Raises
+        ------
+        ValueError
+            If ``holes`` is the wrong length or any card constraint
+            is violated.
         """
+        n = self.n_players
+        if len(holes) != n:
+            raise ValueError(
+                f"with_hole_cards: expected {n} hole tuples (one per "
+                f"seat), got {len(holes)}."
+            )
+        # Validate per-hole, accumulate the new card set as we go.
+        new_cards: List[int] = []
+        for seat, h in enumerate(holes):
+            c0, c1 = int(h[0]), int(h[1])
+            if c0 == c1:
+                raise ValueError(
+                    f"with_hole_cards: seat {seat}'s hole must contain "
+                    f"distinct cards, got ({c0}, {c1})."
+                )
+            new_cards.append(c0)
+            new_cards.append(c1)
+        # Pairwise disjoint across seats: every card appears at most once.
+        if len(set(new_cards)) != len(new_cards):
+            raise ValueError(
+                f"with_hole_cards: cards must be pairwise disjoint "
+                f"across seats; got duplicates in {new_cards}."
+            )
+        # No overlap with the community.
+        community = set(int(c) for c in self.community_cards)
+        overlap = community & set(new_cards)
+        if overlap:
+            raise ValueError(
+                f"with_hole_cards: cards {sorted(overlap)} overlap the "
+                f"community."
+            )
         new = copy.deepcopy(self)
         new.card_info_lut = self.card_info_lut
-        new.players[seat]._cards = tuple(cards)
+        old_union: List[int] = []
+        for seat in range(n):
+            old_union.extend(int(c) for c in new.players[seat]._cards)
+        new_union = tuple(new_cards)
+        for seat in range(n):
+            h = holes[seat]
+            new.players[seat]._cards = (int(h[0]), int(h[1]))
+        new.deck.replace_drawn(tuple(old_union), new_union)
+        new.deck.shuffle_undealt()
         return new
 
     # ------------------------------------------------------------------
@@ -988,6 +1089,49 @@ class PokerEnv:
             actions += sorted(a for a in overlay if a not in seen)
         return actions
 
+    def _compute_info_set(self, cards: Sequence[int]) -> str:
+        """Build the info-set string for the current actor under ``cards``.
+
+        Factored out of :attr:`info_set` so :meth:`policy_state_for`
+        can compute the info-set under a *hypothetical* hole without
+        reading any seat's actual cards — the leak-free path used by
+        a future ``sigma_for_combo`` driver.
+
+        Parameters
+        ----------
+        cards : Sequence[int]
+            The hole cards to assume for the current actor.  Length
+            must match the env's per-seat card count (typically 2).
+
+        Returns
+        -------
+        str
+            JSON info-set key, identical in format to :attr:`info_set`.
+
+        Raises
+        ------
+        ValueError
+            If the combined cards are missing from ``card_info_lut``
+            outside of terminal / show-down stages.
+        """
+        lookup_cards = tuple(sorted(cards) + sorted(self.community_cards))
+        try:
+            cards_cluster = self.card_info_lut[self._betting_stage][lookup_cards]
+        except KeyError:
+            if self._betting_stage not in {"terminal", "show_down"}:
+                raise ValueError("Cards missing from LUT — load it correctly.")
+            return "default info set, please ensure you load it correctly"
+        info_set_dict = {
+            "cards_cluster": cards_cluster,
+            "history": [
+                {stage: list(actions)}
+                for stage, actions in self._history.items()
+            ],
+        }
+        return json.dumps(
+            info_set_dict, separators=(",", ":"), cls=_NumpyJSONEncoder
+        )
+
     @property
     def info_set(self) -> str:
         """JSON-encoded information set string for the current player.
@@ -1008,25 +1152,53 @@ class PokerEnv:
             If the current cards are not found in ``card_info_lut`` and
             the game is not in a terminal or show-down stage.
         """
-        # Cards are ints — sort directly, no .eval_card needed
-        lookup_cards = tuple(
-            sorted(self.current_player._cards) + sorted(self.community_cards)
+        return self._compute_info_set(self.current_player._cards)
+
+    @property
+    def policy_state(self) -> PolicyState:
+        """Decoupled view of fields a :class:`Policy.strategy` needs.
+
+        Bundles ``betting_round``, ``info_set``, ``get_valid_mask()``
+        and the filtered ``legal_actions`` into a frozen
+        :class:`PolicyState` so policies don't have to hold a live
+        env reference.  Built fresh on every read — cheap.
+        """
+        legal = tuple(a for a in self.legal_actions if a is not None)
+        mask = self.get_valid_mask()
+        mask.setflags(write=False)
+        return PolicyState(
+            player_i=self.player_i,
+            betting_round=self.betting_round,
+            info_set=self.info_set,
+            valid_mask=mask,
+            legal_actions=legal,
         )
-        try:
-            cards_cluster = self.card_info_lut[self._betting_stage][lookup_cards]
-        except KeyError:
-            if self._betting_stage not in {"terminal", "show_down"}:
-                raise ValueError("Cards missing from LUT — load it correctly.")
-            return "default info set, please ensure you load it correctly"
-        info_set_dict = {
-            "cards_cluster": cards_cluster,
-            "history": [
-                {stage: list(actions)}
-                for stage, actions in self._history.items()
-            ],
-        }
-        return json.dumps(
-            info_set_dict, separators=(",", ":"), cls=_NumpyJSONEncoder
+
+    def policy_state_for(self, combo: Sequence[int]) -> PolicyState:
+        """:class:`PolicyState` for the current actor under hypothetical hole ``combo``.
+
+        Reads only public state (community cards, history,
+        ``card_info_lut``) plus the supplied ``combo``.  Does **not**
+        read any seat's ``_cards`` — including the current actor's —
+        so the result is identical regardless of opponents' actual
+        holes.  This is the leak-free path a ``sigma_for_combo``
+        driver uses: ``policy.strategy(env.policy_state_for(combo), bias)``.
+
+        Parameters
+        ----------
+        combo : Sequence[int]
+            Hypothetical hole for the current actor; typically a
+            length-2 tuple drawn from ``env.combo_cards``.
+        """
+        legal = tuple(a for a in self.legal_actions if a is not None)
+        mask = self.get_valid_mask()
+        mask.setflags(write=False)
+        return PolicyState(
+            player_i=self.player_i,
+            betting_round=self.betting_round,
+            info_set=self._compute_info_set(combo),
+            valid_mask=mask,
+            legal_actions=legal,
         )
 
     @property

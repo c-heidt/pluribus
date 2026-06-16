@@ -417,6 +417,59 @@ class TestOnSeatFolded:
         tracker.on_seat_folded(1)  # no error
 
 
+class TestFoldedSnapshot:
+    """``on_seat_folded`` retains the seat's range at fold time in
+    a separate ``folded_snapshot()`` channel.  The leaf evaluator
+    samples folded seats' holes from this marginal."""
+
+    def test_folded_seat_appears_in_folded_snapshot(self):
+        _env_, tracker = _tracker(live_seats=[0, 1])
+        tracker.on_seat_folded(1)
+        assert 1 in tracker.folded_snapshot()
+
+    def test_retained_range_matches_pre_fold_snapshot(self):
+        _env_, tracker = _tracker(live_seats=[0, 1])
+        snap_before = tracker.snapshot()
+        tracker.on_seat_folded(1)
+        retained = tracker.folded_snapshot()[1]
+        np.testing.assert_array_equal(retained, snap_before[1])
+
+    def test_unknown_seat_fold_does_not_add_to_folded(self):
+        _env_, tracker = _tracker(live_seats=[0, 1])
+        tracker.on_seat_folded(99)  # never tracked
+        assert 99 not in tracker.folded_snapshot()
+
+    def test_double_fold_does_not_overwrite_retained(self):
+        # Once a seat is folded its retained marginal must not be
+        # touched by subsequent on_seat_folded calls (which find no
+        # live entry and would otherwise insert an empty placeholder).
+        _env_, tracker = _tracker(live_seats=[0, 1])
+        tracker.on_seat_folded(1)
+        retained_first = tracker.folded_snapshot()[1]
+        tracker.on_seat_folded(1)
+        retained_second = tracker.folded_snapshot()[1]
+        np.testing.assert_array_equal(retained_first, retained_second)
+
+    def test_snapshot_excludes_folded_seat(self):
+        # The two channels are disjoint after a fold.
+        _env_, tracker = _tracker(live_seats=[0, 1])
+        tracker.on_seat_folded(1)
+        assert 1 not in tracker.snapshot()
+        assert 1 in tracker.folded_snapshot()
+
+    def test_folded_snapshot_is_deep_copy(self):
+        _env_, tracker = _tracker(live_seats=[0, 1])
+        tracker.on_seat_folded(1)
+        snap = tracker.folded_snapshot()
+        snap[1][0] = 999.0
+        # Internal state untouched.
+        assert tracker.folded_snapshot()[1][0] != 999.0
+
+    def test_folded_snapshot_empty_when_no_folds(self):
+        _env_, tracker = _tracker(live_seats=[0, 1])
+        assert tracker.folded_snapshot() == {}
+
+
 class TestSnapshot:
 
     def test_is_deep_copy(self):

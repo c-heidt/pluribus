@@ -75,3 +75,63 @@ class Deck:
     def remaining(self) -> np.ndarray:
         """Return the undealt portion of the deck as a numpy array."""
         return self._cards[self._idx:]
+
+    def replace_drawn(
+        self,
+        old_cards: tuple,
+        new_cards: tuple,
+    ) -> None:
+        """Swap card values in ``_cards`` so ``new_cards`` occupy
+        ``old_cards``' positions in the drawn segment as a multiset.
+
+        Used by :meth:`PokerEnv.with_hole_cards` to keep the deck
+        consistent after a hole-card replacement: the cards that
+        appear in ``new`` but not ``old`` are moved into the
+        positions held by cards in ``old`` but not ``new``; the
+        displaced cards land where the new cards used to be.
+        ``_idx`` is unchanged.
+
+        The operation is set-based rather than position-by-position,
+        so it is robust when ``new`` reuses one of the seat's own
+        current cards in a different slot (a pairwise iteration
+        would lose the second card to a transient ordering error).
+
+        Caller's contract — each card in ``set(new) - set(old)``
+        must currently occupy a position outside any other dealt
+        slot (community, another seat's hole).  Otherwise the swap
+        would corrupt that slot.  :meth:`PokerEnv.with_hole_cards`
+        validates this before calling.
+
+        Parameters
+        ----------
+        old_cards : tuple[int, ...]
+            Card ints currently in the drawn segment that may be
+            displaced (typically the seat's prior hole).
+        new_cards : tuple[int, ...]
+            Card ints that should end up in the seat's hole
+            positions.  Cards present in both ``old`` and ``new``
+            are no-ops; the difference is what actually swaps.
+        """
+        old_set = set(int(c) for c in old_cards)
+        new_set = set(int(c) for c in new_cards)
+        dropped = sorted(old_set - new_set)  # cards leaving the slot
+        added = sorted(new_set - old_set)    # cards entering the slot
+        # |dropped| == |added| holds because |old| == |new| as input.
+        for d, a in zip(dropped, added):
+            p_d = int(np.where(self._cards == d)[0][0])
+            p_a = int(np.where(self._cards == a)[0][0])
+            tmp = int(self._cards[p_d])
+            self._cards[p_d] = self._cards[p_a]
+            self._cards[p_a] = tmp
+
+    def shuffle_undealt(self) -> None:
+        """Shuffle the undealt segment in place (positions ``>= _idx``).
+
+        Drawn segment (``< _idx``) is untouched.  Called by
+        :meth:`PokerEnv.with_hole_cards` after :meth:`replace_drawn`
+        so the next community deal samples uniformly over the
+        remaining cards instead of preferring the specific positions
+        that received displaced cards from the swap.  Uses the
+        global numpy RNG, matching the construction-time shuffle.
+        """
+        np.random.shuffle(self._cards[self._idx:])

@@ -98,6 +98,15 @@ class RangeTracker:
         self._ranges: Dict[int, np.ndarray] = {
             int(s): initial.copy() for s in live_seats if int(s) != my_seat
         }
+        # Folded seats' marginals are retained here (moved from
+        # ``_ranges`` by :meth:`on_seat_folded`) so the leaf evaluator
+        # can sample folded seats from their fold-time belief instead
+        # of from a uniform fallback.  The principled "fold-time
+        # posterior" is obtained when callers invoke
+        # :meth:`on_action` with ``"fold"`` *before*
+        # :meth:`on_seat_folded` — otherwise the retained range is
+        # the pre-fold belief.
+        self._folded_ranges: Dict[int, np.ndarray] = {}
         self._decision_log: List[Tuple[int, str, str]] = []
 
     def on_board_update(self, new_cards: Sequence[int]) -> None:
@@ -158,8 +167,23 @@ class RangeTracker:
         self._decision_log.append((seat, env_before.info_set, action))
 
     def on_seat_folded(self, seat: int) -> None:
-        """Drop ``seat`` from the tracker.  No-op if already absent."""
-        self._ranges.pop(seat, None)
+        """Move ``seat`` from live ranges into :attr:`folded_snapshot`.
+
+        After this call ``seat`` is absent from :meth:`snapshot` and
+        present in :meth:`folded_snapshot` carrying the range it had
+        in ``_ranges`` at the moment of the move.  The retained
+        marginal is the seat's fold-time belief: callers that ran
+        :meth:`on_action` with ``"fold"`` immediately before get the
+        post-fold Bayes posterior; callers that didn't get the
+        pre-fold belief.  Both are valid; the choice is the caller's
+        modelling policy.
+
+        No-op if ``seat`` is already absent (already folded or never
+        tracked).
+        """
+        range_at_fold = self._ranges.pop(seat, None)
+        if range_at_fold is not None:
+            self._folded_ranges[seat] = range_at_fold
 
     def range_of(self, seat: int) -> Range:
         """Return the in-place range vector for ``seat``.
@@ -173,6 +197,15 @@ class RangeTracker:
         """Deep copy of all live opponent ranges, suitable for handing
         to :meth:`SubgameContext.from_runtime`."""
         return {seat: w.copy() for seat, w in self._ranges.items()}
+
+    def folded_snapshot(self) -> Dict[int, Range]:
+        """Deep copy of all folded opponent ranges at fold time.
+
+        Symmetric to :meth:`snapshot`; consumed by the leaf evaluator
+        to sample folded seats' holes from their fold-time marginal
+        rather than from a uniform prior.
+        """
+        return {seat: w.copy() for seat, w in self._folded_ranges.items()}
 
     def _uniform_fallback(self, seat: int) -> None:
         warnings.warn(

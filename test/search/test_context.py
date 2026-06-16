@@ -19,13 +19,17 @@ def _env(low: int = 2, high: int = 14, n_players: int = 2):
 
 
 def _ctx_from(env, leaf=None, rng=None):
+    if rng is None:
+        # Derive from the global state, which the autouse ``_seeded``
+        # fixture reseeds per trial (see conftest.py).
+        rng = np.random.default_rng(int(np.random.randint(0, 2**31 - 1)))
     return SubgameContext.from_runtime(
         env=env,
         my_seat=0,
         my_hole=tuple(env.players[0].cards),
         opponent_ranges={1: np.ones(env.n_combos, dtype=np.float32)},
         leaf=leaf if leaf is not None else object(),
-        rng=rng if rng is not None else np.random.default_rng(0),
+        rng=rng,
     )
 
 
