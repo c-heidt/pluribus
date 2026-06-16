@@ -1,6 +1,8 @@
 # Subgame Solving & Online Play
 
-Implementation plan for the real-time search component of the Pluribus bot.
+Implementation plan for the real-time search component of the Pluribus bot,
+following Brown & Sandholm (2019), *Superhuman AI for multiplayer poker*, and
+its supplementary materials.
 
 ---
 
@@ -16,9 +18,9 @@ The repository already contains the offline half of Pluribus:
 
 The play loop uses the blueprint for every decision. Brown & Sandholm (2019)
 report that blueprint-only play is materially weaker than the full system; the
-strength of Pluribus at 6-max NLHE comes from **depth-limited subgame solving
-with continuation strategies**, invoked from round 2 onwards and whenever the
-game deviates from the action abstraction. Adding this online component is the
+strength of Pluribus at 6-max NLHE comes from **real-time search with
+continuation strategies**, run on every betting round after the first and in
+rare off-tree situations on the first. Adding this online component is the
 scope of this document.
 
 ## 2. Goals and Non-Goals
@@ -26,17 +28,28 @@ scope of this document.
 ### Goals
 
 - Produce a bot that, at play time, performs real-time search rooted at the
-  current public state rather than reading the blueprint directly.
-- Match the paper's algorithmic structure: biased continuation strategies at
-  depth-limit leaves, unsafe subgame solving on first search in a hand, Linear
-  MCCFR on subsequent searches in the same hand.
-- Deliver in two phases so end-to-end search can be validated before the
-  long-running biased-blueprint training finishes.
+  start of the current betting round rather than reading the blueprint
+  directly.
+- Match the paper's algorithmic structure: nested unsafe search solving from
+  the start of the current betting round; round-dependent depth limits;
+  continuation strategies at depth-limit leaves that are runtime reweightings
+  of the blueprint, chosen via CFR; the paper's two subgame CFR regimes —
+  external-sampling Linear MCCFR for large/early subgames and vector-form
+  Linear CFR for small/late ones; the final iteration's strategy played, the
+  weighted average kept for belief updates.
 
 ### Non-goals
 
-- No changes to the action abstraction or the card clustering.
-- No multi-CPU or distributed search. Search runs on one machine per decision.
+- No changes to the blueprint training pipeline (its action abstraction or the
+  card clustering). Real-time search, as in the paper, uses its **own**
+  abstractions: a coarser raise-size set (≤ 5–6 sizes per decision) for the
+  subgame action tree, and — for cards — lossless abstraction on the root street
+  with the existing 200-bucket LUT on later streets (upgraded to 500 when the new
+  LUT is computed; the 200-vs-500 count is the one accepted divergence from the
+  paper).
+- No distributed (multi-machine) search. Search runs on one machine per
+  decision; within that machine it parallelizes across cores (§6.7), matching
+  the paper's per-thread public-board sampling.
 - No opponent modelling or exploitation; Pluribus plays the same strategy
   regardless of opponent identity, and this project preserves that.
 - No safety guarantees. Safe subgame-solving theorems do not extend beyond
@@ -46,97 +59,92 @@ scope of this document.
 
 | Parameter | Value |
 |---|---|
-| Number of continuation strategies | k = 4 (base, fold-biased, call-biased, raise-biased) |
-| Subgame depth limit | End of the current betting round |
-| Opponent range representation | Dense 1326-combo per opponent, board-conflicting combos zeroed |
-| Search budget | Dual cap: iteration count AND wall-clock; whichever hits first |
-| Default search budget | 10 000 iterations, 15 s wall-clock (configurable via CLI) |
+| Continuation strategies | k = 4: unaltered blueprint; fold-, call-, raise-biased = blueprint with that action class's probability ×5, renormalized at inference time |
+| Subgame depth limit | Round-1 search: end of round 1. Round-2 search with > 2 players at round start: start of round 3 **or** immediately after the 2nd raise of the round, whichever is earlier. All other cases (round 2 heads-up, rounds 3–4): end of the game |
+| Card abstraction in search | Lossless (per-combo) on the root street; 200-bucket LUT clusters on later streets (→ 500 with the new LUT) |
+| Subgame action abstraction | Coarser, search-specific raise-size set — ≤ 5–6 pot-fractions per decision (paper); opponent raises off this set are injected and trigger re-search |
+| CFR algorithm | Two regimes (paper): external-sampling Linear MCCFR for large/early subgames (round 1, round 2, large multiway); vector-form Linear CFR sampling one board runout per iteration for small/late subgames (heads-up turn/river). CFR-P pruning is **not** applied in search — the blueprint's threshold never fires at search scale (§6.5) |
+| Range representation | Dense per-combo distribution for **every** player still in the hand, including the bot (observer perspective) |
+| Belief updates | Bayes' rule at round boundaries under the previous search's weighted-average strategy (blueprint if no search has run yet this hand) |
+| Strategy played | Final iteration of the search; the weighted average is kept only for belief updates |
+| Action translation | Pseudo-harmonic: randomized variant on round 1; deterministic variant for blueprint lookups on histories containing off-tree actions; rounds 2–4 always inject the off-tree action and re-search |
+| Round-1 search trigger | Opponent raise more than $100 from every size in the blueprint abstraction **and** ≤ 4 players remaining in the hand; otherwise blueprint play with randomized pseudo-harmonic mapping |
+| Search budget | Dual cap: 10 000 iterations AND 15 s wall-clock; whichever hits first (CLI-configurable) |
 
-## 4. Biased Blueprints: Definition and Training
+## 4. Continuation Strategies
 
-The k = 4 continuation strategies are **full, independent strategies over the
-entire abstracted game tree**. Each is stored as its own set of regret and
-visit tables, in the same joblib format as the base blueprint and queryable by
-the same code.
+The k = 4 continuation strategies are **inference-time modifications of the
+base blueprint**. At any decision point, the base distribution σ is computed
+from the blueprint's stored regrets via regret matching; the biased variants
+multiply the probability of the biased action class by 5 and renormalize:
 
-They are produced by running MCCFR with a **modified terminal payoff**: a
-bonus `b` is added, proportional to how often the biased action class
-(fold / call / raise) was played along the trajectory to that terminal. The
-regret updates therefore see this modified utility, so the resulting strategy
-both over-uses the biased action class *and* adapts the rest of the tree to
-that tendency. For example, a fold-biased blueprint folds more often and also
-plays its non-folded hands differently, because it has effectively solved a
-game in which continuing is costlier.
+- *blueprint*: σ unaltered.
+- *fold-biased*: σ(fold) ×5, renormalized.
+- *call-biased*: σ(call/check) ×5, renormalized.
+- *raise-biased*: σ(a) ×5 for every `a` starting with `raise` or `all_in`,
+  renormalized.
 
-This downstream adaptation is why the biased blueprints cannot be produced by
-reweighting the base blueprint at inference time.
+No additional training artifacts are required; there is one blueprint on disk
+and the four variants are derived from it at query time. The *choice* among
+the four (including mixtures) is itself an action in the subgame, solved by
+CFR at depth-limit leaves (§6.5).
 
-### Training strategy
+Action classes are identified by prefix: `"fold"`, `"call"` / `"check"`,
+anything starting with `"raise"` or `"all_in"`.
 
-- **Warm-start** each biased variant from the finished base blueprint's
-  regret/visit tables, then run biased MCCFR for a shorter schedule
-  (starting target: 10–25 % of the base-blueprint iteration count per
-  variant; tuned empirically).
-- Reuse the existing training pipeline in [poker_ai/blueprint/](../poker_ai/blueprint/):
-  `CFRTables`, checkpointing, discount/pruning schedule, multi-process server.
-- Add a pluggable **bias hook** that modifies the terminal utility returned to
-  the traversal. The base MCCFR path remains identical when `bias=none`.
+## 5. Search Triggering and Subgame Structure
 
-### New CLI surface
+The online lifecycle follows Algorithm 2 of the supplementary materials.
 
-```
-poker_ai train start --bias {none,fold,call,raise} \
-                     --bias-magnitude <b> \
-                     --warm-start <path-to-base-blueprint>
-```
+### Root placement and triggers
 
-### Outputs
+- The subgame root is the **public state at the start of the current betting
+  round**. It does not move until a new round is reached.
+- **Rounds 2–4**: search is run **at the moment the round begins** (Algorithm 2's
+  `CheckNewRound`) — as soon as the new round's public state becomes the root and
+  the round-boundary belief update has been applied, *before* the bot is asked to
+  act. Whenever an opponent then takes an action outside the subgame's action
+  abstraction, that action is added to every node of the current public state
+  (`env.inject_action`, §6.1) and the subgame is **re-searched from the same
+  root**.
+- **Round 1**: the bot plays the blueprint. An observed off-tree raise is
+  mapped onto the abstraction with **randomized pseudo-harmonic action
+  translation** (§6.3) and play continues from the blueprint — *unless* the
+  raise is more than $100 from every size in the blueprint abstraction and no
+  more than four players remain in the hand, in which case search runs with a
+  subgame extending to the end of round 1.
+- **Own turn**: the bot samples its action from the current search output's
+  final-iteration strategy (blueprint on round 1); no search is triggered.
 
-Four directories in the same format as the base blueprint:
+### Depth limits
 
-```
-blueprints/
-├── base/
-├── fold_biased/
-├── call_biased/
-└── raise_biased/
-```
+Per the table in §3. Subgames that extend to the end of the game have only
+terminal leaves (scored at the showdown / fold-out); the continuation-strategy
+machinery applies only to round-1 search and multiway round-2 search, whose
+leaves are non-terminal. The CFR regime used for each subgame (MCCFR vs vector,
+§6.5) is chosen by size and street, independently of the leaf type.
 
-### Files to add
+### Freezing on re-search
 
-- `poker_ai/blueprint/bias.py` — trajectory-class counter and terminal-utility
-  hook.
-- Extensions to [poker_ai/blueprint/runner.py](../poker_ai/blueprint/runner.py) for the new flags.
-- Extensions to [poker_ai/blueprint/cfr.py](../poker_ai/blueprint/cfr.py) to call the hook at terminal evaluation.
+When the subgame is re-searched within a round, the bot's action
+probabilities at every infoset where it already acted this round are **frozen
+at the values used when it acted — for its actual hand only**. Its other
+possible hands and all opponent infosets remain free to change. Moving the
+root to the next round implicitly freezes everything before the new root.
 
-## 5. Two-Phase Rollout
+### Root distribution and belief updates
 
-### Phase 1 — On-demand bias (no extra training)
+The root is a probability distribution over the nodes of the root public
+state: each player — including the bot — carries a dense per-combo range
+(§6.2). Opponents are assumed to have played the bot's own strategy at their
+past decision points (unsafe search), so hands an opponent would always have
+folded carry zero probability and need no strategy.
 
-At subgame leaves, derive biased continuation strategies at runtime by
-re-running regret matching against the base blueprint's stored regrets with an
-additive bias term on the target action class:
-
-```
-σ_bias(a) ∝ max(0, R(a) + b · 𝟙[a ∈ biased_class])
-```
-
-This is strictly weaker than the paper's method because it lacks the
-downstream adaptation, but it is zero-training-cost and lets the entire search
-pipeline (sections 6–8 below) be implemented and validated end-to-end.
-
-### Phase 2 — Precomputed biased blueprints
-
-Once the four biased blueprints from section 4 finish training, replace the
-Phase 1 leaf-EV source with lookups into the precomputed blueprints. The
-leaf-EV interface is unchanged; only the source of `σ_bias` differs. Both modes
-remain selectable via CLI (`--biased-blueprints` flag present or absent).
-
-### Rationale for order
-
-Biased blueprint training (section 4) is long-running. It is implemented first
-so those runs can start immediately and execute in the background while the
-online-search components are built.
+When a betting round ends, every player's range is updated by Bayes' rule
+conditioned on the actions they took during the round, evaluated under σ =
+the blueprint if no search has run yet this hand, otherwise the **weighted
+average strategy** of the previously-run search. The updated ranges seed the
+next round's root.
 
 ## 6. Architecture
 
@@ -145,9 +153,9 @@ New top-level package: `poker_ai/search/`.
 ```
 poker_ai/search/
 ├── context.py        # SubgameContext: per-search inputs static for one solve()
-├── ranges.py         # Per-opponent range tracking (dense per-combo)
-├── leaf.py           # Depth-limit leaf continuation-value evaluation
-├── solver.py         # Depth-limited MCCFR subgame solver
+├── ranges.py         # Per-player range tracking (dense per-combo)
+├── leaf.py           # Continuation-value evaluation at depth-limit leaves
+├── solver.py         # Subgame solver: MCCFR + vector-form Linear CFR regimes
 ├── policy.py         # Policy ABC, BiasClass, implementations
 └── agent.py          # Search-aware play agent
 ```
@@ -157,9 +165,7 @@ poker_ai/search/
 Card-space dimensions depend on the deck the environment was built for
 (small decks are used in tests and for sub-game LUTs), so they are not
 hard-coded in the search package. The environment exposes them and the
-search package consumes whatever the live `PokerEnv` reports.
-
-**New on `PokerEnv`** (to add in [environment/poker_env.py](../environment/poker_env.py)):
+search package consumes whatever the live `PokerEnv` reports:
 
 ```python
 @property
@@ -176,92 +182,63 @@ def combo_index(self) -> Dict[Tuple[int, int], int]:
     """Inverse of `combo_cards`: (c0, c1) → row index. Cached likewise."""
 ```
 
-The env already exposes [`deck_size`](../environment/poker_env.py#L736-L739),
-[`low_card_rank` / `high_card_rank`](../environment/poker_env.py#L741-L749),
-and [`n_players`](../environment/poker_env.py#L679-L682), which are the
-inputs `n_combos` / `combo_cards` are derived from; none of the
-combo-indexing helpers exist yet.
-
-`poker_ai/search/policy.py` owns the policy abstraction and the
-shared aliases the rest of the search package consumes:
+`poker_ai/search/policy.py` owns the policy abstraction and the shared
+aliases the rest of the search package consumes:
 
 ```python
 BiasClass = Literal["none", "fold", "call", "raise"]
 
 class Policy(ABC):
-    """Base class for anything the solver / leaf-EV can query for an
-    action distribution. Subclasses implement `strategy`; shared
-    regret-matching and bias-mask construction live here so the three
-    tabular implementations (blueprint / biased-blueprint / search) do
-    not re-derive them."""
+    """Base class for anything the solver / leaf evaluation can query for an
+    action distribution."""
 
     @abstractmethod
-    def strategy(self, env: PokerEnv, bias: BiasClass = "none") -> np.ndarray:
-        """Float32 vector aligned with `[a for a in env.legal_actions if a is not None]`."""
+    def strategy(self, state: PolicyState, bias: BiasClass = "none") -> np.ndarray:
+        """Float32 vector aligned with `state.legal_actions`."""
 
     @staticmethod
-    def _bias_mask(legal_actions: List[str], bias: BiasClass) -> np.ndarray:
-        """Boolean mask over `legal_actions` selecting the biased class.
-        Action-class identification by prefix: `"fold"`, `"call"`/`"check"`,
-        anything starting with `"raise"` or `"all_in"`."""
+    def _bias_mask(actions: List[str], bias: BiasClass) -> np.ndarray:
+        """Boolean mask over `actions` selecting the biased class (§4)."""
 
     @staticmethod
-    def _regret_match(
-        regrets: np.ndarray,
+    def _reweight_bias(
+        sigma: np.ndarray,
         bias_mask: np.ndarray,
-        bias_magnitude: float,
+        multiplier: float,
     ) -> np.ndarray:
-        """σ(a) ∝ max(0, R(a) + b · bias_mask). Uniform fallback when all
-        biased regrets are ≤ 0."""
+        """σ[biased_class] *= multiplier, renormalize. `multiplier == 1`
+        returns σ unchanged."""
 ```
 
-ABC over Protocol because the three implementations share real
-behavior (regret matching + bias-mask construction + uniform fallback),
-not just a signature; the runtime enforcement also catches half-finished
-subclasses before they reach the solver. The cost is a single
-inheritance hierarchy — acceptable given the closed set of tabular
-implementations.
+Two implementations:
 
-Three implementations, only the first of which is shipped today:
+- `BlueprintPolicy(tables: CFRTables, bias_multiplier: float = 5.0)` —
+  reads the regret row for `state.info_set` at `state.betting_round`,
+  computes σ via regret matching (`calculate_strategy_from_row`), then
+  applies `_reweight_bias` for the requested bias class; falls back to
+  uniform when the row is absent (unseen info set). When the queried
+  history contains an off-tree action, the lookup key is canonicalized
+  via deterministic pseudo-harmonic translation (§6.3) before reading the
+  tables. Overlay-injected actions that have no blueprint column receive
+  zero mass and the canonical probabilities are renormalized over the
+  legal set (uniform fallback when only overlay actions are legal).
+- `SearchPolicy(state: SolverState, use_average: bool)` — **deferred**
+  until the solver in §6.5 lands. Returned by `solve()`; resolves
+  `PolicyState → public_key → hand row` in the subgame-local tables and
+  regret-matches the row (`use_average=False`, the strategy the bot
+  plays) or normalizes the visit sums (`use_average=True`, the strategy
+  used for belief updates).
 
-- `BlueprintPolicy(tables: CFRTables, bias_magnitude: float = 0.0)` —
-  **implemented** in [poker_ai/search/policy.py](../poker_ai/search/policy.py).
-  Reads the regret row for `env.info_set` at `env.betting_round`,
-  optionally adds `b · 𝟙[a ∈ biased_class]` before regret matching;
-  falls back to uniform when the row is absent (unseen info set).
-  Action classes are identified via prefix: `"fold"`, `"call"` /
-  `"check"`, anything starting with `"raise"` or `"all_in"`.
-- `BiasedBlueprintPolicy({bias: CFRTables})` — **deferred** until the
-  biased blueprint training in §4 produces the four `CFRTables`
-  artifacts.  Phase 2 only; dispatches by `bias` to the matching
-  precomputed tables, with no additive bias term.  Subclasses `Policy`
-  and reuses the same `_bias_mask` / `_regret_match_with_bias`
-  helpers; only the regret-row source differs from `BlueprintPolicy`.
-- `SearchPolicy(in_memory_regret: Dict[str, np.ndarray], ...)` —
-  **deferred** until the solver in §6.5 lands.  Returned by `solve()`;
-  same regret-matching as `BlueprintPolicy`, but reads the subgame-local
-  dict instead of a `CFRTables`.
-
-Stubbing the two deferred classes now would add code with no callers
-and no way to test against a real regret source; they slot into the
-existing ABC unchanged once their inputs exist.
+ABC over Protocol because the implementations share real behavior
+(regret matching, bias-mask construction, uniform fallback), not just a
+signature.
 
 ### 6.1 Subgame state and context (`context.py`, env additions)
 
 A subgame is **not** a new object type — it is a deepcopied `PokerEnv`
-at the bot's decision point. The env already owns game dynamics, the
+at the root public state. The env already owns game dynamics, the
 action abstraction, history, and the LUT, and `apply_action` already
-returns a new env via internal deepcopy. Wrapping it in a `SubgameRoot`
-peer object would force every downstream module (solver, leaf, range
-tracker) to know about the wrapper.
-
-Two pieces are added instead:
-
-1. **Two small env extensions** that move off-tree action injection
-   into the only object that knows the public game tree.
-2. **A frozen `SubgameContext` dataclass** that carries the
-   *static-for-one-search* inputs the solver needs (ranges, my_seat,
-   etc.). This replaces the rejected `SubgameRoot`.
+returns a new env via internal deepcopy.
 
 #### Env extensions ([environment/poker_env.py](../environment/poker_env.py))
 
@@ -283,168 +260,145 @@ def reset_overlay(self) -> None:
 def has_overlay_at_current_node(self) -> bool:
     """True iff at least one injected action exists at this public state."""
 
-def with_hole_cards(self, seat: int, cards: Tuple[int, int]) -> PokerEnv:
-    """Return a deepcopy with `seat`'s hole cards replaced.
+def with_hole_cards(self, holes: Sequence[Tuple[int, int]]) -> PokerEnv:
+    """Return a deepcopy with every seat's hole cards replaced atomically."""
 
-    Used by opponent-response modelling (`RangeTracker`'s
-    `sigma_for_combo` closure, §6.2) to evaluate "what would seat
-    have done with hand X?" without reaching into player internals.
-    Does NOT call `inject_action`."""
+@property
+def public_key(self) -> Tuple:
+    """Hashable identifier of the current public state:
+    (betting_stage, per-stage action-history tuple).  Used to key the
+    solver's in-memory tables and the overlay."""
+
+def cluster_for(self, combo: Tuple[int, int]) -> int:
+    """LUT cluster id for `combo` on the current street and board.
+    Reads `card_info_lut` directly, skipping the JSON info-set build."""
+
+def step_in_place(self, action: str) -> "UndoToken":
+    """Apply `action` by **mutating this env in place**, returning an
+    undo token (the pre-action values of every field the action
+    touched: pot, the acting player's chips/bet/fold state, history,
+    betting-round counters, and — at a chance node — the dealt board /
+    deck cursor).  The hot-loop counterpart to `apply_action`'s
+    copy-on-write."""
+
+def undo(self, token: "UndoToken") -> None:
+    """Reverse the most recent `step_in_place`, restoring the env to its
+    pre-action state in O(action footprint).  Tokens are strictly LIFO."""
 ```
 
-`legal_actions` is extended to union the overlay for the current
-public state with the canonical set, deduping. `apply_action` already
-accepts arbitrary `"raise:<fraction>"` strings — no other change required.
+`legal_actions` unions the overlay for the current public state with the
+canonical set, deduping. `apply_action` already accepts arbitrary
+`"raise:<fraction>"` strings. `apply_action` (copy-on-write) remains the API
+for every caller **outside** the solver's inner loop; `step_in_place` / `undo`
+are the make/undo pair the CFR traversal uses to avoid a per-node deepcopy
+(§6.7).
 
 **Why "public state", not info_set, as the internal overlay key.**
 The overlay describes the *game tree* (a property of public nodes),
 not strategy at an information set. Two seats arriving at the same
 public node — same `(betting_stage, history)` — have different
 `info_set` values because `info_set` embeds the actor's card cluster.
-The solver's opponent traversal and the range tracker's Bayes update
-both need to see the injection regardless of which seat is "viewing"
-the node, so the overlay must be keyed by what they share (public
-history), not what differs (card cluster). This is an *internal*
-implementation detail — callers never see the key; they call
-`env.inject_action(s)` and `env.legal_actions` does the right thing.
+The solver's traversal and the range tracker's Bayes update both need
+to see the injection regardless of which seat is "viewing" the node,
+so the overlay is keyed by what they share (public history), not what
+differs (card cluster).
 
 #### `SubgameContext` ([poker_ai/search/context.py](../poker_ai/search/context.py))
 
 ```python
 @dataclass(frozen=True)
 class SubgameContext:
-    """Inputs to one `solve()` call that do not change during the CFR walk.
-
-    Lives for the duration of one search; carries everything that
-    would otherwise be threaded through 4 arguments deep.
-    """
+    """Inputs to one `solve()` call that do not change during the CFR walk."""
     my_seat: int
     my_hole: Tuple[int, int]
-    opponent_ranges: Dict[int, Range]     # only seats still in the hand
+    ranges: Mapping[int, Range]           # every live seat, incl. my_seat
+    folded_ranges: Mapping[int, Range]    # seats that folded before the root (card removal)
     board_compatible: np.ndarray          # shape (env.n_combos,), bool
-    street_at_root: int                   # 0..3 — halt when env.betting_round > this
+    street_at_root: int                   # 0..3
+    depth_limit: DepthLimit               # see below
     leaf: "LeafConfig"
     rng: np.random.Generator
 
     @classmethod
-    def from_runtime(
-        cls,
-        env: PokerEnv,
-        my_seat: int,
-        my_hole: Tuple[int, int],
-        opponent_ranges: Dict[int, Range],
-        leaf: "LeafConfig",
-        rng: np.random.Generator,
-    ) -> "SubgameContext":
-        """Construct a context for a search rooted at `env`.
-
-        Derives `board_compatible` from the env's combo table and the
-        current community cards.  Sets `street_at_root` to
-        `env.betting_round`.  Does not deepcopy the env — the solver's
-        caller (typically `SearchAgent`) is responsible for that.
-        """
+    def from_runtime(cls, env, my_seat, my_hole, ranges, folded_ranges, leaf, rng): ...
 ```
 
-The construction logic lives next to the dataclass (rather than on
-`RangeTracker` or inline in `SearchAgent.act`) because most of the
-context's fields come from neither: the board-compatible mask is a pure
-function of the env, my_seat/my_hole come from per-hand state, only
-`opponent_ranges` is a tracker snapshot. A classmethod keeps the dataclass
-and its sole non-trivial constructor in one importable place.
+`depth_limit` is a small descriptor derived from `(street_at_root,
+players live at round start)` implementing the §3 table. It answers, for
+any env reached during the walk, one of three verdicts: *internal*,
+*depth-limit leaf* (continuation meta-game, §6.5), or *terminal*
+(`env.payout`). The multiway round-2 case additionally cuts off
+immediately after the second raise of the root round (the env tracks the
+in-round raise count).
 
-Solver and leaf signatures become `solve(root_env, ctx, cfg)` and
-`leaf_value(env, ctx)`. The "root" is just the env passed in; there is
-no `SubgameRoot`, no `build_subgame`, no `legal_actions_at`.
+The bot's entry in `ranges` is its observer-perspective range — the
+search computes a strategy for the bot's **entire range**, and the agent
+plays the actual hand's row. Opponent entries exclude the bot's actual
+cards (known card removal); the bot's own entry excludes only board
+conflicts.
 
 #### Traversal
 
-Inside the solver, each step is plain `env = env.apply_action(a)` —
-the env's `apply_action` already deepcopies, so wrapping it in an
-extra `copy.deepcopy` would copy twice. The depth limit is the same
-condition as before: stop and call `leaf.leaf_value(env, ctx)` when
-`env.betting_round > ctx.street_at_root`.
+The solver's inner CFR traversal descends with `token = env.step_in_place(a)`
+and ascends with `env.undo(token)` (§6.7) — one mutable env per traversal, no
+per-node copy. Code paths outside the hot loop (the agent's lifecycle,
+continuation rollouts that branch) still use the copy-on-write
+`env = env.apply_action(a)`. Leaf classification uses `ctx.depth_limit`;
+`is_terminal` is always checked **before** reading `betting_round` (which raises
+at the `"terminal"` stage).
 
 **Invariants** (asserted in tests): after `root_env = copy.deepcopy(runtime_env)`,
 `root_env.pot_size`, player chip stacks, the per-stage history, and
-`root_env.current_player` match the runtime values. Every leaf
-satisfies `is_terminal or betting_round > street_at_root`.
+`root_env.current_player` match the runtime values. Every leaf satisfies
+the depth-limit verdict of the §3 table.
 
-### 6.2 Opponent range tracking (`ranges.py`)
+### 6.2 Range tracking (`ranges.py`)
 
 ```python
 Range = np.ndarray                                  # float32, shape (env.n_combos,)
 
 class RangeTracker:
-    def __init__(self, n_seats: int, my_seat: int, my_hole: Tuple[int, int]): ...
+    def __init__(self, env, my_seat, my_hole, live_seats): ...
 
     def on_board_update(self, new_cards: Sequence[int]) -> None:
         """Zero every combo sharing a card with the new board; renormalize."""
 
-    def on_action(
-        self,
-        seat: int,
-        env_before: PokerEnv,
-        action: str,
-        sigma_for_combo: Callable[[int], np.ndarray],
-    ) -> None:
-        """w(h) ← w(h) · sigma_for_combo(h)[idx_of(action)]; renormalize.
+    def on_action(self, seat, env_before, action, sigma_for_combo) -> None:
+        """w(h) ← w(h) · sigma_for_combo(h)[idx_of(action)]; renormalize."""
 
-        `sigma_for_combo(h)` returns the strategy vector aligned with
-        `env_before.legal_actions` for the case where seat's hole cards
-        are `COMBO_CARDS[h]`.  The caller (typically `SearchAgent`)
-        constructs this closure so ranges.py never imports policy.py.
-        """
-
+    def on_seat_folded(self, seat: int) -> None: ...
     def range_of(self, seat: int) -> Range: ...
-    def snapshot(self) -> Dict[int, Range]: ...   # deep copy; only live seats
+    def snapshot(self) -> Dict[int, Range]: ...        # deep copy; live seats
+    def folded_snapshot(self) -> Dict[int, Range]: ...
 ```
 
-The tracker has zero search-package imports, takes only env + a
-callable, and can be unit-tested with a hand-written `sigma_for_combo`.
-`SubgameContext.from_runtime` (§6.1) calls `snapshot()` to populate
-`opponent_ranges`; the tracker has no `build_context` method and no
-dependency on `SubgameContext` / `LeafConfig` / RNG / `Policy`.
-
-A new env helper supports the closure side cleanly:
-
-```python
-# environment/poker_env.py
-def with_hole_cards(self, seat: int, cards: Tuple[int, int]) -> PokerEnv:
-    """Return a deepcopy with `seat`'s hole cards replaced.
-
-    Used by opponent-response modelling to evaluate "what would seat
-    have done with hand X?" without reaching into player internals.
-    """
-```
-
-The agent then builds the closure:
-
-```python
-sigma_for_combo = lambda h: opponent_response_policy.strategy(
-    env_before.with_hole_cards(seat, tuple(env.combo_cards[h]))
-)
-```
-
-Implementation notes:
-
-- Vectorize over the card cluster, not over individual combos: combos that
-  map to the same cluster-id on this street have identical `env.info_set`
-  and therefore identical σ. Group combos by cluster once per call, query
-  σ once per distinct cluster.  This optimisation lives in the agent's
-  closure construction (where the policy is known), not in the tracker.
+- The tracker maintains a range for **every seat in the hand, including
+  `my_seat`**. The bot's own range is the observer-perspective
+  distribution: it excludes board conflicts but **not** the bot's actual
+  hole cards. Opponents' ranges additionally exclude the bot's actual
+  cards.
+- **Update timing.** Ranges are updated at **round boundaries**, not per
+  action. The agent buffers `(seat, env_before, action)` tuples during
+  the round; when the round ends it replays them through `on_action`
+  with a `sigma_for_combo` closure built from the last search's
+  **average** policy (the blueprint if no search has run yet this hand).
+  The per-action `on_action` API is the replay primitive.
+- `sigma_for_combo(h)` returns the strategy vector aligned with
+  `env_before.legal_actions` for the case where seat's hole cards are
+  `COMBO_CARDS[h]`. The agent constructs this closure so ranges.py never
+  imports policy.py. Vectorize over the card cluster: combos mapping to
+  the same cluster on a street have identical σ — group combos by
+  cluster once per call, query σ once per distinct cluster.
 - Numerical floor: if `w.sum() < 1e-12` after an update, reset to uniform
-  over board-compatible combos and emit a warning (only reachable via
-  zero-probability observations, e.g. off-tree bets before injection kicks
-  in).
+  over board-compatible combos and emit a warning.
 - A per-decision log `List[Tuple[seat, info_set_before, action]]` is
-  retained for debugging and Phase 1↔Phase 2 replay comparisons.
+  retained for debugging.
 
 ### 6.3 Action translation (env API, no search-side module)
 
-Chip ↔ action-string conversion is a property of the environment, not
-of search. The runtime translator at the chip-denominated boundary (a
-live table or the terminal loop) consumes the env's public chip-math
-methods; the search package sees only action strings.
+Chip ↔ action-string conversion is a property of the environment. The
+runtime translator at the chip-denominated boundary consumes the env's
+public chip-math methods; the search package sees only action strings.
 
 ```python
 # environment/poker_env.py — public methods
@@ -452,84 +406,94 @@ def canonical_raise_fractions(self) -> List[float]:
     """Currently-playable raise fractions, mirroring legal_actions' gating."""
 
 def chips_to_add(self, action: str) -> int:
-    """Inverse of apply_action's chip math.  fold→0, call→biggest_bet−bet,
-    all_in→stack, raise:<f>→_compute_raise_chip_amount(f, enforce_minimum=True)."""
+    """Inverse of apply_action's chip math."""
 
-def string_for_chips(self, chip_amount: int, tol: float = 0.15) -> str:
-    """Map an observed chip raise to the abstraction's action string.
+def string_for_chips(self, chip_amount: int) -> str:
+    """Map an observed chip raise to an action string.
 
     1. chip_amount == actor.n_chips  →  "all_in"
     2. exact canonical clamp         →  "raise:<f>"
-    3. |f_obs − f_near| / f_near ≤ tol → snap to "raise:<f_near>"
-    4. else                          →  off-tree "raise:<f_obs>" (4-dp)
+    3. else                          →  off-tree "raise:<f_obs>" (4-dp)
     """
 ```
 
-- Tolerance is relative pot-fraction distance: `|f_obs − f_near| / f_near`.
-  Default `0.15`; CLI flag `--off-tree-tol` plumbs into the runtime.
-- Fold / call / all-in are always on-tree — only raise sizes can deviate.
-- The runtime's caller pattern (used by `runner.py` and any future
-  table adapter):
+Off-tree raises are resolved with **pseudo-harmonic action translation**
+(Ganzfried & Sandholm 2013). For an observed pot-fraction `x` between
+neighbouring abstraction sizes `A < x < B`:
+
+```
+P(map to A) = ((B − x) · (1 + A)) / ((B − A) · (1 + x))
+```
+
+- **Randomized variant** (sample A or B by that probability): used on
+  **round 1** to map an observed off-tree raise onto the abstraction
+  before continuing from the blueprint (§5).
+- **Deterministic variant** (pick the side with probability ≥ ½): used to
+  canonicalize histories containing off-tree actions whenever the
+  blueprint is queried — e.g. during continuation rollouts (§6.4) — so
+  the `info_set` lookup resolves to the nearest node in the blueprint
+  abstraction instead of missing.
+- **Rounds 2–4 never snap.** Every observed off-tree raise is injected
+  into the subgame (`env.inject_action`) and the subgame is re-searched
+  from the same root (§5). Caller pattern:
   ```python
-  action_str = env.string_for_chips(observed_chips, tol=cfg.off_tree_tol)
+  action_str = env.string_for_chips(observed_chips)
   if action_str not in env.legal_actions:
       env.inject_action(action_str)
   env = env.apply_action(action_str)
   agent.on_observed_action(seat, env_before, action_str)
   ```
-  The runtime decides whether to inject by a single membership check
-  against `env.legal_actions`; no enum or classification value flows
-  out of `string_for_chips`. By the time `SearchAgent.on_observed_action`
-  is invoked, the env's history reflects what happened and the overlay
-  has been recorded if needed.
-- The search package has no translation module. `SearchAgent` works in
-  action strings; chips never enter the search code path.
+- Fold / call / all-in are always on-tree — only raise sizes can deviate.
 
-### 6.4 Leaf continuation-value evaluation (`leaf.py`)
+### 6.4 Continuation-value evaluation (`leaf.py`)
+
+A depth-limit leaf is reached only in the **MCCFR regime** (round-1 and
+multiway round-2 subgames, §6.5). At such a leaf every seat already has a
+**concrete** hand — sampled once at the subgame root for the current MCCFR
+traversal — and the continuation meta-game has fixed each active seat's
+continuation strategy. `continuation_value` evaluates that fixed profile for
+those concrete hands:
 
 ```python
 @dataclass
 class LeafConfig:
-    policies: Dict[BiasClass, Policy]     # one entry per k = 4 bias class
+    policies: Dict[BiasClass, Policy]     # the four §4 variants
     n_rollouts: int = 20
-    rng: np.random.Generator
 
-def leaf_value(
-    env: PokerEnv,                        # state AT the leaf (betting_round > ctx.street_at_root)
-    live_ranges: Dict[int, Range],        # ranges conditioned on path taken (subset of ctx.opponent_ranges)
+def continuation_value(
+    frontier_env: PokerEnv,               # at the leaf; every seat's hole already set
+    profile: Mapping[int, BiasClass],     # one bias class per active seat (chosen by the meta-game)
     ctx: SubgameContext,
-) -> np.ndarray:                          # shape (n_seats,), expected chips won/lost
+) -> np.ndarray:                          # shape (n_players,), expected chips per seat
 ```
 
-Algorithm per call:
+Algorithm per call: repeat `n_rollouts` times — roll the hand forward via
+`env = env.apply_action(a)` until `env.is_terminal`, with each acting seat
+playing `cfg.policies[profile[seat]].strategy(state, bias=profile[seat])`.
+Future board cards are dealt by `apply_action` as the rollout crosses round
+boundaries; blueprint lookups on histories containing off-tree actions
+canonicalize via deterministic pseudo-harmonic (§6.3). Read per-seat payoff from
+`env.payout` (do **not** re-implement side pots). Return the per-seat mean.
 
-1. Repeat `n_rollouts` times:
-   a. For each seat `i`, sample a continuation-strategy choice
-      `c_i ∈ {"none","fold","call","raise"}` uniformly.
-   b. Sample each opponent's hole from its range (board-compatible and
-      mutually non-conflicting; rejection sample or precomputed joint
-      index).
-   c. Roll the hand forward via `env = env.apply_action(a)` until
-      `env.is_terminal`: at every decision node, sample from
-      `cfg.policies[c_i].strategy(env, bias=c_i)` via
-      `tree_utils.sample_action`.
-   d. Read per-seat payoff from `env.payout` (terminal envs already
-      have winners computed by `dynamics.compute_winners`, called
-      from `apply_action`).  **Do not** re-implement payoff via
-      `Evaluator().evaluate(...)` — that duplicates env logic and
-      drops side-pot handling, which the env gets right.
-2. Return the per-seat mean across rollouts.
+The hands are **not** resampled here — the belief is integrated by the solver's
+joint root sampling across MCCFR iterations (§6.5), not inside the leaf; the
+hole-sampling helper (`_sample_all_holes`, which draws one assignment directly
+from the joint belief distribution, §6.5) moves to the solver's root-sampling step. The profile is **fixed** by the caller;
+nothing about the continuation choice is sampled inside this function (the
+random-bias draw of the original design is gone). Determinism: `ctx.rng` is the
+sole RNG; tests assert identical output for a fixed seed.
 
-Phase 1 vs Phase 2 differs **only** in `cfg.policies`:
+**Caching across the whole search, not just a traversal.** The four bias
+policies are static blueprint reweightings, so for a fixed `(leaf public_key,
+concrete-hand tuple, profile)` the continuation value is **invariant across all
+of the search's CFR iterations** — only the meta-game's *weighting* over
+profiles changes between iterations, never the per-profile value. The value is
+therefore memoized in a search-lifetime table keyed by that triple (not
+recomputed per visit), and the table is the unit of work parallelized in §6.7.
+The `n_rollouts` Monte-Carlo estimate is computed **once** per key on first
+demand.
 
-- Phase 1: `policies = {c: BlueprintPolicy(base_tables, bias_magnitude=b_c)
-  for c in ("none","fold","call","raise")}`.
-- Phase 2: `policies = {c: BiasedBlueprintPolicy.variant(c) for c in ...}`.
-
-Determinism: `cfg.rng` is seeded per search call; tests assert identical
-output for fixed seed.
-
-### 6.5 Depth-limited subgame solver (`solver.py`)
+### 6.5 Subgame solver (`solver.py`)
 
 ```python
 @dataclass(frozen=True)
@@ -538,12 +502,20 @@ class SolverConfig:
     max_iterations: int = 10_000
     max_wall_seconds: float = 15.0
     discount_interval: int = 1_000         # Linear-CFR discount cadence
-    prune_threshold: int = -300_000_000    # CFR-P pruning threshold
     leaf: LeafConfig
+
+class SolverState:
+    regret:    Dict[Key, np.ndarray]       # float64, width = legal actions at the node
+    strat_sum: Dict[Key, np.ndarray]       # cumulative strategy, same width
+    legal_at:  Dict[PublicKey, Tuple[str, ...]]
+    actor_at:  Dict[PublicKey, int]
+    frozen:    Dict[Key, np.ndarray]       # pinned σ for the bot's actual-hand rows (§5)
 
 @dataclass
 class SearchResult:
-    policy: SearchPolicy                   # queryable at any node visited during the walk
+    policy: SearchPolicy                   # final iteration — the bot plays this
+    average_policy: SearchPolicy           # weighted average — belief updates
+    state: SolverState                     # warm-start carrier / freeze store
     iterations_run: int
     wall_seconds: float
 
@@ -551,84 +523,96 @@ def solve(
     root_env: PokerEnv,                    # deepcopied by the caller
     ctx: SubgameContext,
     cfg: SolverConfig,
-    warm_start: Optional[SearchPolicy] = None,
+    warm_start: Optional[SolverState] = None,
 ) -> SearchResult: ...
 ```
 
-`warm_start` replaces the `unsafe_init: bool` config flag.  Passing
-`None` is the unsafe-init regime (first search of a hand, empty
-in-memory dicts).  Passing the previous search's
-`SearchResult.policy` is the paper's linear MCCFR re-search regime
-for the 2nd+ search in a hand — rows are copied lazily from the
-warm-start source on first miss.  This keeps `SolverConfig` purely
-static so the agent never has to `dataclasses.replace` it per call.
+Pluribus uses one of **two** CFR forms in the subgame depending on its size and
+the part of the game (paper, p.22–23). The choice is configurable; the default
+rule:
 
-`SearchResult` exposes one policy field; the root distribution is
-`result.policy.strategy(root_env)`.  Storing it as a separate array
-introduced an invariant the caller had to maintain by hand.
+- **MCCFR regime** — *large / early* subgames: round 1, all of round 2, and any
+  large multiway later subgame.
+- **Vector regime** — *small / late* subgames: heads-up turn/river.
 
-In-memory tables, keyed by the JSON `info_set` string. Width is
-**per-node** because injected actions (§6.1, §6.3) extend the legal
-set at specific public keys, so canonical-width rows would either
-waste columns or omit injected slots:
+#### Shared structure (both regimes)
 
-```python
-subgame_regret:   Dict[str, np.ndarray]    # int32, width = len(env.legal_actions) at first visit
-subgame_strategy: Dict[str, np.ndarray]    # int32 visit counts, same width
-```
+Tables keyed `Key = (public_key, hand_row)`. The **hand row** is per-combo on the
+root street (lossless) and a 200-bucket LUT cluster (`env.cluster_for`) on later
+streets (→ 500 with the new LUT). Node **width** is per-node — injected off-tree
+actions extend the legal set at specific public keys. The subgame action tree is
+built from the **coarse search raise-size set** (§3, §6.3), not the blueprint's;
+raises off that set are injected. Per-row regret matching reuses
+[`calculate_strategy_from_row`](../poker_ai/blueprint/tree_utils.py); do **not**
+reuse the fixed-width `accumulate_regrets` / `get_node_strategy`. Tables are
+in-memory (no lmdb / no disk), live for one hand (warm-start across re-searches),
+discarded at hand end. Linear-CFR discount of `regret` and `strat_sum` by
+`d = (t/Δ)/(t/Δ + 1)` every `discount_interval`. Dual stop on `max_iterations` /
+`max_wall_seconds`. **Freezing** (§5): at infosets where the bot already acted
+this round, the bot's **actual-hand** row returns the pinned σ from `frozen` and
+skips regret updates, while all other hands and all opponent infosets stay free.
+**Warm-start**: a non-`None` `SolverState` re-searches the same root after an
+injection, reusing rows in place and rebuilding widened nodes on first visit; the
+freeze map clears when the root advances to a new round. The bot **plays**
+`policy` (final iteration) at the actual hand's row; `average_policy` (normalized
+`strat_sum`) feeds the next round's belief update.
 
-No lmdb / no disk. Both dicts are discarded when the returned `SearchPolicy`
-goes out of scope at end of hand.
+#### MCCFR regime (large / early)
 
-#### Reuse from the blueprint code
+External-sampling Linear MCCFR (Linear-discounted, as the blueprint), **without
+CFR-P pruning** — see step 2. Per traversal:
 
-- **Reuse directly**:
-  [`calculate_strategy_from_row`](../poker_ai/blueprint/tree_utils.py)
-  at every solver node — already shape-agnostic; takes a regret row +
-  valid mask of any length.
-- **Do not reuse**:
-  [`accumulate_regrets`](../poker_ai/blueprint/tree_utils.py),
-  `get_node_strategy`, and the blueprint walker itself. They assume
-  fixed canonical width via `ACTION_TO_IDX`. The subgame uses
-  variable-width rows with a per-node `a_to_i` derived from
-  `env.legal_actions` at first visit. Write a parallel walker in
-  `poker_ai/search/solver.py` that mirrors the blueprint loop's
-  *structure* rather than refactoring `blueprint/cfr.py` to be
-  generic — the two have different lifecycle and persistence semantics.
+1. **Sample one root hand assignment directly from the joint belief
+   distribution.** The subgame root is a single chance node over the public state
+   `G`: its outcomes are the complete, mutually card-disjoint hole assignments `h`
+   (one hole pair per dealt seat — live seats from `ctx.ranges`, seats that folded
+   before the root from `ctx.folded_ranges`, for card removal), and outcome `h` has
+   probability `P(h) = π^σ(h) / Σ_{h'∈G} π^σ(h')` — the normalized **joint** reach
+   under the belief profile σ. The joint weight of an assignment is the product of
+   the seats' per-combo belief weights, zeroed whenever two seats share a card.
+   Each traversal draws **one** assignment directly from this joint `P(h)`
+   (`_sample_all_holes`) — **not** from independent per-seat marginals — so
+   inter-seat card removal is reflected in the draw itself. Every seat is part of
+   the joint draw, **including the bot**: its hole is sampled each iteration, never
+   pinned to its actual hand. Hands an opponent folds with probability 1 carry zero
+   joint mass and are never drawn, which is why unsafe search is cheap.
+2. Pick a traversing player `i`; **explore all of `i`'s actions**, **sample one
+   action** for each opponent (regret-matched σ) and **one outcome** at each chance
+   node; accumulate regret on `i`'s rows. **Every traverser action is always
+   explored** — the blueprint's negative-regret pruning (CFR-P) only engages after a
+   long warm-up and once a regret falls below −300M, neither of which is reached in a
+   short search, so it is omitted entirely here rather than carried as dead code.
+3. **Terminal** node → concrete hands → `env.payout`.
+4. **Depth-limit leaf** (round-1, multiway round-2) → the **continuation
+   meta-game**, solved as an ordinary action. At `i`'s meta-infoset — keyed
+   `(leaf_public_key, "META", i, i's hand_row)`, which carries **no other seat's
+   choice**, so the simultaneous choice stays infoset-consistent — `i` explores its
+   4 continuation strategies while each opponent's choice is **sampled** from its
+   current meta-strategy. The value of a fully-chosen profile is
+   `leaf.continuation_value(frontier_env, profile, ctx)` (§6.4). Freezing for the
+   bot applies only on traversals whose sampled bot hand equals the actual hand.
 
-Resist introducing a `RegretSource` abstraction over `CFRTables` and
-the in-memory dict; the two differ in width semantics, persistence,
-locking, and lifecycle, and a unifying type would leak details both
-ways.
+This mirrors the structure of [`blueprint/cfr.py`](../poker_ai/blueprint/cfr.py)
+but with variable-width rows, the belief-sampled root, the meta-game action, and
+freezing.
 
-#### Per-iteration loop
+#### Vector regime (small / late)
 
-1. Sample hole cards for all seats from `ctx.opponent_ranges`
-   (board-compatible via `ctx.board_compatible`, non-conflicting
-   across seats). The bot's hole is fixed at `ctx.my_hole`.
-2. External-sampling CFR walk rooted at `root_env`. Step the env with
-   plain `env = env.apply_action(a)` (no outer `deepcopy` — env's
-   `apply_action` already deepcopies internally).
-   - Opponent node: regret-match the row via
-     `calculate_strategy_from_row`, sample one action.
-   - Own node: expand all actions; accumulate regrets into the row.
-   - CFR-P pruning: skip subtrees whose regret < `prune_threshold` with
-     probability 0.95 (matches the existing blueprint training schedule).
-3. Leaf handling:
-   - `is_terminal` → read `env.payout` (computed by the env's own
-     `dynamics.compute_winners`).
-   - Depth-limit leaf (`env.betting_round > ctx.street_at_root`) →
-     `leaf.leaf_value(env, live_ranges, ctx)`, where `live_ranges`
-     is the solver's conditioning of `ctx.opponent_ranges` on cards
-     sampled in step 1.
-4. Visit-count accumulation on the acting player's strategy row.
-5. Every `cfg.discount_interval` iterations, apply Linear-CFR discount to
-   both subgame dicts (multiplicative factor, regret floor applied).
-6. Break when `iters >= max_iterations` or
-   `time.monotonic() - t0 >= max_wall_seconds`.
-
-**Unsafe vs linear re-search.** Controlled by the `warm_start`
-argument, not a config flag — see the `solve()` signature above.
+Vector-form Linear CFR carrying a per-combo reach vector per player
+(`reach[p] = ctx.ranges[p]` at the root). **Every action is expanded at every
+decision node** (no action sampling); **one board runout is sampled per iteration**
+at the subgame's chance nodes, the tree then deterministic. Regret / strategy-sum
+updates are reach-weighted per row (float64); opponent reach on combos conflicting
+with the acting combo is zeroed (card removal, idiom from
+`ranges._zero_conflicting`). These subgames extend to the **end of the game**, so
+their terminals are **showdowns**, evaluated with a **vectorised hand-vs-hand
+showdown** on the sampled board (F2): rank every combo on the completed board once,
+then settle each acting combo against the opponents' reach-weighted combo
+distribution via the sorted-rank win/tie/lose aggregation of ref. 42, applying
+card-removal between the two ranges. `env.payout` is **not** used here — it scores
+a single concrete hand assignment, not a range; it remains the terminal source only
+in the MCCFR regime and inside `continuation_value`'s concrete-hand rollouts. The
+vector regime has **no** continuation meta-game (terminal leaves only).
 
 ### 6.6 Search-aware agent (`agent.py`)
 
@@ -636,132 +620,168 @@ argument, not a config flag — see the `solve()` signature above.
 class SearchAgent:
     def __init__(
         self,
-        leaf_policies: Dict[BiasClass, Policy],   # k=4 entries
-        opponent_response_policy: Policy,         # for tracker.on_action closures
-        blueprint_policy: Policy,                 # round-1 fast path (no search)
+        leaf_policies: Dict[BiasClass, Policy],   # the four §4 variants
+        blueprint_policy: Policy,                 # round-1 play + first-round Bayes
         solver_cfg: SolverConfig,
         rng: np.random.Generator,
-        off_tree_tol: float = 0.15,
     ): ...
 
     def on_hand_start(self, env: PokerEnv, my_seat: int): ...
     def on_board_update(self, new_cards: Sequence[int]): ...
-    def on_observed_action(self, env_before: PokerEnv, seat: int, chips: int): ...
-    def act(self, env: PokerEnv) -> str:
-        """Returns an abstract action string accepted by PokerEnv.apply_action."""
+    def on_observed_action(self, env_before: PokerEnv, seat: int, action: str): ...
+    def act(self, env: PokerEnv) -> str: ...
 ```
-
-Phase 1 vs Phase 2 is pure dependency injection at construction time:
-
-- **Phase 1**: `leaf_policies = {c: BlueprintPolicy(base_tables,
-  bias_magnitude=b_c) for c in (...)}`.
-- **Phase 2**: `leaf_policies = {c: BiasedBlueprintPolicy(c, tables_c)
-  for c in (...)}`.
-
-The agent has no `Optional[BiasedBlueprintPolicy]` branch and no
-phase-awareness; the choice lives in
-[poker_ai/terminal/runner.py](../poker_ai/terminal/runner.py) where the
-`--biased-blueprints` flag is parsed.
 
 Per-hand state held on the agent:
 
-- `tracker: RangeTracker`
-- `my_seat: int` (set by `on_hand_start`; `my_hole` read from
-  `env.players[my_seat].cards` on demand — env owns player state)
-- `last_search: Optional[SearchResult]` — warm-start source for re-search
+- `tracker: RangeTracker` (all live seats incl. the bot, §6.2)
+- `my_seat: int`; `my_hole` read from `env.players[my_seat].cards`
+- `last_search: Optional[SearchResult]`
+- `pending_actions: List[Tuple[seat, env_before, action]]` — the
+  round's action buffer for the boundary Bayes update
 
-Off-tree action overlays live on the env itself (§6.1), not on the
-agent. The runtime env and any deepcopy made for search both observe
-the same injections through `env.legal_actions`.
+Lifecycle (Algorithm 2):
 
-**Overlay lifecycle.** `on_hand_start` calls `env.reset_overlay()` so
-injections from previous hands don't leak into this hand's tree.
-
-`act` decision flow:
-
-1. If `env.betting_round == 0` **and** `self.last_search is None` **and**
-   `not env.has_overlay_at_current_node` → return the blueprint-sampled
-   action directly via `tree_utils.sample_action` on
-   `self.blueprint_policy`.
-2. Else build the context and solve:
+1. **`on_hand_start`** — reset tracker, clear the action buffer, call
+   `env.reset_overlay()`. No search (round 1 plays the blueprint).
+2. **Round boundary** (`on_board_update`, fired when a new betting round begins) —
+   (a) replay the buffered `(seat, env_before, action)` tuples through
+   `tracker.on_action` with a `sigma_for_combo` closure from
+   `last_search.average_policy` (or `blueprint_policy` if no search has run yet
+   this hand), Bayes-updating every seat's range, and zero board-conflicting
+   combos; (b) make the new round's public state the root and **immediately run
+   `solve`** (Algorithm 2 `CheckNewRound`) — search completes *before* the bot is
+   asked to act; (c) clear the buffer and the freeze map.
    ```python
-   root_env = copy.deepcopy(env)
-   my_hole = tuple(root_env.players[self.my_seat].cards)
+   root_env = copy.deepcopy(env_at_round_start)
    ctx = SubgameContext.from_runtime(
        root_env, self.my_seat, my_hole,
-       self.tracker.snapshot(), self.solver_cfg.leaf, self.rng,
+       self.tracker.snapshot(), self.tracker.folded_snapshot(),
+       self.solver_cfg.leaf, self.rng,
    )
-   warm = self.last_search.policy if self.last_search is not None else None
-   result = solve(root_env, ctx, self.solver_cfg, warm_start=warm)
+   self.last_search = solve(root_env, ctx, self.solver_cfg)
    ```
-   Sample the action from `result.policy.strategy(root_env)`; store
-   `result` for re-search warm-start.
-3. Return the abstract action (`PokerEnv.apply_action` accepts the
-   string directly; no chip translation needed).
+3. **`act`** —
+   - Round 1 (no search ran): sample from `blueprint_policy`.
+   - Rounds 2–4: read the action from the already-computed
+     `last_search.policy` (final iteration) at the actual hand's row — **no solve
+     here**. Record the σ used into `last_search.state.frozen` for that infoset.
+4. **`on_observed_action`** — append to `pending_actions`. On rounds 2–4, if the
+   action was off-tree (the runtime injected it), **re-search the same root** with
+   `warm_start=self.last_search.state`; the frozen rows keep the bot's
+   already-taken actions fixed for its actual hand. On round 1, apply the
+   randomized pseudo-harmonic mapping; or, when the > $100 / ≤ 4-players trigger
+   fires (§5), `solve` the round-1 root (subgame to the end of round 1) and store
+   it so `act` reads from it.
 
-`on_observed_action` flow. The runtime has already translated the
-chip observation via `env.string_for_chips` and applied the action
-(injecting it via `env.inject_action` first if it was off-tree); the
-agent receives the action string and the pre-action env snapshot:
-
-1. Pick the policy used to model that seat's decision: the cached
-   `last_search.policy` if search ran at least once this hand, else
-   `self.opponent_response_policy`.
-2. Build the per-combo σ closure (cluster-vectorised — see §6.2) and
-   call `tracker.on_action(seat, env_before, action_str, sigma_for_combo)`.
-
-The agent never sees chips. Off-tree injection is the runtime's
-concern at the chip→string boundary (§6.3).
+The agent never sees chips. Off-tree detection and injection are the
+runtime's concern at the chip→string boundary (§6.3).
 
 Wiring: [poker_ai/terminal/runner.py](../poker_ai/terminal/runner.py) gets a
 new `--agent search` branch that instantiates `SearchAgent`, plumbs
 `on_hand_start` / `on_board_update` / `on_observed_action` through the play
 loop, and replaces the inline offline-lookup block with `agent.act(env)`.
 
-## 7. Implementation Order
+### 6.7 Performance and parallelism
 
-Biased blueprint training is implemented first so those long-running jobs can
-start while the rest is being built.
+The dual budget (10 000 iterations **and** 15 s) is only a real-time budget if a
+single search fits inside it. The dominant cost is **not** the CFR arithmetic;
+it is environment cloning. Today every
+[`apply_action`](../environment/poker_env.py) does a `copy.deepcopy` of the
+mutable game state (players, pot, deck, history), and the solver visits
+10⁵–10⁶ nodes per search in the MCCFR regime — plus, at every depth-limit leaf,
+`n_rollouts` rollouts that each deep-copy their way to terminal. The work is
+addressed in three tiers; the constant-factor tier comes first because no amount
+of parallelism rescues a ruinous per-node copy — it only spreads it across
+cores.
+
+#### Tier 1 — single-thread constant-factor (prerequisite for the budget)
+
+- **Make/undo traversal.** The solver descends with `env.step_in_place(a)` and
+  ascends with `env.undo(token)` (§6.1) — one mutable env per traversal, the
+  undo token restoring only the fields the action touched. This removes the
+  per-node deepcopy entirely (the largest single win) and is the structural
+  prerequisite for a native/`nogil` inner loop in Tier 2. `apply_action`'s
+  copy-on-write contract is unchanged for every caller outside the hot loop.
+- **Search-lifetime leaf-value cache.** Continuation values are invariant across
+  CFR iterations for a fixed `(leaf public_key, concrete-hand tuple, profile)`
+  (§6.4), so the `n_rollouts` estimate is computed once per key and reused —
+  collapsing the second bottleneck and yielding the embarrassingly-parallel work
+  unit for Tier 2.
+- **Per-row strategy memoization.** Cache the regret-matched σ per
+  `(public_key, hand_row)` for the duration of an iteration sweep; invalidate on
+  the `discount_interval` tick rather than recomputing
+  `calculate_strategy_from_row` on every node visit.
+- **Flat hot-loop state (longer-term).** Represent the traversal's mutable state
+  as struct-of-arrays (chip/bet/fold vectors, board, deck cursor) rather than
+  `Player` / `Pot` / `Deck` objects. This makes `undo` a slice restore and lets
+  the inner loop drop into `numba @njit(nogil=True)` — the precondition for
+  threads to scale past the GIL.
+
+#### Tier 2 — parallelism (paper-aligned, after Tier 1)
+
+The supplement runs search across cores, sampling **one set of public board
+cards per thread**; the §2 non-goal is distribution across *machines*, not
+cores.
+
+- **Vector regime — one board per worker.** Each worker runs vector-form Linear
+  CFR on its own sampled board runout; the per-board strategies/regrets are
+  averaged. Embarrassingly parallel and naturally coarse-grained — the cheapest
+  real win, and a direct match to the paper's per-thread scheme.
+- **MCCFR regime — batched parallel traversals.** Workers run batches of
+  external-sampling traversals against the shared regret tables, merging
+  per-worker accumulators at the `discount_interval` boundary (summed, then
+  discounted) to keep the merge lock-free.
+- **Leaf-value precompute.** The Tier-1 leaf cache is a pure function of
+  `(leaf, hands, profile)` with no shared mutable state — fan it out across a
+  pool ahead of / alongside the solve.
+- **GIL.** Pure-Python traversal does not scale on threads. Two routes:
+  `multiprocessing` with coarse chunks (whole boards in the vector regime,
+  iteration batches in MCCFR) where the per-task state-serialization cost is
+  amortized; or the `numba nogil` native inner loop from Tier 1, which scales on
+  threads with shared memory. Start with `multiprocessing` on the vector regime
+  (coarse, naturally chunked by board); reserve the native route for when MCCFR
+  fine-grained sharing dominates.
+
+#### Tier 3 — lower-order
+
+- Integer-encode the `(public_key, hand_row)` table keys once the schema is
+  stable, to drop tuple-hashing from the hottest dict lookups.
+- Reuse preallocated regret / strategy-sum buffers instead of allocating a fresh
+  `np.ndarray` per node.
+- Warm-start reuse across re-searches (§6.5) is already specified — it amortizes
+  table construction across an injection's re-solve and stays.
+
+Parallelism is **opt-in and seed-deterministic**: a single-worker run reproduces
+the serial result bit-for-bit; multi-worker runs fix per-worker substreams
+(`np.random.SeedSequence.spawn`) so a given `(seed, n_workers)` is reproducible.
+
+## 7. Implementation Order
 
 | # | Component | File(s) | Status | Blocks on |
 |---|---|---|---|---|
-| 0 | Combo helpers + `Policy` ABC + `BlueprintPolicy` | `environment/utils.py`, `environment/poker_env.py`, `poker_ai/search/policy.py` | **done** | — |
-| 1 | Biased blueprint training | `poker_ai/blueprint/bias.py`, `runner.py`, `cfr.py` | in progress | — |
-| 2 | Env overlay (`inject_action`, `reset_overlay`, `has_overlay_at_current_node`) + `with_hole_cards` + `SubgameContext` | `environment/poker_env.py`, `poker_ai/search/context.py` | **done** | 0 |
-| 3 | Range tracking | `poker_ai/search/ranges.py` | **done** | 0 |
-| 4 | Chip↔action env API (`canonical_raise_fractions`, `chips_to_add`, `string_for_chips`) | `environment/poker_env.py` | **done** | — |
-| 5 | Leaf-EV (Phase 1 bias) | `poker_ai/search/leaf.py` | todo | 0, 2, 3 |
-| 6 | Solver + `SearchPolicy` | `poker_ai/search/solver.py`, `policy.py` | todo | 0, 2, 3, 5 |
+| 0 | Combo helpers + `Policy` ABC + `BlueprintPolicy` | `environment/utils.py`, `environment/poker_env.py`, `poker_ai/search/policy.py` | **rework** — replace additive regret bias with ×5 probability reweighting (`_reweight_bias`, `bias_multiplier=5.0`) | — |
+| 2 | Env overlay + `with_hole_cards` (done) + `SubgameContext` + new env accessors | `environment/poker_env.py`, `poker_ai/search/context.py` | **rework** — `opponent_ranges` → all-seat `ranges`; add `depth_limit` descriptor; add `public_key`, `cluster_for` | 0 |
+| 3 | Range tracking | `poker_ai/search/ranges.py` | **rework** — track the bot's own range; round-boundary update flow | 0 |
+| 4 | Chip↔action env API + search raise-size set | `environment/poker_env.py` | **rework** — pseudo-harmonic translation (randomized + deterministic) + history canonicalization; expose the coarse search raise-size set (≤ 5–6 / node) | — |
+| 5 | Continuation values | `poker_ai/search/leaf.py` | **rework** — `leaf_value` → `continuation_value(profile, ctx)`; fixed profile, per-seat scalar, rollout from concrete hands; hole-sampling helpers move to the solver | 0, 4 |
+| 6 | Solver (MCCFR + vector regimes) + `SearchPolicy` | `poker_ai/search/solver.py`, `policy.py` | todo — two CFR regimes; vectorised showdown for the vector regime | 0, 2, 3, 5 |
 | 7 | Search-aware agent | `poker_ai/search/agent.py`, terminal wiring | todo | 3, 4, 6 |
-| 8 | CLI, config, tests | existing Click runner, `test/search/` | partial | 1–7 |
-| 9 | Phase 2 switch + `BiasedBlueprintPolicy` | `leaf.py`, `policy.py` | todo | 1 complete |
-
-Step 1 can run concurrently with 2–8 on a separate machine / process.
+| 8 | CLI, config, tests | existing Click runner, `test/search/` | partial | 0–7 |
+| 9 | Make/undo traversal (`step_in_place` / `undo`) + search-lifetime leaf-value cache + per-row σ memoization (Tier 1, §6.7) | `environment/poker_env.py`, `poker_ai/search/solver.py`, `leaf.py` | todo — single-thread constant-factor; prerequisite for the time budget | 5, 6 |
+| 10 | Flat hot-loop state + `numba nogil` inner loop (Tier 1, §6.7) | `poker_ai/search/solver.py` | todo — optional; precondition for thread scaling | 9 |
+| 11 | Parallel search: one-board-per-worker (vector) + batched parallel traversals (MCCFR) (Tier 2, §6.7) | `poker_ai/search/solver.py` | todo — `multiprocessing` first; seed-deterministic | 9 |
 
 ## 8. CLI
 
 ```
-# Training a biased variant (warm-started from base blueprint)
-poker_ai train start \
-    --bias fold \
-    --bias-magnitude 0.5 \
-    --warm-start blueprints/base \
-    --output blueprints/fold_biased
-
-# Play with search (Phase 1 — on-demand bias)
+# Play with search
 poker_ai play \
     --agent search \
     --blueprint blueprints/base \
     --iterations 10000 \
-    --time-limit 15s
-
-# Play with search (Phase 2 — precomputed biased blueprints)
-poker_ai play \
-    --agent search \
-    --blueprint blueprints/base \
-    --biased-blueprints blueprints/ \
-    --iterations 10000 \
-    --time-limit 15s
+    --time-limit 15s \
+    --workers 0          # 0 = serial (default); N = parallel search across N cores (§6.7)
 ```
 
 ## 9. Testing Strategy
@@ -769,61 +789,85 @@ poker_ai play \
 - **Unit tests** under `test/search/` for each module, using small
   deterministic fixtures and `@pytest.mark.requires_lut` where the card-info
   LUT is needed.
-  - `ranges.py`: Bayesian-update math, board-conflict zeroing.
+  - `policy.py`: ×5 reweighting — biased class mass exactly 5× its
+    pre-normalization value; `bias_multiplier=1` is numerically identical
+    to base blueprint regret matching; uniform fallback on absent rows;
+    overlay actions get zero mass with canonical renormalization.
   - `environment/poker_env.py` chip API: `canonical_raise_fractions`
-    matches `legal_actions` gating; `chips_to_add` round-trips
-    canonical action strings; `string_for_chips` nearest-size mapping
-    within tolerance and off-tree string formation when the deviation
-    exceeds the tolerance (see
-    [test/environment/unit/test_chip_translation.py](../test/environment/unit/test_chip_translation.py)).
-  - `environment/poker_env.py` (additions): `inject_action` is
-    idempotent and persists across deepcopies; `legal_actions`
-    reports injected actions at the matching public state and nowhere
-    else (verified by stepping the env past the injection point);
-    `has_overlay_at_current_node` flips correctly across
-    inject/reset; `reset_overlay` clears all injections;
-    `with_hole_cards` returns a deepcopy with the named seat's cards
-    replaced and leaves the original untouched.
-  - `context.py`: `SubgameContext.from_runtime` produces
-    `board_compatible` matching `env.community_cards`; `street_at_root`
-    equals `env.betting_round`; opponent_ranges contains only live
-    seats; field set is frozen.
-  - `ranges.py`: `on_action` Bayes-update under a hand-written
-    `sigma_for_combo` callable (no policy.py import needed in the
-    test); board-conflict zeroing; uniform fallback on numerical floor.
-  - `leaf.py`: deterministic output under a fixed RNG seed; payoff at
-    showdown matches `env.payout` (no `Evaluator()` duplication);
-    Phase 1 and Phase 2 sources interchange behind the same interface.
-  - `solver.py`: terminates on either stopping criterion; per-hand tables
-    are released; `warm_start=None` and `warm_start=prev_policy` produce
-    consistent in-memory dicts (re-search builds on prior rows).
-  - `agent.py`: no `Optional` branch on biased-vs-not (DI test:
-    construct the agent with both Phase 1 and Phase 2 `leaf_policies`
-    dicts and verify identical control flow); `on_hand_start` calls
-    `env.reset_overlay`; round-1 fast path skipped when
-    `env.has_overlay_at_current_node` is True.
-- **Biased training regression**: with `b = 0` the biased training path is
-  numerically identical to the base path; with large `b`, on a small toy
-  game, the biased action class dominates.
+    matches `legal_actions` gating; `chips_to_add` round-trips canonical
+    action strings; pseudo-harmonic golden values (e.g. `A=0.5, B=1,
+    x=0.75 ⇒ P(A)=3/7`); randomized variant matches the formula in
+    frequency, deterministic variant picks the ≥ ½ side; the coarse search
+    raise-size set is a subset of the blueprint fractions and ≤ 5–6 per
+    node; `public_key` stable across seats at the same public node;
+    `cluster_for` agrees with `info_set`'s embedded cluster.
+  - `environment/poker_env.py` overlay: `inject_action` idempotent,
+    persists across deepcopies, visible only at the matching public
+    state; `reset_overlay` clears; `with_hole_cards` leaves the original
+    untouched.
+  - `context.py`: `from_runtime` board mask; `street_at_root`;
+    `depth_limit` verdicts for all four §3 situations, including the
+    after-2nd-raise mid-round cutoff and end-of-game subgames; frozen
+    field set.
+  - `ranges.py`: Bayes update under a hand-written `sigma_for_combo`;
+    board-conflict zeroing; uniform fallback on the numerical floor;
+    the bot's own range is tracked and updated; opponents' ranges
+    exclude the bot's actual cards while the bot's own does not.
+  - `leaf.py`: deterministic output under a fixed seed; for a fixed
+    `profile`, only `policies[profile[seat]]` is consulted for that seat
+    and with that bias; rolls from the env's already-set concrete hands
+    (no resampling); payoff read from `env.payout`; per-seat scalar return.
+  - `solver.py`: regime selection picks MCCFR for round-1/round-2/large
+    and vector for heads-up turn/river; terminates on either stopping
+    criterion; per-hand tables released; root-street rows per-combo,
+    later-street rows per-cluster. **MCCFR**: root hand-sampling draws one
+    assignment directly from the joint belief distribution over card-disjoint
+    assignments (`ranges` ∪ `folded_ranges`), not from independent per-seat
+    marginals — so the empirical sample frequencies match the normalized joint
+    reach `π^σ(h)/Σπ^σ(h')`; every traverser action is always explored (no
+    pruning); meta-game keys contain no other seat's choice and on a toy
+    dominant-class game the meta σ converges away from uniform ¼.
+    **Vector**: the vectorised showdown matches a brute-force hand-vs-hand
+    reference (with card removal) to floating tolerance; one board sampled
+    per iteration. Both: frozen rows return the pinned σ across a re-search
+    while other rows move; final and average policies differ mid-run; same
+    seed ⇒ identical output.
+  - `agent.py`: search runs **at the round boundary** (`on_board_update`),
+    before the first `act` of the round; round-1 fast path and the $100 /
+    ≤ 4-players trigger; ranges unchanged mid-round and updated once at the
+    boundary under the average policy; `on_hand_start` calls
+    `env.reset_overlay`.
+  - **Performance & parallelism** (§6.7): `step_in_place` followed by `undo`
+    restores the env to a state equal (field-by-field) to a `deepcopy` taken
+    before the action, across a randomized action sequence (LIFO property);
+    a make/undo traversal and a copy-on-write traversal of the same subgame
+    produce identical regrets. The search-lifetime leaf-value cache returns a
+    value equal to recomputing `continuation_value` for the same
+    `(leaf public_key, hand tuple, profile)`, and is computed once per key
+    (call-count assertion). Determinism under parallelism: `--workers 1`
+    reproduces the serial result bit-for-bit; a fixed `(seed, n_workers)` is
+    reproducible across runs; the MCCFR per-worker accumulator merge equals a
+    serial run over the same total iteration count.
 - **Integration test**: one full hand versus a scripted opponent; assert
-  search fires from round 2 and in round-1 off-tree situations; assert both
-  Phase 1 and Phase 2 agents play legal hands end-to-end.
-- **Empirical evaluation**: `--agent search` (Phase 1) vs. plain `--agent
-  offline`, ≥ 10 000 hands heads-up, expect a material bb/100 improvement.
-  Re-run at Phase 2 once biased blueprints are trained, expect a further
-  improvement.
+  search fires at the start of round 2, an off-tree raise triggers a
+  re-search from the same root with the bot's acted σ frozen, and the agent
+  plays legal hands end-to-end.
+- **Empirical evaluation**: `--agent search` vs. plain `--agent offline`,
+  ≥ 10 000 hands heads-up, expect a material bb/100 improvement.
 - **Profiling**: single search call within the configured time budget;
   subgame memory released between hands. Per-decision log of (searched?,
-  iterations used, wall-clock, `σ_used` source at leaves).
+  iterations used, wall-clock).
 
 ## 10. Risks and Mitigations
 
 | Risk | Mitigation |
 |---|---|
-| Biased blueprint training takes longer than expected | Phase 1 unblocks everything else; Phase 2 is a drop-in swap once training finishes. |
-| Dense 1326-combo ranges are too slow under frequent updates | Update cost is O(1326) per observed action, amortized against search cost; only re-evaluate if profiling shows it as a hotspot. Fallback: cluster-bucketed ranges behind a flag. |
-| Search budget not enough for a good solution on turn/river | Both iteration and wall-clock caps are CLI-configurable; tune per street if needed. |
-| Off-tree translation introduces exploitability | Two-regime policy per Pluribus paper: nearest-size translation only within a pot-relative tolerance, and direct injection of the off-tree size into the subgame tree beyond it. Tolerance is CLI-configurable; tune from empirical play. |
-| Warm-started biased training drifts the base strategy | Warm-started tables are a copy; base blueprint files are untouched on disk. |
-
-
+| Multiway round-2 subgames too expensive (per-seat continuation choices) | Solved with MCCFR (paper regime): external sampling visits one opponent action and one continuation choice per traversal, so cost is independent of the joint profile count; the after-2nd-raise depth cutoff keeps the tree shallow; coarse search raise-size set (≤ 5–6) bounds branching. |
+| Vectorised showdown is subtly wrong (card removal, ties, side pots) | Test against a brute-force hand-vs-hand reference; restrict the vector regime to heads-up late streets (no side pots there); MCCFR (concrete `env.payout`) covers the multiway/side-pot cases. |
+| Heads-up turn/river subgames (to end of game) exceed the time budget | One sampled board runout per iteration keeps per-iteration cost linear in tree size; both caps are CLI-configurable and tunable per street. |
+| Opponent–opponent card-removal in the vector reach product is O(n_combos²) exact | Vector regime is heads-up only, so there is a single opponent range — no opponent–opponent term; mask only against the acting combo. |
+| Dense per-combo ranges too slow under frequent updates | Updates fire once per round boundary, O(n_combos) per observed action, amortized against search cost. Fallback: cluster-bucketed ranges behind a flag. |
+| Off-tree translation introduces exploitability | Paper-matching two-regime policy: randomized pseudo-harmonic on round 1, direct injection + re-search on rounds 2–4. |
+| Per-node `apply_action` deepcopy dominates wall-clock; serial search misses the 15 s budget | Make/undo traversal (`step_in_place` / `undo`, §6.7 Tier 1) removes the per-node copy; search-lifetime leaf-value cache removes the per-iteration rollout cost; both land before parallelism. |
+| Parallel search non-deterministic or races on shared regret tables | Single-worker run reproduces the serial result bit-for-bit; per-worker RNG substreams via `SeedSequence.spawn`; MCCFR merges per-worker accumulators only at the `discount_interval` boundary (lock-free); vector regime shares nothing across boards. |
+| `numba`/native inner loop (Tier 1, §6.7) adds a heavy build-time dependency for uncertain gain | It is optional and gated behind Tier 1's pure-Python make/undo, which alone is expected to reach the budget; pursue only if profiling shows MCCFR fine-grained sharing dominates. |
