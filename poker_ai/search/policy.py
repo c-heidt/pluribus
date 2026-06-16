@@ -1,16 +1,19 @@
 """Policy interface for the search package.
 
 A :class:`Policy` is anything the depth-limited solver (§6.5) or the
-leaf-EV rollouts (§6.4) can query for an action distribution at a given
-``PokerEnv`` state.  Three concrete implementations are planned in
-:doc:`docs/subgame_solving`; only :class:`BlueprintPolicy` is shipped
-in this module.  The other two — ``BiasedBlueprintPolicy`` (reads one
-of k precomputed biased blueprints) and ``SearchPolicy`` (reads
-in-memory subgame regrets) — slot into the same ABC once their
-dependencies land (biased blueprint training in §4, solver in §6.5).
+continuation-value rollouts (§6.4) can query for an action distribution
+at a given ``PokerEnv`` state.  Two concrete implementations are planned
+in :doc:`docs/subgame_solving`; only :class:`BlueprintPolicy` is shipped
+in this module.  The other — ``SearchPolicy`` (reads in-memory subgame
+regrets) — slots into the same ABC once the solver in §6.5 lands.
 
-All implementations share the same regret-matching helpers; the only
-per-implementation logic is *where the regret row comes from*.
+The four §4 continuation strategies are not separate artifacts: they are
+inference-time reweightings of the single base blueprint.  The base
+distribution σ is computed by regret matching; the biased variants
+multiply the probability of one action class by ``bias_multiplier`` (5)
+and renormalize.  All implementations share the same bias-mask and
+reweighting helpers; the only per-implementation logic is *where the
+regret row comes from*.
 """
 
 from __future__ import annotations
@@ -39,9 +42,9 @@ class Policy(ABC):
     """Action-distribution oracle for one state.
 
     Subclasses implement :meth:`strategy`.  The shared helpers
-    :meth:`_bias_mask` and :meth:`_regret_match_with_bias` keep
-    action-class identification and the regret-matching + bias step
-    consistent across implementations.
+    :meth:`_bias_mask` and :meth:`_reweight_bias` keep action-class
+    identification and the multiplicative bias step consistent across
+    implementations.
     """
 
     @abstractmethod
@@ -58,8 +61,8 @@ class Policy(ABC):
             ``sigma_for_combo`` queries).
         bias : BiasClass
             ``"none"`` for the base distribution; ``"fold"`` /
-            ``"call"`` / ``"raise"`` add an additive bias to that
-            action class before regret matching.
+            ``"call"`` / ``"raise"`` multiply that action class's
+            probability by ``bias_multiplier`` and renormalize (§4).
 
         Returns
         -------
@@ -96,75 +99,71 @@ class Policy(ABC):
         return mask
 
     @staticmethod
-    def _regret_match_with_bias(
-        regret_row: np.ndarray,
-        valid_mask: np.ndarray,
+    def _reweight_bias(
+        sigma: np.ndarray,
         bias_mask: np.ndarray,
-        bias_magnitude: float,
+        multiplier: float,
     ) -> np.ndarray:
-        """Regret-match a row with an additive bias on a target action class.
+        """Multiply a target action class's probability and renormalize.
 
-        Computes ``σ(a) ∝ max(0, R(a) + b · 𝟙[a ∈ biased_class])`` over
-        the legal subset, with uniform fallback when all positive
-        biased regrets are zero.  Delegates the final normalisation to
-        :func:`~poker_ai.blueprint.tree_utils.calculate_strategy_from_row`
-        so behaviour matches the blueprint's regret-matching exactly
-        when ``bias_magnitude == 0``.
+        Computes ``σ'(a) ∝ σ(a) · (m if a ∈ biased_class else 1)`` (§4).
+        The input ``sigma`` is an already-regret-matched probability
+        vector (not a regret row); a ``multiplier`` of 1 or an
+        all-false ``bias_mask`` (i.e. ``bias == "none"``) returns it
+        unchanged.
 
         Parameters
         ----------
-        regret_row : numpy.ndarray
-            1-D regret vector, canonical-action width.
-        valid_mask : numpy.ndarray
-            Boolean mask of the same length marking legal actions.
+        sigma : numpy.ndarray
+            Probability vector, canonical-action width; sums to 1.
         bias_mask : numpy.ndarray
             Boolean mask of the same length marking the biased class.
-        bias_magnitude : float
-            Bias amount ``b`` (ignored when zero).
+        multiplier : float
+            Reweighting factor ``m`` (5.0 for the §4 variants).
 
         Returns
         -------
         numpy.ndarray
             Float32 probability vector at canonical width.
         """
-        if bias_magnitude == 0.0:
-            return calculate_strategy_from_row(regret_row, valid_mask)
-        biased = regret_row.astype(np.float32, copy=True)
-        biased[bias_mask] += float(bias_magnitude)
-        return calculate_strategy_from_row(biased, valid_mask)
+        if multiplier == 1.0 or not bias_mask.any():
+            return sigma
+        out = sigma.astype(np.float32, copy=True)
+        out[bias_mask] *= float(multiplier)
+        total = out.sum()
+        return out / total if total > 0 else sigma
 
 
 class BlueprintPolicy(Policy):
-    """Reads the regret row for ``env.info_set`` from a base blueprint.
+    """Reads the regret row for ``state.info_set`` from a base blueprint.
 
-    Optional additive bias on a target action class supports Phase 1
-    of the rollout (`docs/subgame_solving.md` §5), where biased
-    continuation strategies are derived at runtime instead of from
-    precomputed biased blueprints.
+    The base distribution σ is computed by regret matching; the §4
+    continuation variants multiply the requested action class's
+    probability by ``bias_multiplier`` and renormalize at query time.
+    A single blueprint on disk backs all four variants.
 
     Parameters
     ----------
     tables : CFRTables
         Loaded base-blueprint tables.
-    bias_magnitude : float
-        Bias amount ``b``; only applied when :meth:`strategy` is
-        called with ``bias != "none"``.
+    bias_multiplier : float
+        Reweighting factor applied to the biased action class; only
+        takes effect when :meth:`strategy` is called with
+        ``bias != "none"`` (§4 uses 5.0).
     """
 
-    def __init__(self, tables: CFRTables, bias_magnitude: float = 0.0) -> None:
+    def __init__(self, tables: CFRTables, bias_multiplier: float = 5.0) -> None:
         self._tables = tables
-        self._bias_magnitude = float(bias_magnitude)
+        self._bias_multiplier = float(bias_multiplier)
 
     def strategy(self, state: PolicyState, bias: BiasClass = "none") -> np.ndarray:
         r = state.betting_round
         regret_row = self._tables.regret[r].get_row_if_exists(state.info_set)
         if regret_row is None:
             regret_row = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
-        valid_mask = state.valid_mask
+        sigma = calculate_strategy_from_row(regret_row, state.valid_mask)
         bias_mask = self._bias_mask(CANONICAL_ACTIONS[r], bias)
-        full = self._regret_match_with_bias(
-            regret_row, valid_mask, bias_mask, self._bias_magnitude
-        )
+        full = self._reweight_bias(sigma, bias_mask, self._bias_multiplier)
         legal = state.legal_actions
         if not legal:
             return np.array([], dtype=np.float32)

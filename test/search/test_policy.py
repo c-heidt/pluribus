@@ -44,46 +44,49 @@ class TestBiasMask:
 
 
 # ---------------------------------------------------------------------------
-# Regret matching + bias
+# Multiplicative bias reweighting
 # ---------------------------------------------------------------------------
 
 
-class TestRegretMatchWithBias:
+class TestReweightBias:
 
-    def test_no_bias_matches_blueprint(self):
-        regret = np.array([0, 10, 20, 30], dtype=np.int32)
-        valid = np.array([True, True, True, False])
-        bias_mask = np.array([False, True, False, False])
-        sigma = Policy._regret_match_with_bias(regret, valid, bias_mask, 0.0)
-        expected = calculate_strategy_from_row(regret, valid)
-        np.testing.assert_array_equal(sigma, expected)
+    def test_multiplier_one_returns_unchanged(self):
+        sigma = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+        bias_mask = np.array([True, False, False, False])
+        out = Policy._reweight_bias(sigma, bias_mask, 1.0)
+        np.testing.assert_array_equal(out, sigma)
+
+    def test_empty_mask_returns_unchanged(self):
+        sigma = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+        bias_mask = np.zeros(4, dtype=bool)
+        out = Policy._reweight_bias(sigma, bias_mask, 5.0)
+        np.testing.assert_array_equal(out, sigma)
+
+    def test_golden_x5_reweight(self):
+        # σ uniform → biased class ×5 → pre-norm [1.25, .25, .25, .25],
+        # sum 2.0 → [.625, .125, .125, .125].
+        sigma = np.full(4, 0.25, dtype=np.float32)
+        bias_mask = np.array([True, False, False, False])
+        out = Policy._reweight_bias(sigma, bias_mask, 5.0)
+        np.testing.assert_allclose(out, [0.625, 0.125, 0.125, 0.125], atol=1e-6)
 
     def test_bias_shifts_mass(self):
-        regret = np.array([10, 10, 10, 10], dtype=np.int32)
-        valid = np.ones(4, dtype=bool)
+        sigma = np.full(4, 0.25, dtype=np.float32)
         bias_mask = np.array([True, False, False, False])
-        unbiased = Policy._regret_match_with_bias(regret, valid, bias_mask, 0.0)
-        biased = Policy._regret_match_with_bias(regret, valid, bias_mask, 50.0)
-        # Biased index gains; others lose.
-        assert biased[0] > unbiased[0]
-        assert (biased[1:] < unbiased[1:]).all()
-        np.testing.assert_allclose(biased.sum(), 1.0, atol=1e-6)
+        out = Policy._reweight_bias(sigma, bias_mask, 5.0)
+        # Biased index gains; others lose; total stays 1.
+        assert out[0] > sigma[0]
+        assert (out[1:] < sigma[1:]).all()
+        np.testing.assert_allclose(out.sum(), 1.0, atol=1e-6)
 
-    def test_uniform_fallback_no_bias(self):
-        regret = np.zeros(4, dtype=np.int32)
-        valid = np.array([True, True, False, False])
-        bias_mask = np.zeros(4, dtype=bool)
-        sigma = Policy._regret_match_with_bias(regret, valid, bias_mask, 0.0)
-        np.testing.assert_allclose(sigma, [0.5, 0.5, 0.0, 0.0])
-
-    def test_bias_ignores_illegal_actions(self):
-        regret = np.zeros(4, dtype=np.int32)
-        valid = np.array([True, True, False, False])
-        # Bias an illegal action — it must not gain mass.
+    def test_zero_mass_biased_action_stays_zero(self):
+        # An action already at zero probability (e.g. illegal — zeroed by
+        # regret matching) gains nothing from ×5.
+        sigma = np.array([0.5, 0.5, 0.0, 0.0], dtype=np.float32)
         bias_mask = np.array([False, False, True, False])
-        sigma = Policy._regret_match_with_bias(regret, valid, bias_mask, 100.0)
-        assert sigma[2] == 0.0
-        np.testing.assert_allclose(sigma.sum(), 1.0, atol=1e-6)
+        out = Policy._reweight_bias(sigma, bias_mask, 100.0)
+        assert out[2] == 0.0
+        np.testing.assert_allclose(out.sum(), 1.0, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -176,28 +179,49 @@ class TestBlueprintPolicy:
 
     def test_bias_shifts_mass_to_fold(self):
         r = 0
-        legal = _legal_for(r)
+        legal = _legal_for(r)            # fold, call, raise:<f>, all_in → 4 legal
         state = _state(r, legal)
-        # Uniform regrets across all canonical actions.
+        # Uniform regrets across all canonical actions → σ uniform 0.25 over
+        # the 4 legal actions; fold ×5 → pre-norm [1.25, .25, .25, .25] / 2.0.
         row = np.full(MAX_ACTIONS_PER_STREET[r], 10, dtype=np.int32)
         tables = _FakeTables({r: row})
-        unbiased = BlueprintPolicy(tables, bias_magnitude=50.0).strategy(state, bias="none")
-        biased = BlueprintPolicy(tables, bias_magnitude=50.0).strategy(state, bias="fold")
+        biased = BlueprintPolicy(tables, bias_multiplier=5.0).strategy(state, bias="fold")
         fold_i = legal.index("fold")
-        assert biased[fold_i] > unbiased[fold_i]
+        assert biased[fold_i] == pytest.approx(0.625)
+        others = np.delete(biased, fold_i)
+        np.testing.assert_allclose(others, 0.125, atol=1e-6)
         np.testing.assert_allclose(biased.sum(), 1.0, atol=1e-6)
 
-    def test_bias_magnitude_zero_ignores_bias_arg(self):
+    def test_bias_multiplier_one_ignores_bias_arg(self):
         r = 0
         legal = _legal_for(r)
         state = _state(r, legal)
         row = np.full(MAX_ACTIONS_PER_STREET[r], 10, dtype=np.int32)
         tables = _FakeTables({r: row})
-        policy = BlueprintPolicy(tables, bias_magnitude=0.0)
+        policy = BlueprintPolicy(tables, bias_multiplier=1.0)
         np.testing.assert_array_equal(
             policy.strategy(state, bias="none"),
             policy.strategy(state, bias="fold"),
         )
+
+    def test_bias_multiplier_one_matches_blueprint(self):
+        # bias_multiplier=1 is numerically identical to plain regret matching.
+        r = 1
+        legal = _legal_for(r)
+        state = _state(r, legal)
+        row = np.array(
+            [(i * 7) % 13 for i in range(MAX_ACTIONS_PER_STREET[r])],
+            dtype=np.int32,
+        )
+        tables = _FakeTables({r: row})
+        sigma = BlueprintPolicy(tables, bias_multiplier=1.0).strategy(state, bias="fold")
+        # Reference: regret-match the canonical row, then project onto legal.
+        full = calculate_strategy_from_row(row, state.valid_mask)
+        expected = np.array(
+            [full[ACTION_TO_IDX[r][a]] for a in legal], dtype=np.float32
+        )
+        expected /= expected.sum()
+        np.testing.assert_allclose(sigma, expected, atol=1e-6)
 
 
 class TestBlueprintPolicyOverlay:
