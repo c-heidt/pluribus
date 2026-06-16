@@ -140,6 +140,47 @@ class TestInfosetIndex:
             idx.get_or_create("cm_test")
         assert (tmp_path / "cm_idx").exists()
 
+    def test_copy_to_produces_loadable_snapshot(self, tmp_path):
+        """``InfosetIndex.copy_to`` should write a consistent on-disk
+        snapshot that can be opened by a fresh :class:`InfosetIndex`
+        and serves the same row mappings as the original.
+        """
+        src_path = tmp_path / "src_idx"
+        dst_path = tmp_path / "dst_idx"
+        infosets = [f"copy_is_{i}" for i in range(250)]
+        rows_before = {}
+        with InfosetIndex(src_path) as idx:
+            for s in infosets:
+                row, _ = idx.get_or_create(s)
+                rows_before[s] = row
+            idx.copy_to(dst_path)
+        # The original is closed; reopen the *destination* and confirm
+        # it serves the exact same rows.
+        with InfosetIndex(dst_path) as idx:
+            assert idx.n_allocated_rows == len(infosets)
+            for s in infosets:
+                assert idx.get(s) == rows_before[s]
+
+    def test_copy_to_works_with_open_env(self, tmp_path):
+        """``env.copy`` is MVCC-consistent — calling it on a still-open
+        env should yield a snapshot that reflects state at copy time
+        and does not require closing the live env first.
+        """
+        src_path = tmp_path / "src_idx_live"
+        dst_path = tmp_path / "dst_idx_live"
+        with InfosetIndex(src_path) as src:
+            for i in range(100):
+                src.get_or_create(f"live_is_{i}")
+            src.copy_to(dst_path)
+            # Live env keeps working afterwards.
+            row, is_new = src.get_or_create("post_copy")
+            assert is_new
+        with InfosetIndex(dst_path) as dst:
+            # Snapshot has the 100 pre-copy entries; the post-copy
+            # insert is NOT in the snapshot.
+            assert dst.n_allocated_rows == 100
+            assert dst.get("post_copy") is None
+
     @pytest.mark.slow
     def test_1m_insert_then_reload(self, tmp_path):
         n = 1_000_000

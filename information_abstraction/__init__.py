@@ -8,10 +8,12 @@ from information_abstraction.lookup import (
     InfoSetLut,
     MemmapLookup,
     load_info_set_lut,
+    prewarm_lut,
 )
 
 __all__ = [
     "InfoSetLut",
     "MemmapLookup",
     "load_info_set_lut",
+    "prewarm_lut",
 ]

@@ -107,7 +107,13 @@ def lmdb_map_size_for_players(n_players: int) -> int:
     """
     if n_players <= 2:
         return 1 * 1024 ** 3   # 1 GiB
-    return 50 * 1024 ** 3      # 50 GiB
+    # 20 GiB comfortably fits the index at saturation: 200 buckets per
+    # street × the bounded betting-history space yields perhaps tens
+    # of millions of infosets per street; each entry costs ~50 bytes
+    # including B-tree overhead.  If the assumption ever breaks,
+    # :meth:`_reopen` doubles the map_size automatically on
+    # :class:`~lmdb.MapFullError`.
+    return 20 * 1024 ** 3      # 20 GiB
 
 
 def _open_lmdb(path: str, **kwargs):
@@ -179,12 +185,23 @@ class InfosetIndex:
         self._path.mkdir(parents=True, exist_ok=True)
         self._debug: bool = debug or bool(os.environ.get("POKER_AI_DEBUG", False))
         resolved_map_size = map_size if map_size is not None else _MAP_SIZE
+        # max_spare_txns=0: don't cache aborted read txns in the
+        # python-lmdb spare pool.  Without this, the read transaction
+        # used by `_read_next_row` below ends up cached for inheritance
+        # by forked workers.  When a worker then calls
+        # ``env.begin()`` for the first time, python-lmdb tries to
+        # `mdb_txn_renew` the inherited txn — which references a
+        # reader-slot owned by the *parent* — and fails with
+        # ``MDB_BAD_RSLOT``.  Keeping the parent's spare pool empty
+        # avoids the issue at the source; workers also reopen with
+        # max_spare_txns=0 in :meth:`reopen_after_fork`.
         self._env: lmdb.Environment = _open_lmdb(
             str(self._path),
             map_size=resolved_map_size,
             writemap=True,
             map_async=True,
             max_readers=256,
+            max_spare_txns=0,
         )
         self._map_size: int = resolved_map_size
 
@@ -266,6 +283,94 @@ class InfosetIndex:
     # ------------------------------------------------------------------
     # Post-fork
     # ------------------------------------------------------------------
+
+    def copy_to(self, dst_path: Union[str, Path]) -> None:
+        """Write a transactionally consistent snapshot of this index to *dst_path*.
+
+        Wraps :meth:`lmdb.Environment.copy`, which uses LMDB's MVCC
+        to produce a coherent on-disk image of the index even while
+        other readers and writers are active in the live env.  The
+        destination directory is created if missing.  After this
+        returns, *dst_path* contains a complete LMDB env that can be
+        opened by :class:`InfosetIndex` exactly like an original.
+
+        Used by :class:`~poker_ai.tables.checkpoint.CheckpointManager`
+        when the index runtime path lives on node-local fast scratch
+        and must be mirrored to a persistent shared filesystem at
+        each checkpoint.
+
+        Parameters
+        ----------
+        dst_path : str or Path
+            Target directory.  Must be on a writable filesystem and
+            must not already contain an LMDB env (LMDB refuses to
+            overwrite).
+        """
+        dst = Path(dst_path)
+        dst.mkdir(parents=True, exist_ok=True)
+        # compact=False: copy the env preserving its page layout rather
+        # than repacking the B-tree.  Two reasons, both about keeping
+        # the per-checkpoint cost O(new data) instead of O(total size):
+        #
+        #   1. ``compact=True`` walks and rewrites the entire tree on
+        #      the CPU every call — cost grows linearly with the total
+        #      number of allocated infosets, so on a multi-day run the
+        #      copy eventually exceeds the checkpoint interval and
+        #      starves the workers.
+        #   2. Repacking reshuffles physical page numbers, which defeats
+        #      rsync's delta algorithm in :meth:`CheckpointManager.
+        #      _mirror_lmdb_to_persistent` — every mirror then ships
+        #      essentially the whole DB over the network.  Preserving the
+        #      page layout (append-mostly for an LMDB that only grows)
+        #      lets rsync transfer just the changed/appended pages.
+        #
+        # The only cost is a larger on-disk file (free pages are not
+        # reclaimed), which is cheap on the persistent filesystem and
+        # bounded by peak index size.
+        self._env.copy(str(dst), compact=False)
+
+    def close_env(self) -> None:
+        """Close just the LMDB environment without touching the shared counter.
+
+        Used by the server immediately before forking workers so the
+        child processes inherit *closed* env handles.  python-lmdb's
+        per-environment transaction state would otherwise survive
+        :meth:`Environment.close` in the worker and trip
+        ``mdb_txn_renew: MDB_BAD_RSLOT`` on the first read transaction
+        after fork — even with ``max_spare_txns=0`` on the new env.
+        The shared ``n_allocated_rows`` counter (a
+        :class:`multiprocessing.Value`) is left intact so workers can
+        still query the row count without an LMDB transaction.
+
+        Safe to call multiple times; subsequent calls are no-ops
+        because LMDB's own ``close`` is idempotent.
+        """
+        try:
+            self.flush()
+        except Exception:
+            log.debug("Skipping flush during close_env (env already closed)")
+        try:
+            self._env.close()
+        except Exception:
+            pass
+
+    def open_env(self) -> None:
+        """(Re-)open the LMDB environment at the current ``map_size``.
+
+        Counterpart of :meth:`close_env`.  Used by the server after
+        worker spawn to restore the parent's own env handle for
+        flushes during checkpointing.  Does not re-read the
+        ``__next_row__`` watermark — that mirror lives in a shared
+        :class:`multiprocessing.Value` and is already populated.
+        """
+        self._env = _open_lmdb(
+            str(self._path),
+            map_size=self._map_size,
+            writemap=True,
+            map_async=True,
+            max_readers=256,
+            max_spare_txns=0,
+        )
 
     def reopen_after_fork(self) -> None:
         """Reopen the LMDB environment in the current (forked) process.
@@ -384,24 +489,38 @@ class InfosetIndex:
             writemap=True,
             map_async=True,
             max_readers=256,
+            max_spare_txns=0,
         )
 
     def _get_or_create_once(self, info_set: str) -> tuple:
         """Single-shot get-or-create, wrapped by the retry loop.
 
-        Runs the entire get-or-allocate logic inside one LMDB write
-        transaction so concurrent allocators for the same infoset
-        cannot race and create duplicate rows — LMDB blocks the
-        second writer until the first commits, at which point the
-        second sees the freshly-inserted row on ``txn.get``.
+        Uses a read-first / double-checked-write pattern: try a
+        concurrent read transaction first (LMDB allows unlimited
+        concurrent readers), and only escalate to a serialised write
+        transaction when the row is genuinely missing.  Once the
+        table has warmed up, the vast majority of calls take the
+        read path and never contend on LMDB's single-writer mutex.
+
+        The write path re-checks for the row inside the write txn
+        because another writer may have created it between our read
+        and our write — LMDB only serialises writers, so a second
+        writer must always assume the data may have changed since it
+        saw the read-side snapshot.
         """
         key = hash_info_set_bytes(info_set)
 
+        # Read path — concurrent across workers, no writer-lock contention.
+        with self._env.begin() as txn:
+            val = txn.get(key)
+        if val is not None:
+            return struct.unpack("<Q", val)[0], False
+
+        # Write path — serialised at env level; re-check inside the txn.
         with self._env.begin(write=True) as txn:
             val = txn.get(key)
             if val is not None:
-                row = struct.unpack("<Q", val)[0]
-                return row, False
+                return struct.unpack("<Q", val)[0], False
 
             # Allocate a new row.
             meta = txn.get(_NEXT_ROW_KEY)

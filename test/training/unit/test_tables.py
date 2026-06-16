@@ -446,6 +446,78 @@ class TestCFRTablesDiscount:
         assert np.all(result < 1000)
 
 
+class TestCFRTablesCopyIndexes:
+    """``copy_indexes_to`` is the building block for the
+    CheckpointManager's LMDB writeback path: it has to produce a
+    snapshot per street under ``dst/street_{r}/`` that another
+    :class:`CFRTables` can be opened against and that exposes the
+    same infoset → row mapping as the source.
+    """
+
+    def test_round_trip_preserves_rows(self, cfr_tables, tmp_path):
+        # Allocate a few infosets on every street through the live
+        # CFRTables so each street's index has work to mirror.
+        expected = {}
+        for street in range(4):
+            for i in range(15):
+                key = f"r{street}_is{i}"
+                cfr_tables.regret[street].update_row(key, 0, 1)
+                expected[(street, key)] = cfr_tables._indexes[street].get(key)
+
+        # Mirror to a fresh "persistent" directory.
+        persistent = tmp_path / "persistent_indexes"
+        cfr_tables.copy_indexes_to(persistent)
+
+        # Per-street layout must match what CFRTables expects on init.
+        for street in range(4):
+            sd = persistent / f"street_{street}"
+            assert sd.exists()
+            assert (sd / "data.mdb").exists()
+
+        # Open a fresh CFRTables pointing at the mirror; every key
+        # should resolve to the same row id as in the original.
+        shm_dir = str(tmp_path / "shm_clone")
+        os.makedirs(shm_dir, exist_ok=True)
+        clone = CFRTables(
+            index_path=persistent,
+            shm_dir=shm_dir,
+            actions_per_street=MAX_ACTIONS_PER_STREET,
+        )
+        try:
+            for (street, key), row in expected.items():
+                assert clone._indexes[street].get(key) == row
+        finally:
+            clone.close()
+
+    def test_overwrites_existing_destination(self, cfr_tables, tmp_path):
+        """``copy_indexes_to`` must be idempotent so the CheckpointManager
+        can call it repeatedly into the same temp directory across
+        successive checkpoint writes.  LMDB's ``env.copy`` refuses
+        non-empty target directories, so the aggregator has to clear
+        each per-street directory first.
+        """
+        cfr_tables.regret[0].update_row("repeat_test", 0, 1)
+        dst = tmp_path / "dst_dir"
+        # First mirror.
+        cfr_tables.copy_indexes_to(dst)
+        # Allocate another row, then re-mirror to the same dst path.
+        cfr_tables.regret[0].update_row("repeat_test_two", 0, 1)
+        cfr_tables.copy_indexes_to(dst)
+        # The second mirror should reflect both rows.
+        shm_dir = str(tmp_path / "shm_clone2")
+        os.makedirs(shm_dir, exist_ok=True)
+        clone = CFRTables(
+            index_path=dst,
+            shm_dir=shm_dir,
+            actions_per_street=MAX_ACTIONS_PER_STREET,
+        )
+        try:
+            assert clone._indexes[0].get("repeat_test") is not None
+            assert clone._indexes[0].get("repeat_test_two") is not None
+        finally:
+            clone.close()
+
+
 # ---------------------------------------------------------------------------
 # Naming and orphan detection
 # ---------------------------------------------------------------------------

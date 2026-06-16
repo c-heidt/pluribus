@@ -30,6 +30,7 @@ shared-memory mmaps, and LMDB environments.
 
 import logging
 import math
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -358,6 +359,54 @@ class CFRTables:
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    def copy_indexes_to(self, dst_dir: Union[str, Path]) -> None:
+        """Write a consistent snapshot of every per-street LMDB index to *dst_dir*.
+
+        Used by :class:`~poker_ai.tables.checkpoint.CheckpointManager`
+        to mirror a node-local runtime LMDB back to the persistent
+        save directory at checkpoint time.  Each street is written
+        as a sub-directory ``street_{r}/`` under *dst_dir*, matching
+        the layout that :class:`CFRTables` consumes on construction
+        and that :func:`_load_checkpoint_if_exists` looks for on
+        resume.
+
+        The destination is created if missing; existing per-street
+        sub-directories are removed first because LMDB refuses to
+        write into a non-empty env directory.
+
+        Parameters
+        ----------
+        dst_dir : str or Path
+            Target directory that will receive
+            ``street_0/.../street_3/`` LMDB environments.
+        """
+        dst = Path(dst_dir)
+        dst.mkdir(parents=True, exist_ok=True)
+        for r, idx in self._indexes.items():
+            street_dst = dst / f"street_{r}"
+            if street_dst.exists():
+                shutil.rmtree(street_dst)
+            idx.copy_to(street_dst)
+
+    def close_envs(self) -> None:
+        """Close every per-street LMDB environment in this process.
+
+        Used by the server immediately before forking workers so the
+        child processes inherit *closed* env handles, sidestepping
+        ``MDB_BAD_RSLOT`` errors that can otherwise trip on the first
+        post-fork read transaction.  Workers will open their own
+        envs in :meth:`reopen_after_fork`; the parent reopens its
+        envs via :meth:`open_envs` immediately after spawning the
+        pool so checkpoint-time index flushes keep working.
+        """
+        for idx in self._indexes.values():
+            idx.close_env()
+
+    def open_envs(self) -> None:
+        """(Re-)open every per-street LMDB environment in this process."""
+        for idx in self._indexes.values():
+            idx.open_env()
 
     def reopen_after_fork(self) -> None:
         """Reopen every per-street LMDB index in the current process.

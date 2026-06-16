@@ -32,6 +32,8 @@ Process and concurrency model
 import logging
 import multiprocessing as mp
 import os
+import signal
+import sys
 import threading
 import time
 from pathlib import Path
@@ -50,9 +52,34 @@ from poker_ai.blueprint.training import (
     should_discount,
     should_update_strategy,
 )
-from information_abstraction import load_info_set_lut
+from information_abstraction import load_info_set_lut, prewarm_lut
 
 log = logging.getLogger("sync.server")
+
+
+def _startup_signal_handler(signum: int, frame) -> None:
+    """Exit cleanly when SIGTERM/SIGINT arrives during server startup.
+
+    Server startup includes LUT joblib deserialisation, LUT
+    pre-warming, and LMDB env opens — operations that can run for
+    minutes before :class:`CheckpointManager` is constructed and
+    overrides the signal handlers.  Without this handler the default
+    Python disposition (terminate) applies: SLURM's grace-period
+    SIGTERM lands during startup, Python dies without logging, and
+    after the grace window slurm logs the job as KILLED rather than
+    cleanly TERMINATED.
+
+    No training state has been mutated yet, so there is nothing to
+    checkpoint.  We log the signal and call :func:`sys.exit` so
+    Python unwinds normally (running ``atexit`` hooks and flushing
+    log handlers) before the process exits.
+    """
+    sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+    log.warning(
+        f"{sig_name} received during server startup — exiting cleanly "
+        "before training begins (no checkpoint needed)"
+    )
+    sys.exit(143 if signum == signal.SIGTERM else 130)
 
 
 class WorkerError(RuntimeError):
@@ -166,6 +193,22 @@ class Server:
             Defaults to the ``PLURIBUS_CFR_BATCH_SIZE`` environment
             variable if set, else ``5``.
         """
+        # Install a minimal SIGTERM/SIGINT handler immediately so a
+        # signal that arrives during the slow startup phases (LUT
+        # rsync from the LUT loader's perspective is already done,
+        # but joblib deserialise + prewarm + LMDB env open can still
+        # take minutes) causes a clean exit rather than the default
+        # process-terminate.  No training state has been mutated at
+        # this point, so there is nothing to checkpoint — we just
+        # exit promptly so slurm logs the job as terminated rather
+        # than waiting out the grace period and SIGKILL'ing us.
+        # CheckpointManager installs the full "set event, drain
+        # final checkpoint" handler later in this constructor,
+        # overriding this one.
+        signal.signal(signal.SIGTERM, _startup_signal_handler)
+        signal.signal(signal.SIGINT, _startup_signal_handler)
+        log.info("Early SIGTERM/SIGINT handler installed (startup phase)")
+
         if n_processes is None:
             slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
             if slurm_cpus is not None:
@@ -224,8 +267,11 @@ class Server:
 
         # Load the LUT once in the parent; workers inherit the
         # deserialised object via fork copy-on-write, avoiding one
-        # load per worker.
+        # load per worker.  Memmap-backed streets (the river on
+        # 52-card decks) are eagerly pre-warmed so per-traversal
+        # lookups hit RAM instead of paging from disk.
         self._info_set_lut = load_info_set_lut(lut_path, pickle_dir)
+        prewarm_lut(self._info_set_lut)
 
         self._job_queue: mp.JoinableQueue = mp.JoinableQueue(maxsize=n_processes)
         self._logging_queue: mp.Queue = mp.Queue()
@@ -255,9 +301,29 @@ class Server:
                 warm_start_path=Path(warm_start),
                 expected_n_players=n_players,
             )
+        # Optional node-local LMDB staging.  When PLURIBUS_LMDB_LOCAL_DIR
+        # is set the runtime LMDB lives on fast scratch (avoids per-
+        # lookup NFS lock-table latency), and CheckpointManager
+        # mirrors it back to ``save_path/lmdb_index`` at every
+        # checkpoint so the persistent copy stays current and the
+        # job can resume from /pfs if the local scratch is lost.
+        lmdb_persistent_dir = self._save_path / "lmdb_index"
+        lmdb_local_env = os.environ.get("PLURIBUS_LMDB_LOCAL_DIR")
+        if lmdb_local_env:
+            lmdb_runtime_dir = Path(lmdb_local_env)
+            lmdb_runtime_dir.mkdir(parents=True, exist_ok=True)
+            log.info(
+                f"LMDB runtime dir: {lmdb_runtime_dir} (local staging); "
+                f"persistent mirror: {lmdb_persistent_dir}"
+            )
+        else:
+            lmdb_runtime_dir = lmdb_persistent_dir
+            log.info(f"LMDB runtime dir: {lmdb_runtime_dir} (no local staging)")
+        self._lmdb_runtime_dir = lmdb_runtime_dir
+        self._lmdb_persistent_dir = lmdb_persistent_dir
 
         self._tables = CFRTables(
-            index_path=self._save_path / "lmdb_index",
+            index_path=lmdb_runtime_dir,
             shm_dir=shm_dir,
             lmdb_map_size=lmdb_map_size,
             actions_per_street=MAX_ACTIONS_PER_STREET,
@@ -269,7 +335,12 @@ class Server:
         # CheckpointManager registers signal handlers and restores
         # from an existing checkpoint before any worker is spawned so
         # workers observe the restored state.
-        self._checkpoint_manager = CheckpointManager(self, self._save_path)
+        self._checkpoint_manager = CheckpointManager(
+            self,
+            self._save_path,
+            lmdb_runtime_dir=lmdb_runtime_dir,
+            lmdb_persistent_dir=lmdb_persistent_dir,
+        )
         if os.environ.get("TESTING_SUITE"):
             n_processes = 4
         self._workers = self._start_workers(n_processes)
@@ -484,9 +555,20 @@ class Server:
                 bias_magnitude=self._bias_magnitude,
             )
             workers.append(worker)
-        for worker in workers:
-            worker.start()
-            log.info(f"started worker {worker.name}")
+        # Close every LMDB env in the parent immediately before
+        # forking the workers.  python-lmdb (1.3) appears to hold
+        # transaction state that survives env.close() / reopen in the
+        # child — even with max_spare_txns=0 — and triggers
+        # ``MDB_BAD_RSLOT`` on the first read txn after fork.  Forking
+        # while the parent's envs are closed guarantees the child
+        # inherits nothing, then each side reopens its own env.
+        self._tables.close_envs()
+        try:
+            for worker in workers:
+                worker.start()
+                log.info(f"started worker {worker.name}")
+        finally:
+            self._tables.open_envs()
         return workers
 
     # ------------------------------------------------------------------

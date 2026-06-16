@@ -72,6 +72,7 @@ import os
 import queue
 import shutil
 import signal
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -158,7 +159,13 @@ class CheckpointManager:
         final checkpoint before the process exits.
     """
 
-    def __init__(self, server: "Server", save_path: Path) -> None:
+    def __init__(
+        self,
+        server: "Server",
+        save_path: Path,
+        lmdb_runtime_dir: Optional[Path] = None,
+        lmdb_persistent_dir: Optional[Path] = None,
+    ) -> None:
         """Register signal handlers and auto-resume from *save_path* if possible.
 
         Parameters
@@ -169,9 +176,35 @@ class CheckpointManager:
         save_path : Path
             Root directory for checkpoint subdirectories.  Created
             implicitly when the first checkpoint is written.
+        lmdb_runtime_dir : Path, optional
+            Directory where the live LMDB indexes currently reside.
+            When this differs from *lmdb_persistent_dir* (e.g. the
+            indexes are staged on node-local fast scratch), every
+            checkpoint mirrors a consistent snapshot back to
+            *lmdb_persistent_dir* on the background writer thread.
+        lmdb_persistent_dir : Path, optional
+            Persistent destination on shared storage for the LMDB
+            mirror.  Defaults to ``save_path/lmdb_index``.
         """
         self._server = server
         self._save_path = Path(save_path)
+        self._lmdb_runtime_dir = (
+            Path(lmdb_runtime_dir) if lmdb_runtime_dir is not None else None
+        )
+        self._lmdb_persistent_dir = (
+            Path(lmdb_persistent_dir)
+            if lmdb_persistent_dir is not None
+            else self._save_path / "lmdb_index"
+        )
+        self._writeback_lmdb = (
+            self._lmdb_runtime_dir is not None
+            and self._lmdb_runtime_dir.resolve() != self._lmdb_persistent_dir.resolve()
+        )
+        if self._writeback_lmdb:
+            log.info(
+                f"CheckpointManager: LMDB writeback enabled "
+                f"({self._lmdb_runtime_dir} → {self._lmdb_persistent_dir})"
+            )
         self._last_checkpoint_path: Optional[Path] = None
         self._sigterm_event: threading.Event = threading.Event()
 
@@ -234,6 +267,28 @@ class CheckpointManager:
             checkpoint so ``terminate`` cannot race the writer.
         """
         label = "emergency" if emergency else "scheduled"
+
+        # Non-blocking guard for scheduled checkpoints.  The background
+        # writer owns all disk I/O.  If it has not yet even dequeued the
+        # previously-handed-off snapshot, it is behind, and enqueuing
+        # another would block the main loop on the ``maxsize=1`` queue —
+        # but the main loop is the *only* thread that dispatches CFR
+        # jobs, so blocking it idles every worker (the <1% CPU stall).
+        # Skip this checkpoint instead and let the next one catch up.
+        #
+        # We must bail *before* ``snapshot_dirty_chunks`` runs, because
+        # that call clears the chunk dirty flags.  Bailing here leaves
+        # the flags set, so the chunks dirtied since the last successful
+        # checkpoint stay dirty and are captured by the next one —
+        # checkpoints coalesce under disk pressure, nothing is dropped.
+        if not (emergency or wait) and self._write_queue.full():
+            log.warning(
+                f"[t={t}] Checkpoint skipped — background writer still busy "
+                f"with the previous snapshot (disk slower than the checkpoint "
+                f"cadence); dirty state retained for the next checkpoint"
+            )
+            return
+
         log.info(f"[t={t}] Checkpoint ({label}) starting")
         snapshot_start = time.monotonic()
 
@@ -265,17 +320,10 @@ class CheckpointManager:
             self._write_queue.join()
             self._write_snapshot(pending)
         else:
-            # put() blocks if the writer is still busy with the prior
-            # snapshot.  Log a warning when that happens so the
-            # operator knows checkpoint_interval is too tight for disk.
-            put_start = time.monotonic()
+            # The full() guard at the top returned early if a snapshot
+            # was still queued, and the main loop is the only producer,
+            # so the queue has a free slot and this put() cannot block.
             self._write_queue.put(pending)
-            put_wait = time.monotonic() - put_start
-            if put_wait > 1.0:
-                log.warning(
-                    f"[t={t}] Writer thread back-pressured for "
-                    f"{put_wait:.1f}s — consider raising checkpoint_interval"
-                )
 
     def shutdown(self) -> None:
         """Flush the background writer and stop its thread.
@@ -332,6 +380,7 @@ class CheckpointManager:
         tmp_path = self._save_path / f"checkpoint_tmp_{pending.created_wall_time}"
         tmp_path.mkdir(parents=True, exist_ok=True)
 
+        lmdb_ms = 0.0
         try:
             CFRTables.write_buffers(pending.buffers, tmp_path)
 
@@ -346,6 +395,24 @@ class CheckpointManager:
                         os.link(str(old_file), str(new_file))
 
             atomic_joblib_dump(pending.state_dict, tmp_path / "server_state.pkl")
+
+            # Mirror the runtime LMDB indexes back to persistent storage
+            # BEFORE we publish the new chunks.  Ordering matters: if
+            # the process is killed between publishing chunks and
+            # mirroring LMDB, the persistent side would end up with
+            # newer chunks than LMDB.  On resume, workers would
+            # reassign row IDs that the chunks already hold data for,
+            # silently mixing the new run's regrets with stale data
+            # from whichever infoset previously occupied that row.
+            # By mirroring LMDB first, persistent LMDB is always at
+            # least as fresh as persistent chunks; the worst case is
+            # the benign "LMDB knows about rows whose chunks are
+            # zero" pattern (workers re-accumulate regret from zero
+            # for those rows on resume).
+            if self._writeback_lmdb:
+                lmdb_start = time.monotonic()
+                self._mirror_lmdb_to_persistent()
+                lmdb_ms = (time.monotonic() - lmdb_start) * 1000.0
 
             final_path = self._save_path / f"checkpoint_{int(time.time())}"
             tmp_path.rename(final_path)
@@ -368,9 +435,47 @@ class CheckpointManager:
             f"[t={t}] Checkpoint complete — "
             f"snapshot={pending.snapshot_ms:.0f}ms "
             f"writeback={writeback_ms:.0f}ms "
+            f"lmdb={lmdb_ms:.0f}ms "
             f"chunks={len(pending.buffers)} "
             f"path={final_path}"
         )
+
+    def _mirror_lmdb_to_persistent(self) -> None:
+        """Snapshot the live LMDB and rsync it to persistent storage.
+
+        Two-step pattern: first :meth:`CFRTables.copy_indexes_to`
+        writes a compacted, transactionally consistent image to a
+        local temp directory under the runtime LMDB root (fast,
+        same-filesystem); then ``rsync`` ships that snapshot to the
+        persistent location.  Doing the snapshot locally first means
+        ``env.copy`` (which streams the whole DB sequentially) hits
+        node-local I/O speeds, and the network transfer can use
+        rsync's delta algorithm to send only changed pages between
+        checkpoints.
+
+        ``--delete`` is passed to rsync so streets removed from the
+        runtime env (shouldn't happen, but safe to defend against)
+        don't linger in the persistent mirror.
+        """
+        snapshot_root = self._lmdb_runtime_dir.parent / (
+            self._lmdb_runtime_dir.name + f".snapshot_tmp_{int(time.time())}"
+        )
+        try:
+            self._server._tables.copy_indexes_to(snapshot_root)
+            self._lmdb_persistent_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                [
+                    "rsync",
+                    "-a",
+                    "--delete",
+                    f"{snapshot_root}/",
+                    f"{self._lmdb_persistent_dir}/",
+                ],
+                check=True,
+            )
+        finally:
+            if snapshot_root.exists():
+                shutil.rmtree(snapshot_root, ignore_errors=True)
 
     # -----------------------------------------------------------------------
     # SIGTERM handler
