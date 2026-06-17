@@ -114,8 +114,8 @@ class TestFromRuntime:
         # Walk HU pre-flop to flop via two calls; assert from_runtime
         # reports the right street and a non-trivial board mask.
         env = _env()
-        env = env.apply_action("call")
-        env = env.apply_action("call")
+        env.step_in_place("call")
+        env.step_in_place("call")
         assert env.betting_round == 1
         assert len(env.community_cards) == 3
         ctx = _ctx_from(env)

@@ -71,6 +71,19 @@ class Deck:
         self._idx += n
         return cards
 
+    def capture(self) -> int:
+        """Snapshot the deal cursor for make/undo.
+
+        Dealing only advances ``_idx``; the ``_cards`` array is never
+        mutated by ``deal_community`` / ``deal_private_cards``, so the
+        cursor alone fully captures the deck's dealing state.
+        """
+        return self._idx
+
+    def restore(self, cursor: int) -> None:
+        """Restore the deal cursor captured by :meth:`capture`."""
+        self._idx = cursor
+
     @property
     def remaining(self) -> np.ndarray:
         """Return the undealt portion of the deck as a numpy array."""

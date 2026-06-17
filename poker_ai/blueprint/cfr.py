@@ -304,8 +304,9 @@ def _traverse(
                 continue
             if _debug:
                 log.debug("ACTION TRAVERSED FOR REGRET: ph %s ACTION: %s", state.player_i, action)
-            new_state = state.apply_action(action)
-            voa[action] = _traverse(tables, new_state, i, t, local_delta, explore_fn)
+            token = state.step_in_place(action)
+            voa[action] = _traverse(tables, state, i, t, local_delta, explore_fn)
+            state.undo(token)
             if _debug:
                 log.debug("Got EV for %s: %s", action, voa[action])
             vo += sigma[a_to_i[action]] * voa[action]
@@ -328,7 +329,10 @@ def _traverse(
                 "EXTERNAL SAMPLE: opponent ph %s sampled ACTION: %s",
                 state.player_i, action,
             )
-        return _traverse(tables, state.apply_action(action), i, t, local_delta, explore_fn)
+        token = state.step_in_place(action)
+        value = _traverse(tables, state, i, t, local_delta, explore_fn)
+        state.undo(token)
+        return value
 
 
 def _traverse_biased(
@@ -382,19 +386,23 @@ def _traverse_biased(
                 continue
             if _debug:
                 log.debug("ACTION TRAVERSED FOR REGRET: ph %s ACTION: %s", state.player_i, action)
-            new_state = state.apply_action(action)
             new_count = bias_count + 1 if is_biased(action, bias) else bias_count
+            token = state.step_in_place(action)
             voa[action] = _traverse_biased(
-                tables, new_state, i, t, local_delta, explore_fn,
+                tables, state, i, t, local_delta, explore_fn,
                 bias, bias_magnitude, new_count,
             )
+            state.undo(token)
             vo += sigma[a_to_i[action]] * voa[action]
         accumulate_regrets(local_delta, r, state.info_set, voa, vo, a_to_i)
         return vo
     else:
         action = sample_action(legal_actions, sigma, a_to_i)
         new_count = bias_count + 1 if is_biased(action, bias) else bias_count
-        return _traverse_biased(
-            tables, state.apply_action(action), i, t, local_delta, explore_fn,
+        token = state.step_in_place(action)
+        value = _traverse_biased(
+            tables, state, i, t, local_delta, explore_fn,
             bias, bias_magnitude, new_count,
         )
+        state.undo(token)
+        return value

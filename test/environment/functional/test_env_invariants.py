@@ -23,9 +23,10 @@ from environment.poker_env import new_game
 # ---------------------------------------------------------------------------
 
 def _play_step(env):
-    """Advance one action: prefer call, else first legal action."""
+    """Advance one action in place: prefer call, else first legal action."""
     action = "call" if "call" in env.legal_actions else env.legal_actions[0]
-    return env.apply_action(action)
+    env.step_in_place(action)
+    return env
 
 
 def _play_all_calls(env, max_steps=500):
@@ -41,7 +42,7 @@ def _play_fold_first(env, max_steps=500):
     steps = 0
     while not env.is_terminal and steps < max_steps:
         if "fold" in env.legal_actions:
-            env = env.apply_action("fold")
+            env.step_in_place("fold")
         else:
             env = _play_step(env)
         steps += 1
@@ -54,7 +55,7 @@ def _play_all_raises(env, max_steps=500):
     while not env.is_terminal and steps < max_steps:
         raise_actions = [a for a in env.legal_actions if a and a.startswith("raise:0.5")]
         if raise_actions:
-            env = env.apply_action(raise_actions[0])
+            env.step_in_place(raise_actions[0])
         else:
             env = _play_step(env)
         steps += 1
@@ -66,7 +67,7 @@ def _play_all_in_first(env, max_steps=500):
     steps = 0
     while not env.is_terminal and steps < max_steps:
         if "all_in" in env.legal_actions:
-            env = env.apply_action("all_in")
+            env.step_in_place("all_in")
         else:
             env = _play_step(env)
         steps += 1
@@ -186,9 +187,9 @@ class TestBoardCompletionInvariant:
             env = new_game(n_players=2, card_info_lut={})
             for _ in range(n_calls_before):
                 if not env.is_terminal:
-                    env = env.apply_action("call")
+                    env.step_in_place("call")
             if not env.is_terminal and "all_in" in env.legal_actions:
-                env = env.apply_action("all_in")
+                env.step_in_place("all_in")
                 assert env.is_terminal
                 assert len(env.community_cards) == 5, (
                     f"all-in at {target_stage}: expected 5 cards, "

@@ -27,7 +27,7 @@ def _play_to_terminal(env, max_steps=300):
     steps = 0
     while not env.is_terminal and steps < max_steps:
         action = "call" if "call" in env.legal_actions else env.legal_actions[0]
-        env = env.apply_action(action)
+        env.step_in_place(action)
         steps += 1
     return env
 
@@ -117,7 +117,7 @@ class TestCardRankRangeEnforcement:
         for _ in range(n_games):
             env = _env(low, high)
             while env.betting_stage == "pre_flop":
-                env = env.apply_action("call")
+                env.step_in_place("call")
             for card in env.community_cards:
                 assert low <= card_rank_int(card) <= high
 

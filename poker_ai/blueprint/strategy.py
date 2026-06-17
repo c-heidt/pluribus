@@ -90,4 +90,9 @@ def update_strategy(
         log.debug("ACTION SAMPLED: ph %s ACTION: %s", state.player_i, action)
         tables.strategy[r].update_row(state.info_set, a_to_i[action], 1)
 
-    update_strategy(tables, state.apply_action(action), i)
+    # Single sampled action: descend in place and restore on the way back,
+    # so this function leaves its ``state`` argument unchanged (the same
+    # non-mutating contract the old copy-on-write traversal had).
+    token = state.step_in_place(action)
+    update_strategy(tables, state, i)
+    state.undo(token)

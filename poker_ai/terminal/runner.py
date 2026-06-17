@@ -168,7 +168,7 @@ def run_terminal_app(
                             n_table_rotations = n_players - 1
                     else:
                         log.info(term.green(f"{current_player_name} chose {action}"))
-                        state: PokerState = state.apply_action(action)
+                        state.step_in_place(action)
             else:
                 if agent == "random":
                     action = random.choice(state.legal_actions)
@@ -201,7 +201,7 @@ def run_terminal_app(
                     action = np.random.choice(actions, p=probabilties)
                     time.sleep(0.8)
                 log.info(f"{current_player_name} chose {action}")
-                state: PokerState = state.apply_action(action)
+                state.step_in_place(action)
 
 
 if __name__ == "__main__":

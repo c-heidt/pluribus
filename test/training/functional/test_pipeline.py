@@ -29,6 +29,7 @@ from poker_ai.blueprint.cfr import cfr, merge_local_delta
 from poker_ai.tables.cfr_tables import CFRTables, REGRET_FLOOR
 from poker_ai.tables.index import lmdb_map_size_for_players
 from poker_ai.blueprint.singleprocess.train import simple_search
+from test.training.unit.test_cfr import _MakeUndoMock
 from poker_ai.blueprint.strategy import update_strategy
 from poker_ai.blueprint.training import (
     DiscountState,
@@ -164,7 +165,7 @@ class TestRegressions:
         class _FT:
             community_cards = []
 
-        class Term:
+        class Term(_MakeUndoMock):
             def __init__(self, p):
                 self.is_terminal = True
                 self.players = [_FP(), _FP()]
@@ -191,7 +192,7 @@ class TestRegressions:
             def apply_action(self, a):
                 raise RuntimeError
 
-        class Root:
+        class Root(_MakeUndoMock):
             def __init__(self):
                 self.is_terminal = False
                 self.players = [_FP(), _FP()]

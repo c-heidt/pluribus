@@ -2,8 +2,8 @@
 
 The ``PokerEnv`` class is the central state object. It holds all live
 game data (players, pot, deck, community cards) and provides the CFR
-interface: ``apply_action``, ``legal_actions``, ``info_set``, and
-``is_terminal``.
+interface: ``step_in_place`` / ``undo``, ``legal_actions``, ``info_set``,
+and ``is_terminal``.
 
 Deterministic game-logic functions are in ``dynamics.py``; stochastic
 (dealing) operations are in ``chance.py``.
@@ -66,6 +66,35 @@ class PolicyState:
     info_set: str
     valid_mask: np.ndarray
     legal_actions: Tuple[str, ...]
+
+
+@dataclass
+class UndoToken:
+    """Snapshot of the mutable per-hand state taken by
+    :meth:`PokerEnv.step_in_place` and consumed by :meth:`PokerEnv.undo`.
+
+    Covers exactly the field set :meth:`PokerEnv.__deepcopy__` deep-copies
+    (the mutable per-hand state); restoring it returns the env to its
+    pre-step state, field-identical to a pre-step ``deepcopy``.  All
+    mutable containers are copied at capture time so the token is
+    independent of the subsequent in-place mutation.
+    """
+
+    betting_stage: str
+    skip_counter: int
+    first_move_of_current_round: bool
+    last_raise_amount: int
+    all_players_have_made_action: bool
+    n_actions: int
+    n_raises: int
+    player_i_index: int
+    n_players_started_round: int
+    community_cards: Tuple[int, ...]
+    deck_cursor: int
+    pot_chips: List[int]
+    player_states: List[tuple]
+    history: Dict[str, List[str]]
+
 
 logger = logging.getLogger("environment.poker_env")
 
@@ -190,9 +219,10 @@ class PokerEnv:
     Cards are represented as 32-bit integers throughout (see
     ``utils.py`` for the encoding).
 
-    ``apply_action()`` returns a *new* ``PokerEnv`` rather than
-    mutating the current instance, so the caller always has an
-    immutable snapshot of the state before the action.
+    The env is advanced with the make/undo pair ``step_in_place`` /
+    ``undo``: ``step_in_place`` mutates the env in place and returns an
+    ``UndoToken``; ``undo`` reverses it.  A caller that needs both the
+    pre- and post-action state ``copy.deepcopy`` the env first.
 
     Attributes
     ----------
@@ -286,7 +316,7 @@ class PokerEnv:
             Tuple[str, Tuple[str, ...]], FrozenSet[str]
         ] = {}
 
-        # Live game state (deep-copied in apply_action)
+        # Live game state (deep-copied by __deepcopy__)
         self.players: List[Player] = players
         self.pot: Pot = Pot(n_players)
         self.deck: Deck = Deck(low_card_rank, high_card_rank)
@@ -343,8 +373,9 @@ class PokerEnv:
 
         Configuration scalars (blind sizes, rank bounds, etc.) are shared
         rather than copied. All mutable game state (players, pot, deck,
-        history) is deep-copied. ``card_info_lut`` is always set to an
-        empty dict on the copy; the caller is responsible for restoring it.
+        history) is deep-copied. ``card_info_lut`` is shared by reference:
+        it is read-only (never mutated per-env) and is the same loaded
+        object for the whole session, so copying it would be pure waste.
 
         Parameters
         ----------
@@ -358,14 +389,16 @@ class PokerEnv:
         """
         new = self.__class__.__new__(self.__class__)
         memo[id(self)] = new
-        # Immutable config + shared overlay — share references, no copy needed.
+        # Immutable / read-only shared state — share references, no copy.
         # `_extra_legal_actions` is mutated in place by inject_action, so
-        # every env in a deepcopy lineage sees the same augmented game tree.
+        # every env in a deepcopy lineage sees the same augmented game tree;
+        # `card_info_lut` is read-only and large, so it is shared too.
         for attr in (
             "small_blind", "big_blind", "_low_card_rank", "_high_card_rank",
             "_initial_n_chips",
             "_betting_stage_to_round", "_player_i_lut",
             "_extra_legal_actions",
+            "card_info_lut",
         ):
             object.__setattr__(new, attr, getattr(self, attr))
         # Mutable game state — deep copy
@@ -378,27 +411,18 @@ class PokerEnv:
             "_n_players_started_round",
         ):
             object.__setattr__(new, attr, copy.deepcopy(getattr(self, attr), memo))
-        # LUT always excluded (set by caller)
-        new.card_info_lut = {}
         return new
 
     # ------------------------------------------------------------------
     # Core CFR interface
     # ------------------------------------------------------------------
 
-    def apply_action(self, action_str: Optional[str]) -> PokerEnv:
-        """Return a new PokerEnv after applying ``action_str``.
+    def _apply_action_in_place(self, action_str: Optional[str]) -> None:
+        """Apply ``action_str`` by mutating ``self`` in place.
 
-        Parameters
-        ----------
-        action_str : str or None
-            One of ``{"fold", "call", "raise:<fraction>", "all_in"}``
-            or ``None`` for inactive players.
-
-        Returns
-        -------
-        PokerEnv
-            New game state after the action.
+        The forward game-logic core used by :meth:`step_in_place` (which
+        calls it on ``self`` after snapshotting an undo token).  Operates
+        entirely on ``self``; undo bookkeeping is the caller's concern.
         """
         original_action = action_str
         if action_str not in self.legal_actions:
@@ -409,34 +433,30 @@ class PokerEnv:
             action_str = self._map_to_closest_legal_action(action_str)
             logger.info("Mapped '%s' -> '%s'", original_action, action_str)
 
-        lut = self.card_info_lut
-        self.card_info_lut = {}
-        new_env = copy.deepcopy(self)
-        new_env.card_info_lut = self.card_info_lut = lut
-        new_env._first_move_of_current_round = False
+        self._first_move_of_current_round = False
 
         if action_str is None:
             assert (
-                not new_env.current_player.is_active
+                not self.current_player.is_active
             ), "Active player cannot do nothing!"
         elif action_str == "call":
-            new_env.current_player.call(
-                players=new_env.players, pot=new_env.pot
+            self.current_player.call(
+                players=self.players, pot=self.pot
             )
             logger.debug("calling")
         elif action_str == "fold":
-            new_env.current_player.fold()
+            self.current_player.fold()
         elif action_str == "all_in":
-            n_chips_to_add = new_env.current_player.n_chips
-            biggest_bet = max(p.n_bet_chips for p in new_env.players)
-            current_bet = new_env.current_player.n_bet_chips
+            n_chips_to_add = self.current_player.n_chips
+            biggest_bet = max(p.n_bet_chips for p in self.players)
+            current_bet = self.current_player.n_bet_chips
             n_chips_to_call = biggest_bet - current_bet
             actual_raise_amount = n_chips_to_add - n_chips_to_call
-            if actual_raise_amount >= new_env._last_raise_amount:
-                new_env._last_raise_amount = actual_raise_amount
-                new_env._n_raises += 1
+            if actual_raise_amount >= self._last_raise_amount:
+                self._last_raise_amount = actual_raise_amount
+                self._n_raises += 1
             logger.debug("going all-in with %d chips", n_chips_to_add)
-            new_env.current_player.raise_to(pot=new_env.pot, n_chips=n_chips_to_add)
+            self.current_player.raise_to(pot=self.pot, n_chips=n_chips_to_add)
         elif action_str.startswith("raise:"):
             pot_fraction = float(action_str.split(":")[1])
             # Actions reaching this branch are guaranteed in
@@ -447,53 +467,123 @@ class PokerEnv:
             # therefore agrees with ``False`` on every valid input and
             # keeps the chip math consistent with ``chips_to_add`` /
             # ``string_for_chips`` / ``_raise_fraction_is_playable``.
-            n_chips_to_add = new_env._compute_raise_chip_amount(
+            n_chips_to_add = self._compute_raise_chip_amount(
                 pot_fraction, enforce_minimum=True
             )
-            biggest_bet = max(p.n_bet_chips for p in new_env.players)
-            current_bet = new_env.current_player.n_bet_chips
+            biggest_bet = max(p.n_bet_chips for p in self.players)
+            current_bet = self.current_player.n_bet_chips
             n_chips_to_call = biggest_bet - current_bet
             actual_raise_amount = n_chips_to_add - n_chips_to_call
-            if actual_raise_amount >= new_env._last_raise_amount:
-                new_env._last_raise_amount = actual_raise_amount
+            if actual_raise_amount >= self._last_raise_amount:
+                self._last_raise_amount = actual_raise_amount
             logger.debug("adding %d chips to pot (action: %s)", n_chips_to_add, action_str)
-            new_env.current_player.raise_to(pot=new_env.pot, n_chips=n_chips_to_add)
-            new_env._n_raises += 1
+            self.current_player.raise_to(pot=self.pot, n_chips=n_chips_to_add)
+            self._n_raises += 1
         else:
             raise ValueError(
                 f"Unrecognised action '{action_str}'. "
                 "Expected 'fold', 'call', 'raise:<fraction>' or 'all_in'."
             )
 
-        skip_actions = ["skip"] * new_env._skip_counter
-        new_env._history[new_env.betting_stage] += skip_actions
-        new_env._history[new_env.betting_stage].append(action_str)
-        new_env._n_actions += 1
-        new_env._skip_counter = 0
+        skip_actions = ["skip"] * self._skip_counter
+        self._history[self.betting_stage] += skip_actions
+        self._history[self.betting_stage].append(action_str)
+        self._n_actions += 1
+        self._skip_counter = 0
 
         while True:
-            new_env._move_to_next_player()
-            finished_betting = not dynamics.more_betting_needed(new_env)
-            if finished_betting and new_env.all_players_have_actioned:
-                new_env._increment_stage()
-                new_env._reset_betting_round_state()
-                new_env._first_move_of_current_round = True
-            if not new_env.current_player.is_active:
-                new_env._skip_counter += 1
-            elif new_env.current_player.is_active:
-                if dynamics.n_players_with_moves(new_env) == 1:
-                    new_env._betting_stage = "terminal"
-                    cards_needed = 5 - len(new_env.community_cards)
+            self._move_to_next_player()
+            finished_betting = not dynamics.more_betting_needed(self)
+            if finished_betting and self.all_players_have_actioned:
+                self._increment_stage()
+                self._reset_betting_round_state()
+                self._first_move_of_current_round = True
+            if not self.current_player.is_active:
+                self._skip_counter += 1
+            elif self.current_player.is_active:
+                if dynamics.n_players_with_moves(self) == 1:
+                    self._betting_stage = "terminal"
+                    cards_needed = 5 - len(self.community_cards)
                     if cards_needed > 0:
-                        new_env.community_cards += new_env.deck.deal_community(cards_needed)
-                if new_env._betting_stage in {"terminal", "show_down"}:
-                    dynamics.compute_winners(new_env)
+                        self.community_cards += self.deck.deal_community(cards_needed)
+                if self._betting_stage in {"terminal", "show_down"}:
+                    dynamics.compute_winners(self)
                 break
 
-        for player in new_env.players:
+        for player in self.players:
             player.is_turn = False
-        new_env.current_player.is_turn = True
-        return new_env
+        self.current_player.is_turn = True
+
+    def step_in_place(self, action_str: Optional[str]) -> "UndoToken":
+        """Apply ``action_str`` by **mutating this env in place**, returning
+        an :class:`UndoToken` that :meth:`undo` uses to restore the
+        pre-action state.
+
+        The sole way to advance the env, for the depth-first CFR / search
+        inner loop: ``token = env.step_in_place(a); ...recurse on env...;
+        env.undo(token)``.  The token snapshots exactly the mutable per-hand
+        state ``__deepcopy__`` copies, so a ``step_in_place`` followed by an
+        ``undo`` leaves ``self`` field-identical to its pre-action state.
+        A caller that needs the pre- and post-action env at once
+        ``copy.deepcopy`` first.
+        """
+        token = self._capture_undo_token()
+        self._apply_action_in_place(action_str)
+        return token
+
+    def undo(self, token: "UndoToken") -> None:
+        """Reverse the most recent :meth:`step_in_place`, restoring every
+        mutable field from ``token``.
+
+        Tokens are strictly LIFO and single-use: call ``undo`` in the
+        reverse order of the ``step_in_place`` calls that produced them.
+        """
+        self._betting_stage = token.betting_stage
+        self._skip_counter = token.skip_counter
+        self._first_move_of_current_round = token.first_move_of_current_round
+        self._last_raise_amount = token.last_raise_amount
+        self._all_players_have_made_action = token.all_players_have_made_action
+        self._n_actions = token.n_actions
+        self._n_raises = token.n_raises
+        self._player_i_index = token.player_i_index
+        self._n_players_started_round = token.n_players_started_round
+        self.community_cards = token.community_cards
+        self.deck.restore(token.deck_cursor)
+        self.pot.restore(token.pot_chips)
+        for player, snap in zip(self.players, token.player_states):
+            player.restore_mutable(snap)
+        # Restore _history wholesale (preserving exact key presence) so a
+        # later info_set build sees the pre-step history, not a defaultdict
+        # key spuriously materialised during the step.
+        self._history.clear()
+        for stage, actions in token.history.items():
+            self._history[stage] = list(actions)
+
+    def _capture_undo_token(self) -> "UndoToken":
+        """Snapshot the mutable per-hand state before an in-place step.
+
+        Mirrors the deep-copied field set of :meth:`__deepcopy__`; copies
+        every mutable container so the returned token is independent of the
+        subsequent mutation.  ``_history`` is read with ``.get`` semantics
+        (via ``items()``) so the snapshot never materialises a defaultdict
+        key.
+        """
+        return UndoToken(
+            betting_stage=self._betting_stage,
+            skip_counter=self._skip_counter,
+            first_move_of_current_round=self._first_move_of_current_round,
+            last_raise_amount=self._last_raise_amount,
+            all_players_have_made_action=self._all_players_have_made_action,
+            n_actions=self._n_actions,
+            n_raises=self._n_raises,
+            player_i_index=self._player_i_index,
+            n_players_started_round=self._n_players_started_round,
+            community_cards=self.community_cards,
+            deck_cursor=self.deck.capture(),
+            pot_chips=self.pot.capture(),
+            player_states=[p.capture_mutable() for p in self.players],
+            history={stage: list(actions) for stage, actions in self._history.items()},
+        )
 
     # ------------------------------------------------------------------
     # Internal state transitions
@@ -712,8 +802,8 @@ class PokerEnv:
     def chips_to_add(self, action: str) -> int:
         """Chips the actor must add to play ``action``.
 
-        Public inverse of :meth:`apply_action`'s chip math.  Accepts
-        the same action vocabulary as :meth:`apply_action` and
+        Public inverse of :meth:`step_in_place`'s chip math.  Accepts
+        the same action vocabulary as :meth:`step_in_place` and
         :meth:`inject_action` and applies the same shape validation
         on raise fractions (must be finite and positive).
 
@@ -777,7 +867,7 @@ class PokerEnv:
         tolerance ratio that 0.55× snaps to 0.5×.
 
         The runtime then either feeds the result directly to
-        :meth:`apply_action` (if it is already canonical) or first
+        :meth:`step_in_place` (if it is already canonical) or first
         injects it via :meth:`inject_action` (if it is off-tree).
         Whether to inject is a membership check on
         :attr:`legal_actions`, not a property of this return value.
@@ -858,7 +948,7 @@ class PokerEnv:
         Parameters
         ----------
         action : str
-            Action string accepted by :meth:`apply_action`.  Only
+            Action string accepted by :meth:`step_in_place`.  Only
             ``"raise:<fraction>"`` is a meaningful injection — canonical
             ``"fold"`` / ``"call"`` / ``"all_in"`` are always already
             legal and `inject_action` is a no-op returning ``True`` for
@@ -972,7 +1062,7 @@ class PokerEnv:
         single call applies them all.  The returned env is
         indistinguishable from a regular state that was dealt these
         cards from the start: future community deals via
-        :meth:`apply_action` will not collide with the new holes.
+        :meth:`step_in_place` will not collide with the new holes.
 
         Validation (all raise :class:`ValueError`):
 
@@ -1040,7 +1130,6 @@ class PokerEnv:
                 f"community."
             )
         new = copy.deepcopy(self)
-        new.card_info_lut = self.card_info_lut
         old_union: List[int] = []
         for seat in range(n):
             old_union.extend(int(c) for c in new.players[seat]._cards)

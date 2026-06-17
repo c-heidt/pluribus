@@ -17,6 +17,7 @@ import pytest
 from poker_ai.blueprint import training
 from poker_ai.blueprint.strategy import update_strategy
 from poker_ai.blueprint.training import strategy_step
+from test.training.unit.test_cfr import _MakeUndoMock
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +35,7 @@ class _FakeTable:
     community_cards = []
 
 
-class MockTerminal:
+class MockTerminal(_MakeUndoMock):
     def __init__(self, payout, n_players=2):
         self.is_terminal = True
         self.players = [_FakePlayer() for _ in range(n_players)]
@@ -62,7 +63,7 @@ class MockTerminal:
         raise RuntimeError("terminal")
 
 
-class MockState:
+class MockState(_MakeUndoMock):
     def __init__(self, player_i, info_set, actions, children, n_players=2):
         self._player_i = player_i
         self._info_set = info_set

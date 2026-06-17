@@ -29,7 +29,7 @@ class TestPublicKey:
 
     def test_reflects_history_and_is_hashable(self):
         env = _env()
-        env_next = env.apply_action("call")
+        env_next = copy.deepcopy(env); env_next.step_in_place("call")
         assert env_next.public_key == ("pre_flop", ("call",))
         # Hashable → usable as a solver table key.
         _ = {env.public_key: 1, env_next.public_key: 2}
@@ -73,16 +73,16 @@ class TestNRaisesThisRound:
 
     def test_increments_after_raise(self):
         env = _env()
-        env_next = env.apply_action(_first_raise(env))
+        env_next = copy.deepcopy(env); env_next.step_in_place(_first_raise(env))
         assert env_next.n_raises_this_round == 1
 
     def test_resets_at_round_boundary(self):
         # Raise then call to close pre-flop; the flop starts with the
         # counter back at zero.
         env = _env()
-        env = env.apply_action(_first_raise(env))
+        env.step_in_place(_first_raise(env))
         assert env.n_raises_this_round == 1
-        env = env.apply_action("call")
+        env.step_in_place("call")
         assert env.betting_round == 1
         assert env.n_raises_this_round == 0
 
@@ -114,8 +114,8 @@ class TestClusterFor:
     def test_folds_board_into_lookup_on_flop(self):
         # On the flop the LUT lookup must include the board cards.
         env = _env()
-        env = env.apply_action("call")
-        env = env.apply_action("call")
+        env.step_in_place("call")
+        env.step_in_place("call")
         assert env.betting_round == 1
         assert len(env.community_cards) == 3
         board = set(int(c) for c in env.community_cards)

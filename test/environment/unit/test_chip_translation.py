@@ -222,8 +222,8 @@ class TestStringForChips:
         # Walk to the flop and verify canonical mapping uses the
         # flop's raise grid, not pre-flop's.
         env = _env()
-        env = env.apply_action("call")
-        env = env.apply_action("call")
+        env.step_in_place("call")
+        env.step_in_place("call")
         assert env.betting_round == 1
         fractions = env.canonical_raise_fractions()
         assert fractions, "expected playable flop fractions"

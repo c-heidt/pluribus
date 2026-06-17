@@ -237,8 +237,9 @@ signature.
 
 A subgame is **not** a new object type — it is a deepcopied `PokerEnv`
 at the root public state. The env already owns game dynamics, the
-action abstraction, history, and the LUT, and `apply_action` already
-returns a new env via internal deepcopy.
+action abstraction, history, and the LUT. The env is advanced with the
+make/undo pair `step_in_place` / `undo` (the sole advance API; `deepcopy`
+is used only to snapshot the root and by `with_hole_cards`).
 
 #### Env extensions ([environment/poker_env.py](../environment/poker_env.py))
 
@@ -275,11 +276,10 @@ def cluster_for(self, combo: Tuple[int, int]) -> int:
 
 def step_in_place(self, action: str) -> "UndoToken":
     """Apply `action` by **mutating this env in place**, returning an
-    undo token (the pre-action values of every field the action
-    touched: pot, the acting player's chips/bet/fold state, history,
-    betting-round counters, and — at a chance node — the dealt board /
-    deck cursor).  The hot-loop counterpart to `apply_action`'s
-    copy-on-write."""
+    undo token (a snapshot of exactly the mutable per-hand state
+    `__deepcopy__` copies: pot, every player's chips/bet/fold/turn
+    state, history, betting-round counters, community cards and the
+    deck cursor).  The sole way to advance the env."""
 
 def undo(self, token: "UndoToken") -> None:
     """Reverse the most recent `step_in_place`, restoring the env to its
@@ -287,11 +287,11 @@ def undo(self, token: "UndoToken") -> None:
 ```
 
 `legal_actions` unions the overlay for the current public state with the
-canonical set, deduping. `apply_action` already accepts arbitrary
-`"raise:<fraction>"` strings. `apply_action` (copy-on-write) remains the API
-for every caller **outside** the solver's inner loop; `step_in_place` / `undo`
-are the make/undo pair the CFR traversal uses to avoid a per-node deepcopy
-(§6.7).
+canonical set, deduping; `step_in_place` accepts arbitrary
+`"raise:<fraction>"` strings. `step_in_place` / `undo` are the make/undo pair
+the CFR traversal (and the offline blueprint trainer) use to advance the env
+without a per-node deepcopy (§6.7); a caller that needs the pre- and
+post-action env at once `deepcopy`s first.
 
 **Why "public state", not info_set, as the internal overlay key.**
 The overlay describes the *game tree* (a property of public nodes),
@@ -341,11 +341,11 @@ conflicts.
 
 The solver's inner CFR traversal descends with `token = env.step_in_place(a)`
 and ascends with `env.undo(token)` (§6.7) — one mutable env per traversal, no
-per-node copy. Code paths outside the hot loop (the agent's lifecycle,
-continuation rollouts that branch) still use the copy-on-write
-`env = env.apply_action(a)`. Leaf classification uses `ctx.depth_limit`;
-`is_terminal` is always checked **before** reading `betting_round` (which raises
-at the `"terminal"` stage).
+per-node copy. The agent's lifecycle snapshots the search root once with
+`copy.deepcopy`; continuation rollouts walk a per-rollout `with_hole_cards` env
+forward in place. Leaf classification uses `ctx.depth_limit`; `is_terminal` is
+always checked **before** reading `betting_round` (which raises at the
+`"terminal"` stage).
 
 **Invariants** (asserted in tests): after `root_env = copy.deepcopy(runtime_env)`,
 `root_env.pot_size`, player chip stacks, the per-stage history, and
@@ -406,7 +406,7 @@ def canonical_raise_fractions(self) -> List[float]:
     """Currently-playable raise fractions, mirroring legal_actions' gating."""
 
 def chips_to_add(self, action: str) -> int:
-    """Inverse of apply_action's chip math."""
+    """Inverse of the env's action chip math."""
 
 def string_for_chips(self, chip_amount: int) -> str:
     """Map an observed chip raise to an action string.
@@ -440,7 +440,7 @@ P(map to A) = ((B − x) · (1 + A)) / ((B − A) · (1 + x))
   action_str = env.string_for_chips(observed_chips)
   if action_str not in env.legal_actions:
       env.inject_action(action_str)
-  env = env.apply_action(action_str)
+  env.step_in_place(action_str)
   agent.on_observed_action(seat, env_before, action_str)
   ```
 - Fold / call / all-in are always on-tree — only raise sizes can deviate.
@@ -467,13 +467,14 @@ def continuation_value(
 ) -> np.ndarray:                          # shape (n_players,), expected chips per seat
 ```
 
-Algorithm per call: repeat `n_rollouts` times — roll the hand forward via
-`env = env.apply_action(a)` until `env.is_terminal`, with each acting seat
-playing `cfg.policies[profile[seat]].strategy(state, bias=profile[seat])`.
-Future board cards are dealt by `apply_action` as the rollout crosses round
-boundaries; blueprint lookups on histories containing off-tree actions
-canonicalize via deterministic pseudo-harmonic (§6.3). Read per-seat payoff from
-`env.payout` (do **not** re-implement side pots). Return the per-seat mean.
+Algorithm per call: repeat `n_rollouts` times — roll a per-rollout
+`with_hole_cards` env forward in place via `env.step_in_place(a)` until
+`env.is_terminal`, with each acting seat playing
+`cfg.policies[profile[seat]].strategy(state, bias=profile[seat])`. Future board
+cards are dealt by `step_in_place` as the rollout crosses round boundaries;
+blueprint lookups on histories containing off-tree actions canonicalize via
+deterministic pseudo-harmonic (§6.3). Read per-seat payoff from `env.payout`
+(do **not** re-implement side pots). Return the per-seat mean.
 
 The hands are **not** resampled here — the belief is integrated by the solver's
 joint root sampling across MCCFR iterations (§6.5), not inside the leaf; the
@@ -686,23 +687,26 @@ loop, and replaces the inline offline-lookup block with `agent.act(env)`.
 
 The dual budget (10 000 iterations **and** 15 s) is only a real-time budget if a
 single search fits inside it. The dominant cost is **not** the CFR arithmetic;
-it is environment cloning. Today every
-[`apply_action`](../environment/poker_env.py) does a `copy.deepcopy` of the
-mutable game state (players, pot, deck, history), and the solver visits
-10⁵–10⁶ nodes per search in the MCCFR regime — plus, at every depth-limit leaf,
-`n_rollouts` rollouts that each deep-copy their way to terminal. The work is
-addressed in three tiers; the constant-factor tier comes first because no amount
-of parallelism rescues a ruinous per-node copy — it only spreads it across
-cores.
+it is environment cloning. A naive traversal that advanced the env with a
+`copy.deepcopy` of the mutable game state (players, pot, deck, history) per move
+would pay that copy at every one of the 10⁵–10⁶ nodes a search visits in the
+MCCFR regime. The make/undo traversal below removes it. The work is addressed in
+three tiers; the constant-factor tier comes first because no amount of
+parallelism rescues a ruinous per-node copy — it only spreads it across cores.
 
 #### Tier 1 — single-thread constant-factor (prerequisite for the budget)
 
 - **Make/undo traversal.** The solver descends with `env.step_in_place(a)` and
   ascends with `env.undo(token)` (§6.1) — one mutable env per traversal, the
-  undo token restoring only the fields the action touched. This removes the
-  per-node deepcopy entirely (the largest single win) and is the structural
-  prerequisite for a native/`nogil` inner loop in Tier 2. `apply_action`'s
-  copy-on-write contract is unchanged for every caller outside the hot loop.
+  undo token restoring exactly the mutable per-hand state `__deepcopy__` copies.
+  This removes the per-node deepcopy entirely (the largest single win) and is the
+  structural prerequisite for a native/`nogil` inner loop in Tier 2.
+  `step_in_place`/`undo` is the **sole** way to advance the env; `deepcopy` is
+  retained only to snapshot a search root and inside `with_hole_cards`. The same
+  pair backs the **blueprint CFR trainer**
+  ([poker_ai/blueprint/cfr.py](../poker_ai/blueprint/cfr.py)) and the
+  average-strategy pass ([strategy.py](../poker_ai/blueprint/strategy.py)) — so
+  the win applies to offline training as well as online search.
 - **Search-lifetime leaf-value cache.** Continuation values are invariant across
   CFR iterations for a fixed `(leaf public_key, concrete-hand tuple, profile)`
   (§6.4), so the `n_rollouts` estimate is computed once per key and reused —
@@ -768,7 +772,7 @@ the serial result bit-for-bit; multi-worker runs fix per-worker substreams
 | 6 | Solver (MCCFR + vector regimes) + `SearchPolicy` | `poker_ai/search/solver.py`, `policy.py` | todo — two CFR regimes; vectorised showdown for the vector regime | 0, 2, 3, 5 |
 | 7 | Search-aware agent | `poker_ai/search/agent.py`, terminal wiring | todo | 3, 4, 6 |
 | 8 | CLI, config, tests | existing Click runner, `test/search/` | partial | 0–7 |
-| 9 | Make/undo traversal (`step_in_place` / `undo`) + search-lifetime leaf-value cache + per-row σ memoization (Tier 1, §6.7) | `environment/poker_env.py`, `poker_ai/search/solver.py`, `leaf.py` | todo — single-thread constant-factor; prerequisite for the time budget | 5, 6 |
+| 9 | Make/undo traversal (`step_in_place` / `undo`) + search-lifetime leaf-value cache + per-row σ memoization (Tier 1, §6.7) | `environment/poker_env.py`, `poker_ai/search/solver.py`, `leaf.py` | **partial** — env `step_in_place`/`undo` **done** and is now the **sole** advance API (`apply_action` deleted; blueprint CFR + strategy pass on make/undo); leaf-value cache + per-row σ memoization still todo (need the solver, row 6) | 5, 6 |
 | 10 | Flat hot-loop state + `numba nogil` inner loop (Tier 1, §6.7) | `poker_ai/search/solver.py` | todo — optional; precondition for thread scaling | 9 |
 | 11 | Parallel search: one-board-per-worker (vector) + batched parallel traversals (MCCFR) (Tier 2, §6.7) | `poker_ai/search/solver.py` | todo — `multiprocessing` first; seed-deterministic | 9 |
 
@@ -839,9 +843,9 @@ poker_ai play \
     `env.reset_overlay`.
   - **Performance & parallelism** (§6.7): `step_in_place` followed by `undo`
     restores the env to a state equal (field-by-field) to a `deepcopy` taken
-    before the action, across a randomized action sequence (LIFO property);
-    a make/undo traversal and a copy-on-write traversal of the same subgame
-    produce identical regrets. The search-lifetime leaf-value cache returns a
+    before the action, across a randomized action sequence (LIFO property), and
+    a full make/undo traversal leaves the root env unchanged (no leak). The
+    search-lifetime leaf-value cache returns a
     value equal to recomputing `continuation_value` for the same
     `(leaf public_key, hand tuple, profile)`, and is computed once per key
     (call-count assertion). Determinism under parallelism: `--workers 1`
@@ -868,6 +872,6 @@ poker_ai play \
 | Opponent–opponent card-removal in the vector reach product is O(n_combos²) exact | Vector regime is heads-up only, so there is a single opponent range — no opponent–opponent term; mask only against the acting combo. |
 | Dense per-combo ranges too slow under frequent updates | Updates fire once per round boundary, O(n_combos) per observed action, amortized against search cost. Fallback: cluster-bucketed ranges behind a flag. |
 | Off-tree translation introduces exploitability | Paper-matching two-regime policy: randomized pseudo-harmonic on round 1, direct injection + re-search on rounds 2–4. |
-| Per-node `apply_action` deepcopy dominates wall-clock; serial search misses the 15 s budget | Make/undo traversal (`step_in_place` / `undo`, §6.7 Tier 1) removes the per-node copy; search-lifetime leaf-value cache removes the per-iteration rollout cost; both land before parallelism. |
+| Per-node env deepcopy dominates wall-clock; serial search misses the 15 s budget | Make/undo traversal (`step_in_place` / `undo`, §6.7 Tier 1) is the sole advance path — no per-node copy; search-lifetime leaf-value cache removes the per-iteration rollout cost; both land before parallelism. |
 | Parallel search non-deterministic or races on shared regret tables | Single-worker run reproduces the serial result bit-for-bit; per-worker RNG substreams via `SeedSequence.spawn`; MCCFR merges per-worker accumulators only at the `discount_interval` boundary (lock-free); vector regime shares nothing across boards. |
 | `numba`/native inner loop (Tier 1, §6.7) adds a heavy build-time dependency for uncertain gain | It is optional and gated behind Tier 1's pure-Python make/undo, which alone is expected to reach the budget; pursue only if profiling shows MCCFR fine-grained sharing dominates. |

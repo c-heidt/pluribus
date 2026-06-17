@@ -41,7 +41,7 @@ class TestOverlayScopedToPublicState:
         env.inject_action("raise:1.1")
         assert env.has_overlay_at_current_node
         # Step the env — public state (history) changes.
-        env_next = env.apply_action("call")
+        env_next = copy.deepcopy(env); env_next.step_in_place("call")
         assert not env_next.has_overlay_at_current_node
         assert "raise:1.1" not in env_next.legal_actions
 
@@ -49,7 +49,7 @@ class TestOverlayScopedToPublicState:
         env = _env()
         env.inject_action("raise:1.1")
         # Advance via deepcopy, leaving original env untouched.
-        _ = env.apply_action("call")
+        _ = copy.deepcopy(env); _.step_in_place("call")
         assert env.has_overlay_at_current_node
         assert "raise:1.1" in env.legal_actions
 
@@ -231,7 +231,7 @@ class TestLegalActionsOrdering:
         env = _env()
         env.inject_action("raise:1.1")
         assert "raise:1.1" in env.legal_actions
-        env_next = env.apply_action("raise:1.1")
+        env_next = copy.deepcopy(env); env_next.step_in_place("raise:1.1")
         assert env_next.pot_size > env.pot_size
 
 
@@ -255,7 +255,7 @@ class TestInjectApplyRoundTrip:
         bet_before = player.n_bet_chips
         pot_before = env.pot_size
 
-        env_next = env.apply_action("raise:1.1")
+        env_next = copy.deepcopy(env); env_next.step_in_place("raise:1.1")
         new_player = env_next.players[player.player_i]
 
         added = chips_before - new_player.n_chips
@@ -267,13 +267,13 @@ class TestInjectApplyRoundTrip:
         env = _env()
         env.inject_action("raise:1.1")
         assert env._n_raises == 0
-        env_next = env.apply_action("raise:1.1")
+        env_next = copy.deepcopy(env); env_next.step_in_place("raise:1.1")
         assert env_next._n_raises == 1
 
     def test_action_recorded_in_history(self):
         env = _env()
         env.inject_action("raise:1.1")
-        env_next = env.apply_action("raise:1.1")
+        env_next = copy.deepcopy(env); env_next.step_in_place("raise:1.1")
         assert env_next._history["pre_flop"][-1] == "raise:1.1"
 
     def test_next_state_is_terminal_legal(self):
@@ -281,7 +281,7 @@ class TestInjectApplyRoundTrip:
         # well-formed: at least fold and call/all_in available.
         env = _env()
         env.inject_action("raise:1.1")
-        env_next = env.apply_action("raise:1.1")
+        env_next = copy.deepcopy(env); env_next.step_in_place("raise:1.1")
         legal = [a for a in env_next.legal_actions if a is not None]
         assert "fold" in legal
         assert "call" in legal or "all_in" in legal
@@ -292,7 +292,7 @@ class TestInjectApplyRoundTrip:
         # should not show up.
         env = _env()
         env.inject_action("raise:1.1")
-        env_next = env.apply_action("raise:1.1")
+        env_next = copy.deepcopy(env); env_next.step_in_place("raise:1.1")
         assert not env_next.has_overlay_at_current_node
         assert "raise:1.1" not in env_next.legal_actions
 
@@ -304,7 +304,7 @@ class TestInjectApplyRoundTrip:
             env = _env()
             env.inject_action(action)
             assert action in env.legal_actions, action
-            env_next = env.apply_action(action)
+            env_next = copy.deepcopy(env); env_next.step_in_place(action)
             assert env_next.pot_size > env.pot_size, action
             # Final consistency: next state is well-formed.
             assert env_next.current_player.player_i != env.current_player.player_i

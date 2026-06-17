@@ -184,3 +184,15 @@ class Player:
     def is_all_in(self) -> bool:
         """True if the player is active but has no chips remaining."""
         return self._is_active and self.n_chips == 0
+
+    def capture_mutable(self) -> tuple:
+        """Snapshot the fields an action can mutate, for make/undo.
+
+        ``_cards`` / positional flags / ``order`` are fixed for the hand
+        and are not included.  Returns an immutable tuple, cheap to hold.
+        """
+        return (self.n_chips, self.n_bet_chips, self._is_active, self.is_turn)
+
+    def restore_mutable(self, snap: tuple) -> None:
+        """Restore the fields captured by :meth:`capture_mutable`."""
+        self.n_chips, self.n_bet_chips, self._is_active, self.is_turn = snap

@@ -148,7 +148,9 @@ def leaf_value(
             probs = np.asarray(probs, dtype=np.float64)
             probs /= probs.sum()
             idx = int(rng.choice(len(state.legal_actions), p=probs))
-            e = e.apply_action(state.legal_actions[idx])
+            # Forward rollout on a per-rollout env (from with_hole_cards);
+            # advance in place to terminal, then read e.payout.
+            e.step_in_place(state.legal_actions[idx])
         for i in range(n):
             accum[i] += float(e.payout[i])
         completed += 1

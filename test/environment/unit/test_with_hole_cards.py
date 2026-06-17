@@ -8,6 +8,8 @@ undealt segment is shuffled so per-rollout community deals don't
 prefer positions touched by the swap.
 """
 
+import copy
+
 import numpy as np
 import pytest
 
@@ -222,7 +224,7 @@ class TestDeckSync:
         env = _env()
         replacement = _disjoint_combo(env, 1)
         new_env = env.with_hole_cards(_holes_with(env, 1, replacement))
-        terminal = new_env.apply_action("fold")
+        terminal = copy.deepcopy(new_env); terminal.step_in_place("fold")
         assert terminal.is_terminal
         survivor_cards = (
             tuple(int(c) for c in terminal.players[1]._cards)
@@ -279,7 +281,7 @@ class TestAtomicBatch:
             old[1],
             new_card,
         )
-        terminal = new_env.apply_action("fold")
+        terminal = copy.deepcopy(new_env); terminal.step_in_place("fold")
         survivor_cards = (
             tuple(int(c) for c in terminal.players[1]._cards)
             + tuple(int(c) for c in terminal.community_cards)

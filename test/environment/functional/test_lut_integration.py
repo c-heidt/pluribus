@@ -13,6 +13,7 @@ The LUT directory is resolved from the environment variable
 ``PLURIBUS_LUT_PATH`` (default: ``data/20cards_exact``).
 """
 
+import copy
 import pytest
 
 from environment.poker_env import new_game
@@ -30,7 +31,7 @@ def _play_to_terminal(env, max_steps=500):
     steps = 0
     while not env.is_terminal and steps < max_steps:
         action = "call" if "call" in env.legal_actions else env.legal_actions[0]
-        env = env.apply_action(action)
+        env.step_in_place(action)
         steps += 1
     return env
 
@@ -94,7 +95,7 @@ class TestInfoSetWithLUT:
         # Player 0 info set
         info_0 = env.info_set
         # Advance to player 1's turn
-        env2 = env.apply_action("call")
+        env2 = copy.deepcopy(env); env2.step_in_place("call")
         if not env2.is_terminal:
             info_1 = env2.info_set
             # Different players hold different hole cards so info sets differ
@@ -105,7 +106,7 @@ class TestInfoSetWithLUT:
         env = new_game(n_players=2, card_info_lut=lut)
         # Play through pre-flop
         while env.betting_stage == "pre_flop":
-            env = env.apply_action("call")
+            env.step_in_place("call")
         if env.betting_stage == "flop":
             parsed = json.loads(env.info_set)
             assert "cards_cluster" in parsed
@@ -127,7 +128,7 @@ class TestInfoSetWithLUT:
             visited_stages.add(env.betting_stage)
             parsed = json.loads(env.info_set)
             assert "cards_cluster" in parsed
-            env = env.apply_action("call")
+            env.step_in_place("call")
             steps += 1
         # Must have passed through at least pre_flop and flop
         assert "pre_flop" in visited_stages

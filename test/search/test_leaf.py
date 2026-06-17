@@ -1,5 +1,6 @@
 """Tests for :mod:`poker_ai.search.leaf`."""
 
+import copy
 import warnings
 from collections import defaultdict
 from typing import List, Tuple
@@ -133,7 +134,7 @@ class TestLeafValueTerminal:
         root_env = _full_deck_env()
         _stub_lut(root_env)
         ctx = _build_ctx(root_env, n_rollouts=5)
-        leaf_env = root_env.apply_action("fold")
+        leaf_env = copy.deepcopy(root_env); leaf_env.step_in_place("fold")
         assert leaf_env.is_terminal
         result = leaf_value(leaf_env, {}, {}, ctx)
         expected = np.array(
@@ -147,7 +148,7 @@ class TestLeafValueTerminal:
         _stub_lut(root_env)
         policies = _uniform_policies()
         ctx = _build_ctx(root_env, policies=policies)
-        leaf_env = root_env.apply_action("fold")
+        leaf_env = copy.deepcopy(root_env); leaf_env.step_in_place("fold")
         leaf_value(leaf_env, {}, {}, ctx)
         for p in policies.values():
             assert p.calls == []
@@ -187,8 +188,8 @@ class TestHoleSampling:
         # entries are disjoint from board + my_hole.
         env = _full_deck_env()
         _stub_lut(env)
-        env = env.apply_action("call")
-        env = env.apply_action("call")
+        env.step_in_place("call")
+        env.step_in_place("call")
         assert env.betting_round == 1
         assert len(env.community_cards) == 3
         my_hole = set(int(c) for c in env.players[0].cards)

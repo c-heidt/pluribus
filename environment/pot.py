@@ -57,6 +57,14 @@ class Pot:
         """Clear all contributions, zeroing every player's entry."""
         self._chips = [0] * len(self._chips)
 
+    def capture(self) -> list:
+        """Snapshot per-player contributions for make/undo (a copy)."""
+        return list(self._chips)
+
+    def restore(self, snap: list) -> None:
+        """Restore the contributions captured by :meth:`capture`."""
+        self._chips = list(snap)
+
     @property
     def total(self) -> int:
         """Total chips currently in the pot."""

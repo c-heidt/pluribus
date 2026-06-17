@@ -42,7 +42,7 @@ def _env_with_seat1_acting():
     Returned env satisfies ``env.player_i == 1``."""
     env = _env()
     _stub_lut(env)
-    env = env.apply_action("call")
+    env.step_in_place("call")
     assert env.player_i == 1
     return env
 
