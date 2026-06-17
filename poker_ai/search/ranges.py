@@ -66,7 +66,16 @@ def _initial_uniform(
 
 
 class RangeTracker:
-    """Per-opponent dense-per-combo range estimates for one hand.
+    """Dense-per-combo range estimates for one hand, every live seat.
+
+    The tracker maintains a range for **every** live seat **including
+    the bot** (``my_seat``).  The bot's own range is its
+    observer-perspective distribution: uniform over board-compatible
+    combos, excluding only board conflicts — the combo that *is* the
+    bot's actual hand is **kept** (the search solves over the bot's
+    whole range and the agent plays the actual hand's row).  Opponent
+    ranges additionally exclude the bot's actual hole cards (known card
+    removal).
 
     Parameters
     ----------
@@ -74,13 +83,15 @@ class RangeTracker:
         Reference env, used only for combo enumeration / community
         cards.  Not deepcopied; the tracker reads from it.
     my_seat : int
-        Seat index of the bot.  Excluded from :meth:`snapshot`.
+        Seat index of the bot.  Tracked (observer perspective) and
+        present in :meth:`snapshot`.
     my_hole : tuple[int, int]
         Bot's hole cards.  Combos sharing any of these cards start with
-        zero weight in every opponent's range.
+        zero weight in every *opponent's* range, but are kept in the
+        bot's own range.
     live_seats : Iterable[int]
-        Seats with a range to track.  ``my_seat`` is silently filtered
-        out if included.
+        Seats with a range to track, including ``my_seat``.  ``my_seat``
+        is tracked even if omitted here.
     """
 
     def __init__(
@@ -94,9 +105,13 @@ class RangeTracker:
         self._my_seat = my_seat
         self._my_hole = (int(my_hole[0]), int(my_hole[1]))
         self._community: Set[int] = set(int(c) for c in env.community_cards)
-        initial = _initial_uniform(env, self._my_hole, self._community)
+        # The bot's own range excludes only board conflicts (observer
+        # perspective — its actual hand stays in the range); every
+        # opponent additionally excludes the bot's known hole cards.
+        seats = {int(s) for s in live_seats}
+        seats.add(int(my_seat))
         self._ranges: Dict[int, np.ndarray] = {
-            int(s): initial.copy() for s in live_seats if int(s) != my_seat
+            s: self._initial_for_seat(s) for s in seats
         }
         # Folded seats' marginals are retained here (moved from
         # ``_ranges`` by :meth:`on_seat_folded`) so the leaf evaluator
@@ -108,6 +123,16 @@ class RangeTracker:
         # the pre-fold belief.
         self._folded_ranges: Dict[int, np.ndarray] = {}
         self._decision_log: List[Tuple[int, str, str]] = []
+
+    def _initial_for_seat(self, seat: int) -> np.ndarray:
+        """Uniform initial range for ``seat`` over the current board.
+
+        The bot (``my_seat``) excludes only board conflicts (its actual
+        hand is kept — observer perspective); every other seat also
+        excludes the bot's known hole cards (card removal).
+        """
+        exclude = () if seat == self._my_seat else self._my_hole
+        return _initial_uniform(self._env_ref, exclude, self._community)
 
     def on_board_update(self, new_cards: Sequence[int]) -> None:
         """Zero every combo sharing a card with ``new_cards`` and
@@ -140,6 +165,14 @@ class RangeTracker:
         sigma_for_combo: Callable[[int], np.ndarray],
     ) -> None:
         """Bayes-update ``seat``'s range given the observed ``action``.
+
+        This is the round-boundary **replay primitive** (§6.2): the
+        agent buffers ``(seat, env_before, action)`` tuples during a
+        round and replays them through this method at the boundary
+        under the last search's average policy.  It services any
+        tracked seat, **including the bot** (``my_seat``) — the bot's
+        own actions Bayes-update its own range exactly like an
+        opponent's.
 
         ``sigma_for_combo(h)`` must return a probability vector aligned
         with ``[a for a in env_before.legal_actions if a is not None]``
@@ -194,8 +227,9 @@ class RangeTracker:
         return self._ranges[seat]
 
     def snapshot(self) -> Dict[int, Range]:
-        """Deep copy of all live opponent ranges, suitable for handing
-        to :meth:`SubgameContext.from_runtime`."""
+        """Deep copy of every live seat's range — **including the bot**
+        (``my_seat``, observer perspective) — suitable for handing to
+        :meth:`SubgameContext.from_runtime` as its ``ranges`` argument."""
         return {seat: w.copy() for seat, w in self._ranges.items()}
 
     def folded_snapshot(self) -> Dict[int, Range]:
@@ -214,6 +248,4 @@ class RangeTracker:
             RuntimeWarning,
             stacklevel=2,
         )
-        self._ranges[seat] = _initial_uniform(
-            self._env_ref, self._my_hole, self._community
-        )
+        self._ranges[seat] = self._initial_for_seat(seat)

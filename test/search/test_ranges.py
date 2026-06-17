@@ -101,17 +101,52 @@ class TestInitialUniform:
             else:
                 assert r[i] > 0.0
 
-    def test_snapshot_omits_my_seat(self):
+    def test_snapshot_includes_my_seat(self):
         _env_, tracker = _tracker(my_seat=0, live_seats=[0, 1])
         snap = tracker.snapshot()
-        assert 0 not in snap
+        assert 0 in snap  # the bot's own observer-perspective range
         assert 1 in snap
+
+    def test_my_range_keeps_my_hole_combos(self):
+        # The bot's own range is observer perspective: it excludes only
+        # board conflicts, so the combo that *is* the bot's actual hand
+        # (and every other my_hole-containing combo) keeps positive mass,
+        # while every opponent's range zeroes those combos.
+        env, tracker = _tracker(my_seat=0, live_seats=[0, 1])
+        my_hole = set(int(c) for c in env.players[0].cards)
+        my_r = tracker.range_of(0)
+        opp_r = tracker.range_of(1)
+        cc = env.combo_cards
+        saw_my_hole_combo = False
+        for i in range(env.n_combos):
+            uses_my_hole = int(cc[i, 0]) in my_hole or int(cc[i, 1]) in my_hole
+            if uses_my_hole:
+                assert my_r[i] > 0.0
+                assert opp_r[i] == 0.0
+                saw_my_hole_combo = True
+        assert saw_my_hole_combo
+        np.testing.assert_allclose(my_r.sum(), 1.0, rtol=1e-6)
 
     def test_dtype_and_shape(self):
         env, tracker = _tracker()
         r = tracker.range_of(1)
         assert r.dtype == np.float32
         assert r.shape == (env.n_combos,)
+
+    def test_observer_perspective_for_nonzero_my_seat(self):
+        # Guard the seat-aware branch isn't tied to index 0: with the
+        # bot at seat 1, seat 1's own range keeps its hole combos while
+        # seat 0 (an opponent) excludes them.
+        env, tracker = _tracker(my_seat=1, live_seats=[0, 1])
+        my_hole = set(int(c) for c in env.players[1].cards)
+        my_r = tracker.range_of(1)
+        opp_r = tracker.range_of(0)
+        cc = env.combo_cards
+        for i in range(env.n_combos):
+            uses_my_hole = int(cc[i, 0]) in my_hole or int(cc[i, 1]) in my_hole
+            if uses_my_hole:
+                assert my_r[i] > 0.0
+                assert opp_r[i] == 0.0
 
 
 class TestOnBoardUpdate:
@@ -260,20 +295,31 @@ class TestOnActionPreconditions:
         with pytest.raises(AssertionError):
             tracker.on_action(1, env, legal[0], _uniform_sigma(len(legal)))
 
-    def test_seat_is_my_seat_raises_key_error(self):
-        env, tracker = _tracker_seat1()
+    def test_on_action_updates_my_seat(self):
+        # The bot's own seat is now tracked; on_action services it like
+        # any other seat (round-boundary replay of the bot's own
+        # actions Bayes-updates the bot's own range).
+        env, tracker = _tracker(stub_lut=True, my_seat=0)
+        assert env.player_i == 0
         legal = [a for a in env.legal_actions if a is not None]
-        with pytest.raises(AssertionError):
-            # actor is seat 1, but caller passes my_seat=0 — actor-mismatch
-            # assert fires first.  Test the inverse: an env where seat 0
-            # is on action and caller asks the tracker about seat 0.
-            tracker.on_action(0, env, legal[0], _uniform_sigma(len(legal)))
-        # Now exercise the my-seat KeyError path: env at seat 0's turn,
-        # ask about seat 0 — should be KeyError (my_seat never tracked).
-        env0, tracker0 = _tracker(stub_lut=True, my_seat=0)
-        legal0 = [a for a in env0.legal_actions if a is not None]
-        with pytest.raises(KeyError):
-            tracker0.on_action(0, env0, legal0[0], _uniform_sigma(len(legal0)))
+        n_act = len(legal)
+        prior = tracker.range_of(0).copy()
+        likely = np.zeros(n_act, dtype=np.float32)
+        likely[0] = 0.9
+        likely[1:] = 0.1 / (n_act - 1)
+        unlikely = np.zeros(n_act, dtype=np.float32)
+        unlikely[0] = 0.05
+        unlikely[1:] = 0.95 / (n_act - 1)
+        group_a = {h for h in range(env.n_combos) if h % 2 == 0 and prior[h] > 0}
+
+        def sigma(h):
+            return likely if h in group_a else unlikely
+
+        mass_before = sum(prior[h] for h in group_a)
+        tracker.on_action(0, env, legal[0], sigma)
+        post = tracker.range_of(0)
+        assert sum(post[h] for h in group_a) > mass_before
+        np.testing.assert_allclose(post.sum(), 1.0, rtol=1e-6)
 
     def test_seat_after_fold_raises_key_error(self):
         env, tracker = _tracker_seat1()
@@ -366,16 +412,26 @@ class TestMultipleOpponents:
         np.testing.assert_allclose(tracker.range_of(2).sum(), 1.0, rtol=1e-6)
 
 
-class TestLiveSeatsFiltering:
+class TestLiveSeatsTracking:
 
-    def test_my_seat_silently_excluded(self):
+    def test_my_seat_is_tracked(self):
         env = _env()
         my_hole = tuple(int(c) for c in env.players[0].cards)
         tracker = RangeTracker(
             env, my_seat=0, my_hole=my_hole, live_seats=[0, 1]
         )
-        assert 0 not in tracker.snapshot()
+        assert 0 in tracker.snapshot()  # bot's own observer range
         assert 1 in tracker.snapshot()
+
+    def test_my_seat_tracked_even_if_omitted_from_live_seats(self):
+        env = _env()
+        my_hole = tuple(int(c) for c in env.players[0].cards)
+        tracker = RangeTracker(
+            env, my_seat=0, my_hole=my_hole, live_seats=[1]
+        )
+        snap = tracker.snapshot()
+        assert 0 in snap
+        assert 1 in snap
 
 
 class TestInitialUniformity:
@@ -480,6 +536,63 @@ class TestSnapshot:
         # Tracker state untouched.
         assert tracker.range_of(1)[0] != 999.0
         assert 42 not in tracker.snapshot()
+
+
+class TestMyRangeBoardAndFallback:
+    """The bot's own range is observer perspective: board-conflict
+    zeroing applies, but the bot's hole cards are never removed, so the
+    actual-hand combo survives board updates and collapse fallbacks."""
+
+    def _disjoint_board_card(self, env, my_hole):
+        """A single deck card that conflicts with neither ``my_hole`` nor
+        any existing community card."""
+        used = set(int(c) for c in my_hole) | set(
+            int(c) for c in env.community_cards
+        )
+        for c in env.deck._cards.tolist():
+            if int(c) not in used:
+                return int(c)
+        raise AssertionError("no disjoint board card available")
+
+    def test_board_update_keeps_actual_hand_combo(self):
+        env, tracker = _tracker(my_seat=0, live_seats=[0, 1])
+        my_hole = tuple(int(c) for c in env.players[0].cards)
+        actual_idx = env.combo_index[tuple(sorted(my_hole))]
+        board_card = self._disjoint_board_card(env, my_hole)
+        tracker.on_board_update([board_card])
+        my_r = tracker.range_of(0)
+        # Combos using the new board card are zeroed in the bot's range,
+        cc = env.combo_cards
+        for i in range(env.n_combos):
+            if board_card in (int(cc[i, 0]), int(cc[i, 1])):
+                assert my_r[i] == 0.0
+        # but the bot's actual hand (disjoint from the board) survives.
+        assert my_r[actual_idx] > 0.0
+        np.testing.assert_allclose(my_r.sum(), 1.0, rtol=1e-6)
+
+    def test_fallback_on_my_seat_excludes_board_only(self):
+        # Force the bot's own range to collapse, then confirm the
+        # rebuilt uniform excludes only the board (the actual-hand combo
+        # is kept) — not my_hole.
+        env, tracker = _tracker(stub_lut=True, my_seat=0)
+        assert env.player_i == 0
+        my_hole = tuple(int(c) for c in env.players[0].cards)
+        actual_idx = env.combo_index[tuple(sorted(my_hole))]
+        legal = [a for a in env.legal_actions if a is not None]
+        n_act = len(legal)
+        # sigma puts zero mass on the observed action for every combo.
+        zero_for_obs = np.zeros(n_act, dtype=np.float32)
+        zero_for_obs[1] = 1.0
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            tracker.on_action(0, env, legal[0], lambda _h: zero_for_obs)
+        assert any(issubclass(w.category, RuntimeWarning) for w in caught)
+        np.testing.assert_allclose(
+            tracker.range_of(0),
+            _initial_uniform(env, ()),  # board-only, my_hole kept
+            rtol=1e-6,
+        )
+        assert tracker.range_of(0)[actual_idx] > 0.0
 
 
 class TestZeroConflictingHelper:

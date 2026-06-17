@@ -766,7 +766,7 @@ the serial result bit-for-bit; multi-worker runs fix per-worker substreams
 |---|---|---|---|---|
 | 0 | Combo helpers + `Policy` ABC + `BlueprintPolicy` | `environment/utils.py`, `environment/poker_env.py`, `poker_ai/search/policy.py` | **done** — ×5 probability reweighting (`_reweight_bias`, `bias_multiplier=5.0`) | — |
 | 2 | Env overlay + `with_hole_cards` (done) + `SubgameContext` + new env accessors | `environment/poker_env.py`, `poker_ai/search/context.py` | **done** — all-seat `ranges` + `folded_ranges`; `DepthLimit` descriptor; `public_key`, `cluster_for`, `n_raises_this_round` | 0 |
-| 3 | Range tracking | `poker_ai/search/ranges.py` | **rework** — track the bot's own range; round-boundary update flow | 0 |
+| 3 | Range tracking | `poker_ai/search/ranges.py` | **done** — tracks the bot's own observer-perspective range (incl. `my_seat` in `snapshot`); `on_action` is the round-boundary replay primitive servicing every seat | 0 |
 | 4 | Chip↔action env API + search raise-size set | `environment/poker_env.py` | **rework** — pseudo-harmonic translation (randomized + deterministic) + history canonicalization; expose the coarse search raise-size set (≤ 5–6 / node) | — |
 | 5 | Continuation values | `poker_ai/search/leaf.py` | **rework** — `leaf_value` → `continuation_value(profile, ctx)`; fixed profile, per-seat scalar, rollout from concrete hands; hole-sampling helpers move to the solver | 0, 4 |
 | 6 | Solver (MCCFR + vector regimes) + `SearchPolicy` | `poker_ai/search/solver.py`, `policy.py` | todo — two CFR regimes; vectorised showdown for the vector regime | 0, 2, 3, 5 |
