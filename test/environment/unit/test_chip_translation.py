@@ -138,28 +138,18 @@ class TestStringForChips:
         env.current_player.n_chips = chips
         assert env.string_for_chips(chips) == "all_in"
 
-    def test_within_default_tolerance_snaps(self):
-        # chip=470 -> f_obs=3.1333, rel-to-3.0 = 0.0444 < 0.10.
+    def test_near_canonical_is_off_tree_not_snapped(self):
+        # No tolerance snapping any more: chip=470 (f_obs≈3.13, close to
+        # canonical 3.0) is returned OFF-TREE verbatim, not snapped to
+        # raise:3.0.  Approximation is the translation layer's job, not
+        # this chip→string boundary's.
         env = _env()
-        assert env.string_for_chips(470) == "raise:3.0"
-
-    def test_outside_default_tolerance_goes_off_tree(self):
-        # chip=496 -> f_obs=3.3067, rel-to-3.0 = 0.1022 > 0.10.
-        env = _env()
-        s = env.string_for_chips(496)
+        s = env.string_for_chips(470)
         assert s != "raise:3.0"
         assert s.startswith("raise:")
         # Off-tree string is *not* in canonical legal_actions until
         # it has been injected.
         assert s not in env.legal_actions
-
-    def test_tolerance_boundary_inclusive(self):
-        # Use tol = the actual relative distance; result must snap (<=).
-        env = _env()
-        chips = 494
-        f_obs = chips / env.pot_size
-        dist = abs(f_obs - 3.0) / 3.0
-        assert env.string_for_chips(chips, tol=dist) == "raise:3.0"
 
     def test_off_tree_string_has_stable_precision(self):
         env = _env()
@@ -187,33 +177,15 @@ class TestStringForChips:
         with pytest.raises(ValueError, match="positive"):
             env.string_for_chips(-50)
 
-    def test_just_inside_default_tolerance(self):
-        # chip=494 -> rel-to-3.0 = 0.0978 < 0.10, snaps.
+    def test_off_tree_string_carries_observed_fraction(self):
+        # Any non-exact, non-all-in chip raise is off-tree and the
+        # returned string reflects the OBSERVED fraction (no snap to a
+        # nearby canonical size).
         env = _env()
-        assert env.string_for_chips(494) == "raise:3.0"
-
-    def test_just_outside_default_tolerance(self):
-        # chip=496 -> rel-to-3.0 = 0.1022 > 0.10, off-tree.
-        env = _env()
-        assert env.string_for_chips(496) != "raise:3.0"
-
-    def test_picker_uses_relative_metric_with_sparse_canonical(self):
-        # F1 regression: with canonical [0.5, 3.0] and f_obs=2.5 the
-        # absolute-nearest is 0.5 (abs dist 1.0... wait, 2.5 to 0.5 = 2.0,
-        # 2.5 to 3.0 = 0.5 — abs and rel both pick 3.0 here).  Use
-        # f_obs=1.6 between the two canonicals: abs picks 0.5
-        # (dist 1.1) over 3.0 (dist 1.4); rel picks 3.0
-        # (rel 0.47) over 0.5 (rel 2.2).  With the relative
-        # metric the result is OFF_TREE (rel 0.47 > 0.10) and the
-        # off-tree string reflects the OBSERVED fraction, not a
-        # spurious snap to 0.5.
-        env = _env()
-        # Hand-set the canonical grid to a sparse one by monkey-patching.
         env.canonical_raise_fractions = lambda: [0.5, 3.0]
         f_obs_target = 1.6
         chips = int(round(f_obs_target * env.pot_size))
         s = env.string_for_chips(chips)
-        # OFF_TREE: returned string carries f_obs, not 0.5 or 3.0.
         assert s.startswith("raise:")
         f_parsed = float(s.split(":", 1)[1])
         assert abs(f_parsed - 1.6) < 1e-3, s

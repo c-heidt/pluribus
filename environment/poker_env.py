@@ -17,7 +17,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -125,6 +125,32 @@ RAISE_SIZES_BY_STAGE: Dict[str, Dict[str, List[float]]] = {
     "flop": {
         "first_raise":      [0.33, 0.5, 0.75, 1.0, 1.5, 2.0],
         "subsequent_raise": [0.5, 0.75, 1.0, 1.5],
+    },
+    "turn": {
+        "first_raise":      [0.5, 1.0],
+        "subsequent_raise": [1.0],
+    },
+    "river": {
+        "first_raise":      [0.5, 1.0],
+        "subsequent_raise": [1.0],
+    },
+}
+
+# Coarser raise-size abstraction used by the real-time subgame search
+# (docs/subgame_solving.md §3, §6.3).  Each cell is a strict subset of the
+# corresponding RAISE_SIZES_BY_STAGE cell, capped at <= 5-6 fractions per
+# node so the solver's action tree stays shallow.  The solver enumerates
+# its tree from THIS set (via `search_raise_actions`); `legal_actions`
+# stays on the full blueprint abstraction, and opponent raises off the
+# search set are injected (`inject_action`) and trigger a re-search.
+SEARCH_RAISE_SIZES_BY_STAGE: Dict[str, Dict[str, List[float]]] = {
+    "pre_flop": {
+        "first_raise":      [0.25, 0.5, 0.75, 1.0, 1.5, 2.0],
+        "subsequent_raise": [0.5, 0.75, 1.0, 1.5, 2.0],
+    },
+    "flop": {
+        "first_raise":      [0.33, 0.5, 1.0, 1.5, 2.0],
+        "subsequent_raise": [0.5, 1.0, 1.5],
     },
     "turn": {
         "first_raise":      [0.5, 1.0],
@@ -745,6 +771,105 @@ class PokerEnv:
         return raise_actions
 
     # ------------------------------------------------------------------
+    # Pseudo-harmonic action translation (Ganzfried & Sandholm 2013)
+    # ------------------------------------------------------------------
+    # Off-tree raise sizes are mapped onto a static abstraction grid.  The
+    # mapping is purely on pot-fractions, so the grid depends only on
+    # (stage, first-vs-subsequent raise) — never on pot/stack — which lets
+    # history canonicalisation run as a pure history walk (§6.3).
+
+    @staticmethod
+    def _pseudo_harmonic_prob(a: float, x: float, b: float) -> float:
+        """P(map ``x`` to ``A``) for ``A < x < B`` (Ganzfried-Sandholm).
+
+        ``((b - x) * (1 + a)) / ((b - a) * (1 + x))``.  Pure arithmetic;
+        the caller guarantees ``a < x < b`` (via
+        :meth:`_pseudo_harmonic_neighbours`).
+        """
+        return ((b - x) * (1.0 + a)) / ((b - a) * (1.0 + x))
+
+    @staticmethod
+    def _abstraction_fractions(
+        stage: str,
+        raise_index: int,
+        sizes_by_stage: Dict[str, Dict[str, List[float]]] = RAISE_SIZES_BY_STAGE,
+    ) -> List[float]:
+        """Sorted abstraction fractions for a ``(stage, raise_index)`` cell.
+
+        ``raise_index == 0`` selects the ``"first_raise"`` list, otherwise
+        ``"subsequent_raise"``.  Depends only on the size table — no chip
+        state — so it is valid for canonicalising a historical action.
+        """
+        cell = sizes_by_stage.get(stage, {})
+        key = "first_raise" if raise_index == 0 else "subsequent_raise"
+        return sorted(cell.get(key, []))
+
+    @staticmethod
+    def _pseudo_harmonic_neighbours(
+        fractions: List[float], x: float
+    ) -> Tuple[Optional[float], Optional[float], float]:
+        """Locate ``x`` in the sorted grid ``fractions``; return ``(A, B, P_A)``.
+
+        - empty grid           -> ``(None, None, 1.0)``  (caller leaves x as-is)
+        - ``x <= fractions[0]`` -> ``(None, fractions[0], 0.0)``  (below: always B)
+        - ``x >= fractions[-1]`` -> ``(fractions[-1], None, 1.0)`` (above: always A)
+        - ``x == f`` exactly    -> ``(f, f, 1.0)``  (on-tree identity)
+        - otherwise A < x < B bracketing pair, ``P_A`` from the formula.
+        """
+        if not fractions:
+            return (None, None, 1.0)
+        if x <= fractions[0]:
+            return (None, fractions[0], 0.0)
+        if x >= fractions[-1]:
+            return (fractions[-1], None, 1.0)
+        for i in range(len(fractions) - 1):
+            a, b = fractions[i], fractions[i + 1]
+            if x == a:
+                return (a, a, 1.0)
+            if a < x < b:
+                return (a, b, PokerEnv._pseudo_harmonic_prob(a, x, b))
+        # x == fractions[-1] is caught by the >= branch above; any
+        # remaining exact hit on an interior point returns identity.
+        return (x, x, 1.0)
+
+    def _translate_fraction(
+        self,
+        x: float,
+        stage: str,
+        raise_index: int,
+        *,
+        randomized: bool,
+        rng: Optional["np.random.Generator"] = None,
+        sizes_by_stage: Dict[str, Dict[str, List[float]]] = RAISE_SIZES_BY_STAGE,
+    ) -> float:
+        """Map off-tree pot-fraction ``x`` onto the abstraction grid.
+
+        ``randomized=True`` (round-1 mapping, §5): sample ``A`` with
+        probability ``P_A`` else ``B``; an explicit ``rng`` is required so
+        a fixed seed is reproducible end-to-end.  ``randomized=False``
+        (deterministic — history canonicalisation / continuation-rollout
+        blueprint lookups): return ``A`` iff ``P_A >= 0.5`` else ``B``.
+
+        An exact grid hit returns that fraction with **no** ``rng`` draw;
+        an empty grid returns ``x`` unchanged.
+        """
+        fractions = self._abstraction_fractions(stage, raise_index, sizes_by_stage)
+        a, b, p_a = self._pseudo_harmonic_neighbours(fractions, x)
+        if a is None and b is None:
+            return x
+        if a is None:
+            return b
+        if b is None or a == b:
+            return a
+        if randomized:
+            if rng is None:
+                raise ValueError(
+                    "_translate_fraction: randomized=True requires an rng"
+                )
+            return a if rng.random() < p_a else b
+        return a if p_a >= 0.5 else b
+
+    # ------------------------------------------------------------------
     # Public chip <-> action conversion
     # ------------------------------------------------------------------
 
@@ -775,14 +900,14 @@ class PokerEnv:
         return fraction
 
     def canonical_raise_fractions(self) -> List[float]:
-        """Currently-playable raise fractions for the actor.
+        """Currently-playable blueprint raise fractions for the actor.
 
         Mirrors the gating that :meth:`legal_actions` applies before
         delegating to :meth:`_get_available_raise_sizes`: an inactive
-        player, a call amount that meets or exceeds the stack, or
-        having already hit :data:`MAX_RAISES_PER_ROUND` all yield an
-        empty list.  Stack-clamping and min-raise enforcement come
-        from ``_get_available_raise_sizes`` itself.
+        player, a call amount that meets or exceeds the stack, or having
+        already hit :data:`MAX_RAISES_PER_ROUND` all yield an empty list.
+        Stack-clamping and min-raise enforcement come from
+        ``_get_available_raise_sizes`` itself.
         """
         if not self.current_player.is_active:
             return []
@@ -792,12 +917,35 @@ class PokerEnv:
             return []
         if self._n_raises >= MAX_RAISES_PER_ROUND:
             return []
-        raise_strs = self._get_available_raise_sizes()
         return [
             float(s.split(":", 1)[1])
-            for s in raise_strs
+            for s in self._get_available_raise_sizes()
             if s.startswith("raise:")
         ]
+
+    def search_raise_fractions(self) -> List[float]:
+        """Currently-playable **coarse search** raise fractions for the actor.
+
+        The :data:`SEARCH_RAISE_SIZES_BY_STAGE` subset of the *currently
+        playable blueprint fractions* (<= 5-6 per node).  Derived by
+        filtering :meth:`canonical_raise_fractions` rather than running an
+        independent gate, so ``search_raise_fractions() ⊆
+        canonical_raise_fractions() ⊆ legal_actions`` holds at **every**
+        node — every search action is directly playable, never silently
+        remapped.  This is the action tree the subgame solver enumerates;
+        :attr:`legal_actions` stays blueprint-based and off-search-set
+        raises are injected (docs/subgame_solving.md §6.3, §6.5).
+        """
+        cell = set(
+            self._abstraction_fractions(
+                self._betting_stage, self._n_raises, SEARCH_RAISE_SIZES_BY_STAGE
+            )
+        )
+        return [f for f in self.canonical_raise_fractions() if f in cell]
+
+    def search_raise_actions(self) -> List[str]:
+        """:meth:`search_raise_fractions` as ``"raise:<f>"`` strings."""
+        return [f"raise:{f}" for f in self.search_raise_fractions()]
 
     def chips_to_add(self, action: str) -> int:
         """Chips the actor must add to play ``action``.
@@ -835,7 +983,7 @@ class PokerEnv:
             return self._compute_raise_chip_amount(fraction, enforce_minimum=True)
         raise ValueError(f"chips_to_add: unknown action {action!r}")
 
-    def string_for_chips(self, chip_amount: int, tol: float = 0.10) -> str:
+    def string_for_chips(self, chip_amount: int) -> str:
         """Map an observed chip raise to the abstraction's action string.
 
         ``chip_amount`` is the total chips the actor added to the pot
@@ -845,26 +993,21 @@ class PokerEnv:
         raises (including ``all_in``) and so requires
         ``chip_amount > 0``.
 
-        Snapping rule:
+        Conversion rule (§6.3 — the chip→string boundary; it does **not**
+        approximate off-tree sizes):
 
         1. ``chip_amount == actor.n_chips`` -> ``"all_in"``.
         2. Exact match against any canonical clamp -> ``"raise:<f>"``.
-        3. Otherwise, the nearest canonical fraction is chosen by
-           **relative distance** ``|f - f_obs| / f``, and the same
-           metric gates the snap: a canonical ``f_near`` is accepted
-           iff ``|f_near - f_obs| / f_near <= tol``.  Same metric for
-           picking and gating: a candidate selected as "nearest" can
-           never be rejected by a stricter metric in a downstream
-           check.
-        4. Else return an off-tree ``"raise:<f_obs>"`` string with
-           ``f_obs`` rounded to 4 decimals (stable overlay key).
+        3. Else an off-tree ``"raise:<f_obs>"`` string with ``f_obs``
+           rounded to 4 decimals (a stable overlay key).
 
-        The default ``tol = 0.10`` corresponds to "the observed raise
-        is within 10% of the snapped abstraction size" — so e.g. an
-        observed 0.55× pot snaps to canonical 0.5× (exactly at the
-        boundary, inclusive), but 0.6× does not.  Relative semantics
-        scale evenly across the grid: 2.2× snaps to 2.0× at the same
-        tolerance ratio that 0.55× snaps to 0.5×.
+        Off-tree sizes are returned verbatim — they are **not** snapped
+        to the nearest abstraction fraction here.  Approximation is the
+        job of the explicit translation layer: rounds 2-4 inject the
+        off-tree size (:meth:`inject_action`) and re-search, while
+        round-1 / blueprint-lookup paths apply pseudo-harmonic
+        translation (:meth:`_translate_fraction`).  Snapping here would
+        pre-empt and corrupt both.
 
         The runtime then either feeds the result directly to
         :meth:`step_in_place` (if it is already canonical) or first
@@ -893,17 +1036,10 @@ class PokerEnv:
             )
         if chip_amount == self.current_player.n_chips:
             return "all_in"
-        canonical = self.canonical_raise_fractions()
-        for f in canonical:
+        for f in self.canonical_raise_fractions():
             if self._compute_raise_chip_amount(f, enforce_minimum=True) == chip_amount:
                 return f"raise:{f}"
         f_obs = chip_amount / self.pot_size
-        if canonical:
-            def _rel(f: float) -> float:
-                return abs(f - f_obs) / f
-            f_near = min(canonical, key=_rel)
-            if _rel(f_near) <= tol:
-                return f"raise:{f_near}"
         return f"raise:{round(f_obs, 4)}"
 
     # ------------------------------------------------------------------
@@ -1231,6 +1367,80 @@ class PokerEnv:
             info_set_dict, separators=(",", ":"), cls=_NumpyJSONEncoder
         )
 
+    def _canonicalize_history(
+        self, history: "Mapping[str, Sequence[str]]"
+    ) -> List[Tuple[str, List[str]]]:
+        """History with off-tree raise sizes snapped to the blueprint grid.
+
+        Walks each stage's action list in order, tracking a per-stage
+        raise index (0 for the first raise/all-in, 1+ thereafter) so the
+        ``first_raise`` vs ``subsequent_raise`` grid matches what the env
+        used when the action was played.  ``fold`` / ``call`` / ``skip``
+        are copied verbatim and leave the index unchanged; ``all_in`` is
+        copied verbatim and advances the index; an on-tree ``raise:<f>``
+        is copied verbatim while an off-tree one is replaced by its
+        deterministic pseudo-harmonic neighbour, both advancing the index.
+
+        Strict no-op when every raise is already on-tree (the universal
+        offline case): the returned ``(stage, actions)`` pairs preserve
+        ``history`` order and content, so :meth:`_blueprint_info_set`
+        produces a string byte-identical to :meth:`_compute_info_set`.
+        """
+        out: List[Tuple[str, List[str]]] = []
+        for stage, actions in history.items():
+            grid = self._abstraction_fractions(stage, 0)
+            sub_grid = self._abstraction_fractions(stage, 1)
+            raise_index = 0
+            rewritten: List[str] = []
+            for token in actions:
+                if isinstance(token, str) and token.startswith("raise:"):
+                    cell = grid if raise_index == 0 else sub_grid
+                    canonical_strs = {f"raise:{g}" for g in cell}
+                    if token in canonical_strs:
+                        rewritten.append(token)
+                    else:
+                        f = float(token.split(":", 1)[1])
+                        f_canon = self._translate_fraction(
+                            f, stage, raise_index, randomized=False
+                        )
+                        rewritten.append(f"raise:{f_canon}")
+                    raise_index += 1
+                elif token == "all_in":
+                    rewritten.append(token)
+                    raise_index += 1
+                else:  # fold / call / skip
+                    rewritten.append(token)
+            out.append((stage, rewritten))
+        return out
+
+    def _blueprint_info_set(self, cards: Sequence[int]) -> str:
+        """Like :meth:`_compute_info_set`, but with the action history
+        canonicalised (off-tree raises snapped to the nearest on-tree
+        node via deterministic pseudo-harmonic translation) so a
+        blueprint table lookup resolves instead of missing the table.
+
+        A strict no-op versus :meth:`_compute_info_set` whenever the
+        history contains no off-tree raises (see
+        :meth:`_canonicalize_history`).
+        """
+        lookup_cards = tuple(sorted(cards) + sorted(self.community_cards))
+        try:
+            cards_cluster = self.card_info_lut[self._betting_stage][lookup_cards]
+        except KeyError:
+            if self._betting_stage not in {"terminal", "show_down"}:
+                raise ValueError("Cards missing from LUT — load it correctly.")
+            return "default info set, please ensure you load it correctly"
+        info_set_dict = {
+            "cards_cluster": cards_cluster,
+            "history": [
+                {stage: list(actions)}
+                for stage, actions in self._canonicalize_history(self._history)
+            ],
+        }
+        return json.dumps(
+            info_set_dict, separators=(",", ":"), cls=_NumpyJSONEncoder
+        )
+
     @property
     def info_set(self) -> str:
         """JSON-encoded information set string for the current player.
@@ -1273,7 +1483,9 @@ class PokerEnv:
             legal_actions=legal,
         )
 
-    def policy_state_for(self, combo: Sequence[int]) -> PolicyState:
+    def policy_state_for(
+        self, combo: Sequence[int], *, for_blueprint: bool = False
+    ) -> PolicyState:
         """:class:`PolicyState` for the current actor under hypothetical hole ``combo``.
 
         Reads only public state (community cards, history,
@@ -1288,14 +1500,25 @@ class PokerEnv:
         combo : Sequence[int]
             Hypothetical hole for the current actor; typically a
             length-2 tuple drawn from ``env.combo_cards``.
+        for_blueprint : bool
+            When ``True`` the ``info_set`` is built with the action
+            history canonicalised (off-tree raises snapped to the
+            nearest on-tree node, §6.3) so a :class:`BlueprintPolicy`
+            lookup resolves to a populated regret row instead of the
+            uniform fallback.  A no-op on fully on-tree histories.
         """
         legal = tuple(a for a in self.legal_actions if a is not None)
         mask = self.get_valid_mask()
         mask.setflags(write=False)
+        info_set = (
+            self._blueprint_info_set(combo)
+            if for_blueprint
+            else self._compute_info_set(combo)
+        )
         return PolicyState(
             player_i=self.player_i,
             betting_round=self.betting_round,
-            info_set=self._compute_info_set(combo),
+            info_set=info_set,
             valid_mask=mask,
             legal_actions=legal,
         )
