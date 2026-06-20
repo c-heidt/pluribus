@@ -1,8 +1,15 @@
-"""Tests for :mod:`poker_ai.search.leaf`."""
+"""Tests for :mod:`poker_ai.search.leaf` (§6.4 continuation-value rework).
 
+``continuation_value(frontier_env, profile, ctx)`` evaluates a **fixed**
+continuation profile over the frontier's **concrete** hands by Monte-Carlo
+rollout — no hole resampling, the bias per seat supplied (not drawn).  When a
+rollout reaches an all-in showdown over an incomplete board it takes the exact
+board-average via :meth:`PokerEnv.runout_equity`, gated by the
+``use_decision_free_equity`` A/B toggle.
+"""
+
+import collections
 import copy
-import warnings
-from collections import defaultdict
 from typing import List, Tuple
 
 import numpy as np
@@ -11,37 +18,32 @@ import pytest
 from environment.player import Player
 from environment.poker_env import PokerEnv, PolicyState
 from poker_ai.search.context import SubgameContext
-from poker_ai.search.leaf import LeafConfig, leaf_value
+from poker_ai.search.leaf import LeafConfig, continuation_value
 from poker_ai.search.policy import BiasClass, Policy
 
 
-def _env(low: int = 10, high: int = 14, n_players: int = 2) -> PokerEnv:
-    return PokerEnv(
-        players=[Player(i, 10000) for i in range(n_players)],
-        low_card_rank=low,
-        high_card_rank=high,
-    )
-
-
 def _full_deck_env(n_players: int = 2) -> PokerEnv:
-    """Full deck (2..14) — required when the rollout must reach a
-    showdown / fold-terminal, because the Evaluator's lookup tables
-    are sized for the full rank range."""
     return PokerEnv(players=[Player(i, 10000) for i in range(n_players)])
 
 
 def _stub_lut(env: PokerEnv) -> None:
-    env.card_info_lut = defaultdict(lambda: defaultdict(lambda: 0))
+    env.card_info_lut = collections.defaultdict(lambda: collections.defaultdict(lambda: 0))
+
+
+def _to_flop(env: PokerEnv) -> None:
+    """Calldown pre-flop so a 3-card board is dealt."""
+    while env.betting_round < 1 and not env.is_terminal:
+        env.step_in_place("call" if "call" in env.legal_actions else "check")
 
 
 class UniformPolicy(Policy):
-    """Returns uniform over ``state.legal_actions``.  Records every call."""
+    """Uniform over ``state.legal_actions``; records every call."""
 
     def __init__(self) -> None:
-        self.calls: List[Tuple[int, BiasClass, Tuple[str, ...]]] = []
+        self.calls: List[Tuple[int, BiasClass, str]] = []
 
     def strategy(self, state: PolicyState, bias: BiasClass = "none") -> np.ndarray:
-        self.calls.append((state.player_i, bias, tuple(state.legal_actions)))
+        self.calls.append((state.player_i, bias, state.info_set))
         n = len(state.legal_actions)
         if n == 0:
             return np.array([], dtype=np.float32)
@@ -49,7 +51,7 @@ class UniformPolicy(Policy):
 
 
 class FoldOrCallPolicy(Policy):
-    """Always folds if legal; otherwise picks the first legal action."""
+    """Folds if legal, else the first legal action."""
 
     def strategy(self, state: PolicyState, bias: BiasClass = "none") -> np.ndarray:
         legal = state.legal_actions
@@ -62,45 +64,61 @@ class FoldOrCallPolicy(Policy):
         return probs
 
 
-def _uniform_policies() -> dict:
-    return {c: UniformPolicy() for c in ("none", "fold", "call", "raise")}
+class AllInPolicy(Policy):
+    """Goes all-in whenever legal, else the first legal action — forces a
+    decision-free runout."""
+
+    def strategy(self, state: PolicyState, bias: BiasClass = "none") -> np.ndarray:
+        legal = state.legal_actions
+        probs = np.zeros(len(legal), dtype=np.float32)
+        for i, a in enumerate(legal):
+            if a == "all_in":
+                probs[i] = 1.0
+                return probs
+        probs[0] = 1.0
+        return probs
 
 
-def _build_ctx(
-    env: PokerEnv,
-    *,
-    n_rollouts: int = 10,
-    seed=None,
-    policies: dict = None,
-    ranges: dict = None,
-) -> SubgameContext:
+class CheckCallPolicy(Policy):
+    """Only ever checks/calls — never folds, raises, or goes all-in, so a
+    rollout reaches a normal complete-board showdown (no decision-free runout)."""
+
+    def strategy(self, state: PolicyState, bias: BiasClass = "none") -> np.ndarray:
+        legal = state.legal_actions
+        probs = np.zeros(len(legal), dtype=np.float32)
+        for i, a in enumerate(legal):
+            if a in ("check", "call"):
+                probs[i] = 1.0
+                return probs
+        probs[0] = 1.0
+        return probs
+
+
+def _policies(cls=UniformPolicy) -> dict:
+    return {c: cls() for c in ("none", "fold", "call", "raise")}
+
+
+def _ctx(env, *, policies=None, n_rollouts=10, seed=42, use_equity=True):
     if policies is None:
-        policies = _uniform_policies()
-    if ranges is None:
-        ranges = {1: np.ones(env.n_combos, dtype=np.float32)}
-    if seed is None:
-        # Draw the ctx.rng seed from the global RNG state, which is
-        # itself reseeded per trial by the autouse ``_seeded`` fixture
-        # in ``conftest.py``.  Tests that need a specific seed (e.g.
-        # to verify reproducibility) pass it explicitly.
-        seed = int(np.random.randint(0, 2**31 - 1))
+        policies = _policies()
     return SubgameContext.from_runtime(
         env=env,
         my_seat=0,
         my_hole=tuple(int(c) for c in env.players[0].cards),
-        ranges=ranges,
+        ranges={1: np.ones(env.n_combos, dtype=np.float32)},
         folded_ranges={},
-        leaf=LeafConfig(policies=policies, n_rollouts=n_rollouts),
+        leaf=LeafConfig(policies=policies, n_rollouts=n_rollouts,
+                        use_decision_free_equity=use_equity),
         rng=np.random.default_rng(seed),
     )
 
 
-def _capture_with_hole_cards(monkeypatch):
-    """Install a spy on ``PokerEnv.with_hole_cards`` that records every
-    ``holes`` argument the leaf passes through, then defers to the
-    original method.  Returns the recording list (list of lists).
-    """
-    recorded: List[List[Tuple[int, int]]] = []
+def _profile(env, bias: BiasClass = "none") -> dict:
+    return {i: bias for i in range(env.n_players)}
+
+
+def _spy_with_hole_cards(monkeypatch):
+    recorded: List[List[Tuple[int, ...]]] = []
     original = PokerEnv.with_hole_cards
 
     def spy(self, holes):
@@ -113,413 +131,277 @@ def _capture_with_hole_cards(monkeypatch):
 
 class TestLeafConfig:
 
-    def test_fields_pass_through(self):
-        policies = _uniform_policies()
-        cfg = LeafConfig(policies=policies, n_rollouts=3)
-        assert cfg.policies is policies
+    def test_fields(self):
+        pol = _policies()
+        cfg = LeafConfig(policies=pol, n_rollouts=3)
+        assert cfg.policies is pol
         assert cfg.n_rollouts == 3
 
     def test_default_n_rollouts(self):
-        cfg = LeafConfig(policies=_uniform_policies())
-        assert cfg.n_rollouts == 20
+        assert LeafConfig(policies=_policies()).n_rollouts == 20
 
-    def test_default_n_rejection_retries(self):
-        cfg = LeafConfig(policies=_uniform_policies())
-        assert cfg.n_rejection_retries == 4
+    def test_default_use_decision_free_equity_true(self):
+        assert LeafConfig(policies=_policies()).use_decision_free_equity is True
 
 
-class TestLeafValueTerminal:
+class TestTerminal:
 
-    def test_terminal_leaf_returns_payout(self):
-        root_env = _full_deck_env()
-        _stub_lut(root_env)
-        ctx = _build_ctx(root_env, n_rollouts=5)
-        leaf_env = copy.deepcopy(root_env); leaf_env.step_in_place("fold")
-        assert leaf_env.is_terminal
-        result = leaf_value(leaf_env, {}, {}, ctx)
-        expected = np.array(
-            [float(leaf_env.payout[i]) for i in range(leaf_env.n_players)],
-            dtype=np.float64,
-        )
-        np.testing.assert_array_equal(result, expected)
+    def test_terminal_returns_payout(self):
+        env = _full_deck_env(); _stub_lut(env)
+        ctx = _ctx(env)  # build the ctx while the env is still non-terminal
+        env.step_in_place("fold")
+        assert env.is_terminal
+        out = continuation_value(env, _profile(env), ctx)
+        expected = np.array([float(env.payout[i]) for i in range(env.n_players)])
+        np.testing.assert_array_equal(out, expected)
 
-    def test_terminal_leaf_does_not_call_policy(self):
-        root_env = _full_deck_env()
-        _stub_lut(root_env)
-        policies = _uniform_policies()
-        ctx = _build_ctx(root_env, policies=policies)
-        leaf_env = copy.deepcopy(root_env); leaf_env.step_in_place("fold")
-        leaf_value(leaf_env, {}, {}, ctx)
-        for p in policies.values():
+    def test_terminal_allin_frontier_honours_equity_flag(self):
+        # An already-terminal all-in frontier is scored by the same toggle as a
+        # mid-rollout terminal: flag-on → exact runout_equity, flag-off → payout.
+        np.random.seed(13)
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        ctx_on = _ctx(env, n_rollouts=3, use_equity=True)
+        ctx_off = _ctx(env, n_rollouts=3, use_equity=False)
+        env.step_in_place("all_in")  # force-resolve → decision-free terminal
+        assert env.is_terminal and env.is_decision_free
+        eq = env.runout_equity()
+        out_on = continuation_value(env, _profile(env), ctx_on)
+        out_off = continuation_value(env, _profile(env), ctx_off)
+        for i in range(env.n_players):
+            assert abs(out_on[i] - eq[i]) < 1e-9
+            assert abs(out_off[i] - float(env.payout[i])) < 1e-9
+
+    def test_terminal_consults_no_policy(self):
+        env = _full_deck_env(); _stub_lut(env)
+        pol = _policies()
+        ctx = _ctx(env, policies=pol)
+        env.step_in_place("fold")
+        continuation_value(env, _profile(env), ctx)
+        for p in pol.values():
             assert p.calls == []
 
 
-class TestLeafValueDeterminism:
+class TestRolloutBasics:
 
-    def test_same_seed_same_value(self):
-        # The leaf's per-rollout decisions use ctx.rng; the env's
-        # deck.shuffle_undealt uses the global numpy RNG.  Pin both
-        # for bit-exact reproducibility.
-        env = _full_deck_env()
-        _stub_lut(env)
-        np.random.seed(0)
-        ctx_a = _build_ctx(env, seed=42, n_rollouts=8)
-        a = leaf_value(env, {1: ctx_a.ranges[1]}, {}, ctx_a)
-        np.random.seed(0)
-        ctx_b = _build_ctx(env, seed=42, n_rollouts=8)
-        b = leaf_value(env, {1: ctx_b.ranges[1]}, {}, ctx_b)
-        np.testing.assert_array_equal(a, b)
+    def test_shape_and_finite(self):
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        out = continuation_value(env, _profile(env), _ctx(env))
+        assert out.shape == (env.n_players,)
+        assert np.isfinite(out).all()
 
-    def test_different_seeds_diverge(self):
-        env = _full_deck_env()
-        _stub_lut(env)
-        ctx_a = _build_ctx(env, seed=1, n_rollouts=20)
-        ctx_b = _build_ctx(env, seed=2, n_rollouts=20)
-        a = leaf_value(env, {1: ctx_a.ranges[1]}, {}, ctx_a)
-        b = leaf_value(env, {1: ctx_b.ranges[1]}, {}, ctx_b)
-        assert not np.array_equal(a, b)
+    def test_n_rollouts_zero_returns_zeros(self):
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        out = continuation_value(env, _profile(env), _ctx(env, n_rollouts=0))
+        np.testing.assert_array_equal(out, np.zeros(env.n_players))
 
+    def test_large_sample_finite_zero_sum(self):
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        out = continuation_value(env, _profile(env), _ctx(env, n_rollouts=50, seed=123))
+        assert np.isfinite(out).all()
+        assert abs(out.sum()) < 1e-6
 
-class TestHoleSampling:
-
-    def test_sampled_holes_exclude_community_and_my_hole(self, monkeypatch):
-        # Walk to the flop so a real board is dealt; capture every
-        # ``with_hole_cards`` call's input list and verify opponent
-        # entries are disjoint from board + my_hole.
-        env = _full_deck_env()
-        _stub_lut(env)
-        env.step_in_place("call")
-        env.step_in_place("call")
-        assert env.betting_round == 1
-        assert len(env.community_cards) == 3
-        my_hole = set(int(c) for c in env.players[0].cards)
-        board = set(int(c) for c in env.community_cards)
-
-        recorded = _capture_with_hole_cards(monkeypatch)
-        policies = {c: FoldOrCallPolicy() for c in ("none", "fold", "call", "raise")}
-        ctx = _build_ctx(env, policies=policies, n_rollouts=30)
-        leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
-        assert recorded, "expected at least one with_hole_cards call"
-        for holes in recorded:
-            opp = set(holes[1])
-            assert opp.isdisjoint(board), (opp, board)
-            assert opp.isdisjoint(my_hole), (opp, my_hole)
-
-    def test_sampled_holes_mutually_disjoint_three_seats(self, monkeypatch):
-        env = _full_deck_env(n_players=3)
-        _stub_lut(env)
-        ranges = {
-            1: np.ones(env.n_combos, dtype=np.float32),
-            2: np.ones(env.n_combos, dtype=np.float32),
-        }
-        recorded = _capture_with_hole_cards(monkeypatch)
-        policies = {c: FoldOrCallPolicy() for c in ("none", "fold", "call", "raise")}
-        ctx = SubgameContext.from_runtime(
-            env=env,
-            my_seat=0,
-            my_hole=tuple(int(c) for c in env.players[0].cards),
-            ranges=ranges,
-            folded_ranges={},
-            leaf=LeafConfig(policies=policies, n_rollouts=15),
-            rng=np.random.default_rng(7),
+    def test_payout_from_env_fold_or_call(self):
+        # SB folds pre-flop under FoldOrCall → loses the small blind only.
+        env = _full_deck_env(); _stub_lut(env)
+        out = continuation_value(
+            env, _profile(env), _ctx(env, policies=_policies(FoldOrCallPolicy), n_rollouts=3)
         )
-        leaf_value(env, dict(ctx.ranges), {}, ctx)
-        assert recorded
-        for holes in recorded:
-            assert set(holes[1]).isdisjoint(set(holes[2])), holes
+        assert abs(out.sum()) < 1e-6
+        assert out[0] * out[1] < 0
 
-    def test_uniform_fallback_on_zero_range_warns(self):
-        env = _full_deck_env()
-        _stub_lut(env)
-        zero_range = {1: np.zeros(env.n_combos, dtype=np.float32)}
-        policies = {c: FoldOrCallPolicy() for c in ("none", "fold", "call", "raise")}
-        ctx = _build_ctx(
-            env, n_rollouts=3, ranges=zero_range, policies=policies
-        )
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            result = leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
-        assert any(issubclass(w.category, RuntimeWarning) for w in caught)
-        assert result.shape == (env.n_players,)
-        assert np.isfinite(result).all()
+    def test_float32_drift_succeeds(self):
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
 
-
-class TestRolloutMechanics:
-
-    def test_observed_biases_subset_of_classes(self):
-        env = _full_deck_env()
-        _stub_lut(env)
-        policies = _uniform_policies()
-        ctx = _build_ctx(env, policies=policies, n_rollouts=4)
-        leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
-        observed_biases = set()
-        for p in policies.values():
-            for _player_i, bias, _legal in p.calls:
-                observed_biases.add(bias)
-        assert observed_biases.issubset({"none", "fold", "call", "raise"})
-
-    def test_only_active_seat_strategy_consulted(self):
-        env = _full_deck_env()
-        _stub_lut(env)
-        policies = _uniform_policies()
-        ctx = _build_ctx(env, policies=policies, n_rollouts=5)
-        leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
-        for p in policies.values():
-            for player_i, _bias, _legal in p.calls:
-                assert player_i in {0, 1}
-
-    def test_uses_ctx_rng_for_sampling_decisions(self, monkeypatch):
-        # The leaf's sampling and action choices must come from
-        # ctx.rng, not the module-level ``np.random.choice``.
-        # ``Deck.shuffle_undealt`` uses ``np.random.shuffle`` which
-        # is a different function — only patch ``choice``.
-        env = _full_deck_env()
-        _stub_lut(env)
-
-        def _explode(*args, **kwargs):
-            raise AssertionError(
-                "leaf_value must not touch np.random.choice; "
-                "ctx.rng is the sole source of sampling randomness."
-            )
-
-        monkeypatch.setattr(np.random, "choice", _explode)
-        ctx = _build_ctx(env, n_rollouts=5)
-        result = leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
-        assert result.shape == (env.n_players,)
-
-    def test_payout_from_env_not_evaluator(self):
-        # FoldOrCallPolicy always folds; SB folds preflop → loses SB.
-        env = _full_deck_env()
-        _stub_lut(env)
-        policies = {c: FoldOrCallPolicy() for c in ("none", "fold", "call", "raise")}
-        ctx = _build_ctx(env, policies=policies, n_rollouts=3)
-        result = leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
-        assert abs(result.sum()) < 1e-6
-        assert result[0] * result[1] < 0
-
-
-class TestLeafValuePreconditions:
-
-    def test_live_ranges_with_my_seat_raises(self):
-        env = _env()
-        _stub_lut(env)
-        ctx = _build_ctx(env, n_rollouts=3)
-        bad_ranges = {0: np.ones(env.n_combos, dtype=np.float32)}
-        with pytest.raises(ValueError, match="my_seat"):
-            leaf_value(env, bad_ranges, {}, ctx)
-
-    def test_folded_ranges_with_my_seat_raises(self):
-        env = _env()
-        _stub_lut(env)
-        ctx = _build_ctx(env, n_rollouts=3)
-        with pytest.raises(ValueError, match="my_seat"):
-            leaf_value(env, {}, {0: np.ones(env.n_combos, dtype=np.float32)}, ctx)
-
-    def test_overlap_between_live_and_folded_raises(self):
-        # The same seat cannot be both live and folded simultaneously.
-        env = _env()
-        _stub_lut(env)
-        ctx = _build_ctx(env, n_rollouts=3)
-        w = np.ones(env.n_combos, dtype=np.float32)
-        with pytest.raises(ValueError, match="both"):
-            leaf_value(env, {1: w}, {1: w}, ctx)
-
-
-class TestNonTerminalEmptyRanges:
-
-    def test_empty_ranges_non_terminal(self):
-        # Heads-up env with no live opponents (e.g. bot is HU after a
-        # fold already happened upstream of the search).  No sampling
-        # needed; rollout runs against env's current holes.
-        env = _full_deck_env(n_players=3)
-        _stub_lut(env)
-        ctx = _build_ctx(
-            env,
-            n_rollouts=3,
-            ranges={
-                2: np.ones(env.n_combos, dtype=np.float32),
-            },
-        )
-        result = leaf_value(env, {}, {}, ctx)
-        assert result.shape == (env.n_players,)
-        assert np.isfinite(result).all()
-
-
-class TestNRolloutsEdge:
-
-    def test_zero_rollouts_returns_zeros(self):
-        env = _env()
-        _stub_lut(env)
-        ctx = _build_ctx(env, n_rollouts=0)
-        result = leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
-        np.testing.assert_array_equal(result, np.zeros(env.n_players))
-
-
-class TestBiasDiversity:
-
-    def test_all_four_classes_appear(self):
-        # 50 rollouts × 2 seats = 100 bias draws.  Missing-a-class
-        # probability is (3/4)^100 ≈ 3e-13.
-        env = _full_deck_env()
-        _stub_lut(env)
-        policies = _uniform_policies()
-        ctx = _build_ctx(env, policies=policies, n_rollouts=50)
-        leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
-        observed = set()
-        for p in policies.values():
-            for _player_i, bias, _legal in p.calls:
-                observed.add(bias)
-        assert observed == {"none", "fold", "call", "raise"}
-
-
-class TestHoleResampling:
-
-    def test_resampled_holes_reflect_one_hot_range(self, monkeypatch):
-        # One-hot range pins seat 1 to a target combo; every
-        # ``with_hole_cards`` call must place that combo at seat 1.
-        env = _full_deck_env()
-        _stub_lut(env)
-        original_opp = tuple(int(c) for c in env.players[1].cards)
-        my_hole = set(int(c) for c in env.players[0].cards)
-        target_idx = None
-        for i in range(env.n_combos):
-            combo = (int(env.combo_cards[i, 0]), int(env.combo_cards[i, 1]))
-            if combo != original_opp and not (set(combo) & my_hole):
-                target_idx = i
-                break
-        assert target_idx is not None
-        one_hot = np.zeros(env.n_combos, dtype=np.float32)
-        one_hot[target_idx] = 1.0
-        expected = (
-            int(env.combo_cards[target_idx, 0]),
-            int(env.combo_cards[target_idx, 1]),
-        )
-
-        recorded = _capture_with_hole_cards(monkeypatch)
-        policies = {c: FoldOrCallPolicy() for c in ("none", "fold", "call", "raise")}
-        ctx = _build_ctx(env, policies=policies, n_rollouts=5)
-        leaf_value(env, {1: one_hot}, {}, ctx)
-        assert recorded
-        for holes in recorded:
-            assert set(holes[1]) == set(expected), (holes[1], expected)
-
-
-class TestFoldedHoleSampling:
-    """Folded seats' holes are resampled from ``folded_ranges`` —
-    their fold-time marginal — rather than left at the simulator's
-    original deal.  Verifies the leaf calls ``with_hole_cards`` with
-    folded seats' cards drawn from the supplied range."""
-
-    def test_folded_seat_resampled_from_one_hot_range(self, monkeypatch):
-        # 3-player env, bot=0, seat 1 live, seat 2 "folded" — its
-        # range goes in folded_ranges.  One-hot pin verifies the
-        # resampling actually consumes folded_ranges.
-        env = _full_deck_env(n_players=3)
-        _stub_lut(env)
-        my_hole = set(int(c) for c in env.players[0].cards)
-        seat1_hole = set(int(c) for c in env.players[1].cards)
-        # Target combo disjoint from my_hole and from seat 1's
-        # current hole (so the rejection sampler never has to retry
-        # for an extreme reason).
-        target_idx = None
-        for i in range(env.n_combos):
-            combo = (int(env.combo_cards[i, 0]), int(env.combo_cards[i, 1]))
-            if not (set(combo) & my_hole) and not (set(combo) & seat1_hole):
-                target_idx = i
-                break
-        assert target_idx is not None
-        one_hot = np.zeros(env.n_combos, dtype=np.float32)
-        one_hot[target_idx] = 1.0
-        expected = (
-            int(env.combo_cards[target_idx, 0]),
-            int(env.combo_cards[target_idx, 1]),
-        )
-
-        recorded = _capture_with_hole_cards(monkeypatch)
-        policies = {c: FoldOrCallPolicy() for c in ("none", "fold", "call", "raise")}
-        live = {1: np.ones(env.n_combos, dtype=np.float32)}
-        folded = {2: one_hot}
-        ctx = SubgameContext.from_runtime(
-            env=env,
-            my_seat=0,
-            my_hole=tuple(int(c) for c in env.players[0].cards),
-            ranges=live,
-            folded_ranges=folded,
-            leaf=LeafConfig(policies=policies, n_rollouts=10),
-            rng=np.random.default_rng(3),
-        )
-        leaf_value(env, dict(ctx.ranges), folded, ctx)
-        assert recorded
-        for holes in recorded:
-            assert set(holes[2]) == set(expected), (holes[2], expected)
-
-    def test_bot_seat_unchanged_under_folded_sampling(self, monkeypatch):
-        env = _full_deck_env(n_players=3)
-        _stub_lut(env)
-        my_hole = tuple(int(c) for c in env.players[0].cards)
-        recorded = _capture_with_hole_cards(monkeypatch)
-        policies = {c: FoldOrCallPolicy() for c in ("none", "fold", "call", "raise")}
-        live = {1: np.ones(env.n_combos, dtype=np.float32)}
-        folded = {2: np.ones(env.n_combos, dtype=np.float32)}
-        ctx = SubgameContext.from_runtime(
-            env=env,
-            my_seat=0,
-            my_hole=my_hole,
-            ranges=live,
-            folded_ranges=folded,
-            leaf=LeafConfig(policies=policies, n_rollouts=5),
-            rng=np.random.default_rng(5),
-        )
-        leaf_value(env, dict(ctx.ranges), folded, ctx)
-        assert recorded
-        for holes in recorded:
-            assert tuple(holes[0]) == my_hole
-
-
-class TestRolloutAbort:
-
-    def test_returns_zeros_when_every_rollout_aborts(self):
-        env = _env()
-        _stub_lut(env)
-        all_cards = set()
-        for i in range(env.n_combos):
-            all_cards.add(int(env.combo_cards[i, 0]))
-            all_cards.add(int(env.combo_cards[i, 1]))
-        env.community_cards = tuple(all_cards)
-        zero_range = {1: np.zeros(env.n_combos, dtype=np.float32)}
-        ctx = _build_ctx(env, n_rollouts=3, ranges=zero_range)
-        with warnings.catch_warnings(record=True):
-            warnings.simplefilter("always")
-            result = leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
-        np.testing.assert_array_equal(result, np.zeros(env.n_players))
-
-
-class TestFloat32Probabilities:
-
-    def test_float32_probs_with_drift_succeeds(self):
-        env = _full_deck_env()
-        _stub_lut(env)
-
-        class Float32ThirdsPolicy(Policy):
-            def strategy(self, state: PolicyState, bias: BiasClass = "none") -> np.ndarray:
+        class Float32Thirds(Policy):
+            def strategy(self, state, bias="none"):
                 legal = state.legal_actions
                 if not legal:
                     return np.array([], dtype=np.float32)
                 base = np.full(len(legal), 1.0 / len(legal), dtype=np.float32)
                 return (base * np.float32(7.0)) / np.float32(7.0)
 
-        policies = {c: Float32ThirdsPolicy() for c in ("none", "fold", "call", "raise")}
-        ctx = _build_ctx(env, policies=policies, n_rollouts=10)
-        result = leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
-        assert result.shape == (env.n_players,)
+        out = continuation_value(
+            env, _profile(env), _ctx(env, policies={c: Float32Thirds() for c in
+                                                    ("none", "fold", "call", "raise")})
+        )
+        assert out.shape == (env.n_players,)
 
 
-class TestLeafConvergence:
+class TestDeterminism:
 
-    def test_large_sample_finite_and_zero_sum(self):
-        env = _full_deck_env()
-        _stub_lut(env)
-        ctx = _build_ctx(env, n_rollouts=50, seed=12345)
-        result = leaf_value(env, {1: ctx.ranges[1]}, {}, ctx)
-        assert np.isfinite(result).all()
-        assert abs(result.sum()) < 1e-6
+    def test_same_seed_identical(self):
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        np.random.seed(0)
+        a = continuation_value(env, _profile(env), _ctx(env, seed=7, n_rollouts=8))
+        np.random.seed(0)
+        b = continuation_value(env, _profile(env), _ctx(env, seed=7, n_rollouts=8))
+        np.testing.assert_array_equal(a, b)
+
+    def test_different_ctx_seed_diverges(self):
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        a = continuation_value(env, _profile(env), _ctx(env, seed=1, n_rollouts=20))
+        b = continuation_value(env, _profile(env), _ctx(env, seed=2, n_rollouts=20))
+        assert not np.array_equal(a, b)
+
+
+class TestNoResampling:
+
+    def test_every_rollout_uses_frontier_concrete_holes(self, monkeypatch):
+        env = _full_deck_env(n_players=3); _stub_lut(env); _to_flop(env)
+        expected = [tuple(int(c) for c in env.players[i].cards) for i in range(3)]
+        recorded = _spy_with_hole_cards(monkeypatch)
+        ctx = SubgameContext.from_runtime(
+            env=env, my_seat=0, my_hole=expected[0],
+            ranges={1: np.ones(env.n_combos, dtype=np.float32),
+                    2: np.ones(env.n_combos, dtype=np.float32)},
+            folded_ranges={}, leaf=LeafConfig(policies=_policies(FoldOrCallPolicy), n_rollouts=8),
+            rng=np.random.default_rng(3),
+        )
+        continuation_value(env, _profile(env), ctx)
+        assert recorded
+        for holes in recorded:
+            assert holes == expected  # identity every rollout — no resampling
+
+
+class TestProfileDrivesBias:
+
+    def test_seat_uses_its_profile_bias(self):
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        pol = _policies()
+        profile = {0: "raise", 1: "fold"}
+        continuation_value(env, profile, _ctx(env, policies=pol, n_rollouts=6))
+        # Every recorded call for a seat carries that seat's profile bias, and
+        # only the policy of that bias was consulted for the seat.
+        for bias, p in pol.items():
+            for seat, b, _info in p.calls:
+                assert b == bias                      # policy[bias] only ever queried with bias
+                assert profile[seat] == bias          # and only for seats whose profile is bias
+
+    def test_missing_seat_raises(self):
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        with pytest.raises(ValueError, match="missing acting seat"):
+            continuation_value(env, {0: "none"}, _ctx(env))  # seat 1 absent
+
+
+class TestBlueprintCanonicalisation:
+
+    def test_rollout_uses_for_blueprint_lookups(self, monkeypatch):
+        # Every policy query during a rollout must go through
+        # ``policy_state_for(..., for_blueprint=True)`` so off-tree histories
+        # canonicalise to populated blueprint rows (§6.3).
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        seen_flags = []
+        original = PokerEnv.policy_state_for
+
+        def spy(self, combo, *, for_blueprint=False):
+            seen_flags.append(for_blueprint)
+            return original(self, combo, for_blueprint=for_blueprint)
+
+        monkeypatch.setattr(PokerEnv, "policy_state_for", spy)
+        continuation_value(env, _profile(env), _ctx(env, n_rollouts=4))
+        assert seen_flags  # the rollout did query a policy
+        assert all(seen_flags)  # always for_blueprint=True
+
+
+class TestDecisionFreeEquityFlag:
+
+    def _flop_allin_frontier(self, seed):
+        np.random.seed(seed)
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        return env
+
+    def test_flag_on_equals_exact_runout_equity(self):
+        # AllIn profile on the flop → decision-free 2-card runout.  Flag-on
+        # value must equal the env's exact runout_equity (board-prefix fixed by
+        # the frontier, so reshuffling the undealt deck cannot change it).
+        env = self._flop_allin_frontier(7)
+        # Reference: step the all-in directly and read exact equity.
+        ref_env = copy.deepcopy(env)
+        ref_env.step_in_place("all_in")
+        assert ref_env.is_decision_free
+        ref = ref_env.runout_equity()
+        out = continuation_value(
+            env, _profile(env),
+            _ctx(env, policies=_policies(AllInPolicy), n_rollouts=5, use_equity=True),
+        )
+        for i in range(env.n_players):
+            assert abs(out[i] - ref[i]) < 1e-9
+
+    def test_flag_on_is_runout_rng_independent(self):
+        # With a deterministic all-in line and exact equity, the value does not
+        # depend on the global board-shuffle seed (the runout is integrated, not
+        # sampled).  Holes/flop are fixed; only the board-deal RNG varies.
+        base = self._fixed_frontier()
+        results = []
+        for s in range(4):
+            np.random.seed(2000 + s)
+            results.append(continuation_value(
+                base, _profile(base),
+                _ctx(base, policies=_policies(AllInPolicy), n_rollouts=3, use_equity=True),
+            ))
+        for r in results[1:]:
+            np.testing.assert_array_equal(results[0], r)
+
+    def test_flag_off_samples_and_can_differ(self):
+        # Flag-off uses the env's single sampled runout → varies with the
+        # board-deal RNG, and differs from the exact flag-on value.
+        base = self._fixed_frontier()
+        ref_env = copy.deepcopy(base); ref_env.step_in_place("all_in")
+        exact = ref_env.runout_equity()
+        sampled = []
+        for s in range(8):
+            np.random.seed(3000 + s)
+            sampled.append(continuation_value(
+                base, _profile(base),
+                _ctx(base, policies=_policies(AllInPolicy), n_rollouts=1, use_equity=False),
+            ))
+        # At least one sampled single-board value differs from the exact mean.
+        assert any(abs(v[0] - exact[0]) > 1e-6 for v in sampled)
+
+    def test_flag_is_noop_when_no_allin_occurs(self):
+        # A check/call-down reaches a normal complete-board showdown — never a
+        # decision-free runout — so flag on and off must agree bit-for-bit.
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        pol_on = _policies(CheckCallPolicy)
+        pol_off = _policies(CheckCallPolicy)
+        np.random.seed(5)
+        on = continuation_value(env, _profile(env),
+                                _ctx(env, policies=pol_on, n_rollouts=4, seed=8, use_equity=True))
+        np.random.seed(5)
+        off = continuation_value(env, _profile(env),
+                                 _ctx(env, policies=pol_off, n_rollouts=4, seed=8, use_equity=False))
+        np.testing.assert_array_equal(on, off)
+
+    def test_three_way_decision_free_uses_exact_equity(self):
+        # An all-in line in a 3-way subgame (side pots) takes the exact
+        # board-average; flag-on equals the env's runout_equity.
+        np.random.seed(21)
+        env = _full_deck_env(n_players=3); _stub_lut(env); _to_flop(env)
+        ref_env = copy.deepcopy(env)
+        # Drive the same all-in line the AllInPolicy would on the flop.
+        guard = 0
+        while not ref_env.is_terminal and guard < 8:
+            legal = [a for a in ref_env.legal_actions if a is not None]
+            ref_env.step_in_place("all_in" if "all_in" in legal else legal[0])
+            guard += 1
+        if not ref_env.is_decision_free:
+            pytest.skip("flop line did not reach a decision-free runout")
+        ref = ref_env.runout_equity()
+        ctx = SubgameContext.from_runtime(
+            env=env, my_seat=0, my_hole=tuple(int(c) for c in env.players[0].cards),
+            ranges={1: np.ones(env.n_combos, dtype=np.float32),
+                    2: np.ones(env.n_combos, dtype=np.float32)},
+            folded_ranges={},
+            leaf=LeafConfig(policies=_policies(AllInPolicy), n_rollouts=5,
+                            use_decision_free_equity=True),
+            rng=np.random.default_rng(0),
+        )
+        out = continuation_value(env, _profile(env), ctx)
+        for i in range(3):
+            assert abs(out[i] - ref[i]) < 1e-9
+
+    def _fixed_frontier(self) -> PokerEnv:
+        # A frontier with deterministic holes/flop so only the runout varies.
+        np.random.seed(99)
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        return env

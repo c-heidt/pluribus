@@ -67,6 +67,7 @@ scope of this document.
 | Range representation | Dense per-combo distribution for **every** player still in the hand, including the bot (observer perspective) |
 | Belief updates | Bayes' rule at round boundaries under the previous search's weighted-average strategy (blueprint if no search has run yet this hand) |
 | Strategy played | Final iteration of the search; the weighted average is kept only for belief updates |
+| Leaf / terminal all-in runouts | **Exact** board-averaged equity at decision-free (all-in) showdowns instead of the paper's single sampled runout (§6.4.1) — an accepted, flag-toggled divergence (`use_decision_free_equity`), alongside the 200-vs-500 LUT divergence |
 | Action translation | Pseudo-harmonic: randomized variant on round 1; deterministic variant for blueprint lookups on histories containing off-tree actions; rounds 2–4 always inject the off-tree action and re-search |
 | Round-1 search trigger | Opponent raise more than $100 from every size in the blueprint abstraction **and** ≤ 4 players remaining in the hand; otherwise blueprint play with randomized pseudo-harmonic mapping |
 | Search budget | Dual cap: 10 000 iterations AND 15 s wall-clock; whichever hits first (CLI-configurable) |
@@ -459,6 +460,7 @@ those concrete hands:
 class LeafConfig:
     policies: Dict[BiasClass, Policy]     # the four §4 variants
     n_rollouts: int = 20
+    use_decision_free_equity: bool = True # §6.4.1 A/B toggle
 
 def continuation_value(
     frontier_env: PokerEnv,               # at the leaf; every seat's hole already set
@@ -470,19 +472,67 @@ def continuation_value(
 Algorithm per call: repeat `n_rollouts` times — roll a per-rollout
 `with_hole_cards` env forward in place via `env.step_in_place(a)` until
 `env.is_terminal`, with each acting seat playing
-`cfg.policies[profile[seat]].strategy(state, bias=profile[seat])`. Future board
-cards are dealt by `step_in_place` as the rollout crosses round boundaries;
+`cfg.policies[profile[seat]].strategy(state, bias=profile[seat])`. The acting
+seat is queried through `env.policy_state_for(own_hole, for_blueprint=True)` so
 blueprint lookups on histories containing off-tree actions canonicalize via
-deterministic pseudo-harmonic (§6.3). Read per-seat payoff from `env.payout`
-(do **not** re-implement side pots). Return the per-seat mean.
+deterministic pseudo-harmonic (§6.3). Future board cards are dealt by
+`step_in_place` as the rollout crosses round boundaries. Read per-seat payoff
+from `env.payout` (do **not** re-implement side pots) — except at a
+decision-free all-in showdown, where the exact board-average is taken instead
+(§6.4.1). Return the per-seat mean. `ctx.rng` drives action sampling; the board
+runout uses the env's global-`np.random` deal, as elsewhere in the engine
+(determinism tests pin both).
+
+#### 6.4.1 Decision-free runout equity (over-the-paper improvement)
+
+The paper scores an all-in showdown by sampling **one** board runout. But once
+betting is closed (an all-in showdown), the rest of the hand is **pure chance**
+with a **board-independent side-pot structure**, so its value can be integrated
+**exactly** over the remaining board completions instead of sampled — a strict
+variance reduction concentrated on the highest-variance terminals. This is an
+explicit, measurable divergence from the paper.
+
+It is a **shared env primitive**, not a leaf-only addition:
+
+```python
+# environment/poker_env.py
+@property
+def is_decision_free(self) -> bool: ...        # all-in showdown over an incomplete board
+def runout_equity(self) -> Dict[int, float]:   # exact mean payout over all board completions
+```
+
+When a hand force-resolves to showdown over an incomplete board, the env records
+a pre-runout snapshot (board prefix, frozen pot contributions, active mask)
+*before* `compute_winners` resets the pot; `runout_equity` enumerates every
+completion of that prefix, scoring each with the existing scalar evaluator and
+`Pot.compute_utility` (side pots **reused, not re-implemented**), and returns the
+mean minus each seat's contribution. It is **decoupled from the F2 vectorized
+(range-vs-range) showdown** — at a decision-free node the hands are concrete.
+The enumeration is bounded in search (≤2 board cards → ≤~1000 unordered
+completions) and capped with a Monte-Carlo fallback for the pathological deep
+runout (e.g. a pre-flop all-in). Both the **leaf rollouts** and the **solver's
+forced-runout terminals** (§6.5) consume the same primitive, so their estimators
+stay consistent. The `LeafConfig.use_decision_free_equity` flag (read by the leaf
+here and by the solver as `cfg.leaf.use_decision_free_equity`) toggles the whole
+effect for A/B measurement; `False` reproduces the paper's sampled single-board
+runout.
+
+**Expected improvement** (a hypothesis to be measured, not a guarantee):
+lower-variance leaf/terminal values yield a cleaner meta-game/CFR signal and
+steadier convergence, amplified by the search-lifetime cache below (a value
+computed once and reused across ~10⁴ iterations benefits from being exact). The
+net effect is to be quantified by bb/100 and convergence-stability deltas
+between flag-on and flag-off runs.
 
 The hands are **not** resampled here — the belief is integrated by the solver's
 joint root sampling across MCCFR iterations (§6.5), not inside the leaf; the
 hole-sampling helper (`_sample_all_holes`, which draws one assignment directly
 from the joint belief distribution, §6.5) moves to the solver's root-sampling step. The profile is **fixed** by the caller;
 nothing about the continuation choice is sampled inside this function (the
-random-bias draw of the original design is gone). Determinism: `ctx.rng` is the
-sole RNG; tests assert identical output for a fixed seed.
+random-bias draw of the original design is gone). Determinism: `ctx.rng` drives
+action sampling and the board runout uses the engine's global `np.random` deal,
+so tests pin both seeds for bit-exact reproducibility (RNG unification is
+deferred §6.7 plumbing).
 
 **Caching across the whole search, not just a traversal.** The four bias
 policies are static blueprint reweightings, so for a fixed `(leaf public_key,
@@ -768,8 +818,9 @@ the serial result bit-for-bit; multi-worker runs fix per-worker substreams
 | 2 | Env overlay + `with_hole_cards` (done) + `SubgameContext` + new env accessors | `environment/poker_env.py`, `poker_ai/search/context.py` | **done** — all-seat `ranges` + `folded_ranges`; `DepthLimit` descriptor; `public_key`, `cluster_for`, `n_raises_this_round` | 0 |
 | 3 | Range tracking | `poker_ai/search/ranges.py` | **done** — tracks the bot's own observer-perspective range (incl. `my_seat` in `snapshot`); `on_action` is the round-boundary replay primitive servicing every seat | 0 |
 | 4 | Chip↔action env API + search raise-size set | `environment/poker_env.py` | **done** — pseudo-harmonic translation (`_translate_fraction`, randomized + deterministic); history canonicalization (`_canonicalize_history`/`_blueprint_info_set`/`policy_state_for(for_blueprint=…)`, no-op on on-tree histories); `SEARCH_RAISE_SIZES_BY_STAGE` + `search_raise_fractions`/`search_raise_actions`; `string_for_chips` tolerance snap removed | — |
-| 5 | Continuation values | `poker_ai/search/leaf.py` | **rework** — `leaf_value` → `continuation_value(profile, ctx)`; fixed profile, per-seat scalar, rollout from concrete hands; hole-sampling helpers move to the solver | 0, 4 |
-| 6 | Solver (MCCFR + vector regimes) + `SearchPolicy` | `poker_ai/search/solver.py`, `policy.py` | todo — two CFR regimes; vectorised showdown for the vector regime | 0, 2, 3, 5 |
+| 5.1 | Decision-free runout evaluator (§6.4.1) | `environment/poker_env.py` | **done** — `is_decision_free` + `runout_equity` (exact board-average over completions, side-pots via `Pot.compute_utility`, cap+MC fallback); pre-runout snapshot recorded at the force-resolve (`_runout_info`, undo/deepcopy round-tripped); brute-force tested. Shared by the leaf (5.2) and the solver's forced-runout terminals (row 6) | 0 |
+| 5.2 | Continuation values | `poker_ai/search/leaf.py` | **done** — `leaf_value` → `continuation_value(frontier_env, profile, ctx)`; fixed profile, per-seat scalar, rollout from concrete hands (no resampling); blueprint-canonical lookups; decision-free exact equity via 5.1 gated by `use_decision_free_equity`; obsolete hole-samplers deleted (joint sampler is the solver's, row 6) | 0, 4, 5.1 |
+| 6 | Solver (MCCFR + vector regimes) + `SearchPolicy` | `poker_ai/search/solver.py`, `policy.py` | todo — two CFR regimes; vectorised showdown for the vector regime; consumes `runout_equity` (5.1) at forced-runout terminals under the shared `use_decision_free_equity` flag | 0, 2, 3, 5.1, 5.2 |
 | 7 | Search-aware agent | `poker_ai/search/agent.py`, terminal wiring | todo | 3, 4, 6 |
 | 8 | CLI, config, tests | existing Click runner, `test/search/` | partial | 0–7 |
 | 9 | Make/undo traversal (`step_in_place` / `undo`) + search-lifetime leaf-value cache + per-row σ memoization (Tier 1, §6.7) | `environment/poker_env.py`, `poker_ai/search/solver.py`, `leaf.py` | **partial** — env `step_in_place`/`undo` **done** and is now the **sole** advance API (`apply_action` deleted; blueprint CFR + strategy pass on make/undo); leaf-value cache + per-row σ memoization still todo (need the solver, row 6) | 5, 6 |
@@ -817,10 +868,24 @@ poker_ai play \
     board-conflict zeroing; uniform fallback on the numerical floor;
     the bot's own range is tracked and updated; opponents' ranges
     exclude the bot's actual cards while the bot's own does not.
+  - `environment/poker_env.py` decision-free runout (§6.4.1): `runout_equity`
+    matches an independent brute-force enumerate-and-score reference to exact
+    integer chips (heads-up and 3-way unequal-stack side pots); `is_decision_free`
+    is True only at an all-in showdown over an incomplete board (False for
+    fold-terminals, complete-board river all-ins, and non-terminal states);
+    zero-sum; card removal excludes every dealt hole; the exact equity equals
+    the mean of the env's own sampled-board resolution; make/undo + deepcopy
+    round-trip the `_runout_info` snapshot; the cap fallback samples and warns.
   - `leaf.py`: deterministic output under a fixed seed; for a fixed
     `profile`, only `policies[profile[seat]]` is consulted for that seat
-    and with that bias; rolls from the env's already-set concrete hands
-    (no resampling); payoff read from `env.payout`; per-seat scalar return.
+    and with that bias (heterogeneous profile honoured; a missing acting seat
+    raises); rolls from the env's already-set concrete hands (no resampling —
+    every `with_hole_cards` call gets the frontier holes); blueprint-canonical
+    lookups (`for_blueprint=True`); payoff read from `env.payout`; per-seat
+    scalar return. **Decision-free flag**: with `use_decision_free_equity=True`
+    an all-in line equals the env's exact `runout_equity` and is runout-RNG
+    independent; with `False` it takes the sampled single-board path and can
+    differ (the paper baseline).
   - `solver.py`: regime selection picks MCCFR for round-1/round-2/large
     and vector for heads-up turn/river; terminates on either stopping
     criterion; per-hand tables released; root-street rows per-combo,

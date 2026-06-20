@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import collections
 import copy
+import itertools
 import json
 import logging
 import math
@@ -94,9 +95,21 @@ class UndoToken:
     pot_chips: List[int]
     player_states: List[tuple]
     history: Dict[str, List[str]]
+    runout_info: Optional[Tuple]
 
 
 logger = logging.getLogger("environment.poker_env")
+
+
+def _n_choose_k(n: int, k: int) -> int:
+    """Binomial coefficient C(n, k) (``math.comb`` is Python 3.8+; we target 3.7)."""
+    if k < 0 or k > n:
+        return 0
+    k = min(k, n - k)
+    num = 1
+    for i in range(k):
+        num = num * (n - i) // (i + 1)
+    return num
 
 
 class _NumpyJSONEncoder(json.JSONEncoder):
@@ -347,6 +360,13 @@ class PokerEnv:
         self.pot: Pot = Pot(n_players)
         self.deck: Deck = Deck(low_card_rank, high_card_rank)
         self.community_cards: tuple = ()
+        # Snapshot of a decision-free (all-in) board runout, recorded when a
+        # hand force-resolves to showdown over an *incomplete* board (§6.4
+        # decision-free runout equity).  ``None`` unless the hand ended that
+        # way.  Layout: ``(prefix_board, pot_contributions, active_mask)`` —
+        # all immutable — captured *before* ``compute_winners`` resets the pot,
+        # so :meth:`runout_equity` can integrate over every board completion.
+        self._runout_info: Optional[Tuple] = None
 
         # Round setup: reset pot, assign order, post blinds
         self.pot.reset()
@@ -434,7 +454,7 @@ class PokerEnv:
             "_skip_counter", "_first_move_of_current_round",
             "_last_raise_amount", "_all_players_have_made_action",
             "_n_actions", "_n_raises", "_player_i_index",
-            "_n_players_started_round",
+            "_n_players_started_round", "_runout_info",
         ):
             object.__setattr__(new, attr, copy.deepcopy(getattr(self, attr), memo))
         return new
@@ -531,6 +551,19 @@ class PokerEnv:
                     self._betting_stage = "terminal"
                     cards_needed = 5 - len(self.community_cards)
                     if cards_needed > 0:
+                        # All-in showdown over an incomplete board: the rest of
+                        # the hand is pure chance.  Record the pre-runout state
+                        # (board prefix, pot contributions, active mask) *before*
+                        # the board is dealt and ``compute_winners`` resets the
+                        # pot, so :meth:`runout_equity` can integrate the value
+                        # over every board completion (§6.4).  Only meaningful
+                        # with >=2 players still active (an actual showdown).
+                        if dynamics.n_active_players(self) >= 2:
+                            self._runout_info = (
+                                tuple(self.community_cards),
+                                tuple(self.pot.capture()),
+                                tuple(p.is_active for p in self.players),
+                            )
                         self.community_cards += self.deck.deal_community(cards_needed)
                 if self._betting_stage in {"terminal", "show_down"}:
                     dynamics.compute_winners(self)
@@ -573,6 +606,7 @@ class PokerEnv:
         self._n_raises = token.n_raises
         self._player_i_index = token.player_i_index
         self._n_players_started_round = token.n_players_started_round
+        self._runout_info = token.runout_info
         self.community_cards = token.community_cards
         self.deck.restore(token.deck_cursor)
         self.pot.restore(token.pot_chips)
@@ -609,6 +643,7 @@ class PokerEnv:
             pot_chips=self.pot.capture(),
             player_states=[p.capture_mutable() for p in self.players],
             history={stage: list(actions) for stage, actions in self._history.items()},
+            runout_info=self._runout_info,
         )
 
     # ------------------------------------------------------------------
@@ -1599,6 +1634,126 @@ class PokerEnv:
             i: player.n_chips - self._initial_n_chips
             for i, player in enumerate(self.players)
         }
+
+    @property
+    def is_decision_free(self) -> bool:
+        """True iff the hand resolved as an all-in showdown over an incomplete
+        board — a *decision-free* runout whose value depends only on the
+        remaining community cards (§6.4).
+
+        Equivalent to "a :meth:`runout_equity` is applicable and differs from
+        the single sampled :attr:`payout`".  Set when the env force-resolves to
+        showdown with the board not yet complete and at least two players still
+        active; ``False`` for fold-terminals, complete-board (river) showdowns,
+        and every non-terminal state.  The bot/solver use it to decide whether
+        to replace the env's single sampled runout with the exact board-average.
+        """
+        return self._runout_info is not None
+
+    def runout_equity(
+        self, *, rng: Optional["np.random.Generator"] = None, cap: int = 5000
+    ) -> Dict[int, float]:
+        """Exact expected per-seat chip delta over every board completion of a
+        decision-free all-in runout (§6.4).
+
+        Replaces the env's single sampled runout (one random board scored by
+        ``compute_winners``) with the mean over **all** completions of the
+        committed board prefix — the value the depth-limited solver and the
+        leaf evaluator want for an all-in showdown.  Reuses the recorded
+        pre-runout snapshot (``_runout_info``): the board prefix, the frozen
+        per-player pot contributions (side-pot structure is board-independent
+        once all bets are in), and the active mask.  Side-pot distribution is
+        delegated to :meth:`Pot.compute_utility` — not re-implemented.
+
+        Card removal excludes every dealt hole (active *and* folded seats) and
+        the prefix board from the completion deck.  The result has the same
+        shape/sign convention as :attr:`payout` but is float-valued.
+
+        Parameters
+        ----------
+        rng : numpy.random.Generator, optional
+            Source for the sampling fallback (below).  Unused on the exact
+            path; defaults to a fresh default generator only if sampling is
+            actually needed.
+        cap : int
+            Maximum number of completions enumerated exactly.  If the number of
+            distinct completions exceeds ``cap`` (e.g. a pre-flop all-in with
+            five board cards to come), ``cap`` completions are Monte-Carlo
+            sampled instead and a warning is logged.  In search the runout is
+            <= 2 cards, so the exact path always runs.
+
+        Returns
+        -------
+        dict[int, float]
+            Mapping of player index → expected chip delta vs. their starting
+            stack, averaged over the runout.
+
+        Raises
+        ------
+        ValueError
+            If called on a state that is not a decision-free runout
+            (:attr:`is_decision_free` is ``False``).
+        """
+        if self._runout_info is None:
+            raise ValueError(
+                "runout_equity requires a decision-free all-in runout state "
+                "(is_decision_free is False); nothing to integrate."
+            )
+        prefix, pot_chips, active = self._runout_info
+        n = len(self.players)
+        active_players = [
+            self.players[i] for i in range(n) if active[i]
+        ]
+        k = 5 - len(prefix)
+
+        # Completion deck: every card not already dealt to a hole or on the
+        # prefix board (card removal across all seats, incl. folded).
+        used = set(int(c) for c in prefix)
+        for p in self.players:
+            used.update(int(c) for c in p._cards)
+        available = [int(c) for c in self.deck._cards if int(c) not in used]
+
+        if k <= 0:
+            # Board already complete — single deterministic showdown.
+            completions: "Sequence" = [()]
+        else:
+            n_combos = _n_choose_k(len(available), k)
+            if n_combos <= cap:
+                completions = itertools.combinations(available, k)
+            else:
+                logger.warning(
+                    "runout_equity: %d completions exceed cap %d; sampling %d "
+                    "boards instead (street prefix=%d).",
+                    n_combos, cap, cap, len(prefix),
+                )
+                gen = rng if rng is not None else np.random.default_rng()
+                completions = (
+                    tuple(gen.choice(available, size=k, replace=False))
+                    for _ in range(cap)
+                )
+
+        scratch = Pot(n)
+        scratch._chips = list(pot_chips)
+        prefix_list = list(prefix)
+        accum = [0.0] * n
+        count = 0
+        for comp in completions:
+            board = prefix_list + [int(c) for c in comp]
+            groups: Dict[int, List[Player]] = collections.defaultdict(list)
+            for p in active_players:
+                rank = dynamics._evaluator.evaluate(board, list(p._cards))
+                groups[rank].append(p)
+            ranked = [groups[r] for r in sorted(groups)]
+            winnings = scratch.compute_utility(self.players, ranked)
+            for i in range(n):
+                accum[i] += winnings[i]
+            count += 1
+
+        if count == 0:
+            # No feasible completion (degenerate card exhaustion) — fall back to
+            # the contributions, i.e. everyone loses what they put in.
+            return {i: float(-pot_chips[i]) for i in range(n)}
+        return {i: accum[i] / count - pot_chips[i] for i in range(n)}
 
     @property
     def deck_size(self) -> int:
