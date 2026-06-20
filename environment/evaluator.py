@@ -7,6 +7,8 @@ is the worst (7-high).
 
 import itertools
 
+import numpy as np
+
 from environment.utils import prime_product_from_hand, prime_product_from_rankbits
 from environment.hand_rank_table import HandRankTable
 
@@ -27,9 +29,128 @@ class Evaluator(object):
     """
 
     def __init__(self):
-        """Initialise the evaluator by building the lookup table."""
+        """Initialise the evaluator by building the lookup table.
+
+        Besides the scalar ``HandRankTable`` dictionaries, this builds dense
+        numpy lookup artifacts used by the vectorised :meth:`evaluate_batch`
+        path.  They are **derived from** the same ``HandRankTable`` (the single
+        source of truth), so the batch and scalar evaluators are guaranteed
+        consistent — proven exhaustively in the tests.
+        """
         self.table = HandRankTable()
         self.hand_size_map = {5: self._five, 6: self._six, 7: self._seven}
+        self._build_vectorised_tables()
+
+    # ------------------------------------------------------------------
+    # Vectorised (batch) evaluation
+    # ------------------------------------------------------------------
+
+    def _build_vectorised_tables(self) -> None:
+        """Derive the dense numpy lookup tables from :class:`HandRankTable`."""
+        flush_lookup = self.table.flush_lookup
+        unsuited_lookup = self.table.unsuited_lookup
+
+        # Dense flush table: 13-bit rank-OR pattern -> flush/straight-flush rank.
+        # Only patterns with exactly five set bits are real 5-card flushes; the
+        # rest stay 0 (a sentinel never indexed for a valid flush).
+        self._flush_rank = np.zeros(1 << 13, dtype=np.int16)
+        for rankbits in range(1 << 13):
+            if bin(rankbits).count("1") == 5:
+                rank = flush_lookup.get(prime_product_from_rankbits(rankbits))
+                if rank is not None:
+                    self._flush_rank[rankbits] = rank
+
+        # Non-flush hands: prime-product -> rank, sorted for vectorised
+        # searchsorted.  dict key/value iteration order is consistent (Py3.7+).
+        keys = np.fromiter(unsuited_lookup.keys(), dtype=np.int64)
+        vals = np.fromiter(unsuited_lookup.values(), dtype=np.int16)
+        order = np.argsort(keys)
+        self._unsuited_keys = keys[order]
+        self._unsuited_ranks = vals[order]
+
+        # Fixed 5-card subset index tables for the best-of-K reduction.
+        self._subsets = {
+            k: np.array(list(itertools.combinations(range(k), 5)), dtype=np.intp)
+            for k in (5, 6, 7)
+        }
+
+    def _eval5_vec(self, cards5: np.ndarray) -> np.ndarray:
+        """Rank a batch of exactly-5-card hands.
+
+        Parameters
+        ----------
+        cards5 : numpy.ndarray
+            ``(M, 5)`` array of card integers.
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(M,)`` int16 ranks in [1, 7462] (lower = stronger), matching
+            :meth:`_five` element-for-element.
+        """
+        suits = (cards5 >> 12) & 0xF
+        is_flush = np.bitwise_and.reduce(suits, axis=1) != 0
+        out = np.empty(cards5.shape[0], dtype=np.int16)
+
+        if is_flush.any():
+            rankbits = np.bitwise_or.reduce(
+                (cards5[is_flush] >> 16) & 0x1FFF, axis=1
+            )
+            out[is_flush] = self._flush_rank[rankbits]
+
+        nf = ~is_flush
+        if nf.any():
+            products = np.prod((cards5[nf] & 0xFF).astype(np.int64), axis=1)
+            idx = np.searchsorted(self._unsuited_keys, products)
+            out[nf] = self._unsuited_ranks[idx]
+        return out
+
+    def evaluate_batch(self, cards: np.ndarray) -> np.ndarray:
+        """Rank a batch of hands of a fixed card count.
+
+        The vectorised counterpart of :meth:`evaluate` — same ranks, evaluated
+        for many hands at once.  Use it on hot many-hands paths (range showdown
+        ranking, runout completions); use the scalar :meth:`evaluate` for single
+        hands.
+
+        Parameters
+        ----------
+        cards : numpy.ndarray
+            ``(N, K)`` array of card integers, ``K in {5, 6, 7}`` (every row has
+            the same card count).
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(N,)`` int64 ranks in [1, 7462]; entry ``i`` is the best 5-card
+            hand reachable from row ``i``.
+
+        Raises
+        ------
+        ValueError
+            If ``cards`` is not 2-D or ``K`` is unsupported.
+        """
+        cards = np.asarray(cards)
+        if cards.ndim != 2:
+            raise ValueError(f"evaluate_batch expects a 2-D array, got {cards.ndim}-D")
+        n, k = cards.shape
+        subsets = self._subsets.get(k)
+        if subsets is None:
+            raise ValueError(f"evaluate_batch supports K in {{5, 6, 7}}, got K={k}")
+
+        out = np.empty(n, dtype=np.int64)
+        if n == 0:
+            return out
+        n_subsets = subsets.shape[0]
+        # Chunk over rows so peak memory stays bounded for large callers.
+        chunk = 1 << 15
+        for start in range(0, n, chunk):
+            block = cards[start : start + chunk]
+            b = block.shape[0]
+            sub = block[:, subsets]  # (b, n_subsets, 5)
+            ranks5 = self._eval5_vec(sub.reshape(b * n_subsets, 5))
+            out[start : start + b] = ranks5.reshape(b, n_subsets).min(axis=1)
+        return out
 
     def evaluate(self, cards, board):
         """Return the rank of the best 5-card hand reachable from the given cards.

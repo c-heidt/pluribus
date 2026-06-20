@@ -1736,18 +1736,35 @@ class PokerEnv:
         scratch._chips = list(pot_chips)
         prefix_list = list(prefix)
         accum = [0.0] * n
-        count = 0
-        for comp in completions:
-            board = prefix_list + [int(c) for c in comp]
-            groups: Dict[int, List[Player]] = collections.defaultdict(list)
-            for p in active_players:
-                rank = dynamics._evaluator.evaluate(board, list(p._cards))
-                groups[rank].append(p)
-            ranked = [groups[r] for r in sorted(groups)]
-            winnings = scratch.compute_utility(self.players, ranked)
-            for i in range(n):
-                accum[i] += winnings[i]
-            count += 1
+
+        # Materialise the (cap-bounded) completions and rank every
+        # (completion x active player) seven-card hand in one vectorised batch,
+        # then keep the per-completion side-pot scoring exactly as before.
+        completions = [
+            prefix_list + [int(c) for c in comp] for comp in completions
+        ]
+        count = len(completions)
+        if count and active_players:
+            boards = np.asarray(completions, dtype=np.int64)  # (count, 5)
+            holes = np.asarray(
+                [[int(c) for c in p._cards] for p in active_players], dtype=np.int64
+            )  # (n_active, 2)
+            n_active = len(active_players)
+            hands = np.empty((count, n_active, 5 + 2), dtype=np.int64)
+            hands[:, :, :5] = boards[:, None, :]
+            hands[:, :, 5:] = holes[None, :, :]
+            rank_mat = dynamics._evaluator.evaluate_batch(
+                hands.reshape(count * n_active, 7)
+            ).reshape(count, n_active)
+
+            for ci in range(count):
+                groups: Dict[int, List[Player]] = collections.defaultdict(list)
+                for a, p in enumerate(active_players):
+                    groups[int(rank_mat[ci, a])].append(p)
+                ranked = [groups[r] for r in sorted(groups)]
+                winnings = scratch.compute_utility(self.players, ranked)
+                for i in range(n):
+                    accum[i] += winnings[i]
 
         if count == 0:
             # No feasible completion (degenerate card exhaustion) — fall back to
