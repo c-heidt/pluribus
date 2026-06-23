@@ -114,6 +114,14 @@ def continuation_value(
     ]
 
     accum = np.zeros(n, dtype=np.float64)
+    # Holes are fixed across the rollouts, so a decision-free runout's exact
+    # board-average depends only on the env's pre-runout snapshot ``_runout_info``
+    # (board prefix, frozen pot contributions, active mask) — identical for any
+    # two rollouts that reach the same all-in.  Memoise on that snapshot so the
+    # integration runs once per distinct all-in, not once per rollout.  In a leaf
+    # the runout is always <=2 board cards (the exact path), so the cached value
+    # is a deterministic function of the key.
+    runout_cache: dict = {}
     for _ in range(cfg.n_rollouts):
         e = frontier_env.with_hole_cards(holes)
         while not e.is_terminal:
@@ -141,7 +149,11 @@ def continuation_value(
         # exact board-average instead of the single dealt runout (§6.4),
         # unless the A/B toggle reproduces the sampled-runout baseline.
         if use_equity and e.is_decision_free:
-            eq = e.runout_equity(rng=rng)
+            key = e._runout_info
+            eq = runout_cache.get(key)
+            if eq is None:
+                eq = e.runout_equity(rng=rng)
+                runout_cache[key] = eq
             for i in range(n):
                 accum[i] += eq[i]
         else:

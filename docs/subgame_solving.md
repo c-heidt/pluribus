@@ -505,10 +505,14 @@ def runout_equity(self) -> Dict[int, float]:   # exact mean payout over all boar
 When a hand force-resolves to showdown over an incomplete board, the env records
 a pre-runout snapshot (board prefix, frozen pot contributions, active mask)
 *before* `compute_winners` resets the pot; `runout_equity` enumerates every
-completion of that prefix, scoring each with the existing scalar evaluator and
-`Pot.compute_utility` (side pots **reused, not re-implemented**), and returns the
-mean minus each seat's contribution. It is **decoupled from the F2 vectorized
-(range-vs-range) showdown** — at a decision-free node the hands are concrete.
+completion of that prefix, ranks all `(completion × active-seat)` hands in one
+batched `Evaluator.evaluate_batch`, and settles the side pots — the side-pot
+**structure is board-independent**, so every completion with no rank tie is
+scored by a vectorised `argmin`-per-pot + `bincount` over completions, and only
+the rare tie completions fall back to the exact `Pot.compute_utility` (side pots
+**reused, not re-implemented**) — returning the mean minus each seat's
+contribution. It is **decoupled from the F2 vectorized (range-vs-range)
+showdown** — at a decision-free node the hands are concrete.
 The enumeration is bounded in search (≤2 board cards → ≤~1000 unordered
 completions) and capped with a Monte-Carlo fallback for the pathological deep
 runout (e.g. a pre-flop all-in). Both the **leaf rollouts** and the **solver's
@@ -544,6 +548,56 @@ therefore memoized in a search-lifetime table keyed by that triple (not
 recomputed per visit), and the table is the unit of work parallelized in §6.7.
 The `n_rollouts` Monte-Carlo estimate is computed **once** per key on first
 demand.
+
+#### 6.4.2 Performance notes for the solver (row 6.2)
+
+Profiling the two implemented CFR consumers (the vector showdown and the MC leaf
+`continuation_value`) established where time actually goes; the solver must be
+built with these in mind. The hand *evaluator* is already batched and is **not**
+the bottleneck on either path — these notes are about how the solver *uses* the
+shared primitives.
+
+1. **`runout_equity` scoring has a fast path; it fires for any completion with no
+   rank tie, regardless of pot count.** The side-pot structure is fixed by the
+   frozen contributions (board-independent), so no-tie completions are settled by
+   a vectorised `argmin`-per-pot + `bincount`; tie completions use the exact
+   scalar `Pot.compute_utility`. The MCCFR **forced-runout terminals** (the
+   `env.payout` → decision-free branch, §6.5 step 3) and the leaf rollouts both
+   call this same primitive, so both inherit the speedup for free. Measured: a
+   heads-up flop leaf (`continuation_value`, 20 rollouts) dropped from ≈40 ms to
+   ≈17 ms (2.4×), with `runout_equity`'s share falling from 76% to 40%. No
+   correctness assumption is needed — the scalar path is the exact fallback.
+
+2. **A decision-free runout is invariant in the holes + snapshot, so memoise it.**
+   `continuation_value` already caches per call on the env's `_runout_info`
+   snapshot `(prefix, pot_chips, active)` (holes are fixed across its rollouts),
+   collapsing the ~9 runouts/leaf to 2–3 distinct integrations. The solver should
+   extend this to a **search-lifetime** cache: the §6.4.1 memo on
+   `(leaf public_key, concrete-hand tuple, profile)` subsumes the leaf's runout,
+   but the **MCCFR forced-runout terminal is a separate call site** — key its
+   runout on `(hands, prefix, pot_chips, active)` so the same all-in reached from
+   many lines/iterations is integrated once, not per visit.
+
+3. **Vector regime: rank each board once, not per iteration.** `rank_combos_on_board`
+   is **reach-independent**, so it is a one-time setup cost amortised across all
+   CFR iterations; the per-iteration cost is the ≈0.1 ms `showdown_cfv` settle.
+   For a turn subgame (only the river varies) `solve()` should precompute the
+   ≤~46 river rankings **once** and reuse them every iteration — never re-rank in
+   the iteration loop. This is the right lever; a board-specialised evaluator
+   would only optimise the already-amortised ranking cost and is **not** needed.
+
+4. **The MCCFR walk must use make/undo, not deepcopy.** `step_in_place` / `undo`
+   (§6.1) are the advance API and must drive the tree walk. The leaf's
+   per-rollout `with_hole_cards` deepcopy is harmless at heads-up scale (~0.07 ms)
+   but is linear in node count; the solver walk must not deepcopy per node. A
+   rollout that never calls `undo` still pays `_capture_undo_token` it discards —
+   a snapshot-free advance is an option there (negligible now, flagged for scale).
+
+5. **info_set construction is the per-node cost that dominates at solver scale.**
+   `policy_state_for` / info_set build is ≈0.047 ms/node — noise over the leaf's
+   ~2.7 nodes, but linear in the full walk's node count. When wiring
+   `CFRTables` / `SolverState` access, consider interned / integer-keyed infosets
+   rather than string keys, and profile it on the **real** walk, not the leaf.
 
 ### 6.5 Subgame solver (`solver.py`)
 

@@ -327,6 +327,30 @@ class TestDecisionFreeEquityFlag:
         for i in range(env.n_players):
             assert abs(out[i] - ref[i]) < 1e-9
 
+    def test_runout_cache_computes_once_per_snapshot(self, monkeypatch):
+        # All rollouts go all-in at the same flop frontier → one distinct
+        # _runout_info, so the exact integration runs once, not once per rollout.
+        env = self._flop_allin_frontier(7)
+        calls = {"n": 0}
+        original = PokerEnv.runout_equity
+
+        def spy(self, *a, **k):
+            calls["n"] += 1
+            return original(self, *a, **k)
+
+        monkeypatch.setattr(PokerEnv, "runout_equity", spy)
+        out = continuation_value(
+            env, _profile(env),
+            _ctx(env, policies=_policies(AllInPolicy), n_rollouts=20, use_equity=True),
+        )
+        assert calls["n"] == 1
+        # The cached value still equals the exact runout equity.
+        ref_env = copy.deepcopy(env)
+        ref_env.step_in_place("all_in")
+        ref = ref_env.runout_equity()
+        for i in range(env.n_players):
+            assert abs(out[i] - ref[i]) < 1e-9
+
     def test_flag_on_is_runout_rng_independent(self):
         # With a deterministic all-in line and exact equity, the value does not
         # depend on the global board-shuffle seed (the runout is integrated, not

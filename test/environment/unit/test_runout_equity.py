@@ -299,3 +299,78 @@ class TestRunoutEquityCapFallback:
         with caplog.at_level("WARNING"):
             env.runout_equity()
         assert not any("exceed cap" in r.message for r in caplog.records)
+
+
+class TestSinglePotFastPath:
+    """The single-pot vectorised scoring path (winner-takes-pot) must match the
+    scalar ``compute_utility`` reference exactly, and the rare board-tie
+    completions must route through the scalar fallback."""
+
+    def _tie_completions(self, env) -> int:
+        """Number of board completions where >=2 active players tie for best."""
+        prefix, _, active = env._runout_info
+        used = set(int(c) for c in prefix)
+        for p in env.players:
+            used.update(int(c) for c in p._cards)
+        avail = [int(c) for c in env.deck._cards if int(c) not in used]
+        k = 5 - len(prefix)
+        ties = 0
+        for comp in itertools.combinations(avail, k):
+            board = list(prefix) + list(comp)
+            ranks = sorted(
+                dynamics._evaluator.evaluate(board, list(env.players[i]._cards))
+                for i in range(len(env.players))
+                if active[i]
+            )
+            if len(ranks) >= 2 and ranks[0] == ranks[1]:
+                ties += 1
+        return ties
+
+    @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+    def test_headsup_runout_matches_scalar(self, seed):
+        # A heads-up all-in runout (no board tie expected) is settled by the
+        # vectorised no-tie path; it must equal the scalar brute-force reference
+        # bit-for-bit.
+        env = _env([10000, 10000], seed=seed)
+        env.step_in_place("all_in")
+        assert env.is_decision_free
+        eq = env.runout_equity()
+        ref, _ = _brute_runout_equity(env)
+        for i in range(2):
+            assert abs(eq[i] - ref[i]) < 1e-9
+
+    def test_board_ties_exercise_scalar_fallback(self):
+        # A small deck makes board-tie completions common; at least one seed must
+        # hit the nwin>=2 fallback branch, and equity must still match exactly.
+        seen_tie = False
+        for seed in range(8):
+            env = _env([10000, 10000], seed=seed)
+            env.step_in_place("all_in")
+            if not env.is_decision_free:
+                continue
+            if self._tie_completions(env) > 0:
+                seen_tie = True
+                eq = env.runout_equity()
+                ref, _ = _brute_runout_equity(env)
+                for i in range(2):
+                    assert abs(eq[i] - ref[i]) < 1e-9
+        assert seen_tie, "no seed produced a board-tie completion"
+
+    def test_multiway_side_pot_uses_scalar_path(self):
+        # Unequal all-in stacks → >1 side pot → the fast path is *not* taken; the
+        # untouched scalar path must still match the brute-force reference.
+        found = False
+        for seed in range(16):
+            env = _env([3000, 8000, 8000], seed=seed)
+            if not _drive_to_allin_runout(env):
+                continue
+            scratch = Pot(3)
+            scratch._chips = list(env._runout_info[1])
+            if len(scratch.side_pots) <= 1:
+                continue
+            found = True
+            eq = env.runout_equity()
+            ref, _ = _brute_runout_equity(env)
+            for i in range(3):
+                assert abs(eq[i] - ref[i]) < 1e-9
+        assert found, "no seed produced a multiway side-pot runout"

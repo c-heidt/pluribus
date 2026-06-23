@@ -1757,14 +1757,60 @@ class PokerEnv:
                 hands.reshape(count * n_active, 7)
             ).reshape(count, n_active)
 
-            for ci in range(count):
-                groups: Dict[int, List[Player]] = collections.defaultdict(list)
-                for a, p in enumerate(active_players):
-                    groups[int(rank_mat[ci, a])].append(p)
-                ranked = [groups[r] for r in sorted(groups)]
-                winnings = scratch.compute_utility(self.players, ranked)
-                for i in range(n):
-                    accum[i] += winnings[i]
+            def _score_scalar(indices) -> None:
+                for ci in indices:
+                    groups: Dict[int, List[Player]] = collections.defaultdict(list)
+                    for a, p in enumerate(active_players):
+                        groups[int(rank_mat[ci, a])].append(p)
+                    ranked = [groups[r] for r in sorted(groups)]
+                    winnings = scratch.compute_utility(self.players, ranked)
+                    for i in range(n):
+                        accum[i] += winnings[i]
+
+            # Fast path.  The side-pot structure is **board-independent** (it is
+            # fixed by the frozen contributions), and a board changes the payout
+            # only through the active players' relative ranks.  For any completion
+            # whose every pot has a *unique* best eligible active hand, each pot is
+            # won outright by that hand — `compute_utility`'s "best eligible group
+            # takes the pot" rule with singleton groups — so the whole settlement
+            # vectorises (`argmin` per pot + `bincount` over completions).  Only
+            # completions with a tie in some pot need the exact scalar split, and a
+            # pot with no eligible active contributor (degenerate) routes every
+            # completion to the scalar path.  Equivalent to the per-board loop, just
+            # without Python per board.
+            specs = []
+            degenerate = False
+            for sp in scratch.side_pots:
+                cols = np.fromiter(
+                    (a for a, p in enumerate(active_players) if p.player_i in sp),
+                    dtype=np.intp,
+                )
+                if cols.size == 0:
+                    degenerate = True
+                    break
+                glob = np.fromiter(
+                    (active_players[a].player_i for a in cols),
+                    dtype=np.intp,
+                    count=cols.size,
+                )
+                specs.append((cols, float(sum(sp.values())), glob))
+
+            if degenerate:
+                _score_scalar(range(count))
+            else:
+                clean = np.ones(count, dtype=bool)
+                per_pot = []
+                for cols, total, glob in specs:
+                    sub = rank_mat[:, cols]                       # (count, |cols|)
+                    best = sub.min(axis=1)
+                    clean &= (sub == best[:, None]).sum(axis=1) == 1
+                    per_pot.append((glob[sub.argmin(axis=1)], total))
+                if clean.any():
+                    for glob_win, total in per_pot:
+                        wins = np.bincount(glob_win[clean], minlength=n)
+                        for i in range(n):
+                            accum[i] += float(wins[i]) * total
+                _score_scalar(np.flatnonzero(~clean).tolist())
 
         if count == 0:
             # No feasible completion (degenerate card exhaustion) — fall back to
