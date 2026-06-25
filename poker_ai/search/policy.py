@@ -31,6 +31,7 @@ from environment.action_space import (
 )
 from environment.poker_env import PolicyState
 from poker_ai.blueprint.tree_utils import calculate_strategy_from_row
+from poker_ai.search.solver_state import SolverState
 from poker_ai.tables.cfr_tables import CFRTables
 
 
@@ -186,3 +187,86 @@ class BlueprintPolicy(Policy):
         else:
             probs[:] = 1.0 / len(legal)
         return probs
+
+
+class SearchPolicy:
+    """Reader over a solved :class:`SolverState` (§6.5).
+
+    A :class:`SearchResult` exposes two of these: the **final-iteration** policy
+    the bot plays, and the **average** policy that feeds the next round's belief
+    update.  Unlike :class:`Policy`, it is keyed by the solver's native
+    ``(public_key, hand_row)`` — the in-memory tables are keyed that way and
+    ``PolicyState`` does not carry ``public_key``/``hand_row`` (the four §4 bias
+    variants are a leaf-continuation concept, not the bot's own play).  The
+    consumer (the search agent) holds the env, so it computes the key and calls
+    :meth:`strategy_for`; this keeps :class:`SearchPolicy` regime-agnostic — it
+    reads the same rows whether they were written by the MCCFR or vector regime.
+
+    Parameters
+    ----------
+    state : SolverState
+        The solved tables.
+    use_average : bool
+        ``True`` reads the normalised cumulative strategy (``strat_sum``) — the
+        weighted-average policy for belief updates; ``False`` reads the
+        regret-matched final strategy (with frozen rows pinned) — the policy the
+        bot plays.
+    """
+
+    def __init__(self, state: SolverState, *, use_average: bool) -> None:
+        self._state = state
+        self._use_average = use_average
+
+    @property
+    def use_average(self) -> bool:
+        return self._use_average
+
+    def strategy_for(
+        self,
+        public_key,
+        hand_row: int,
+        legal_actions,
+        *,
+        use_average: bool = None,
+    ) -> np.ndarray:
+        """Action distribution at ``(public_key, hand_row)`` aligned to ``legal_actions``.
+
+        Reads the average (``strat_sum``) or the final regret-matched strategy
+        (frozen rows pinned for play).  The stored row is in ``legal_at`` order;
+        it is remapped onto ``legal_actions`` by string, so overlay-injected
+        actions absent from the row receive zero mass and the result is
+        renormalised over the legal set (mirroring :meth:`BlueprintPolicy.strategy`).
+        An unseen node, or a node with no accumulated strategy, falls back to
+        uniform over ``legal_actions``.
+        """
+        use_avg = self._use_average if use_average is None else use_average
+        legal_actions = tuple(legal_actions)
+        n = len(legal_actions)
+        if n == 0:
+            return np.array([], dtype=np.float32)
+
+        state = self._state
+        legal_at = state.legal_at.get(public_key)
+        key = (public_key, hand_row)
+        node = None
+        if legal_at is not None:
+            if use_avg:
+                node = state.average_sigma(key)
+            elif key in state.frozen:
+                node = np.asarray(state.frozen[key], dtype=np.float32)
+            else:
+                node = state.sigma(key)
+        if node is None or legal_at is None:
+            return np.full(n, 1.0 / n, dtype=np.float32)
+
+        idx = {a: j for j, a in enumerate(legal_at)}
+        out = np.zeros(n, dtype=np.float32)
+        for j, a in enumerate(legal_actions):
+            if a in idx:
+                out[j] = node[idx[a]]
+        total = out.sum()
+        if total > 0.0:
+            out /= total
+        else:
+            out[:] = 1.0 / n
+        return out

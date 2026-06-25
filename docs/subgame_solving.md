@@ -157,8 +157,11 @@ poker_ai/search/
 ├── ranges.py         # Per-player range tracking (dense per-combo)
 ├── leaf.py           # Continuation-value evaluation at depth-limit leaves
 ├── showdown.py       # Vectorised range-vs-range F2 showdown (vector regime)
-├── solver.py         # Subgame solver: MCCFR + vector-form Linear CFR regimes
-├── policy.py         # Policy ABC, BiasClass, implementations
+├── solver_state.py   # SolverConfig, SolverState (shared CFR tables + ops), _hand_row
+├── mccfr.py          # External-sampling Linear MCCFR regime (_MCCFRSolver)
+├── vector.py         # Vector-form Linear CFR regime (_VectorSolver; seam, todo)
+├── solver.py         # solve() orchestrator + SearchResult + regime selection
+├── policy.py         # Policy ABC, BiasClass, BlueprintPolicy, SearchPolicy
 └── agent.py          # Search-aware play agent
 ```
 
@@ -837,6 +840,16 @@ parallelism rescues a ruinous per-node copy — it only spreads it across cores.
   `(public_key, hand_row)` for the duration of an iteration sweep; invalidate on
   the `discount_interval` tick rather than recomputing
   `calculate_strategy_from_row` on every node visit.
+- **Direct 7-card evaluator (optional).** *Once make/undo removes per-node
+  cloning,* profiling the MC path identifies the **hand evaluator invoked via
+  `runout_equity`** (and inside the leaf rollouts / the vector showdown) as the
+  dominant remaining cost (~58–74% of MC time) — not env cloning. The 21-subset
+  batch path (`evaluate_batch`) can be replaced by a direct 7-card evaluator
+  (TwoPlusTwo table or 7-card perfect hash) on the **order-only** paths
+  (showdown/runout need *ordering*, not the exact `[1,7462]` rank), validated
+  order-equivalent against the proven `Evaluator`. Est. ~5–10× on the evaluator,
+  ~2× overall (Amdahl), benefiting both regimes and the leaf. Optional, and
+  deferred until the full pipeline can be measured (row 9.3).
 - **Flat hot-loop state (longer-term).** Represent the traversal's mutable state
   as struct-of-arrays (chip/bet/fold vectors, board, deck cursor) rather than
   `Player` / `Pot` / `Deck` objects. This makes `undo` a slice restore and lets
@@ -892,12 +905,14 @@ the serial result bit-for-bit; multi-worker runs fix per-worker substreams
 | 5.1 | Decision-free runout evaluator (§6.4.1) | `environment/poker_env.py` | **done** — `is_decision_free` + `runout_equity` (exact board-average over completions, side-pots via `Pot.compute_utility`, cap+MC fallback); pre-runout snapshot recorded at the force-resolve (`_runout_info`, undo/deepcopy round-tripped); brute-force tested. Shared by the leaf (5.2) and the solver's forced-runout terminals (row 6) | 0 |
 | 5.2 | Continuation values | `poker_ai/search/leaf.py` | **done** — `leaf_value` → `continuation_value(frontier_env, profile, ctx)`; fixed profile, per-seat scalar, rollout from concrete hands (no resampling); blueprint-canonical lookups; decision-free exact equity via 5.1 gated by `use_decision_free_equity`; obsolete hole-samplers deleted (joint sampler is the solver's, row 6) | 0, 4, 5.1 |
 | 6.1 | Vectorised range-vs-range showdown (F2) | `poker_ai/search/showdown.py` | **done** — `rank_combos_on_board` + `showdown_cfv`/`showdown_values`; O(n log n) sorted card-removal sweep, heads-up winner-takes-pot `stake·(W−L)`, no n² matrix; brute-force tested (exact match, zero-sum, card removal, ties, engine-consistency). Consumed by the vector regime (6.2) | 0, 2, 3 |
-| 6.2 | Rest of solver (MCCFR + vector CFR loops) + `SearchPolicy` | `poker_ai/search/solver.py`, `policy.py` | todo — two CFR regimes; vector regime consumes the 6.1 showdown; consumes `runout_equity` (5.1) at forced-runout terminals under the shared `use_decision_free_equity` flag | 0, 2, 3, 5.1, 5.2, 6.1 |
+| 6.2 | Rest of solver (MCCFR + vector CFR loops) + `SearchPolicy` | `poker_ai/search/solver_state.py`, `mccfr.py`, `vector.py`, `solver.py`, `policy.py` | **partial** — **MCCFR path + `SearchPolicy` done** (composition: `SolverState` shared data+ops, `_MCCFRSolver` with joint root sampling, external-sampling traversal, meta-game-as-action leaf, freezing, warm-start widening; `solve()` orchestrator + regime selection + Linear-CFR discount + dual stop; forced-runout terminals via `runout_equity` under `use_decision_free_equity`; unit + integration + fast convergence/stability tests; the exact-equilibrium **independent brute-force CFR cross-validation is deferred to land with the vector regime** so one oracle covers both paths, §9). **Vector regime is the documented seam** (`vector.py` raises `NotImplementedError`) — consumes the 6.1 showdown, follow-up | 0, 2, 3, 5.1, 5.2, 6.1 |
 | 7 | Search-aware agent | `poker_ai/search/agent.py`, terminal wiring | todo | 3, 4, 6.2 |
 | 8 | CLI, config, tests | existing Click runner, `test/search/` | partial | 0–7 |
-| 9 | Make/undo traversal (`step_in_place` / `undo`) + search-lifetime leaf-value cache + per-row σ memoization (Tier 1, §6.7) | `environment/poker_env.py`, `poker_ai/search/solver.py`, `leaf.py` | **partial** — env `step_in_place`/`undo` **done** and is now the **sole** advance API (`apply_action` deleted; blueprint CFR + strategy pass on make/undo); leaf-value cache + per-row σ memoization still todo (need the solver, row 6.2) | 5, 6.2 |
-| 10 | Flat hot-loop state + `numba nogil` inner loop (Tier 1, §6.7) | `poker_ai/search/solver.py` | todo — optional; precondition for thread scaling | 9 |
-| 11 | Parallel search: one-board-per-worker (vector) + batched parallel traversals (MCCFR) (Tier 2, §6.7) | `poker_ai/search/solver.py` | todo — `multiprocessing` first; seed-deterministic | 9 |
+| 9.1 | Make/undo traversal (`step_in_place` / `undo`) (Tier 1, §6.7) | `environment/poker_env.py` | **done** — the **sole** advance API (`apply_action` deleted); the blueprint CFR + strategy passes and the search solver all traverse via make/undo (the solver reuses one restored env across its regret and strategy passes); LIFO round-trip + no-leak tested | — |
+| 9.2 | Search-lifetime caches: leaf-value / forced-runout cache + per-row σ memoization (Tier 1, §6.4.2, §6.7) | `poker_ai/search/solver.py`, `mccfr.py`, `leaf.py` | **todo (deferred)** — memoize `continuation_value` by `(leaf public_key, hand tuple, profile)` and `runout_equity` by `(holes, prefix, pot, active)`; the latter **shared across a leaf's four bias calls** is the main round-1 win (profiling shows the meta-game recomputes identical runouts once per bias — the redundancy a cache removes), plus a per-row σ cache for the hot loop. (Preflop already scores all-in terminals by `env.payout` to skip the 5-card-runout cap — landed in 6.2.) **Deferred until the full pipeline can be evaluated end-to-end** | 6.2 |
+| 9.3 | **Optional** direct 7-card evaluator (Tier 1, §6.7) | `environment/evaluator.py` (consumed by `runout_equity` 5.1 + `rank_combos_on_board` 6.1) | **todo — optional** — replace the 21-subset batch path with a direct 7-card evaluator (TwoPlusTwo table or 7-card perfect hash) on the **order-only** paths (showdown/runout need *ordering*, not the exact `[1,7462]` rank), validated **order-equivalent** against the proven `Evaluator` (C(52,5) exhaustive core + large random 7-card argsort sample). Profiled as the dominant MC-path cost (~58–74%); est. **~5–10× on the evaluator, ~2× overall** (Amdahl), benefiting both CFR regimes and the leaf. ~1–2 days + a ~130 MB table artifact (or a smaller perfect-hash table). **Deferred until the complete pipeline can be evaluated**; pursue only if the evaluator is confirmed on the real-time critical path | 5.1, 6.1 |
+| 10 | Flat hot-loop state + `numba nogil` inner loop (Tier 1, §6.7) | `poker_ai/search/solver.py` | todo — optional; precondition for thread scaling | 9.1 |
+| 11 | Parallel search: one-board-per-worker (vector) + batched parallel traversals (MCCFR) (Tier 2, §6.7) | `poker_ai/search/solver.py` | todo — `multiprocessing` first; seed-deterministic | 9.1 |
 
 ## 8. CLI
 
@@ -998,6 +1013,32 @@ poker_ai play \
     reproduces the serial result bit-for-bit; a fixed `(seed, n_workers)` is
     reproducible across runs; the MCCFR per-worker accumulator merge equals a
     serial run over the same total iteration count.
+- **Independent CFR cross-validation** (deferred — runs once **both** regimes
+  exist, so a single oracle validates the MCCFR *and* vector paths). A
+  **brute-force full-enumeration vanilla CFR** — written as a wholly independent
+  loop (its own regret/strategy tables and recursion, reusing the env only for
+  game *rules* and terminal payoffs, **not** `SolverState`/`_MCCFRSolver`) —
+  solves a tiny subgame to its exact equilibrium; each solver path must then
+  converge to the same fixed point.
+  - **Setting**: a **heads-up river** subgame with **small-support ranges** (a
+    few board-compatible combos per seat). The river is the sweet spot: the board
+    is complete, so there is **no board chance, no depth-limit leaf, and no
+    decision-free runout** — terminals are plain showdowns/folds via `env.payout`,
+    making the full tree **deterministic and exhaustively enumerable**; and it is
+    **2-player zero-sum**, so a true Nash exists for both paths to match. Small
+    support keeps the root hole-deal enumeration (the only chance) tiny.
+  - **Both paths on the same subgame**: the vector regime is selected for HU
+    river natively; the MCCFR path is exercised by instantiating `_MCCFRSolver`
+    directly on the river root (its mechanics are street-agnostic — this skips
+    only the meta-game leaf, which is covered separately). Both write rows keyed
+    the same `(public_key, hand_row)`, so they compare directly.
+  - **Metric**: the range-aggregated root average strategy (and/or the game
+    value) of each path matches the brute-force reference within tolerance — the
+    same drift distance used by the fast stability test, but now against a true
+    equilibrium rather than self-consistency. Marked `slow`.
+  - Until then, the MCCFR path is guarded by the **fast convergence/stability
+    test** (`TestConvergence`): the root range-average drifts little between *N*
+    and *2N* iterations (a genuine convergence property, no external oracle).
 - **Integration test**: one full hand versus a scripted opponent; assert
   search fires at the start of round 2, an off-tree raise triggers a
   re-search from the same root with the bot's acted σ frozen, and the agent
