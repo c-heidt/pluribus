@@ -131,6 +131,17 @@ def _ranked_cached(low_card_rank: int, high_card_rank: int, board: Tuple[int, ..
     return ranks, valid
 
 
+@lru_cache(maxsize=1024)
+def _valid_cached(low_card_rank: int, high_card_rank: int, board: Tuple[int, ...]):
+    cards, _ = enumerate_combos(low_card_rank, high_card_rank)
+    board_arr = np.asarray(board, dtype=cards.dtype)
+    valid = ~(
+        np.isin(cards[:, 0], board_arr) | np.isin(cards[:, 1], board_arr)
+    )
+    valid.flags.writeable = False
+    return valid
+
+
 @lru_cache(maxsize=64)
 def _removal_cached(low_card_rank: int, high_card_rank: int):
     cards, _ = enumerate_combos(low_card_rank, high_card_rank)
@@ -152,6 +163,22 @@ def ranked_board(
 def removal_for(low_card_rank: int, high_card_rank: int):
     """Memoised :func:`removal_index` for a deck's combo set (board-independent)."""
     return _removal_cached(int(low_card_rank), int(high_card_rank))
+
+
+def board_valid_mask(
+    low_card_rank: int, high_card_rank: int, board: Sequence[int]
+) -> np.ndarray:
+    """Memoised board-compatibility mask for a deck's combo set on ``board``.
+
+    The rank-free counterpart of :func:`ranked_board`'s ``valid`` output: ``True``
+    iff the combo shares no card with ``board``.  A **fold** terminal needs only
+    this (no showdown, so no hand ranking), so settling it this way avoids the
+    evaluator pass — and avoids ranking a partial (pre-river) board, keeping the
+    "rank each completed board once" invariant intact.  The returned array is
+    read-only — do not mutate.
+    """
+    return _valid_cached(int(low_card_rank), int(high_card_rank),
+                         tuple(int(c) for c in board))
 
 
 def reach_after_removal(

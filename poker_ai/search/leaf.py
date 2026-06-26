@@ -115,7 +115,7 @@ def continuation_value(
 
     accum = np.zeros(n, dtype=np.float64)
     # Holes are fixed across the rollouts, so a decision-free runout's exact
-    # board-average depends only on the env's pre-runout snapshot ``_runout_info``
+    # board-average depends only on the env's pre-runout snapshot ``runout_key``
     # (board prefix, frozen pot contributions, active mask) — identical for any
     # two rollouts that reach the same all-in.  Memoise on that snapshot so the
     # integration runs once per distinct all-in, not once per rollout.  In a leaf
@@ -149,7 +149,7 @@ def continuation_value(
         # exact board-average instead of the single dealt runout (§6.4),
         # unless the A/B toggle reproduces the sampled-runout baseline.
         if use_equity and e.is_decision_free:
-            key = e._runout_info
+            key = e.runout_key
             eq = runout_cache.get(key)
             if eq is None:
                 eq = e.runout_equity(rng=rng)

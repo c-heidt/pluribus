@@ -745,7 +745,13 @@ then `showdown_cfv` settles each acting combo against the opponent's reach-weigh
 combo distribution. The regime passes only the CFR quantities — the traverser seat,
 the opponent reach, and the sampled river — and the env owns the stake (from
 `terminal_contributions`), showdown-vs-fold detection, board completion, card
-removal, and the board-keyed ranking cache. The value of acting combo `i` is `v_i = stake · (W_i − L_i)`,
+removal, and the board-keyed ranking cache. A **fold** terminal settles on the
+board the hand actually reached: the engine force-deals the community out to five
+even on an early fold, so `len(community_cards)` cannot tell a turn-side fold from
+a river-side one — `PokerEnv.terminal_board_len` (the board length captured before
+that force-deal) does, and a pre-river fold therefore does card removal against the
+shorter board it saw (not the dealt-out completion, and not the sampled river it
+never reached). The value of acting combo `i` is `v_i = stake · (W_i − L_i)`,
 where `W_i` (resp. `L_i`) is the opponent reach on combos `i` beats (resp. loses
 to) and `stake` is each player's matched contribution — heads-up showdown is
 winner-takes-pot, so ties net zero and there are **no side pots**. The win/tie/lose
@@ -1012,7 +1018,11 @@ poker_ai play \
     `PokerEnv.vector_payout` against a one-hot opponent equals the engine's concrete
     net chips when the two hands are dealt and the same betting line replayed —
     across showdown/fold/all-in terminals and equal *and* unequal stacks (the
-    matched-stake / uncalled-excess case).
+    matched-stake / uncalled-excess case).  A **turn-side fold** in a turn subgame
+    is **river-independent**: `vector_payout(..., river=r)` is identical for every
+    candidate river `r` and equals the card removal on the four-card turn board
+    (regression for the force-deal masking bug); `terminal_board_len` round-trips
+    through make/undo.
   - `solver.py`: regime selection picks MCCFR for round-1/round-2/large
     and vector for heads-up turn/river; terminates on either stopping
     criterion; per-hand tables released; root-street rows per-combo,

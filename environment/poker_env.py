@@ -99,6 +99,7 @@ class UndoToken:
     history: Dict[str, List[str]]
     runout_info: Optional[Tuple]
     terminal_contributions: Optional[Tuple]
+    terminal_board_len: Optional[int]
 
 
 logger = logging.getLogger("environment.poker_env")
@@ -377,6 +378,14 @@ class PokerEnv:
         # bigger stack's uncalled excess is the difference).  Consumed by the
         # range-vs-range showdown evaluator so the search need not reconstruct it.
         self._terminal_contributions: Optional[Tuple] = None
+        # Number of community cards that were actually on the board when betting
+        # ended, captured *before* the force-deal that completes the runout on a
+        # fold/all-in (``None`` until the hand ends).  The engine deals the board
+        # out to five at every terminal, so ``len(community_cards)`` no longer
+        # distinguishes the street the hand ended on; this preserves it.  Consumed
+        # by :meth:`vector_payout` so a pre-river fold does card removal against
+        # the board it actually saw, not the force-dealt completion.
+        self._terminal_board_len: Optional[int] = None
 
         # Round setup: reset pot, assign order, post blinds
         self.pot.reset()
@@ -465,7 +474,7 @@ class PokerEnv:
             "_last_raise_amount", "_all_players_have_made_action",
             "_n_actions", "_n_raises", "_player_i_index",
             "_n_players_started_round", "_runout_info",
-            "_terminal_contributions",
+            "_terminal_contributions", "_terminal_board_len",
         ):
             object.__setattr__(new, attr, copy.deepcopy(getattr(self, attr), memo))
         return new
@@ -548,6 +557,13 @@ class PokerEnv:
         self._n_actions += 1
         self._skip_counter = 0
 
+        # Board length as of the street the just-applied action was made on.  A
+        # hand-ending action (fold/last call) can also *close* the round, which
+        # advances the stage and deals the next street before the terminal is
+        # detected below — so this is captured up front, not read off the
+        # post-advance ``community_cards`` (see ``_terminal_board_len``).
+        board_len_at_action = len(self.community_cards)
+
         while True:
             self._move_to_next_player()
             finished_betting = not dynamics.more_betting_needed(self)
@@ -560,6 +576,11 @@ class PokerEnv:
             elif self.current_player.is_active:
                 if dynamics.n_players_with_moves(self) == 1:
                     self._betting_stage = "terminal"
+                    # Board the hand-ending action actually saw — before the
+                    # force-deal below (and before any round-closing stage
+                    # advance) completes it to five.  A fold/all-in that ends the
+                    # hand early never "saw" the dealt-out cards.
+                    self._terminal_board_len = board_len_at_action
                     cards_needed = 5 - len(self.community_cards)
                     if cards_needed > 0:
                         # All-in showdown over an incomplete board: the rest of
@@ -577,6 +598,11 @@ class PokerEnv:
                             )
                         self.community_cards += self.deck.deal_community(cards_needed)
                 if self._betting_stage in {"terminal", "show_down"}:
+                    # Normal river show-down (reached via ``_increment_stage``,
+                    # not the force-deal above): the board the final action saw is
+                    # already complete (five cards).
+                    if self._terminal_board_len is None:
+                        self._terminal_board_len = board_len_at_action
                     dynamics.compute_winners(self)
                 break
 
@@ -619,6 +645,7 @@ class PokerEnv:
         self._n_players_started_round = token.n_players_started_round
         self._runout_info = token.runout_info
         self._terminal_contributions = token.terminal_contributions
+        self._terminal_board_len = token.terminal_board_len
         self.community_cards = token.community_cards
         self.deck.restore(token.deck_cursor)
         self.pot.restore(token.pot_chips)
@@ -657,6 +684,7 @@ class PokerEnv:
             history={stage: list(actions) for stage, actions in self._history.items()},
             runout_info=self._runout_info,
             terminal_contributions=self._terminal_contributions,
+            terminal_board_len=self._terminal_board_len,
         )
 
     # ------------------------------------------------------------------
@@ -1663,6 +1691,30 @@ class PokerEnv:
         return self._terminal_contributions
 
     @property
+    def terminal_board_len(self) -> Optional[int]:
+        """Community cards on the board when betting ended (``None`` until then).
+
+        The engine force-deals the board out to five at every terminal, so
+        ``len(community_cards)`` cannot tell a turn-side fold from a river-side
+        one.  This is the count captured *before* that force-deal — the board the
+        hand actually reached.  Used by :meth:`vector_payout` so a pre-river fold
+        does card removal against the board it saw, not the dealt-out completion.
+        """
+        return self._terminal_board_len
+
+    @property
+    def runout_key(self) -> Optional[Tuple]:
+        """Hashable identity of a decision-free runout (``None`` if not one).
+
+        The pre-runout snapshot ``(board_prefix, pot_contributions, active_mask)``
+        recorded at an incomplete-board all-in.  Because the holes are fixed at a
+        terminal, this triple fully determines :meth:`runout_equity`'s value, so
+        callers may memoise that integration on it without reaching into the env's
+        internals.
+        """
+        return self._runout_info
+
+    @property
     def is_decision_free(self) -> bool:
         """True iff the hand resolved as an all-in showdown over an incomplete
         board — a *decision-free* runout whose value depends only on the
@@ -1906,13 +1958,23 @@ class PokerEnv:
         # Fold: the still-active contesting seat wins; value is rank-independent.
         winner = seat if self.players[seat].is_active else opp_seat
         sign = 1.0 if winner == seat else -1.0
-        # Mask the opponent reach by the board in effect — a river-side fold sees
-        # the (sampled) river, a turn-side fold does not.
-        if river is not None and len(community) == 5:
+        # Mask the opponent reach by the board the hand actually reached.  The
+        # engine force-deals the community out to five on a fold, so
+        # ``len(community)`` is always 5 here and cannot distinguish a river-side
+        # fold from a turn-side one — ``terminal_board_len`` (captured before the
+        # force-deal) can.  Only a genuine river-side fold (real board complete)
+        # sees the search's sampled river; a pre-river fold uses the shorter board
+        # it saw, so card removal does not include cards that were never dealt.
+        real_len = self._terminal_board_len
+        if real_len is None:
+            real_len = len(community)
+        if river is not None and real_len == 5:
             board = community[:4] + [int(river)]
         else:
-            board = community
-        _, valid = range_showdown.ranked_board(low, high, board)
+            board = community[:real_len]
+        # A fold needs only board-compatibility (no showdown ranking), so use the
+        # rank-free mask — cheaper, and it never ranks a partial pre-river board.
+        valid = range_showdown.board_valid_mask(low, high, board)
         opp = np.where(valid, opp_reach, 0.0)
         avail = range_showdown.reach_after_removal(combo_cards, opp, removal)
         return sign * stake * np.where(valid, avail, 0.0)

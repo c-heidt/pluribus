@@ -89,6 +89,14 @@ class _VectorSolver:
         self._reach: Dict[int, np.ndarray] = {
             s: np.asarray(ctx.ranges[s], dtype=np.float64) * bc for s in self._seats
         }
+        # Fail fast on a degenerate range (mirrors the MCCFR regime's guard): a
+        # seat with no board-compatible reach would otherwise silently yield
+        # all-zero regrets and a junk uniform strategy.
+        for s in self._seats:
+            if self._reach[s].sum() <= 0.0:
+                raise ValueError(
+                    f"vector regime: seat {s} has zero board-compatible reach."
+                )
 
         # Bot's actual-hand combo row + seat (freezing, §5).
         my = tuple(sorted(int(c) for c in ctx.my_hole))
