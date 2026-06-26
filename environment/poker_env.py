@@ -23,7 +23,9 @@ from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tupl
 import numpy as np
 
 from environment import dynamics
+from environment import range_showdown
 from environment.chance import Deck
+from environment.evaluator import default_evaluator
 from environment.player import Player
 from environment.pot import Pot
 from environment.utils import enumerate_combos
@@ -96,6 +98,7 @@ class UndoToken:
     player_states: List[tuple]
     history: Dict[str, List[str]]
     runout_info: Optional[Tuple]
+    terminal_contributions: Optional[Tuple]
 
 
 logger = logging.getLogger("environment.poker_env")
@@ -367,6 +370,13 @@ class PokerEnv:
         # all immutable — captured *before* ``compute_winners`` resets the pot,
         # so :meth:`runout_equity` can integrate over every board completion.
         self._runout_info: Optional[Tuple] = None
+        # Per-seat pot contributions captured at the terminal *before*
+        # ``compute_winners`` resets the pot (``None`` until the hand ends).  The
+        # authoritative source for the matched/contested stake at a terminal — the
+        # smaller of two contributions in heads-up is the winner-takes amount (the
+        # bigger stack's uncalled excess is the difference).  Consumed by the
+        # range-vs-range showdown evaluator so the search need not reconstruct it.
+        self._terminal_contributions: Optional[Tuple] = None
 
         # Round setup: reset pot, assign order, post blinds
         self.pot.reset()
@@ -455,6 +465,7 @@ class PokerEnv:
             "_last_raise_amount", "_all_players_have_made_action",
             "_n_actions", "_n_raises", "_player_i_index",
             "_n_players_started_round", "_runout_info",
+            "_terminal_contributions",
         ):
             object.__setattr__(new, attr, copy.deepcopy(getattr(self, attr), memo))
         return new
@@ -607,6 +618,7 @@ class PokerEnv:
         self._player_i_index = token.player_i_index
         self._n_players_started_round = token.n_players_started_round
         self._runout_info = token.runout_info
+        self._terminal_contributions = token.terminal_contributions
         self.community_cards = token.community_cards
         self.deck.restore(token.deck_cursor)
         self.pot.restore(token.pot_chips)
@@ -644,6 +656,7 @@ class PokerEnv:
             player_states=[p.capture_mutable() for p in self.players],
             history={stage: list(actions) for stage, actions in self._history.items()},
             runout_info=self._runout_info,
+            terminal_contributions=self._terminal_contributions,
         )
 
     # ------------------------------------------------------------------
@@ -1636,6 +1649,20 @@ class PokerEnv:
         }
 
     @property
+    def terminal_contributions(self) -> Optional[Tuple[int, ...]]:
+        """Per-seat pot contributions captured at the terminal, before reset.
+
+        ``None`` until the hand ends; otherwise the tuple of chips each seat put
+        in, snapshotted by ``compute_winners`` **before** it resets the pot (so
+        the matched/contested stake is recoverable even though ``payout`` has
+        already netted the winnings).  The authoritative stake source for the
+        :meth:`vector_payout` evaluator — in heads-up the **smaller** of the two
+        contributions is the winner-takes amount, the larger stack's excess being
+        the uncalled difference.
+        """
+        return self._terminal_contributions
+
+    @property
     def is_decision_free(self) -> bool:
         """True iff the hand resolved as an all-in showdown over an incomplete
         board — a *decision-free* runout whose value depends only on the
@@ -1753,7 +1780,7 @@ class PokerEnv:
             hands = np.empty((count, n_active, 5 + 2), dtype=np.int64)
             hands[:, :, :5] = boards[:, None, :]
             hands[:, :, 5:] = holes[None, :, :]
-            rank_mat = dynamics._evaluator.evaluate_batch(
+            rank_mat = default_evaluator.evaluate_batch(
                 hands.reshape(count * n_active, 7)
             ).reshape(count, n_active)
 
@@ -1817,6 +1844,78 @@ class PokerEnv:
             # the contributions, i.e. everyone loses what they put in.
             return {i: float(-pot_chips[i]) for i in range(n)}
         return {i: accum[i] / count - pot_chips[i] for i in range(n)}
+
+    def vector_payout(
+        self,
+        seat: int,
+        opp_seat: int,
+        opp_reach: "np.ndarray",
+        river: Optional[int] = None,
+    ) -> "np.ndarray":
+        """Per-combo counterfactual value to ``seat`` vs the opponent's range.
+
+        The **vectorised** terminal payout (heads-up): values an entire range
+        against an entire range at a terminal, returning a value per hole combo
+        (aligned to :attr:`combo_cards`) for ``seat`` against ``opp_reach`` (the
+        ``opp_seat`` reach-weighted range).  The counterpart of :attr:`payout`
+        (one dealt hand) and :meth:`runout_equity` (board-average); all three
+        rank hands with the one shared evaluator, so they agree to the chip.
+
+        The env owns the settlement entirely — the caller supplies only the
+        search quantities it owns:
+
+        Parameters
+        ----------
+        seat, opp_seat : int
+            The two live (contesting) seats; ``seat`` is the acting/traverser
+            seat whose combos index the result.
+        opp_reach : numpy.ndarray
+            ``(n_combos,)`` reach-weighted range of ``opp_seat`` (board masking
+            and card removal are applied here).
+        river : int, optional
+            The board runout card the search sampled for this iteration (a turn
+            subgame's chance outcome).  ``None`` for a river subgame / complete
+            board.  The engine's own dealt river is ignored in favour of this.
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(n_combos,)`` float64 value to ``seat``; ``0`` on combos that cannot
+            be held given the board.
+        """
+        if self._terminal_contributions is None:
+            raise ValueError("vector_payout is only defined at a terminal node.")
+        # Matched stake: the smaller of the two contesting seats' final
+        # contributions (winner-takes; the larger stack's excess is uncalled).
+        tc = self._terminal_contributions
+        stake = float(min(tc[seat], tc[opp_seat]))
+        low, high = self._low_card_rank, self._high_card_rank
+        combo_cards = self.combo_cards
+        removal = range_showdown.removal_for(low, high)
+        community = list(self.community_cards)
+
+        if self.players[seat].is_active and self.players[opp_seat].is_active:
+            # Showdown: complete the board to five with the search's sampled river
+            # (substituting it for whatever the engine dealt), then settle ranges.
+            board = community[:4] + [int(river)] if river is not None else community
+            ranks, valid = range_showdown.ranked_board(low, high, board)
+            return range_showdown.showdown_cfv(
+                ranks, valid, combo_cards, opp_reach, stake, removal=removal
+            )
+
+        # Fold: the still-active contesting seat wins; value is rank-independent.
+        winner = seat if self.players[seat].is_active else opp_seat
+        sign = 1.0 if winner == seat else -1.0
+        # Mask the opponent reach by the board in effect — a river-side fold sees
+        # the (sampled) river, a turn-side fold does not.
+        if river is not None and len(community) == 5:
+            board = community[:4] + [int(river)]
+        else:
+            board = community
+        _, valid = range_showdown.ranked_board(low, high, board)
+        opp = np.where(valid, opp_reach, 0.0)
+        avail = range_showdown.reach_after_removal(combo_cards, opp, removal)
+        return sign * stake * np.where(valid, avail, 0.0)
 
     @property
     def deck_size(self) -> int:

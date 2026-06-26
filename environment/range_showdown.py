@@ -1,36 +1,41 @@
-"""Vectorised range-vs-range showdown for the vector-form CFR regime (§6.5).
+"""Vectorised range-vs-range showdown — the env's per-combo terminal payout.
 
-The vector regime (heads-up turn/river, §6.5) carries a per-combo *reach* vector
-per player and, at a showdown terminal over a completed board, must value an
-entire range against an entire range at once — the paper's **F2 vectorised
-hand-vs-hand showdown**.  Rather than the O(n_combos^2) all-pairs sum, this
-module settles every acting combo in **O(n_combos log n_combos)** via two sorted
-sweeps with exact card removal (the "ref. 42" trick): the value of acting combo
-``i`` against the opponent's reach-weighted range is
+This is the third of the environment's terminal-payout evaluators, alongside the
+**concrete** settlement (:func:`environment.dynamics.compute_winners` /
+``PokerEnv.payout``) and the **decision-free** board-average (``PokerEnv.runout_equity``).
+Where those score a single dealt hand, this one values an **entire range against an
+entire range** on a completed board at once — the paper's F2 vectorised hand-vs-hand
+showdown — and is consumed by ``PokerEnv.vector_payout``.
+
+Rather than the O(n_combos^2) all-pairs sum, every acting combo is settled in
+**O(n_combos log n_combos)** via two sorted sweeps with exact card removal (the
+"ref. 42" trick): the value of acting combo ``i`` against the opponent's
+reach-weighted range is
 
     v_i = stake * (W_i - L_i),
       W_i = sum of opp reach on combos i beats   (rank[j] > rank[i]),
       L_i = sum of opp reach on combos i loses to (rank[j] < rank[i]),
 
 restricted to opponent combos that share **no** card with ``i`` (card removal).
-Ties net zero (heads-up showdown is winner-takes-pot with equal contributions).
+Ties net zero.  Folds (no showdown) use :func:`reach_after_removal` instead.
 
-Scope is **heads-up only** — a single opponent range, so there is no
-opponent-opponent card-removal term and no side pots (§10).  The hand *ranking*
-(:func:`rank_combos_on_board`) is player-count-agnostic; only the settlement is
-heads-up.  Both halves are pure and deterministic (no RNG, no env mutation): the
-hand evaluator is the same scalar :class:`Evaluator` the rest of the engine uses
-(``compute_winners`` / ``runout_equity``), so a showdown here is scored
-identically to a concrete resolution.
+The hand *ranking* is player-count-agnostic; only the settlement is heads-up (a
+single opponent range → no opponent-opponent removal term).  Everything is pure and
+deterministic, and ranks hands with the **same shared** :data:`environment.evaluator.default_evaluator`
+the concrete path uses — so a range showdown is scored identically to a concrete
+resolution (aligned by construction).  Board rankings are memoised (board-keyed
+LRU) so the env settles many terminals on the same deck without re-ranking.
 """
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
-import environment.dynamics as dynamics
+from environment.evaluator import default_evaluator
+from environment.utils import enumerate_combos
 
 # A rank strictly worse than any real hand rank (Evaluator returns [1, 7462],
 # lower = stronger).  Board-incompatible combos are parked here and carry zero
@@ -53,8 +58,9 @@ def rank_combos_on_board(
         Community cards (card integers).  Any length the evaluator accepts; in
         the vector regime this is the completed 5-card runout.
     evaluator : optional
-        Scalar hand evaluator; defaults to ``environment.dynamics._evaluator``
-        (the same object ``compute_winners`` and ``runout_equity`` use).
+        Scalar hand evaluator; defaults to the shared
+        :data:`environment.evaluator.default_evaluator` (the same object
+        ``compute_winners`` and ``runout_equity`` use).
 
     Returns
     -------
@@ -67,7 +73,7 @@ def rank_combos_on_board(
         the board (impossible to hold, excluded from the showdown).
     """
     if evaluator is None:
-        evaluator = dynamics._evaluator
+        evaluator = default_evaluator
     board_list = [int(c) for c in board]
 
     n = combo_cards.shape[0]
@@ -107,6 +113,91 @@ def removal_index(combo_cards: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]
     s0 = np.searchsorted(uniq, combo_cards[:, 0])
     s1 = np.searchsorted(uniq, combo_cards[:, 1])
     return s0.astype(np.int64), s1.astype(np.int64), int(uniq.shape[0])
+
+
+# --------------------------------------------------------------------------- #
+# Board-keyed memoisation (the env's "fast" responsibility).  Keyed by the deck
+# rank range + the board tuple; ``combo_cards`` is rebuilt from the (already
+# cached) :func:`enumerate_combos`, so callers pass only hashable identifiers.
+# Returned arrays are read-only — callers must not mutate them.
+# --------------------------------------------------------------------------- #
+
+@lru_cache(maxsize=1024)
+def _ranked_cached(low_card_rank: int, high_card_rank: int, board: Tuple[int, ...]):
+    cards, _ = enumerate_combos(low_card_rank, high_card_rank)
+    ranks, valid = rank_combos_on_board(cards, board)
+    ranks.flags.writeable = False
+    valid.flags.writeable = False
+    return ranks, valid
+
+
+@lru_cache(maxsize=64)
+def _removal_cached(low_card_rank: int, high_card_rank: int):
+    cards, _ = enumerate_combos(low_card_rank, high_card_rank)
+    return removal_index(cards)
+
+
+def ranked_board(
+    low_card_rank: int, high_card_rank: int, board: Sequence[int]
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Memoised :func:`rank_combos_on_board` for a deck's combo set on ``board``.
+
+    Ranks the ≤~46 candidate boards of a subgame **once** each and reuses them
+    across CFR iterations.  ``(ranks, valid)`` are read-only — do not mutate.
+    """
+    return _ranked_cached(int(low_card_rank), int(high_card_rank),
+                          tuple(int(c) for c in board))
+
+
+def removal_for(low_card_rank: int, high_card_rank: int):
+    """Memoised :func:`removal_index` for a deck's combo set (board-independent)."""
+    return _removal_cached(int(low_card_rank), int(high_card_rank))
+
+
+def reach_after_removal(
+    combo_cards: np.ndarray,
+    opp_reach: np.ndarray,
+    removal: Optional[Tuple[np.ndarray, np.ndarray, int]] = None,
+) -> np.ndarray:
+    """Per acting combo, the opponent reach on combos sharing **no** card with it.
+
+    The rank-independent counterpart of :func:`showdown_cfv`, for **fold** terminals
+    (no showdown: the pot is decided by the fold, but card removal between the two
+    ranges still applies).  For acting combo ``i = {c0, c1}`` it returns
+
+        available_i = total - on_card[c0] - on_card[c1] + opp_reach[i]
+
+    where ``total`` is the summed opponent reach and ``on_card[c]`` is the opponent
+    reach on combos containing card ``c``.  The trailing ``+ opp_reach[i]`` is the
+    **inclusion-exclusion add-back**: combo ``i`` itself contains *both* ``c0`` and
+    ``c1``, so the two per-card subtractions remove it twice — it must be added back
+    once so it is excluded exactly once.  (:func:`showdown_cfv` needs no such add-back
+    because ``i`` shares its rank group and is excluded from both the strictly-stronger
+    and strictly-weaker sums anyway.)  Fully vectorised, O(n_combos), no n^2 matrix.
+
+    Parameters
+    ----------
+    combo_cards : numpy.ndarray
+        ``(n_combos, 2)`` hole-card pairs; used only to derive ``removal`` when it is
+        not supplied.
+    opp_reach : numpy.ndarray
+        ``(n_combos,)`` opponent reach (unnormalised).  Pass a board-masked vector
+        (zeros on board-incompatible combos) for correct card removal at the terminal.
+    removal : optional
+        Precomputed :func:`removal_index` for ``combo_cards``.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(n_combos,)`` float64 available opponent reach per acting combo.
+    """
+    s0, s1, deck_size = removal if removal is not None else removal_index(combo_cards)
+    w = np.asarray(opp_reach, dtype=np.float64)
+    total = float(w.sum())
+    on_card = np.bincount(
+        np.concatenate([s0, s1]), weights=np.concatenate([w, w]), minlength=deck_size
+    )
+    return total - on_card[s0] - on_card[s1] + w
 
 
 def showdown_cfv(
@@ -203,8 +294,7 @@ def showdown_values(
     """Heads-up showdown: per-combo CFV for both players on a completed board.
 
     Ranks the board once, then settles each player against the *other* player's
-    reach.  This is the entry point the vector regime calls at a showdown
-    terminal.
+    reach.
 
     Returns
     -------

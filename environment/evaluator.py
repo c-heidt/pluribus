@@ -414,3 +414,15 @@ class Evaluator(object):
                     )
                 else:
                     print(f"Players {winners} tied for the win with a {hand_result}\n")
+
+
+# The single shared evaluator instance for the whole environment.  Building the
+# vectorised lookup tables in ``Evaluator.__init__`` is non-trivial, so every
+# terminal-payout path (concrete settlement in :mod:`dynamics`, the range-vs-range
+# showdown in :mod:`environment.range_showdown`, and ``PokerEnv``'s batch ranking)
+# shares this one instance.  Hosting it here at the leaf evaluator layer — rather
+# than in ``dynamics`` — keeps :mod:`environment.range_showdown` dependent on the
+# evaluator only (no cycle through ``dynamics``/``poker_env``), and it is what makes
+# the concrete and vectorised payouts *aligned by construction*: identical tables,
+# identical ranks.
+default_evaluator: Evaluator = Evaluator()

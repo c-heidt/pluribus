@@ -156,14 +156,25 @@ poker_ai/search/
 ├── context.py        # SubgameContext: per-search inputs static for one solve()
 ├── ranges.py         # Per-player range tracking (dense per-combo)
 ├── leaf.py           # Continuation-value evaluation at depth-limit leaves
-├── showdown.py       # Vectorised range-vs-range F2 showdown (vector regime)
 ├── solver_state.py   # SolverConfig, SolverState (shared CFR tables + ops), _hand_row
 ├── mccfr.py          # External-sampling Linear MCCFR regime (_MCCFRSolver)
-├── vector.py         # Vector-form Linear CFR regime (_VectorSolver; seam, todo)
+├── vector.py         # Vector-form Linear CFR regime (_VectorSolver)
 ├── solver.py         # solve() orchestrator + SearchResult + regime selection
 ├── policy.py         # Policy ABC, BiasClass, BlueprintPolicy, SearchPolicy
 └── agent.py          # Search-aware play agent
 ```
+
+**Terminal payouts are owned by the `environment` package, not the search.** The
+solver scores terminals by *calling* one of three env-owned payout evaluators, all
+ranking hands with the one shared `environment.evaluator.default_evaluator` (so
+they agree to the chip): `PokerEnv.payout` (a single dealt hand), `runout_equity`
+(the decision-free board-average), and `PokerEnv.vector_payout` (range-vs-range,
+per-combo CFV — the vector regime's terminal value). The vectorised settlement
+math lives in `environment/range_showdown.py` (`rank_combos_on_board`,
+`showdown_cfv`, `reach_after_removal`; board-keyed ranking cache), depending on the
+evaluator only. The matched **stake** is env-owned too: `compute_winners` snapshots
+the final per-seat contributions (`PokerEnv.terminal_contributions`) before it
+resets the pot, so the search never reconstructs settlement.
 
 ### 6.0 Policy interface (`policy.py`)
 
@@ -710,16 +721,31 @@ freezing.
 Vector-form Linear CFR carrying a per-combo reach vector per player
 (`reach[p] = ctx.ranges[p]` at the root). **Every action is expanded at every
 decision node** (no action sampling); **one board runout is sampled per iteration**
-at the subgame's chance nodes, the tree then deterministic. Regret / strategy-sum
-updates are reach-weighted per row (float64); opponent reach on combos conflicting
-with the acting combo is zeroed (card removal, idiom from
-`ranges._zero_conflicting`). These subgames extend to the **end of the game**, so
-their terminals are **showdowns**, evaluated with a **vectorised hand-vs-hand
-showdown** on the sampled board (F2, [`search/showdown.py`](../poker_ai/search/showdown.py)):
+at the subgame's chance nodes, the tree then deterministic. The implementation does
+**alternating updates** — one tree pass per seat, the traverser's per-combo regret
+updated from opponent-reach-weighted counterfactual values (summed across the
+opponent's actions, since the opponent mixes per *its* combo), the strategy sum
+weighted by the traverser's own reach. The betting tree is hole- and card-independent,
+so a single make/undo env walk serves every combo at once; the **river is sampled
+from `ctx.rng`** over the ranges' candidate set (the cards not on the board) and the
+engine's own deal is ignored — the correct chance distribution over ranges, and free
+of any global-RNG dependence (the MCCFR path still deals via the engine's global
+`np.random`, §6.4.1). Regret / strategy-sum updates are reach-weighted per row
+(float64); opponent reach on combos conflicting with the acting combo is zeroed (card
+removal, idiom from `ranges._zero_conflicting`). The per-combo rows persist as
+`(n_combos, width)` matrices keyed by `public_key` in the shared `SolverState` (the
+combo axis is `combo_index`, lossless at every depth), and `solve()`'s Linear-CFR
+discount and `SearchPolicy` read them unchanged. These subgames extend to the **end of the game**, so
+their terminals are **showdowns**, evaluated by the env-owned **vectorised payout**
+`PokerEnv.vector_payout` on the sampled board (F2, settlement math in
+[`environment/range_showdown.py`](../environment/range_showdown.py)):
 `rank_combos_on_board` ranks every combo on the completed board once (the shared
-scalar `Evaluator`, so it scores identically to `compute_winners` / `runout_equity`),
+`default_evaluator`, so it scores identically to `compute_winners` / `runout_equity`),
 then `showdown_cfv` settles each acting combo against the opponent's reach-weighted
-combo distribution. The value of acting combo `i` is `v_i = stake · (W_i − L_i)`,
+combo distribution. The regime passes only the CFR quantities — the traverser seat,
+the opponent reach, and the sampled river — and the env owns the stake (from
+`terminal_contributions`), showdown-vs-fold detection, board completion, card
+removal, and the board-keyed ranking cache. The value of acting combo `i` is `v_i = stake · (W_i − L_i)`,
 where `W_i` (resp. `L_i`) is the opponent reach on combos `i` beats (resp. loses
 to) and `stake` is each player's matched contribution — heads-up showdown is
 winner-takes-pot, so ties net zero and there are **no side pots**. The win/tie/lose
@@ -904,8 +930,8 @@ the serial result bit-for-bit; multi-worker runs fix per-worker substreams
 | 4 | Chip↔action env API + search raise-size set | `environment/poker_env.py` | **done** — pseudo-harmonic translation (`_translate_fraction`, randomized + deterministic); history canonicalization (`_canonicalize_history`/`_blueprint_info_set`/`policy_state_for(for_blueprint=…)`, no-op on on-tree histories); `SEARCH_RAISE_SIZES_BY_STAGE` + `search_raise_fractions`/`search_raise_actions`; `string_for_chips` tolerance snap removed | — |
 | 5.1 | Decision-free runout evaluator (§6.4.1) | `environment/poker_env.py` | **done** — `is_decision_free` + `runout_equity` (exact board-average over completions, side-pots via `Pot.compute_utility`, cap+MC fallback); pre-runout snapshot recorded at the force-resolve (`_runout_info`, undo/deepcopy round-tripped); brute-force tested. Shared by the leaf (5.2) and the solver's forced-runout terminals (row 6) | 0 |
 | 5.2 | Continuation values | `poker_ai/search/leaf.py` | **done** — `leaf_value` → `continuation_value(frontier_env, profile, ctx)`; fixed profile, per-seat scalar, rollout from concrete hands (no resampling); blueprint-canonical lookups; decision-free exact equity via 5.1 gated by `use_decision_free_equity`; obsolete hole-samplers deleted (joint sampler is the solver's, row 6) | 0, 4, 5.1 |
-| 6.1 | Vectorised range-vs-range showdown (F2) | `poker_ai/search/showdown.py` | **done** — `rank_combos_on_board` + `showdown_cfv`/`showdown_values`; O(n log n) sorted card-removal sweep, heads-up winner-takes-pot `stake·(W−L)`, no n² matrix; brute-force tested (exact match, zero-sum, card removal, ties, engine-consistency). Consumed by the vector regime (6.2) | 0, 2, 3 |
-| 6.2 | Rest of solver (MCCFR + vector CFR loops) + `SearchPolicy` | `poker_ai/search/solver_state.py`, `mccfr.py`, `vector.py`, `solver.py`, `policy.py` | **partial** — **MCCFR path + `SearchPolicy` done** (composition: `SolverState` shared data+ops, `_MCCFRSolver` with joint root sampling, external-sampling traversal, meta-game-as-action leaf, freezing, warm-start widening; `solve()` orchestrator + regime selection + Linear-CFR discount + dual stop; forced-runout terminals via `runout_equity` under `use_decision_free_equity`; unit + integration + fast convergence/stability tests; the exact-equilibrium **independent brute-force CFR cross-validation is deferred to land with the vector regime** so one oracle covers both paths, §9). **Vector regime is the documented seam** (`vector.py` raises `NotImplementedError`) — consumes the 6.1 showdown, follow-up | 0, 2, 3, 5.1, 5.2, 6.1 |
+| 6.1 | Vectorised range-vs-range showdown (F2) | `environment/range_showdown.py` (env-owned) | **done** — `rank_combos_on_board` + `showdown_cfv`/`reach_after_removal`; O(n log n) sorted card-removal sweep, heads-up winner-takes-pot `stake·(W−L)`, no n² matrix; board-keyed ranking cache; depends on the shared `default_evaluator` only. Brute-force tested + cross-validated against concrete `payout` to the chip. Surfaced as `PokerEnv.vector_payout`, called by the vector regime (6.2) | 0, 2, 3 |
+| 6.2 | Rest of solver (MCCFR + vector CFR loops) + `SearchPolicy` | `poker_ai/search/solver_state.py`, `mccfr.py`, `vector.py`, `solver.py`, `policy.py` | **done** — **both regimes + `SearchPolicy`** (composition: `SolverState` shared data+ops, `_MCCFRSolver` with joint root sampling, external-sampling traversal, meta-game-as-action leaf, freezing, warm-start widening; `solve()` orchestrator + regime selection + Linear-CFR discount + dual stop; forced-runout terminals via `runout_equity` under `use_decision_free_equity`). **Vector regime** (`_VectorSolver`, HU turn/river): alternating-updates vector-form Linear CFR carrying per-combo reach vectors, all-actions-expanded, **one river sampled per iteration from `ctx.rng`** (engine deal ignored → no global-RNG dependence); **all terminal settlement is delegated to the env-owned `PokerEnv.vector_payout`** (6.1) — the regime passes only the traverser seat, opponent reach, and sampled river, and does no stake/showdown/fold/ranking itself; per-combo rows persist as `(n_combos, width)` matrices keyed by `public_key` in the same `SolverState`, read unchanged by `SearchPolicy`. Unit + integration + fast convergence/stability tests for both. The exact-equilibrium **independent brute-force CFR cross-validation is still deferred** (§9) so one oracle covers both paths | 0, 2, 3, 5.1, 5.2, 6.1 |
 | 7 | Search-aware agent | `poker_ai/search/agent.py`, terminal wiring | todo | 3, 4, 6.2 |
 | 8 | CLI, config, tests | existing Click runner, `test/search/` | partial | 0–7 |
 | 9.1 | Make/undo traversal (`step_in_place` / `undo`) (Tier 1, §6.7) | `environment/poker_env.py` | **done** — the **sole** advance API (`apply_action` deleted); the blueprint CFR + strategy passes and the search solver all traverse via make/undo (the solver reuses one restored env across its regret and strategy passes); LIFO round-trip + no-leak tested | — |
@@ -973,15 +999,20 @@ poker_ai play \
     an all-in line equals the env's exact `runout_equity` and is runout-RNG
     independent; with `False` it takes the sampled single-board path and can
     differ (the paper baseline).
-  - `showdown.py` (§6.5 vector regime, F2): `showdown_cfv` matches an
-    independent brute-force O(n²) all-pairs reference (built from the same scalar
-    evaluator, with card removal) to floating tolerance across boards and random
-    reach vectors; opponent reach on combos sharing a card with the acting combo
-    contributes **zero** (card removal), and a no-removal reference differs;
-    equal-rank matchups net zero (ties); board-incompatible acting combos return
-    zero; heads-up **zero-sum** (`Σ reach_a·cfv_a + Σ reach_b·cfv_b = 0`); CFV is
-    **linear in `stake`**; for a one-hot pair the CFV equals the chip delta from
-    `Pot.compute_utility` (engine-consistency); deterministic (no RNG).
+  - `environment/range_showdown.py` (§6.5 vector regime, F2): `showdown_cfv`
+    matches an independent brute-force O(n²) all-pairs reference (built from the
+    same shared evaluator, with card removal) to floating tolerance across boards
+    and random reach vectors; opponent reach on combos sharing a card with the
+    acting combo contributes **zero** (card removal), and a no-removal reference
+    differs; equal-rank matchups net zero (ties); board-incompatible acting combos
+    return zero; heads-up **zero-sum** (`Σ reach_a·cfv_a + Σ reach_b·cfv_b = 0`);
+    CFV is **linear in `stake`**; for a one-hot pair the CFV equals the chip delta
+    from `Pot.compute_utility` (engine-consistency); deterministic (no RNG).
+  - `test_payout_consistency.py` (the env's payout family is aligned):
+    `PokerEnv.vector_payout` against a one-hot opponent equals the engine's concrete
+    net chips when the two hands are dealt and the same betting line replayed —
+    across showdown/fold/all-in terminals and equal *and* unequal stacks (the
+    matched-stake / uncalled-excess case).
   - `solver.py`: regime selection picks MCCFR for round-1/round-2/large
     and vector for heads-up turn/river; terminates on either stopping
     criterion; per-hand tables released; root-street rows per-combo,
@@ -1054,7 +1085,7 @@ poker_ai play \
 | Risk | Mitigation |
 |---|---|
 | Multiway round-2 subgames too expensive (per-seat continuation choices) | Solved with MCCFR (paper regime): external sampling visits one opponent action and one continuation choice per traversal, so cost is independent of the joint profile count; the after-2nd-raise depth cutoff keeps the tree shallow; coarse search raise-size set (≤ 5–6) bounds branching. |
-| Vectorised showdown is subtly wrong (card removal, ties, side pots) | Test against a brute-force hand-vs-hand reference; restrict the vector regime to heads-up late streets (no side pots there); MCCFR (concrete `env.payout`) covers the multiway/side-pot cases. |
+| Vectorised showdown is subtly wrong (card removal, ties, side pots) | Test against a brute-force hand-vs-hand reference; the vector regime is heads-up late streets, so there are no *multiway* side pots — but an **unequal all-in** still arises (one stack short), handled by taking the **matched** (smaller) final contribution as the stake (the bigger stack's uncalled excess is excluded), reconstructed at the parent as `min(contribs[other], contribs[actor] + stack[actor])` because the engine resets the pot at the terminal; MCCFR (concrete `env.payout`) covers the multiway/side-pot cases. |
 | Heads-up turn/river subgames (to end of game) exceed the time budget | One sampled board runout per iteration keeps per-iteration cost linear in tree size; both caps are CLI-configurable and tunable per street. |
 | Opponent–opponent card-removal in the vector reach product is O(n_combos²) exact | Vector regime is heads-up only, so there is a single opponent range — no opponent–opponent term; mask only against the acting combo. |
 | Dense per-combo ranges too slow under frequent updates | Updates fire once per round boundary, O(n_combos) per observed action, amortized against search cost. Fallback: cluster-bucketed ranges behind a flag. |

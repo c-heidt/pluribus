@@ -84,6 +84,14 @@ class SolverState:
     legal_at: Dict[PublicKey, Tuple[str, ...]] = field(default_factory=dict)
     actor_at: Dict[PublicKey, int] = field(default_factory=dict)
     frozen: Dict[Key, np.ndarray] = field(default_factory=dict)
+    # Vector regime (§6.5): per-public-node ``(n_combos, width)`` matrices, the
+    # combo axis indexed by ``combo_index`` (lossless, every depth).  These are the
+    # vector regime's native storage — the hot loop is one vectorised op per node
+    # rather than ~n_combos dict rows.  A given ``SolverState`` is only ever written
+    # by one regime, so ``regret``/``strat_sum`` (MCCFR) and ``vregret``/``vstrat``
+    # (vector) never both populate; the readers below dispatch on which is present.
+    vregret: Dict[PublicKey, np.ndarray] = field(default_factory=dict)
+    vstrat: Dict[PublicKey, np.ndarray] = field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> "SolverState":
@@ -119,6 +127,27 @@ class SolverState:
             self._grow_rows(public_key, prev, legal)
             self.legal_at[public_key] = legal
 
+    def ensure_vnode(
+        self,
+        public_key: PublicKey,
+        legal_actions: Sequence[str],
+        actor: int,
+        n_combos: int,
+    ) -> None:
+        """Register a public node and lazily allocate its vector-regime matrices.
+
+        Like :meth:`ensure_node` (it delegates the ``legal_at``/``actor_at``
+        bookkeeping and warm-start widening — which now also grows the matrix
+        **columns**), but additionally allocates the ``(n_combos, width)``
+        ``vregret``/``vstrat`` matrices for ``public_key`` on first visit.  The
+        combo axis is indexed by ``combo_index`` (lossless at every depth, §6.5).
+        """
+        self.ensure_node(public_key, legal_actions, actor)
+        if public_key not in self.vregret:
+            width = len(self.legal_at[public_key])
+            self.vregret[public_key] = np.zeros((n_combos, width), dtype=np.float64)
+            self.vstrat[public_key] = np.zeros((n_combos, width), dtype=np.float64)
+
     def _grow_rows(
         self,
         public_key: PublicKey,
@@ -135,6 +164,13 @@ class SolverState:
                     grown = np.zeros(width, dtype=old.dtype)
                     grown[cols] = old
                     table[key] = grown
+        # Vector regime: grow the per-public-node matrices along the action axis.
+        for table in (self.vregret, self.vstrat):
+            mat = table.get(public_key)
+            if mat is not None:
+                grown = np.zeros((mat.shape[0], width), dtype=mat.dtype)
+                grown[:, cols] = mat
+                table[public_key] = grown
 
     # ------------------------------------------------------------------
     # Strategy / regret operations
@@ -152,7 +188,13 @@ class SolverState:
         — a condition the caller checks (it is encoded in the key only on the
         root street).  ``frozen`` is therefore consulted by the consumers
         (:mod:`mccfr`, :class:`SearchPolicy`) under that guard, not here.
+
+        Vector regime: when ``key``'s public node has a regret **matrix**
+        (``vregret``), regret-match its ``combo_index`` row.
         """
+        mat = self.vregret.get(key[0])
+        if mat is not None:
+            return calculate_strategy_from_row(mat[key[1]])
         width = len(self.legal_at[key[0]])
         row = self.regret.get(key)
         if row is None:
@@ -178,14 +220,22 @@ class SolverState:
 
         Mirrors ``CFRTables.apply_discount`` (in-memory, no floor clamp — the
         blueprint's regret floor guards a long training run, not a short search).
+        Scales the vector regime's per-node matrices too.
         """
-        for table in (self.regret, self.strat_sum):
+        for table in (self.regret, self.strat_sum, self.vregret, self.vstrat):
             for row in table.values():
                 row *= factor
 
     def average_sigma(self, key: Key) -> "np.ndarray | None":
-        """Normalised cumulative strategy at ``key``; ``None`` if unaccumulated."""
-        row = self.strat_sum.get(key)
+        """Normalised cumulative strategy at ``key``; ``None`` if unaccumulated.
+
+        Vector regime: read the ``combo_index`` row of the ``vstrat`` matrix.
+        """
+        mat = self.vstrat.get(key[0])
+        if mat is not None:
+            row = mat[key[1]]
+        else:
+            row = self.strat_sum.get(key)
         if row is None:
             return None
         total = row.sum()

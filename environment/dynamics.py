@@ -11,7 +11,7 @@ import collections
 import logging
 from typing import TYPE_CHECKING
 
-from environment.evaluator import Evaluator
+from environment.evaluator import default_evaluator as _evaluator
 
 if TYPE_CHECKING:
     from environment.poker_env import PokerEnv
@@ -19,10 +19,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Module-level singleton: immutable after init, NEVER deep-copied.
-# ---------------------------------------------------------------------------
-_evaluator: Evaluator = Evaluator()
+# The shared evaluator now lives in :mod:`environment.evaluator` as
+# ``default_evaluator`` (imported above as ``_evaluator`` for backward
+# compatibility).  Hosting it at the leaf evaluator layer keeps the
+# range-showdown settlement free of any dependency on this module.
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +142,10 @@ def compute_winners(env: PokerEnv) -> None:
     """
     ranked = rank_players_by_best_hand(env)
     payouts = env.pot.compute_utility(env.players, ranked)
+    # Snapshot the per-seat contributions *before* the pot is reset, so the
+    # terminal's matched/contested stake stays available to the payout evaluators
+    # (the smaller of two heads-up contributions is the winner-takes amount).
+    env._terminal_contributions = tuple(env.pot.capture())
     env.pot.reset()
     for player in env.players:
         player.add_chips(payouts[player.player_i])

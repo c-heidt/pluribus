@@ -16,8 +16,8 @@ import pytest
 from environment.player import Player
 from environment.poker_env import PokerEnv
 from environment.pot import Pot
-from poker_ai.search import showdown
-from poker_ai.search.showdown import (
+from environment import range_showdown as showdown
+from environment.range_showdown import (
     rank_combos_on_board,
     removal_index,
     showdown_cfv,

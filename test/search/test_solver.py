@@ -8,7 +8,7 @@ The solver is exercised at three levels:
 - **Integration** — ``solve()`` on a heads-up **flop** subgame (the MCCFR regime's
   terminal-only setting: no depth-limit leaf, exact small-deck runouts) runs,
   produces valid strategies, is deterministic, and reuses warm-start state.
-- **Convergence (slow)** — the average strategy stabilises over iterations.
+- **Convergence (fast)** — the average strategy stabilises over iterations.
 
 The heads-up flop subgame (`street_at_root == 1`, two live seats) is chosen
 deliberately: ``_select_regime`` routes it to MCCFR, and ``DepthLimit.classify``
@@ -28,8 +28,10 @@ from poker_ai.search.context import SubgameContext
 from poker_ai.search.leaf import LeafConfig
 from poker_ai.search.mccfr import _MCCFRSolver, _BIAS_CLASSES
 from poker_ai.search.policy import Policy, SearchPolicy
+from environment.range_showdown import reach_after_removal
 from poker_ai.search.solver import solve, SolverConfig, SolverState, _select_regime
 from poker_ai.search.solver_state import _hand_row
+from poker_ai.search.vector import _VectorSolver, _regret_match_matrix
 
 
 # --------------------------------------------------------------------------- #
@@ -68,6 +70,27 @@ def _flop_env(low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
         env.step_in_place("call" if "call" in env.legal_actions else "check")
         guard += 1
     return env
+
+
+def _advance_to(env: PokerEnv, target_round: int) -> PokerEnv:
+    """Walk a heads-up env (calls/checks only) to ``target_round``."""
+    guard = 0
+    while env.betting_round < target_round and not env.is_terminal and guard < 60:
+        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        guard += 1
+    return env
+
+
+def _late_env(target_round, low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
+    """Heads-up small-deck env advanced to ``target_round`` (2=turn, 3=river)."""
+    np.random.seed(seed)
+    env = PokerEnv(
+        players=[Player(i, s) for i, s in enumerate(stacks)],
+        low_card_rank=low,
+        high_card_rank=high,
+    )
+    _stub_lut(env)
+    return _advance_to(env, target_round)
 
 
 def _ctx(env, *, n_rollouts=2, seed=0, ranges=None, folded=None) -> SubgameContext:
@@ -115,22 +138,16 @@ class TestRegimeSelect:
         )
         assert _select_regime(ctx) == expected
 
-    def test_vector_regime_raises_not_implemented(self):
-        # Drive a HU env to the turn, then a search must dispatch to the (stub)
-        # vector regime and raise.
-        np.random.seed(1)
-        env = PokerEnv(players=[Player(i, 200) for i in range(2)],
-                       low_card_rank=11, high_card_rank=14)
-        _stub_lut(env)
-        guard = 0
-        while env.betting_round < 2 and not env.is_terminal and guard < 30:
-            env.step_in_place("call" if "call" in env.legal_actions else "check")
-            guard += 1
+    def test_vector_regime_dispatches_and_runs(self):
+        # Drive a HU env to the turn; a search must dispatch to the vector regime
+        # and run (no NotImplementedError), populating the per-node matrices.
+        env = _late_env(2, seed=1)
         assert env.betting_round == 2
         ctx = _ctx(env)
         assert _select_regime(ctx) == "vector"
-        with pytest.raises(NotImplementedError, match="vector regime"):
-            solve(env, ctx, _cfg(ctx, iters=1))
+        res = solve(env, ctx, _cfg(ctx, iters=5))
+        assert res.iterations_run == 5
+        assert len(res.state.vregret) > 0
 
 
 # --------------------------------------------------------------------------- #
@@ -502,4 +519,255 @@ class TestConvergence:
         a_n = root_range_average(200)
         a_2n = root_range_average(400)
         # deterministic; observed worst-case drift across the 5 trials is ~0.16.
+        assert np.abs(a_n - a_2n).max() < 0.25
+
+
+# --------------------------------------------------------------------------- #
+# Vector regime (heads-up turn/river)
+# --------------------------------------------------------------------------- #
+
+class TestVectorRegime:
+    """The vector-form Linear CFR path (§6.5): per-combo matrices, chance-sampled
+    river, showdown/fold terminals, all read back through the shared state."""
+
+    # -- units -------------------------------------------------------------- #
+
+    def test_regret_match_matrix(self):
+        regret = np.array([[0.0, 3.0, 1.0], [-1.0, -2.0, -3.0], [0.0, 0.0, 0.0]])
+        sigma = _regret_match_matrix(regret)
+        np.testing.assert_allclose(sigma[0], [0.0, 0.75, 0.25], atol=1e-6)
+        np.testing.assert_allclose(sigma[1], [1 / 3, 1 / 3, 1 / 3], atol=1e-6)  # no +regret
+        np.testing.assert_allclose(sigma[2], [1 / 3, 1 / 3, 1 / 3], atol=1e-6)  # fresh
+
+    def test_reach_after_removal_matches_bruteforce(self):
+        env = _late_env(2, seed=1)
+        cc = env.combo_cards
+        opp = np.random.default_rng(0).random(cc.shape[0])
+        got = reach_after_removal(cc, opp)
+        sets = [set(row) for row in cc.tolist()]
+        exp = np.array([
+            sum(opp[j] for j in range(len(sets)) if not (sets[i] & sets[j]))
+            for i in range(len(sets))
+        ])
+        # exercises the inclusion-exclusion add-back (j==i and one-card overlaps drop out)
+        np.testing.assert_allclose(got, exp, rtol=1e-9, atol=1e-9)
+
+    # -- SolverState matrix storage ---------------------------------------- #
+
+    def test_ensure_vnode_allocates_and_discount_scales(self):
+        st = SolverState.empty()
+        pk = ("turn", ())
+        st.ensure_vnode(pk, ("fold", "call"), actor=0, n_combos=6)
+        assert st.vregret[pk].shape == (6, 2) and st.vstrat[pk].shape == (6, 2)
+        st.vregret[pk][:] = 2.0
+        st.vstrat[pk][:] = 4.0
+        st.discount(0.5)
+        assert np.allclose(st.vregret[pk], 1.0) and np.allclose(st.vstrat[pk], 2.0)
+
+    def test_vnode_widening_grows_columns_preserving_values(self):
+        st = SolverState.empty()
+        pk = ("turn", ())
+        st.ensure_vnode(pk, ("fold", "call"), actor=0, n_combos=3)
+        st.vregret[pk][:] = [[1.0, 2.0]]
+        st.ensure_vnode(pk, ("fold", "call", "raise:1.0"), actor=0, n_combos=3)
+        assert st.vregret[pk].shape == (3, 3)
+        np.testing.assert_allclose(st.vregret[pk][:, :2], [[1.0, 2.0]] * 3)
+        np.testing.assert_allclose(st.vregret[pk][:, 2], [0.0, 0.0, 0.0])
+
+    def test_state_reads_matrix_rows(self):
+        st = SolverState.empty()
+        pk = ("turn", ())
+        st.ensure_vnode(pk, ("fold", "call", "raise"), actor=0, n_combos=4)
+        st.vregret[pk][2] = [0.0, 3.0, 1.0]
+        np.testing.assert_allclose(st.sigma((pk, 2)), [0.0, 0.75, 0.25], atol=1e-6)
+        st.vstrat[pk][2] = [2.0, 1.0, 1.0]
+        np.testing.assert_allclose(st.average_sigma((pk, 2)), [0.5, 0.25, 0.25], atol=1e-6)
+        assert st.average_sigma((pk, 0)) is None  # unaccumulated row
+
+    # -- terminal / value correctness -------------------------------------- #
+
+    def test_root_value_is_zero_sum(self):
+        # Under uniform play (fresh state) the reach-weighted root value to each
+        # seat sums to zero — a property that holds only if the showdown/fold
+        # stake is the matched contribution and card removal is consistent.
+        env = _late_env(3, seed=5)  # river: deterministic, no chance node
+        ctx = _ctx(env)
+        cfg = _cfg(ctx, iters=1)
+        s0, s1 = sorted(ctx.ranges)
+        bc = np.asarray(ctx.board_compatible, dtype=np.float64)
+        r0 = np.asarray(ctx.ranges[s0], np.float64) * bc
+        r1 = np.asarray(ctx.ranges[s1], np.float64) * bc
+        v0 = _VectorSolver(env, SolverState.empty(), ctx, cfg, ctx.rng)._walk(env, s0, r0, r1)
+        v1 = _VectorSolver(env, SolverState.empty(), ctx, cfg, ctx.rng)._walk(env, s1, r1, r0)
+        big = abs(float(r0 @ v0)) + abs(float(r1 @ v1)) + 1.0
+        assert abs(float(r0 @ v0) + float(r1 @ v1)) < 1e-6 * big
+
+    # -- regime behaviour --------------------------------------------------- #
+
+    def test_runs_on_turn_and_river_with_valid_strategies(self):
+        for target in (2, 3):
+            env = _late_env(target, seed=6)
+            ctx = _ctx(env)
+            assert _select_regime(ctx) == "vector"
+            res = solve(env, ctx, _cfg(ctx, iters=25))
+            assert len(res.state.vregret) > 0
+            for pk, legal in res.state.legal_at.items():
+                for pol in (res.policy, res.average_policy):
+                    d = pol.strategy_for(pk, 0, legal)
+                    assert d.shape == (len(legal),)
+                    assert abs(d.sum() - 1.0) < 1e-5 and (d >= -1e-9).all()
+
+    def test_determinism_independent_of_global_rng(self):
+        # The river is sampled from ctx.rng, so the result must not depend on the
+        # engine's global np.random state (unlike the MCCFR path).
+        def run(global_seed):
+            env = _late_env(2, seed=2)
+            ctx = _ctx(env, seed=7)
+            np.random.seed(global_seed)  # perturb global RNG after the subgame is fixed
+            return solve(env, ctx, _cfg(ctx, iters=30))
+
+        a, b = run(111), run(999)
+        assert set(a.state.vregret) == set(b.state.vregret)
+        for k in a.state.vregret:
+            np.testing.assert_allclose(a.state.vregret[k], b.state.vregret[k])
+
+    def test_no_reranking_in_iteration_loop(self, monkeypatch):
+        # §6.4.2 pt 3: ranking is reach-independent, so the env memoises each board
+        # and never re-ranks it across iterations.  Over many iterations the
+        # underlying rank_combos_on_board is called at most once per distinct
+        # candidate river — not once per node per iteration.
+        import environment.range_showdown as rs
+        rs._ranked_cached.cache_clear()
+        env = _late_env(2, seed=3)
+        ctx = _ctx(env)
+        calls = {"n": 0}
+        real = rs.rank_combos_on_board
+
+        def spy(*a, **k):
+            calls["n"] += 1
+            return real(*a, **k)
+
+        monkeypatch.setattr(rs, "rank_combos_on_board", spy)
+        solver = _VectorSolver(env, SolverState.empty(), ctx, _cfg(ctx, iters=1), ctx.rng)
+        n_candidate_rivers = len(solver._rivers)
+        for _ in range(40):
+            solver.iterate()
+        # bounded by distinct boards, independent of the 40 iterations / node count
+        assert 0 < calls["n"] <= n_candidate_rivers
+
+    def test_search_policy_reads_vector_result_and_frozen(self):
+        env = _late_env(2, seed=4)
+        ctx = _ctx(env)
+        res = solve(env, ctx, _cfg(ctx, iters=20))
+        pk = env.public_key
+        legal = tuple(a for a in env.legal_actions if a is not None)
+        ci = env.combo_index[tuple(sorted(int(c) for c in env.players[0].cards))]
+        play = res.policy.strategy_for(pk, ci, legal)
+        avg = res.average_policy.strategy_for(pk, ci, legal)
+        for d in (play, avg):
+            assert d.shape == (len(legal),)
+            assert abs(d.sum() - 1.0) < 1e-5 and (d >= -1e-9).all()
+        # a pinned actual-hand row is returned verbatim for play
+        frozen = np.zeros(len(legal), np.float32)
+        frozen[0] = 1.0
+        res.state.frozen[(pk, ci)] = frozen
+        np.testing.assert_allclose(
+            res.policy.strategy_for(pk, ci, legal), frozen, atol=1e-6
+        )
+
+    def test_unequal_allin_stake_is_matched_not_max(self):
+        # Heads-up unequal stacks: a short stack calls all-in for less against a
+        # standing partial bet.  The env exposes the *final* contributions
+        # (terminal_contributions) so the matched stake is unambiguously their
+        # min (the bigger stack's excess is uncalled) — no parent reconstruction,
+        # and a naive max() over the standing bet would overstate it.
+        np.random.seed(1)  # a decisive call-all-in-for-less showdown
+        start = [200, 2000]
+        env = PokerEnv(players=[Player(0, start[0]), Player(1, start[1])],
+                       low_card_rank=11, high_card_rank=14)
+        _stub_lut(env)
+        _advance_to(env, 3)
+        standing = None
+        while not env.is_terminal:
+            legal = [a for a in env.legal_actions if a]
+            actor = env.player_i
+            pc = env.pot.capture()
+            if actor == 1 and any(a.startswith("raise") for a in legal):
+                env.step_in_place([a for a in legal if a.startswith("raise")][-1])
+            elif actor == 0 and "all_in" in legal and pc[0] != pc[1]:
+                standing = list(pc)  # pre-close standing bet (unequal contributions)
+                env.step_in_place("all_in")  # short stack calls all-in for less
+            else:
+                env.step_in_place("call" if "call" in legal else legal[0])
+        assert standing is not None and standing[0] != standing[1]
+        assert env.is_terminal and not env.is_decision_free
+        assert len([s for s in (0, 1) if env.players[s].is_active]) == 2  # showdown
+
+        # The env's final contributions give the matched stake directly.
+        tc = env.terminal_contributions
+        matched = min(tc[0], tc[1])
+        assert matched < max(standing)              # not the standing-bet level
+        # winner's net == matched (per-player baseline; payout's single baseline is
+        # invalid for unequal stacks)
+        net = [env.players[s].n_chips - start[s] for s in (0, 1)]
+        assert max(abs(net[0]), abs(net[1])) == matched
+
+        # vector_payout uses that stake: one-hot opponent → ±matched per matchup.
+        cc = env.combo_cards
+        board = set(int(c) for c in env.community_cards)
+        valid = [k for k in range(cc.shape[0])
+                 if int(cc[k, 0]) not in board and int(cc[k, 1]) not in board]
+        i, j = valid[0], next(k for k in valid
+                              if not (set(cc[k].tolist()) & set(cc[valid[0]].tolist())))
+        opp = np.zeros(env.n_combos)
+        opp[j] = 1.0
+        v = env.vector_payout(0, 1, opp, river=None)[i]
+        assert abs(abs(v) - matched) < 1e-9
+
+    def test_freezing_pins_actual_hand_row(self):
+        # A pre-seeded frozen row for the bot's actual hand is never updated during
+        # the search (its regret stays zero while other rows move), and the search
+        # plays it back verbatim.  my_seat is the root actor so the root is a bot node.
+        env = _late_env(3, seed=8)  # river subgame, deterministic
+        actor = env.player_i
+        my_hole = tuple(int(c) for c in env.players[actor].cards)
+        ranges = {s: np.ones(env.n_combos, np.float32) / env.n_combos for s in range(2)}
+        leaf = LeafConfig(policies=_policies(), n_rollouts=1)
+        ctx = SubgameContext.from_runtime(
+            env=env, my_seat=actor, my_hole=my_hole, ranges=ranges,
+            folded_ranges={}, leaf=leaf, rng=np.random.default_rng(0),
+        )
+        pk = env.public_key
+        legal = tuple(a for a in env.legal_actions if a is not None)
+        ci = env.combo_index[tuple(sorted(my_hole))]
+        pinned = np.zeros(len(legal), np.float64)
+        pinned[0] = 1.0
+        state = SolverState.empty()
+        state.frozen[(pk, ci)] = pinned
+        res = solve(env, ctx, _cfg(ctx, iters=30), warm_start=state)
+        # the frozen actual-hand row accrued no regret...
+        np.testing.assert_allclose(res.state.vregret[pk][ci], 0.0)
+        # ...while other rows at the same node did move
+        assert np.abs(res.state.vregret[pk]).sum() > 0.0
+        np.testing.assert_allclose(res.policy.strategy_for(pk, ci, legal), pinned, atol=1e-6)
+
+    def test_average_strategy_stabilises(self, _seeded):
+        # A heads-up *river* subgame is fully deterministic (board complete, no
+        # chance), so the vector regime's average strategy settles tightly.
+        trial = _seeded
+
+        def root_average(iters):
+            env = _late_env(3, seed=20 + trial)
+            ctx = _ctx(env, seed=4 + trial)
+            pk = env.public_key
+            width = len([a for a in env.legal_actions if a is not None])
+            res = solve(env, ctx, _cfg(ctx, iters=iters))
+            mat = res.state.vstrat.get(pk)
+            if mat is None:
+                return np.full(width, 1.0 / width)
+            agg = mat.sum(axis=0)
+            return agg / agg.sum() if agg.sum() > 0 else np.full(width, 1.0 / width)
+
+        a_n = root_average(150)
+        a_2n = root_average(300)
         assert np.abs(a_n - a_2n).max() < 0.25
