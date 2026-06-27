@@ -937,7 +937,7 @@ the serial result bit-for-bit; multi-worker runs fix per-worker substreams
 | 5.1 | Decision-free runout evaluator (§6.4.1) | `environment/poker_env.py` | **done** — `is_decision_free` + `runout_equity` (exact board-average over completions, side-pots via `Pot.compute_utility`, cap+MC fallback); pre-runout snapshot recorded at the force-resolve (`_runout_info`, undo/deepcopy round-tripped); brute-force tested. Shared by the leaf (5.2) and the solver's forced-runout terminals (row 6) | 0 |
 | 5.2 | Continuation values | `poker_ai/search/leaf.py` | **done** — `leaf_value` → `continuation_value(frontier_env, profile, ctx)`; fixed profile, per-seat scalar, rollout from concrete hands (no resampling); blueprint-canonical lookups; decision-free exact equity via 5.1 gated by `use_decision_free_equity`; obsolete hole-samplers deleted (joint sampler is the solver's, row 6) | 0, 4, 5.1 |
 | 6.1 | Vectorised range-vs-range showdown (F2) | `environment/range_showdown.py` (env-owned) | **done** — `rank_combos_on_board` + `showdown_cfv`/`reach_after_removal`; O(n log n) sorted card-removal sweep, heads-up winner-takes-pot `stake·(W−L)`, no n² matrix; board-keyed ranking cache; depends on the shared `default_evaluator` only. Brute-force tested + cross-validated against concrete `payout` to the chip. Surfaced as `PokerEnv.vector_payout`, called by the vector regime (6.2) | 0, 2, 3 |
-| 6.2 | Rest of solver (MCCFR + vector CFR loops) + `SearchPolicy` | `poker_ai/search/solver_state.py`, `mccfr.py`, `vector.py`, `solver.py`, `policy.py` | **done** — **both regimes + `SearchPolicy`** (composition: `SolverState` shared data+ops, `_MCCFRSolver` with joint root sampling, external-sampling traversal, meta-game-as-action leaf, freezing, warm-start widening; `solve()` orchestrator + regime selection + Linear-CFR discount + dual stop; forced-runout terminals via `runout_equity` under `use_decision_free_equity`). **Vector regime** (`_VectorSolver`, HU turn/river): alternating-updates vector-form Linear CFR carrying per-combo reach vectors, all-actions-expanded, **one river sampled per iteration from `ctx.rng`** (engine deal ignored → no global-RNG dependence); **all terminal settlement is delegated to the env-owned `PokerEnv.vector_payout`** (6.1) — the regime passes only the traverser seat, opponent reach, and sampled river, and does no stake/showdown/fold/ranking itself; per-combo rows persist as `(n_combos, width)` matrices keyed by `public_key` in the same `SolverState`, read unchanged by `SearchPolicy`. Unit + integration + fast convergence/stability tests for both. The exact-equilibrium **independent brute-force CFR cross-validation is still deferred** (§9) so one oracle covers both paths | 0, 2, 3, 5.1, 5.2, 6.1 |
+| 6.2 | Rest of solver (MCCFR + vector CFR loops) + `SearchPolicy` | `poker_ai/search/solver_state.py`, `mccfr.py`, `vector.py`, `solver.py`, `policy.py` | **done** — **both regimes + `SearchPolicy`** (composition: `SolverState` shared data+ops, `_MCCFRSolver` with joint root sampling, external-sampling traversal, meta-game-as-action leaf, freezing, warm-start widening; `solve()` orchestrator + regime selection + Linear-CFR discount + dual stop; forced-runout terminals via `runout_equity` under `use_decision_free_equity`). **Vector regime** (`_VectorSolver`, HU turn/river): alternating-updates vector-form Linear CFR carrying per-combo reach vectors, all-actions-expanded, **one river sampled per iteration from `ctx.rng`** (engine deal ignored → no global-RNG dependence); **all terminal settlement is delegated to the env-owned `PokerEnv.vector_payout`** (6.1) — the regime passes only the traverser seat, opponent reach, and sampled river, and does no stake/showdown/fold/ranking itself; per-combo rows persist as `(n_combos, width)` matrices keyed by `public_key` in the same `SolverState`, read unchanged by `SearchPolicy`. Unit + integration + fast convergence/stability tests for both. The exact-equilibrium **independent brute-force CFR cross-validation is landed** (§9; `test/search/brute_force_cfr.py` + `test_equilibrium_oracle.py`, `slow`): one oracle solves a HU-river subgame to exact Nash and both regimes match it on best-response exploitability (tight for vector) and game value (the hard gate for sampled MCCFR) | 0, 2, 3, 5.1, 5.2, 6.1 |
 | 7 | Search-aware agent | `poker_ai/search/agent.py`, terminal wiring | todo | 3, 4, 6.2 |
 | 8 | CLI, config, tests | existing Click runner, `test/search/` | partial | 0–7 |
 | 9.1 | Make/undo traversal (`step_in_place` / `undo`) (Tier 1, §6.7) | `environment/poker_env.py` | **done** — the **sole** advance API (`apply_action` deleted); the blueprint CFR + strategy passes and the search solver all traverse via make/undo (the solver reuses one restored env across its regret and strategy passes); LIFO round-trip + no-leak tested | — |
@@ -1054,32 +1054,55 @@ poker_ai play \
     reproduces the serial result bit-for-bit; a fixed `(seed, n_workers)` is
     reproducible across runs; the MCCFR per-worker accumulator merge equals a
     serial run over the same total iteration count.
-- **Independent CFR cross-validation** (deferred — runs once **both** regimes
-  exist, so a single oracle validates the MCCFR *and* vector paths). A
-  **brute-force full-enumeration vanilla CFR** — written as a wholly independent
-  loop (its own regret/strategy tables and recursion, reusing the env only for
-  game *rules* and terminal payoffs, **not** `SolverState`/`_MCCFRSolver`) —
-  solves a tiny subgame to its exact equilibrium; each solver path must then
-  converge to the same fixed point.
-  - **Setting**: a **heads-up river** subgame with **small-support ranges** (a
-    few board-compatible combos per seat). The river is the sweet spot: the board
-    is complete, so there is **no board chance, no depth-limit leaf, and no
-    decision-free runout** — terminals are plain showdowns/folds via `env.payout`,
+- **Independent CFR cross-validation** (**done** — `test/search/brute_force_cfr.py`
+  + `test/search/test_equilibrium_oracle.py`, marked `slow`; one oracle validates
+  the MCCFR *and* vector paths). A **brute-force full-enumeration Linear CFR** —
+  written as a wholly independent loop (its own regret/strategy tables and
+  recursion, reusing the env only for game *rules* and terminal payoffs, **not**
+  `SolverState`/`_MCCFRSolver`/`vector_payout`) — solves a tiny subgame to its exact
+  equilibrium; each solver path then converges to the same fixed point.
+  - **Setting**: a **heads-up river** subgame with **small-support ranges** (two
+    board-compatible combos per seat, over disjoint card sets; deep stacks so the
+    river root offers graded raises, not just a shove). The river is the sweet spot:
+    the board is complete, so there is **no board chance, no depth-limit leaf, and
+    no decision-free runout** — terminals are plain showdowns/folds via `env.payout`,
     making the full tree **deterministic and exhaustively enumerable**; and it is
-    **2-player zero-sum**, so a true Nash exists for both paths to match. Small
-    support keeps the root hole-deal enumeration (the only chance) tiny.
+    **2-player zero-sum**, so a true Nash exists for both paths to match.
+  - **Reference construction**: one DFS (make/undo) captures the hole-independent
+    public betting tree; a concrete **payoff tensor** `M[leaf][(a,b)]` is built by
+    replaying each terminal line under every card-disjoint support pair via
+    `with_hole_cards` + `env.payout` (concrete settlement — *not* `vector_payout`,
+    so the vector path's exploitability also cross-checks `vector_payout`). The
+    oracle CFR, the game-value walk, and an exact **best-response** (per-hole
+    backward induction) all run on that static tree.
   - **Both paths on the same subgame**: the vector regime is selected for HU
     river natively; the MCCFR path is exercised by instantiating `_MCCFRSolver`
     directly on the river root (its mechanics are street-agnostic — this skips
-    only the meta-game leaf, which is covered separately). Both write rows keyed
-    the same `(public_key, hand_row)`, so they compare directly.
-  - **Metric**: the range-aggregated root average strategy (and/or the game
-    value) of each path matches the brute-force reference within tolerance — the
-    same drift distance used by the fast stability test, but now against a true
-    equilibrium rather than self-consistency. Marked `slow`.
-  - Until then, the MCCFR path is guarded by the **fast convergence/stability
-    test** (`TestConvergence`): the root range-average drifts little between *N*
-    and *2N* iterations (a genuine convergence property, no external oracle).
+    only the meta-game leaf, which is covered separately) and driving the same
+    iterate/discount loop as `solve()`. Both expose their average via
+    `SolverState.average_sigma((public_key, combo_index))`, so they compare directly.
+  - **Metric**: best-response **exploitability** drives to ~0, and the unique
+    zero-sum **game value** of each path matches the oracle within tolerance.
+    Exploitability is the tight gate for the full-width **vector** regime. For the
+    sampled **MCCFR** regime the gates are (1) **game value** matches the oracle and
+    (2) the **trained** part of the average is a genuine equilibrium. The latter is
+    needed because external-sampling MCCFR trains *regrets* everywhere (the regret
+    pass explores all the traverser's actions) but accumulates the *average* only
+    along the strategy pass's sampled trajectory (as the production blueprint
+    `update_strategy` does), so off-equilibrium-path infosets keep `strat_sum == 0`
+    and fall back to **uniform** — a whole-tree best response deviates into those
+    branches, giving the *raw* sampled-average exploitability a residual floor that
+    is roughly constant in `T` (≈15–18 chips on a mixed-equilibrium board even at
+    320k iterations), even though the game value is exact and the on-path average
+    matches the oracle. Filling only the untrained infosets from the oracle drives
+    exploitability back to ~0, isolating that the trained strategy is correct. (In
+    live play those off-path branches are never relied on — an opponent deviation
+    triggers a fresh re-search, §5.) Game value is preferred over raw strategy
+    equality because a zero-sum Nash is value-unique but not necessarily
+    strategy-unique.
+  - The MCCFR path remains additionally guarded by the **fast convergence/stability
+    test** (`TestConvergence`): the root range-average drifts little between *N* and
+    *2N* iterations (a genuine convergence property, no external oracle).
 - **Integration test**: one full hand versus a scripted opponent; assert
   search fires at the start of round 2, an off-tree raise triggers a
   re-search from the same root with the bot's acted σ frozen, and the agent
