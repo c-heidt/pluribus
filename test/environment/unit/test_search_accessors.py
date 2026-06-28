@@ -30,9 +30,35 @@ class TestPublicKey:
     def test_reflects_history_and_is_hashable(self):
         env = _env()
         env_next = copy.deepcopy(env); env_next.step_in_place("call")
-        assert env_next.public_key == ("pre_flop", ("call",))
+        # Full cross-street history: each touched stage carried as
+        # (stage, actions), led by the current betting stage.
+        assert env_next.public_key == ("pre_flop", (("pre_flop", ("call",)),))
         # Hashable → usable as a solver table key.
         _ = {env.public_key: 1, env_next.public_key: 2}
+
+    def test_distinguishes_cross_street_lines(self):
+        # Two river nodes reached via different earlier-street betting have
+        # different pots/stacks and must NOT collide onto one key (regression
+        # for the truncated-to-current-stage bug: every river node hashing to
+        # ("river", ()) and silently sharing CFR rows / crashing widening).
+        def to_river(raise_flop: bool) -> PokerEnv:
+            env = _env()
+            env.step_in_place("call")          # pre-flop
+            env.step_in_place("call")
+            if raise_flop:                     # flop: build a bigger pot on one line
+                env.step_in_place(_first_raise(env))
+                env.step_in_place("call")
+            else:
+                env.step_in_place("call")
+                env.step_in_place("call")
+            env.step_in_place("call")          # turn
+            env.step_in_place("call")
+            return env
+
+        small, big = to_river(False), to_river(True)
+        assert small.betting_round == 3 and big.betting_round == 3
+        assert small.pot_size != big.pot_size          # genuinely different states
+        assert small.public_key != big.public_key      # ... so distinct keys
 
     def test_independent_of_actor(self):
         # public_key embeds no actor cards — it's a pure function of the

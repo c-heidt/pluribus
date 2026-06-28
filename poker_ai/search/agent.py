@@ -1,0 +1,307 @@
+"""Search-aware play agent (§6.6) — the online orchestrator (Algorithm 2).
+
+:class:`SearchAgent` ties the already-landed search pieces (range tracking,
+subgame context, the two CFR regimes behind :func:`solve`, the policy readers and
+the leaf evaluator) into a per-hand play lifecycle.  It owns no game dynamics and
+**never sees chips** — action strings in, an action string out:
+
+- ``on_hand_start`` resets the per-hand state and snapshots the round-1 root.
+- ``on_board_update`` runs the round-boundary Bayes belief update over every
+  seat's range, then immediately solves the new round's subgame (so the search is
+  ready *before* the bot is asked to act).
+- ``on_observed_action`` buffers each observed action for the next boundary update
+  and, on rounds 2–4, re-searches the same root (warm-started) whenever an
+  opponent takes an action outside the subgame's action abstraction.
+- ``act`` plays the blueprint on round 1 (unless a round-1 search was triggered)
+  and the searched final-iteration strategy on rounds 2–4, pinning the bot's
+  actual-hand action so a re-search keeps it fixed.
+
+Runner / play-loop wiring lives outside this module: a runner instantiates the
+agent and drives these four hooks (plus :meth:`search_round1` if it owns the
+chip-denominated round-1 trigger).  See ``docs/subgame_solving.md`` §4–§6.6.
+"""
+
+from __future__ import annotations
+
+import copy
+from typing import Callable, Dict, List, Mapping, Optional, Tuple
+
+import numpy as np
+
+from environment.poker_env import PokerEnv
+from poker_ai.search.context import SubgameContext
+from poker_ai.search.policy import BiasClass, Policy
+from poker_ai.search.ranges import RangeTracker
+from poker_ai.search.solver import SearchResult, SolverConfig, solve
+
+
+class SearchAgent:
+    """Real-time-search play agent (§6.6)."""
+
+    def __init__(
+        self,
+        leaf_policies: Mapping[BiasClass, Policy],
+        blueprint_policy: Policy,
+        solver_cfg: SolverConfig,
+        rng: np.random.Generator,
+        *,
+        round1_offtree_threshold: float = 0.25,
+        round1_max_players: int = 4,
+    ) -> None:
+        # --- session-static ---
+        self._leaf_policies = leaf_policies     # the four §4 variants (== cfg.leaf.policies)
+        self._blueprint = blueprint_policy      # round-1 play + round-1->2 Bayes
+        self._cfg = solver_cfg                  # carries .leaf (the LeafConfig)
+        self._rng = rng
+        self._round1_threshold = float(round1_offtree_threshold)
+        self._round1_max_players = int(round1_max_players)
+
+        # --- per-hand (initialised in on_hand_start) ---
+        self.my_seat: int = -1
+        self.my_hole: Tuple[int, int] = (-1, -1)
+        self.tracker: Optional[RangeTracker] = None
+        self.pending_actions: List[Tuple[int, PokerEnv, str]] = []
+        self.last_search: Optional[SearchResult] = None
+        self._root_env: Optional[PokerEnv] = None
+        self._ctx: Optional[SubgameContext] = None
+        self._searched_this_round: bool = False
+        self._folded: bool = False              # bot has folded → agent dormant
+
+    # ----------------------------------------------------------------- #
+    # Lifecycle (Algorithm 2)
+    # ----------------------------------------------------------------- #
+    def on_hand_start(self, env: PokerEnv, my_seat: int) -> None:
+        """Reset per-hand state at the start of a new hand (round 1, pre-flop).
+
+        Snapshots the round-1 root (``self._root_env``) so a round-1 search can be
+        triggered later, and clears any off-tree injections left over from the
+        previous hand.  No search runs — round 1 plays the blueprint by default.
+        """
+        self.my_seat = int(my_seat)
+        self.my_hole = tuple(sorted(int(c) for c in env.players[my_seat].cards))
+        live = [i for i in range(env.n_players) if env.players[i].is_active]
+        self.tracker = RangeTracker(env, self.my_seat, self.my_hole, live)
+        self.pending_actions = []
+        self.last_search = None
+        self._ctx = None
+        self._searched_this_round = False
+        self._folded = False
+        # Frozen at pre-flop start; the overlay dict is shared by reference so
+        # later injections into the live env are visible here automatically.
+        self._root_env = copy.deepcopy(env)
+        env.reset_overlay()
+
+    def on_board_update(self, env: PokerEnv, new_cards) -> None:
+        """A new betting round has begun; ``env`` is the round-start root.
+
+        Runs the round-boundary belief update (replay buffered actions under the
+        round-just-ended's strategy, then zero new-board-conflicting combos), then
+        roots and solves the new round's subgame so it is ready before ``act``.
+
+        No-op once the bot has folded — it has no further decisions this hand, so
+        there is nothing to search.
+        """
+        if self._folded:
+            return
+        self._apply_boundary_belief_update()
+        self.tracker.on_board_update(new_cards)
+        self._solve_and_store(copy.deepcopy(env))
+        self.pending_actions = []
+
+    def on_observed_action(self, env_before: PokerEnv, seat: int, action: str) -> None:
+        """Record an observed action and re-search on an off-tree opponent raise.
+
+        ``env_before`` must be the pre-action env where ``env_before.player_i ==
+        seat`` (the caller deepcopies before stepping).  The action is buffered for
+        the next boundary's Bayes update.  A (re-)search is a reaction to an
+        **opponent's** action only — the bot's own action never triggers one, and a
+        bot fold puts the agent dormant for the rest of the hand.  On rounds 2–4 a
+        genuinely off-abstraction opponent raise (one the runtime injected into the
+        shared overlay, so legal here yet off the canonical set) triggers a
+        warm-started re-search of the same root; on round 1 it may trigger a
+        round-1 search.
+        """
+        if self._folded:
+            return
+        self.pending_actions.append((seat, env_before, action))
+        if seat == self.my_seat:
+            if action == "fold":
+                self._folded = True
+            return
+        if self.last_search is not None:
+            # Re-search only when an off-canonical opponent raise was actually
+            # injected into the tree (present in ``legal_actions`` via the overlay,
+            # yet off the canonical set) — so an unplayable/uninjected size is a
+            # no-op, not a wasted full re-solve.  Same root + ctx; the injection is
+            # visible via the shared overlay.
+            if self._is_off_tree(env_before, action) and action in env_before.legal_actions:
+                self.last_search = solve(
+                    self._root_env, self._ctx, self._cfg,
+                    warm_start=self.last_search.state,
+                )
+        else:
+            self._maybe_trigger_round1(env_before, action)
+
+    def act(self, env: PokerEnv) -> str:
+        """Return the action the bot plays at its current decision.
+
+        Round 1 with no search: sample the blueprint.  Otherwise: sample the
+        search's **final-iteration** strategy for the bot's actual hand and pin
+        that mixed strategy into the freeze map so a re-search keeps it fixed.
+        """
+        if self.last_search is None:
+            state = env.policy_state_for(self.my_hole, for_blueprint=True)
+            prob = self._blueprint.strategy(state, "none")
+            return self._sample(prob, list(state.legal_actions))
+
+        pk = env.public_key
+        hr = self._hand_row(env)
+        legal = [a for a in env.legal_actions if a is not None]
+        prob = np.asarray(
+            self.last_search.policy.strategy_for(pk, hr, legal), dtype=np.float64
+        )
+        total = prob.sum()
+        prob = prob / total if total > 0 else np.full(len(legal), 1.0 / len(legal))
+        action = self._sample(prob, legal)
+        # Freeze the actual-hand row at the (normalised) mixed σ just played — not
+        # the realised sample — so a within-round re-search keeps it pinned (§5).
+        st = self.last_search.state
+        st.legal_at.setdefault(pk, tuple(legal))
+        st.frozen[(pk, hr)] = prob
+        return action
+
+    # ----------------------------------------------------------------- #
+    # Public mechanism (a chip-aware runner may also call this directly)
+    # ----------------------------------------------------------------- #
+    def search_round1(self) -> None:
+        """Run a round-1 subgame search and store it so ``act`` reads the search.
+
+        Always roots at the pre-flop root snapshotted in :meth:`on_hand_start` (its
+        ``street_at_root == 0`` makes the depth limit cut leaves at the end of
+        round 1) — it takes no env argument because the round-1 root is fixed for
+        the hand.  The *decision* of when to call this is the caller's; the agent
+        provides a chip-free trigger in :meth:`_maybe_trigger_round1`.
+        """
+        self._solve_and_store(self._root_env)
+
+    # ----------------------------------------------------------------- #
+    # Belief update + solve
+    # ----------------------------------------------------------------- #
+    def _apply_boundary_belief_update(self) -> None:
+        """Replay the round's buffered actions through the range tracker.
+
+        Each ``(seat, env_before, action)`` is Bayes-applied under the strategy of
+        the round just ending (the last search's average policy, or the blueprint
+        for the round-1→2 boundary).  A fold is replayed *then* the seat is moved
+        to the folded set, yielding the post-fold posterior for card removal.
+        """
+        for seat, env_before, action in self.pending_actions:
+            sigma = self._make_sigma_for_combo(env_before)
+            self.tracker.on_action(seat, env_before, action, sigma)
+            if action == "fold":
+                self.tracker.on_seat_folded(seat)
+
+    def _solve_and_store(self, root_env: PokerEnv) -> None:
+        """Build the ctx from the current ranges, solve, and store the result."""
+        self._root_env = root_env
+        self._ctx = SubgameContext.from_runtime(
+            root_env,
+            self.my_seat,
+            self.my_hole,
+            self.tracker.snapshot(),
+            self.tracker.folded_snapshot(),
+            self._cfg.leaf,
+            self._rng,
+        )
+        self.last_search = solve(root_env, self._ctx, self._cfg)
+        self._searched_this_round = True
+
+    def _make_sigma_for_combo(
+        self, env_before: PokerEnv
+    ) -> Callable[[int], np.ndarray]:
+        """Closure mapping a combo row ``h`` → its action distribution at ``env_before``.
+
+        Aligned to ``[a for a in env_before.legal_actions if a is not None]`` for
+        the hypothetical hole ``env_before.combo_cards[h]`` — the contract
+        :meth:`RangeTracker.on_action` requires.  ``ranges.py`` never imports
+        ``policy.py``; the agent owns this bridge.
+        """
+        if self._searched_this_round and self.last_search is not None:
+            pk = env_before.public_key
+            legal = [a for a in env_before.legal_actions if a is not None]
+            avg = self.last_search.average_policy
+
+            def sigma(h: int) -> np.ndarray:
+                return avg.strategy_for(pk, h, legal)
+
+            return sigma
+
+        combo_cards = env_before.combo_cards
+
+        def sigma_blueprint(h: int) -> np.ndarray:
+            state = env_before.policy_state_for(
+                tuple(int(c) for c in combo_cards[h]), for_blueprint=True
+            )
+            return self._blueprint.strategy(state, "none")
+
+        return sigma_blueprint
+
+    # ----------------------------------------------------------------- #
+    # Round-1 trigger (pot-relative fraction-gap; chip-free)
+    # ----------------------------------------------------------------- #
+    def _maybe_trigger_round1(self, env_before: PokerEnv, action: str) -> None:
+        """Trigger a round-1 search on a sufficiently off-abstraction raise.
+
+        Pot-relative analog of §5's "> $100 from every blueprint size": the
+        observed off-tree raise fraction ``f_obs`` (= chips/pot, straight from the
+        injected ``raise:<f_obs>`` string) must differ from *every* canonical
+        abstraction fraction by more than ``round1_offtree_threshold`` (pot
+        fractions), with no more than ``round1_max_players`` seats live.  Both
+        conditions are chip-free.
+        """
+        if self.last_search is not None:
+            return
+        if not self._is_off_tree(env_before, action):
+            return
+        f_obs = float(action.split(":", 1)[1])
+        sizes = env_before.canonical_raise_fractions()
+        gap = min((abs(f_obs - a) for a in sizes), default=float("inf"))
+        n_live = sum(1 for p in env_before.players if p.is_active)
+        if gap > self._round1_threshold and n_live <= self._round1_max_players:
+            self.search_round1()
+
+    # ----------------------------------------------------------------- #
+    # Pure helpers
+    # ----------------------------------------------------------------- #
+    def _is_off_tree(self, env_before: PokerEnv, action: str) -> bool:
+        """True iff ``action`` is a raise off the blueprint (canonical) raise set.
+
+        The solver branches on the full canonical abstraction (``legal_actions``),
+        and the runtime injects exactly the raises that fall off it, so off-tree
+        detection uses the same set: fold / call / check / ``all_in`` are always
+        on-tree, and only a ``raise:<f>`` whose fraction is not a currently-playable
+        canonical fraction is off-tree (and therefore worth a re-search).  Matches
+        the ``"raise:"`` prefix specifically so a malformed bare ``"raise"`` is
+        treated as on-tree rather than parsed downstream.
+        """
+        if not action.startswith("raise:"):
+            return False
+        canonical = {f"raise:{f}" for f in env_before.canonical_raise_fractions()}
+        return action not in canonical
+
+    def _sample(self, prob, legal: List[str]) -> str:
+        """Sample a legal action from ``prob`` (renormalised in float64)."""
+        if not legal:
+            raise ValueError("SearchAgent._sample: no legal actions to sample from")
+        prob = np.asarray(prob, dtype=np.float64)
+        total = prob.sum()
+        if total > 0:
+            prob = prob / total
+        else:
+            prob = np.full(len(legal), 1.0 / len(legal))
+        idx = int(self._rng.choice(len(legal), p=prob))
+        return legal[idx]
+
+    def _hand_row(self, env: PokerEnv) -> int:
+        """Combo index of the bot's actual hand on the (current = root) street."""
+        return int(env.combo_index[self.my_hole])

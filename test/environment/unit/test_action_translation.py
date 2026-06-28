@@ -1,12 +1,10 @@
-"""Tests for pseudo-harmonic action translation, history canonicalisation,
-and the coarse search raise-size set (docs/subgame_solving.md §6.3).
+"""Tests for pseudo-harmonic action translation and history canonicalisation
+(docs/subgame_solving.md §6.3).
 
 Covers :meth:`PokerEnv._pseudo_harmonic_prob` /
 ``_pseudo_harmonic_neighbours`` / ``_translate_fraction``,
 ``_canonicalize_history`` / ``_blueprint_info_set`` /
-``policy_state_for(for_blueprint=...)``, and
-``search_raise_fractions`` / ``search_raise_actions`` against
-``SEARCH_RAISE_SIZES_BY_STAGE``.
+``policy_state_for(for_blueprint=...)``.
 """
 
 from collections import defaultdict
@@ -19,7 +17,6 @@ from environment.player import Player
 from environment.poker_env import (
     PokerEnv,
     RAISE_SIZES_BY_STAGE,
-    SEARCH_RAISE_SIZES_BY_STAGE,
 )
 from poker_ai.blueprint.tree_utils import calculate_strategy_from_row
 from poker_ai.search.policy import BlueprintPolicy
@@ -141,72 +138,6 @@ class TestTranslateFraction:
         )
         # Expected P(A) = 3/7 ≈ 0.4286; binomial std ≈ 0.0025, allow 5σ.
         assert abs(a_count / n - 3 / 7) < 0.0125
-
-
-# ---------------------------------------------------------------------------
-# Coarse search raise-size set
-# ---------------------------------------------------------------------------
-
-
-class TestSearchRaiseSet:
-
-    def test_subset_of_blueprint_and_capped(self):
-        for stage, cells in SEARCH_RAISE_SIZES_BY_STAGE.items():
-            for key, fracs in cells.items():
-                full = set(RAISE_SIZES_BY_STAGE[stage][key])
-                assert set(fracs) <= full, (stage, key)
-                assert len(fracs) <= 6, (stage, key)
-
-    def test_preflop_first_raise_matches_user_spec(self):
-        assert SEARCH_RAISE_SIZES_BY_STAGE["pre_flop"]["first_raise"] == [
-            0.25, 0.5, 0.75, 1.0, 1.5, 2.0
-        ]
-
-    def test_search_fractions_subset_of_canonical_at_live_node(self):
-        env = _env()
-        assert env.player_i == 0
-        search = set(env.search_raise_fractions())
-        canonical = set(env.canonical_raise_fractions())
-        assert search <= canonical
-        assert len(search) <= 6
-
-    def test_search_actions_are_raise_strings(self):
-        env = _env()
-        for a in env.search_raise_actions():
-            assert a.startswith("raise:")
-            assert float(a.split(":", 1)[1]) in env.search_raise_fractions()
-
-    def test_search_actions_are_directly_legal(self):
-        # The safety invariant the solver relies on: every enumerated
-        # search action is in legal_actions, so step_in_place never
-        # silently remaps it (which would desync the solver's table key).
-        env = _env()
-        legal = set(a for a in env.legal_actions if a is not None)
-        for a in env.search_raise_actions():
-            assert a in legal, a
-
-    def test_search_subset_of_canonical_across_streets(self):
-        # Walk to each street and assert the subset invariant holds at a
-        # live raise node (not just pre-flop).
-        env = _env()
-        for _ in range(8):
-            if env.is_terminal:
-                break
-            search = set(env.search_raise_fractions())
-            canonical = set(env.canonical_raise_fractions())
-            assert search <= canonical
-            nxt = "check" if "check" in env.legal_actions else "call"
-            if nxt not in env.legal_actions:
-                break
-            env.step_in_place(nxt)
-
-    def test_gating_tracks_canonical_when_maxed(self):
-        # At MAX_RAISES the canonical set is empty; the search set must be too.
-        env = _env()
-        from environment.poker_env import MAX_RAISES_PER_ROUND
-        env._n_raises = MAX_RAISES_PER_ROUND
-        assert env.canonical_raise_fractions() == []
-        assert env.search_raise_fractions() == []
 
 
 # ---------------------------------------------------------------------------

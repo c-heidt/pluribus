@@ -41,9 +41,12 @@ scope of this document.
 ### Non-goals
 
 - No changes to the blueprint training pipeline (its action abstraction or the
-  card clustering). Real-time search, as in the paper, uses its **own**
-  abstractions: a coarser raise-size set (≤ 5–6 sizes per decision) for the
-  subgame action tree, and — for cards — lossless abstraction on the root street
+  card clustering). Real-time search currently **reuses the blueprint's
+  (canonical) raise-size set** for the subgame action tree — the paper's coarser
+  search-specific set (≤ 5–6 sizes per decision) was removed for simplicity and
+  is deferred (see §6.5); it can be reintroduced as a search-speed optimization
+  if the canonical tree proves too large in real time. For cards, search uses
+  lossless abstraction on the root street
   with the existing 200-bucket LUT on later streets (upgraded to 500 when the new
   LUT is computed; the 200-vs-500 count is the one accepted divergence from the
   paper).
@@ -62,7 +65,7 @@ scope of this document.
 | Continuation strategies | k = 4: unaltered blueprint; fold-, call-, raise-biased = blueprint with that action class's probability ×5, renormalized at inference time |
 | Subgame depth limit | Round-1 search: end of round 1. Round-2 search with > 2 players at round start: start of round 3 **or** immediately after the 2nd raise of the round, whichever is earlier. All other cases (round 2 heads-up, rounds 3–4): end of the game |
 | Card abstraction in search | Lossless (per-combo) on the root street; 200-bucket LUT clusters on later streets (→ 500 with the new LUT) |
-| Subgame action abstraction | Coarser, search-specific raise-size set — ≤ 5–6 pot-fractions per decision (paper); opponent raises off this set are injected and trigger re-search |
+| Subgame action abstraction | The blueprint's **canonical** raise-size set (`RAISE_SIZES_BY_STAGE`); opponent raises off it are injected and trigger re-search. The paper's coarser search-specific set (≤ 5–6 pot-fractions) was removed and is deferred — reintroduce only as a search-speed optimization if needed (§6.5) |
 | CFR algorithm | Two regimes (paper): external-sampling Linear MCCFR for large/early subgames (round 1, round 2, large multiway); vector-form Linear CFR sampling one board runout per iteration for small/late subgames (heads-up turn/river). CFR-P pruning is **not** applied in search — the blueprint's threshold never fires at search scale (§6.5) |
 | Range representation | Dense per-combo distribution for **every** player still in the hand, including the bot (observer perspective) |
 | Belief updates | Bayes' rule at round boundaries under the previous search's weighted-average strategy (blueprint if no search has run yet this hand) |
@@ -661,8 +664,13 @@ Tables keyed `Key = (public_key, hand_row)`. The **hand row** is per-combo on th
 root street (lossless) and a 200-bucket LUT cluster (`env.cluster_for`) on later
 streets (→ 500 with the new LUT). Node **width** is per-node — injected off-tree
 actions extend the legal set at specific public keys. The subgame action tree is
-built from the **coarse search raise-size set** (§3, §6.3), not the blueprint's;
-raises off that set are injected. Per-row regret matching reuses
+built from the **blueprint's canonical raise-size set** (`env.legal_actions`);
+raises off it are injected. (The paper's coarser search-specific raise set was
+removed for simplicity — both regimes branch on `legal_actions` — and is deferred
+as a possible search-speed optimization: a smaller per-node action set would
+shrink the tree, with the largest win pre-flop where the canonical set is widest.
+The agent's off-tree re-search trigger keys off the same canonical set, so
+detection and the tree stay aligned.) Per-row regret matching reuses
 [`calculate_strategy_from_row`](../poker_ai/blueprint/tree_utils.py); do **not**
 reuse the fixed-width `accumulate_regrets` / `get_node_strategy`. Tables are
 in-memory (no lmdb / no disk), live for one hand (warm-start across re-searches),
@@ -933,13 +941,13 @@ the serial result bit-for-bit; multi-worker runs fix per-worker substreams
 | 0 | Combo helpers + `Policy` ABC + `BlueprintPolicy` | `environment/utils.py`, `environment/poker_env.py`, `poker_ai/search/policy.py` | **done** — ×5 probability reweighting (`_reweight_bias`, `bias_multiplier=5.0`) | — |
 | 2 | Env overlay + `with_hole_cards` (done) + `SubgameContext` + new env accessors | `environment/poker_env.py`, `poker_ai/search/context.py` | **done** — all-seat `ranges` + `folded_ranges`; `DepthLimit` descriptor; `public_key`, `cluster_for`, `n_raises_this_round` | 0 |
 | 3 | Range tracking | `poker_ai/search/ranges.py` | **done** — tracks the bot's own observer-perspective range (incl. `my_seat` in `snapshot`); `on_action` is the round-boundary replay primitive servicing every seat | 0 |
-| 4 | Chip↔action env API + search raise-size set | `environment/poker_env.py` | **done** — pseudo-harmonic translation (`_translate_fraction`, randomized + deterministic); history canonicalization (`_canonicalize_history`/`_blueprint_info_set`/`policy_state_for(for_blueprint=…)`, no-op on on-tree histories); `SEARCH_RAISE_SIZES_BY_STAGE` + `search_raise_fractions`/`search_raise_actions`; `string_for_chips` tolerance snap removed | — |
+| 4 | Chip↔action env API | `environment/poker_env.py` | **done** — pseudo-harmonic translation (`_translate_fraction`, randomized + deterministic); history canonicalization (`_canonicalize_history`/`_blueprint_info_set`/`policy_state_for(for_blueprint=…)`, no-op on on-tree histories); `string_for_chips` tolerance snap removed. (The separate coarse search raise-size set — `SEARCH_RAISE_SIZES_BY_STAGE` / `search_raise_fractions` / `search_raise_actions` — was removed; search uses the canonical `RAISE_SIZES_BY_STAGE` set, §6.5.) | — |
 | 5.1 | Decision-free runout evaluator (§6.4.1) | `environment/poker_env.py` | **done** — `is_decision_free` + `runout_equity` (exact board-average over completions, side-pots via `Pot.compute_utility`, cap+MC fallback); pre-runout snapshot recorded at the force-resolve (`_runout_info`, undo/deepcopy round-tripped); brute-force tested. Shared by the leaf (5.2) and the solver's forced-runout terminals (row 6) | 0 |
 | 5.2 | Continuation values | `poker_ai/search/leaf.py` | **done** — `leaf_value` → `continuation_value(frontier_env, profile, ctx)`; fixed profile, per-seat scalar, rollout from concrete hands (no resampling); blueprint-canonical lookups; decision-free exact equity via 5.1 gated by `use_decision_free_equity`; obsolete hole-samplers deleted (joint sampler is the solver's, row 6) | 0, 4, 5.1 |
 | 6.1 | Vectorised range-vs-range showdown (F2) | `environment/range_showdown.py` (env-owned) | **done** — `rank_combos_on_board` + `showdown_cfv`/`reach_after_removal`; O(n log n) sorted card-removal sweep, heads-up winner-takes-pot `stake·(W−L)`, no n² matrix; board-keyed ranking cache; depends on the shared `default_evaluator` only. Brute-force tested + cross-validated against concrete `payout` to the chip. Surfaced as `PokerEnv.vector_payout`, called by the vector regime (6.2) | 0, 2, 3 |
 | 6.2 | Rest of solver (MCCFR + vector CFR loops) + `SearchPolicy` | `poker_ai/search/solver_state.py`, `mccfr.py`, `vector.py`, `solver.py`, `policy.py` | **done** — **both regimes + `SearchPolicy`** (composition: `SolverState` shared data+ops, `_MCCFRSolver` with joint root sampling, external-sampling traversal, meta-game-as-action leaf, freezing, warm-start widening; `solve()` orchestrator + regime selection + Linear-CFR discount + dual stop; forced-runout terminals via `runout_equity` under `use_decision_free_equity`). **Vector regime** (`_VectorSolver`, HU turn/river): alternating-updates vector-form Linear CFR carrying per-combo reach vectors, all-actions-expanded, **one river sampled per iteration from `ctx.rng`** (engine deal ignored → no global-RNG dependence); **all terminal settlement is delegated to the env-owned `PokerEnv.vector_payout`** (6.1) — the regime passes only the traverser seat, opponent reach, and sampled river, and does no stake/showdown/fold/ranking itself; per-combo rows persist as `(n_combos, width)` matrices keyed by `public_key` in the same `SolverState`, read unchanged by `SearchPolicy`. Unit + integration + fast convergence/stability tests for both. The exact-equilibrium **independent brute-force CFR cross-validation is landed** (§9; `test/search/brute_force_cfr.py` + `test_equilibrium_oracle.py`, `slow`): one oracle solves a HU-river subgame to exact Nash and both regimes match it on best-response exploitability (tight for vector) and game value (the hard gate for sampled MCCFR) | 0, 2, 3, 5.1, 5.2, 6.1 |
-| 7 | Search-aware agent | `poker_ai/search/agent.py`, terminal wiring | todo | 3, 4, 6.2 |
-| 8 | CLI, config, tests | existing Click runner, `test/search/` | partial | 0–7 |
+| 7 | Search-aware agent | `poker_ai/search/agent.py` | **done** — `SearchAgent` orchestrates the per-hand lifecycle (Algorithm 2): `on_hand_start` / `on_board_update` / `on_observed_action` / `act`, with the round-boundary Bayes belief update (`sigma_for_combo` bridges `RangeTracker` to the blueprint or the last search's average policy), immediate `solve` at each new round, warm-started off-tree re-search with actual-hand freezing, and a **chip-free** round-1 search trigger (pot-relative fraction-gap vs. the canonical abstraction, replacing the paper's $100 measure). Unit-tested in `test/search/test_agent.py` (lifecycle, belief update, freezing, off-tree re-search, round-1 trigger). **Runner/play-loop wiring is still deferred** (the old `terminal/runner.py` is deprecated; a replacement runner will instantiate `SearchAgent` and drive its hooks) | 3, 4, 6.2 |
+| 8 | CLI, config, tests | `test/search/` | partial — search tests landed; the **CLI/play entry point is deferred** along with the new runner (the old Click runner under `terminal/` is deprecated) | 0–7 |
 | 9.1 | Make/undo traversal (`step_in_place` / `undo`) (Tier 1, §6.7) | `environment/poker_env.py` | **done** — the **sole** advance API (`apply_action` deleted); the blueprint CFR + strategy passes and the search solver all traverse via make/undo (the solver reuses one restored env across its regret and strategy passes); LIFO round-trip + no-leak tested | — |
 | 9.2 | Search-lifetime caches: leaf-value / forced-runout cache + per-row σ memoization (Tier 1, §6.4.2, §6.7) | `poker_ai/search/solver.py`, `mccfr.py`, `leaf.py` | **todo (deferred)** — memoize `continuation_value` by `(leaf public_key, hand tuple, profile)` and `runout_equity` by `(holes, prefix, pot, active)`; the latter **shared across a leaf's four bias calls** is the main round-1 win (profiling shows the meta-game recomputes identical runouts once per bias — the redundancy a cache removes), plus a per-row σ cache for the hot loop. (Preflop already scores all-in terminals by `env.payout` to skip the 5-card-runout cap — landed in 6.2.) **Deferred until the full pipeline can be evaluated end-to-end** | 6.2 |
 | 9.3 | **Optional** direct 7-card evaluator (Tier 1, §6.7) | `environment/evaluator.py` (consumed by `runout_equity` 5.1 + `rank_combos_on_board` 6.1) | **todo — optional** — replace the 21-subset batch path with a direct 7-card evaluator (TwoPlusTwo table or 7-card perfect hash) on the **order-only** paths (showdown/runout need *ordering*, not the exact `[1,7462]` rank), validated **order-equivalent** against the proven `Evaluator` (C(52,5) exhaustive core + large random 7-card argsort sample). Profiled as the dominant MC-path cost (~58–74%); est. **~5–10× on the evaluator, ~2× overall** (Amdahl), benefiting both CFR regimes and the leaf. ~1–2 days + a ~130 MB table artifact (or a smaller perfect-hash table). **Deferred until the complete pipeline can be evaluated**; pursue only if the evaluator is confirmed on the real-time critical path | 5.1, 6.1 |
@@ -971,10 +979,10 @@ poker_ai play \
     matches `legal_actions` gating; `chips_to_add` round-trips canonical
     action strings; pseudo-harmonic golden values (e.g. `A=0.5, B=1,
     x=0.75 ⇒ P(A)=3/7`); randomized variant matches the formula in
-    frequency, deterministic variant picks the ≥ ½ side; the coarse search
-    raise-size set is a subset of the blueprint fractions and ≤ 5–6 per
-    node; `public_key` stable across seats at the same public node;
-    `cluster_for` agrees with `info_set`'s embedded cluster.
+    frequency, deterministic variant picks the ≥ ½ side; `public_key` stable
+    across seats at the same public node and **distinct across betting lines**
+    (full cross-street history, so river nodes from different flop/turn play do
+    not collide); `cluster_for` agrees with `info_set`'s embedded cluster.
   - `environment/poker_env.py` overlay: `inject_action` idempotent,
     persists across deepcopies, visible only at the matching public
     state; `reset_overlay` clears; `with_hole_cards` leaves the original
@@ -1117,7 +1125,7 @@ poker_ai play \
 
 | Risk | Mitigation |
 |---|---|
-| Multiway round-2 subgames too expensive (per-seat continuation choices) | Solved with MCCFR (paper regime): external sampling visits one opponent action and one continuation choice per traversal, so cost is independent of the joint profile count; the after-2nd-raise depth cutoff keeps the tree shallow; coarse search raise-size set (≤ 5–6) bounds branching. |
+| Multiway round-2 subgames too expensive (per-seat continuation choices) | Solved with MCCFR (paper regime): external sampling visits one opponent action and one continuation choice per traversal, so cost is independent of the joint profile count; the after-2nd-raise depth cutoff keeps the tree shallow; the canonical raise-size set bounds branching (and a coarser search-specific set can be reintroduced to shrink it further if needed, §6.5). |
 | Vectorised showdown is subtly wrong (card removal, ties, side pots) | Test against a brute-force hand-vs-hand reference; the vector regime is heads-up late streets, so there are no *multiway* side pots — but an **unequal all-in** still arises (one stack short), handled by taking the **matched** (smaller) final contribution as the stake (the bigger stack's uncalled excess is excluded), reconstructed at the parent as `min(contribs[other], contribs[actor] + stack[actor])` because the engine resets the pot at the terminal; MCCFR (concrete `env.payout`) covers the multiway/side-pot cases. |
 | Heads-up turn/river subgames (to end of game) exceed the time budget | One sampled board runout per iteration keeps per-iteration cost linear in tree size; both caps are CLI-configurable and tunable per street. |
 | Opponent–opponent card-removal in the vector reach product is O(n_combos²) exact | Vector regime is heads-up only, so there is a single opponent range — no opponent–opponent term; mask only against the acting combo. |

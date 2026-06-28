@@ -153,32 +153,6 @@ RAISE_SIZES_BY_STAGE: Dict[str, Dict[str, List[float]]] = {
     },
 }
 
-# Coarser raise-size abstraction used by the real-time subgame search
-# (docs/subgame_solving.md §3, §6.3).  Each cell is a strict subset of the
-# corresponding RAISE_SIZES_BY_STAGE cell, capped at <= 5-6 fractions per
-# node so the solver's action tree stays shallow.  The solver enumerates
-# its tree from THIS set (via `search_raise_actions`); `legal_actions`
-# stays on the full blueprint abstraction, and opponent raises off the
-# search set are injected (`inject_action`) and trigger a re-search.
-SEARCH_RAISE_SIZES_BY_STAGE: Dict[str, Dict[str, List[float]]] = {
-    "pre_flop": {
-        "first_raise":      [0.25, 0.5, 0.75, 1.0, 1.5, 2.0],
-        "subsequent_raise": [0.5, 0.75, 1.0, 1.5, 2.0],
-    },
-    "flop": {
-        "first_raise":      [0.33, 0.5, 1.0, 1.5, 2.0],
-        "subsequent_raise": [0.5, 1.0, 1.5],
-    },
-    "turn": {
-        "first_raise":      [0.5, 1.0],
-        "subsequent_raise": [1.0],
-    },
-    "river": {
-        "first_raise":      [0.5, 1.0],
-        "subsequent_raise": [1.0],
-    },
-}
-
 MAX_RAISES_PER_ROUND: int = 3
 
 
@@ -999,30 +973,6 @@ class PokerEnv:
             if s.startswith("raise:")
         ]
 
-    def search_raise_fractions(self) -> List[float]:
-        """Currently-playable **coarse search** raise fractions for the actor.
-
-        The :data:`SEARCH_RAISE_SIZES_BY_STAGE` subset of the *currently
-        playable blueprint fractions* (<= 5-6 per node).  Derived by
-        filtering :meth:`canonical_raise_fractions` rather than running an
-        independent gate, so ``search_raise_fractions() ⊆
-        canonical_raise_fractions() ⊆ legal_actions`` holds at **every**
-        node — every search action is directly playable, never silently
-        remapped.  This is the action tree the subgame solver enumerates;
-        :attr:`legal_actions` stays blueprint-based and off-search-set
-        raises are injected (docs/subgame_solving.md §6.3, §6.5).
-        """
-        cell = set(
-            self._abstraction_fractions(
-                self._betting_stage, self._n_raises, SEARCH_RAISE_SIZES_BY_STAGE
-            )
-        )
-        return [f for f in self.canonical_raise_fractions() if f in cell]
-
-    def search_raise_actions(self) -> List[str]:
-        """:meth:`search_raise_fractions` as ``"raise:<f>"`` strings."""
-        return [f"raise:{f}" for f in self.search_raise_fractions()]
-
     def chips_to_add(self, action: str) -> int:
         """Chips the actor must add to play ``action``.
 
@@ -1122,25 +1072,39 @@ class PokerEnv:
     # Off-tree action overlay
     # ------------------------------------------------------------------
 
-    def _current_public_state(self) -> Tuple[str, Tuple[str, ...]]:
+    def _current_public_state(self) -> Tuple[str, Tuple[Tuple[str, Tuple[str, ...]], ...]]:
         """Identifier for the current public game-tree node.
 
-        Pure function of state visible to every seat: the betting
-        stage and the action history within it.  Used as the overlay
-        lookup key so injected actions are visible to every actor
-        that reaches the same public node, not just the seat that
-        was acting when the injection was recorded.
+        Pure function of state visible to every seat: the betting stage
+        and the **full cross-street** action history (every stage's
+        actions, in play order).  This is the card-free projection of
+        :meth:`_compute_info_set` — the same history, minus the actor's
+        card cluster — so two seats at the same public node share the key,
+        while public nodes that differ only in *earlier* streets' betting
+        (hence pot size, stack depth, and the raise sizes that are legal
+        there) stay distinct.
 
-        Reads ``_history`` with ``.get`` rather than indexing: a bare
-        ``self._history[stage]`` on the ``defaultdict`` would *insert*
-        an empty list for an as-yet-unseen stage, and that empty entry
-        would then leak into a later ``_compute_info_set`` (which
-        iterates ``_history.items()``), silently changing the info-set
-        key.  ``.get`` keeps this a true read.
+        The history **must** span all streets, not just the current one:
+        the betting line alone determines pot and stacks, so truncating to
+        the current stage would collapse e.g. every river node reached via
+        a different flop/turn line onto ``("river", ())`` — distinct
+        decisions (often with distinct legal raise sets) sharing one key.
+
+        Reads ``_history`` via ``items()`` — a pure read that never inserts
+        an empty stage (a bare ``self._history[stage]`` on the defaultdict
+        would, and that empty entry would then leak into
+        :meth:`_compute_info_set`, which iterates ``_history.items()``).
+        The current stage is carried explicitly as the first element, so a
+        node at the *start* of a street (that street absent from
+        ``_history`` until its first action) is still distinguished from
+        the end of the previous one.
         """
         return (
             self._betting_stage,
-            tuple(self._history.get(self._betting_stage, ())),
+            tuple(
+                (stage, tuple(actions))
+                for stage, actions in self._history.items()
+            ),
         )
 
     def inject_action(self, action: str) -> bool:
@@ -2010,10 +1974,12 @@ class PokerEnv:
     def public_key(self) -> Tuple[str, Tuple[str, ...]]:
         """Hashable identifier of the current public state.
 
-        ``(betting_stage, current-stage action history)`` — the key the
+        ``(betting_stage, full cross-street action history)`` — the key the
         subgame solver's in-memory tables and the off-tree overlay share.
         Public alias of :meth:`_current_public_state`; two seats at the
-        same public node see the same key (it embeds no actor cards).
+        same public node see the same key (it embeds no actor cards), while
+        nodes differing in earlier streets' betting (pot / stack depth)
+        stay distinct.
         """
         return self._current_public_state()
 
