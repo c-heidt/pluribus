@@ -92,6 +92,16 @@ class SolverState:
     # (vector) never both populate; the readers below dispatch on which is present.
     vregret: Dict[PublicKey, np.ndarray] = field(default_factory=dict)
     vstrat: Dict[PublicKey, np.ndarray] = field(default_factory=dict)
+    # Search-lifetime caches (§6.4.2, §6.7 Tier 1).  Both hold values that are
+    # **invariant across CFR iterations** for a fixed key, so they are *not*
+    # touched by ``discount`` and persist across a warm-started re-search:
+    #   ``leaf_value_cache`` — ``continuation_value`` keyed by
+    #     ``(leaf public_key, all-seat holes, profile)`` (§6.4.1).
+    #   ``runout_cache`` — exact decision-free ``runout_equity`` keyed by
+    #     ``(all-seat holes, runout snapshot)``; shared by the leaf rollouts
+    #     (a leaf's four bias calls) and the forced-runout terminal (§6.4.2).
+    leaf_value_cache: Dict = field(default_factory=dict)
+    runout_cache: Dict = field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> "SolverState":

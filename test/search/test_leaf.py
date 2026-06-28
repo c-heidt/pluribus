@@ -429,3 +429,69 @@ class TestDecisionFreeEquityFlag:
         np.random.seed(99)
         env = _full_deck_env(); _stub_lut(env); _to_flop(env)
         return env
+
+
+class TestSharedRunoutCache:
+    """The optional ``runout_cache`` extends the per-call runout memo across
+    calls (§6.4.2): a leaf's four bias profiles — and the solver's forced-runout
+    terminal — share one integration per distinct ``(holes, snapshot)``."""
+
+    def _flop_allin_frontier(self, seed=7) -> PokerEnv:
+        np.random.seed(seed)
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        return env
+
+    def test_shared_dict_integrates_once_across_calls(self, monkeypatch):
+        # Two continuation_value calls with DIFFERENT profiles but the same
+        # frontier holes share one exact integration via a passed-in dict.
+        env = self._flop_allin_frontier()
+        calls = {"n": 0}
+        original = PokerEnv.runout_equity
+
+        def spy(self, *a, **k):
+            calls["n"] += 1
+            return original(self, *a, **k)
+
+        monkeypatch.setattr(PokerEnv, "runout_equity", spy)
+        shared: dict = {}
+        kw = dict(policies=_policies(AllInPolicy), n_rollouts=20, use_equity=True)
+        out_a = continuation_value(
+            env, _profile(env, "none"), _ctx(env, **kw), runout_cache=shared
+        )
+        out_b = continuation_value(
+            env, _profile(env, "raise"), _ctx(env, **kw), runout_cache=shared
+        )
+        # Same (holes, snapshot) over 40 rollouts across two calls → ONE integration.
+        assert calls["n"] == 1
+        assert len(shared) == 1
+        ref_env = copy.deepcopy(env); ref_env.step_in_place("all_in")
+        ref = ref_env.runout_equity()
+        for out in (out_a, out_b):
+            for i in range(env.n_players):
+                assert abs(out[i] - ref[i]) < 1e-9
+
+    def test_cache_key_includes_holes(self):
+        # The shared key carries the all-seat holes, so two frontiers with
+        # different holes never collide (distinct entries, both exact).
+        env_a = self._flop_allin_frontier(7)
+        env_b = self._flop_allin_frontier(8)
+        holes_a = tuple(tuple(int(c) for c in env_a.players[s].cards) for s in range(2))
+        holes_b = tuple(tuple(int(c) for c in env_b.players[s].cards) for s in range(2))
+        if holes_a == holes_b:
+            pytest.skip("seeds happened to draw identical holes")
+        shared: dict = {}
+        kw = dict(policies=_policies(AllInPolicy), n_rollouts=4, use_equity=True)
+        continuation_value(env_a, _profile(env_a), _ctx(env_a, **kw), runout_cache=shared)
+        continuation_value(env_b, _profile(env_b), _ctx(env_b, **kw), runout_cache=shared)
+        assert len(shared) == 2  # no collision across holes
+
+    def test_cache_param_does_not_change_value(self):
+        # Supplying a cache must never change the result (runout is exact /
+        # rng-independent); equal bit-for-bit to the uncached call.
+        env = self._flop_allin_frontier()
+        kw = dict(policies=_policies(AllInPolicy), n_rollouts=5, use_equity=True)
+        np.random.seed(5)
+        without = continuation_value(env, _profile(env), _ctx(env, **kw))
+        np.random.seed(5)
+        withcache = continuation_value(env, _profile(env), _ctx(env, **kw), runout_cache={})
+        np.testing.assert_array_equal(without, withcache)

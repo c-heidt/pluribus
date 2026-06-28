@@ -17,6 +17,7 @@ without the continuation meta-game — isolating the core CFR loop.
 """
 
 import collections
+import copy
 from typing import Dict
 
 import numpy as np
@@ -771,3 +772,114 @@ class TestVectorRegime:
         a_n = root_average(150)
         a_2n = root_average(300)
         assert np.abs(a_n - a_2n).max() < 0.25
+
+
+# --------------------------------------------------------------------------- #
+# Search-lifetime caches (§6.4.2, §6.7 Tier 1)
+# --------------------------------------------------------------------------- #
+
+class TestSearchLifetimeCaches:
+    """The leaf-value and runout caches on ``SolverState``: a continuation value
+    is computed once per ``(leaf public_key, holes, profile)`` and a decision-free
+    runout integrated once per ``(holes, snapshot)`` — persisting across a
+    warm-started re-search, and never breaking same-seed determinism."""
+
+    def _preflop_env(self, low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
+        # street_at_root == 0 → the depth limit makes the flop a continuation
+        # meta-game leaf, so ``continuation_value`` is exercised.
+        np.random.seed(seed)
+        env = PokerEnv(
+            players=[Player(i, s) for i, s in enumerate(stacks)],
+            low_card_rank=low, high_card_rank=high,
+        )
+        _stub_lut(env)
+        return env
+
+    def _count_continuation(self, monkeypatch):
+        """Patch the solver's ``continuation_value`` with a counting wrapper that
+        records the same key ``_leaf_value`` memoises on; delegates to the real fn."""
+        import poker_ai.search.mccfr as mod
+        keys = []
+        original = mod.continuation_value
+
+        def wrapper(env, profile, ctx, runout_cache=None):
+            n = env.n_players
+            hk = tuple(tuple(int(c) for c in env.players[s].cards) for s in range(n))
+            keys.append((env.public_key, hk, tuple(sorted(profile.items()))))
+            return original(env, profile, ctx, runout_cache=runout_cache)
+
+        monkeypatch.setattr(mod, "continuation_value", wrapper)
+        return keys
+
+    def test_leaf_value_computed_once_per_key(self, monkeypatch):
+        keys = self._count_continuation(monkeypatch)
+        env = self._preflop_env(seed=3)
+        ctx = _ctx(env, seed=1)
+        res = solve(env, ctx, _cfg(ctx, iters=40))
+        assert keys, "preflop solve never reached a depth-limit leaf"
+        # Each distinct (leaf pk, holes, profile) hits the rollouts exactly once;
+        # every later visit is a cache hit (no duplicate keys recorded).
+        assert len(keys) == len(set(keys))
+        assert len(res.state.leaf_value_cache) == len(set(keys))
+
+    def test_warm_start_reuses_cached_leaf_values(self, monkeypatch):
+        env = self._preflop_env(seed=4)
+        ctx = _ctx(env, seed=2)
+        first = solve(env, ctx, _cfg(ctx, iters=30))
+        cached_before = set(first.state.leaf_value_cache)
+        assert cached_before, "no depth-limit leaf reached"
+        # Re-search the same root with the carried state; record any recomputes.
+        recomputed = self._count_continuation(monkeypatch)
+        env2 = self._preflop_env(seed=4)
+        ctx2 = _ctx(env2, seed=5)
+        second = solve(env2, ctx2, _cfg(ctx2, iters=30), warm_start=first.state)
+        assert second.state is first.state
+        # No already-cached key is recomputed — cache hits skip the rollouts.
+        assert set(recomputed).isdisjoint(cached_before)
+
+    def test_caches_preserve_same_seed_determinism(self):
+        def run():
+            env = self._preflop_env(seed=6)
+            ctx = _ctx(env, seed=7)
+            np.random.seed(123)  # board-deal RNG (§6.4.1)
+            return solve(env, ctx, _cfg(ctx, iters=25))
+
+        r1, r2 = run(), run()
+        assert set(r1.state.regret) == set(r2.state.regret)
+        for k in r1.state.regret:
+            np.testing.assert_allclose(r1.state.regret[k], r2.state.regret[k])
+        # The caches themselves reproduce key-for-key under a fixed seed.
+        assert set(r1.state.leaf_value_cache) == set(r2.state.leaf_value_cache)
+
+    def test_forced_runout_terminal_memoises_once(self, monkeypatch):
+        # The MCCFR forced-runout terminal integrates a given all-in once and
+        # reuses it across seats / revisits via SolverState.runout_cache.
+        env = _flop_env(seed=10)
+        ctx = _ctx(env, seed=0)
+        state = SolverState.empty()
+        solver = _MCCFRSolver(env, state, ctx, _cfg(ctx), ctx.rng)
+        term = copy.deepcopy(env)
+        guard = 0
+        while not term.is_terminal and guard < 12:
+            legal = [a for a in term.legal_actions if a is not None]
+            term.step_in_place("all_in" if "all_in" in legal else legal[0])
+            guard += 1
+        if not (term.is_decision_free and solver._use_equity):
+            pytest.skip("flop line did not reach a decision-free runout")
+        ref = copy.deepcopy(term).runout_equity()  # before patching the counter
+
+        calls = {"n": 0}
+        original = PokerEnv.runout_equity
+
+        def spy(self, *a, **k):
+            calls["n"] += 1
+            return original(self, *a, **k)
+
+        monkeypatch.setattr(PokerEnv, "runout_equity", spy)
+        v0 = solver._terminal_value(term, 0)
+        v0b = solver._terminal_value(term, 0)  # same key → hit
+        v1 = solver._terminal_value(term, 1)   # other seat, same key → hit
+        assert calls["n"] == 1
+        assert v0b == v0
+        assert abs(v0 - ref[0]) < 1e-9
+        assert abs(v1 - ref[1]) < 1e-9

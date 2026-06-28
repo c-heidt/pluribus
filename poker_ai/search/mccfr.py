@@ -256,8 +256,45 @@ class _MCCFRSolver:
 
     def _terminal_value(self, env, i: int) -> float:
         if self._use_equity and env.is_decision_free:
-            return float(env.runout_equity(rng=self.rng)[i])
+            # Search-lifetime runout memo (§6.4.2): the same all-in reached from
+            # many lines/iterations integrates once.  Key on the all-seat holes
+            # plus the exact pre-runout snapshot, built exactly as the leaf
+            # rollouts do (``leaf.py``) so the two call sites share entries.
+            holes_key = tuple(
+                tuple(int(c) for c in env.players[s].cards)
+                for s in range(self.n_players)
+            )
+            key = (holes_key, env.runout_key)
+            eq = self.state.runout_cache.get(key)
+            if eq is None:
+                eq = env.runout_equity(rng=self.rng)
+                self.state.runout_cache[key] = eq
+            return float(eq[i])
         return float(env.payout[i])
+
+    def _leaf_value(self, env, profile: Dict[int, BiasClass], pk_base) -> np.ndarray:
+        """Continuation value at this leaf, memoised search-wide (§6.4.1).
+
+        For a fixed ``(leaf public_key, all-seat holes, profile)`` the value is
+        invariant across CFR iterations — only the meta-game's weighting over
+        profiles changes — so the ``n_rollouts`` estimate is computed once per
+        key and reused.  The estimate stored is the **first** draw (subsequent
+        visits consume no ``ctx.rng``); the search stays deterministic per seed.
+        The shared ``runout_cache`` is threaded so a leaf's four bias profiles
+        share their decision-free runout integrations.
+        """
+        holes_key = tuple(
+            tuple(int(c) for c in env.players[s].cards)
+            for s in range(self.n_players)
+        )
+        ck = (pk_base, holes_key, tuple(sorted(profile.items())))
+        val = self.state.leaf_value_cache.get(ck)
+        if val is None:
+            val = continuation_value(
+                env, profile, self.ctx, runout_cache=self.state.runout_cache
+            )
+            self.state.leaf_value_cache[ck] = val
+        return val
 
     # ------------------------------------------------------------------
     # Continuation meta-game leaf (§6.5 step 4)
@@ -287,7 +324,7 @@ class _MCCFRSolver:
 
         if i not in active:
             # Traverser cannot act here; score the sampled profile as-is.
-            return float(continuation_value(env, dict(sampled), self.ctx)[i])
+            return float(self._leaf_value(env, dict(sampled), pk_base)[i])
 
         key, sig = self._meta_node(env, holes, i, pk_base)
         sig = self._frozen_or(sig, key, i, holes)
@@ -295,7 +332,7 @@ class _MCCFRSolver:
         for b, bias in enumerate(_BIAS_CLASSES):
             profile = dict(sampled)
             profile[i] = bias
-            va[b] = float(continuation_value(env, profile, self.ctx)[i])
+            va[b] = float(self._leaf_value(env, profile, pk_base)[i])
         node_v = float(np.dot(sig, va))
         if not self._is_frozen(key, i, holes):
             self.state.add_regret(key, va - node_v)

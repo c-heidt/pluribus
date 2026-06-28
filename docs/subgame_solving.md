@@ -871,15 +871,20 @@ parallelism rescues a ruinous per-node copy — it only spreads it across cores.
   ([poker_ai/blueprint/cfr.py](../poker_ai/blueprint/cfr.py)) and the
   average-strategy pass ([strategy.py](../poker_ai/blueprint/strategy.py)) — so
   the win applies to offline training as well as online search.
-- **Search-lifetime leaf-value cache.** Continuation values are invariant across
-  CFR iterations for a fixed `(leaf public_key, concrete-hand tuple, profile)`
-  (§6.4), so the `n_rollouts` estimate is computed once per key and reused —
-  collapsing the second bottleneck and yielding the embarrassingly-parallel work
-  unit for Tier 2.
-- **Per-row strategy memoization.** Cache the regret-matched σ per
-  `(public_key, hand_row)` for the duration of an iteration sweep; invalidate on
-  the `discount_interval` tick rather than recomputing
-  `calculate_strategy_from_row` on every node visit.
+- **Search-lifetime leaf-value cache.** *(landed, row 9.2.)* Continuation values
+  are invariant across CFR iterations for a fixed `(leaf public_key, concrete-hand
+  tuple, profile)` (§6.4), so the `n_rollouts` estimate is computed once per key
+  and reused — collapsing the second bottleneck and yielding the
+  embarrassingly-parallel work unit for Tier 2. Paired with an exact
+  `runout_equity` memo shared by the leaf rollouts and the forced-runout terminal.
+- **Per-row strategy memoization.** *(deferred, row 9.2.)* Cache the regret-matched
+  σ per `(public_key, hand_row)` rather than recomputing
+  `calculate_strategy_from_row` on every node visit. Held back: §6.4.2 note 5
+  finds info_set construction, not regret-matching, is the per-node cost that
+  dominates, and a coarse "invalidate on the `discount_interval` tick" serves
+  stale σ between ticks; an exact invalidate-on-write yields little in MCCFR
+  (σ is read ~once per regret write). Revisit only if a profiler on the real walk
+  flags it.
 - **Direct 7-card evaluator (optional).** *Once make/undo removes per-node
   cloning,* profiling the MC path identifies the **hand evaluator invoked via
   `runout_equity`** (and inside the leaf rollouts / the vector showdown) as the
@@ -949,7 +954,7 @@ the serial result bit-for-bit; multi-worker runs fix per-worker substreams
 | 7 | Search-aware agent | `poker_ai/search/agent.py` | **done** — `SearchAgent` orchestrates the per-hand lifecycle (Algorithm 2): `on_hand_start` / `on_board_update` / `on_observed_action` / `act`, with the round-boundary Bayes belief update (`sigma_for_combo` bridges `RangeTracker` to the blueprint or the last search's average policy), immediate `solve` at each new round, warm-started off-tree re-search with actual-hand freezing, and a **chip-free** round-1 search trigger (pot-relative fraction-gap vs. the canonical abstraction, replacing the paper's $100 measure). Unit-tested in `test/search/test_agent.py` (lifecycle, belief update, freezing, off-tree re-search, round-1 trigger). **Runner/play-loop wiring is still deferred** (the old `terminal/runner.py` is deprecated; a replacement runner will instantiate `SearchAgent` and drive its hooks) | 3, 4, 6.2 |
 | 8 | CLI, config, tests | `test/search/` | partial — search tests landed; the **CLI/play entry point is deferred** along with the new runner (the old Click runner under `terminal/` is deprecated) | 0–7 |
 | 9.1 | Make/undo traversal (`step_in_place` / `undo`) (Tier 1, §6.7) | `environment/poker_env.py` | **done** — the **sole** advance API (`apply_action` deleted); the blueprint CFR + strategy passes and the search solver all traverse via make/undo (the solver reuses one restored env across its regret and strategy passes); LIFO round-trip + no-leak tested | — |
-| 9.2 | Search-lifetime caches: leaf-value / forced-runout cache + per-row σ memoization (Tier 1, §6.4.2, §6.7) | `poker_ai/search/solver.py`, `mccfr.py`, `leaf.py` | **todo (deferred)** — memoize `continuation_value` by `(leaf public_key, hand tuple, profile)` and `runout_equity` by `(holes, prefix, pot, active)`; the latter **shared across a leaf's four bias calls** is the main round-1 win (profiling shows the meta-game recomputes identical runouts once per bias — the redundancy a cache removes), plus a per-row σ cache for the hot loop. (Preflop already scores all-in terminals by `env.payout` to skip the 5-card-runout cap — landed in 6.2.) **Deferred until the full pipeline can be evaluated end-to-end** | 6.2 |
+| 9.2 | Search-lifetime caches: leaf-value / forced-runout cache (Tier 1, §6.4.2, §6.7) | `poker_ai/search/solver_state.py`, `mccfr.py`, `leaf.py` | **done (data caches)** — two iteration-invariant memos hang on `SolverState` (the warm-start carrier, so they survive a within-round re-search and reset per boundary solve): `leaf_value_cache` keys `continuation_value` by `(leaf public_key, all-seat holes, profile)` (`_MCCFRSolver._leaf_value`); `runout_cache` keys exact `runout_equity` by `(all-seat holes, runout snapshot)` and is **shared across a leaf's four bias calls** (threaded into `continuation_value`) **and** the forced-runout terminal (`_terminal_value`) — the main round-1 win (profiling showed the meta-game recomputed identical runouts once per bias). `runout_cache` is exact/rng-independent → bit-identical to uncached; `leaf_value_cache` stores the first MC estimate and reuses it (§6.4.1), so the MCCFR trajectory differs from an uncached run but stays deterministic per seed (same-seed reproducibility + N-vs-2N convergence gate hold; the equilibrium oracle is river/vector, no leaves). Neither is scaled by `discount` (values are iteration-invariant). (Preflop already scores all-in terminals by `env.payout` to skip the 5-card-runout cap — landed in 6.2.) **Deferred:** the per-row σ memo — §6.4.2 note 5 finds info_set construction, not regret-matching, is the per-node cost that dominates, and the literal "invalidate on discount tick" serves stale σ; revisit only if a profiler on the real walk shows `calculate_strategy_from_row` is hot. | 6.2 |
 | 9.3 | **Optional** direct 7-card evaluator (Tier 1, §6.7) | `environment/evaluator.py` (consumed by `runout_equity` 5.1 + `rank_combos_on_board` 6.1) | **todo — optional** — replace the 21-subset batch path with a direct 7-card evaluator (TwoPlusTwo table or 7-card perfect hash) on the **order-only** paths (showdown/runout need *ordering*, not the exact `[1,7462]` rank), validated **order-equivalent** against the proven `Evaluator` (C(52,5) exhaustive core + large random 7-card argsort sample). Profiled as the dominant MC-path cost (~58–74%); est. **~5–10× on the evaluator, ~2× overall** (Amdahl), benefiting both CFR regimes and the leaf. ~1–2 days + a ~130 MB table artifact (or a smaller perfect-hash table). **Deferred until the complete pipeline can be evaluated**; pursue only if the evaluator is confirmed on the real-time critical path | 5.1, 6.1 |
 | 10 | Flat hot-loop state + `numba nogil` inner loop (Tier 1, §6.7) | `poker_ai/search/solver.py` | todo — optional; precondition for thread scaling | 9.1 |
 | 11 | Parallel search: one-board-per-worker (vector) + batched parallel traversals (MCCFR) (Tier 2, §6.7) | `poker_ai/search/solver.py` | todo — `multiprocessing` first; seed-deterministic | 9.1 |
@@ -1055,10 +1060,14 @@ poker_ai play \
     restores the env to a state equal (field-by-field) to a `deepcopy` taken
     before the action, across a randomized action sequence (LIFO property), and
     a full make/undo traversal leaves the root env unchanged (no leak). The
-    search-lifetime leaf-value cache returns a
-    value equal to recomputing `continuation_value` for the same
-    `(leaf public_key, hand tuple, profile)`, and is computed once per key
-    (call-count assertion). Determinism under parallelism: `--workers 1`
+    search-lifetime **leaf-value** cache invokes `continuation_value` exactly once
+    per distinct `(leaf public_key, holes, profile)` (call-count vs. distinct-key
+    assertion on a preflop solve), and cached keys are never recomputed across a
+    warm-started re-search; the **runout** cache integrates a decision-free all-in
+    once per `(holes, snapshot)` — shared across a leaf's four bias calls and the
+    forced-runout terminal — and is bit-identical to the uncached value (exact /
+    rng-independent); enabling the caches preserves same-seed determinism (regret
+    tables and cache key-sets reproduce). Determinism under parallelism: `--workers 1`
     reproduces the serial result bit-for-bit; a fixed `(seed, n_workers)` is
     reproducible across runs; the MCCFR per-worker accumulator merge equals a
     serial run over the same total iteration count.
