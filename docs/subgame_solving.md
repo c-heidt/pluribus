@@ -616,6 +616,24 @@ shared primitives.
    `CFRTables` / `SolverState` access, consider interned / integer-keyed infosets
    rather than string keys, and profile it on the **real** walk, not the leaf.
 
+6. **`legal_actions` is memoised per public state on the env *(landed)*.** Deriving
+   the legal set (the raise-size enumeration `_get_available_raise_sizes` →
+   `_compute_raise_chip_amount`) was the hottest per-advance cost: it is recomputed
+   on every node visit, inside `step_in_place`'s action validation, per combo in the
+   belief update, per node in the leaf rollouts, and in offline training. Since it is
+   a pure function of the public state (plus the public-state-keyed overlay),
+   `PokerEnv` now memoises it in `_legal_actions_cache` keyed by
+   `_current_public_state()` — a sibling of `_extra_legal_actions`. The key *is* the
+   validation, so `step_in_place`/`undo` need no cache bookkeeping (the public state
+   they restore re-selects the right entry, and the dict retains every visited
+   state's entry so ascends and per-advance validations hit); the overlay mutators
+   (`inject_action` / `reset_overlay`) are the sole invalidation points; `__deepcopy__`
+   starts an empty, *unshared* memo (no stale entry can cross a config boundary). The
+   vector regime walks `root_env` directly so it gets cross-iteration reuse (turn
+   ≈481 → ≈331 ms/iter, ~31%); MCCFR (fresh `with_hole_cards` copy per iteration) gets
+   within-iteration reuse — `legal_actions` cum dropped ~45% on a flop-6p walk. All
+   callers (both regimes, leaf rollouts, `blueprint/cfr.py`) benefit transparently.
+
 ### 6.5 Subgame solver (`solver.py`)
 
 ```python
@@ -908,6 +926,12 @@ parallelism rescues a ruinous per-node copy — it only spreads it across cores.
   and reused — collapsing the second bottleneck and yielding the
   embarrassingly-parallel work unit for Tier 2. Paired with an exact
   `runout_equity` memo shared by the leaf rollouts and the forced-runout terminal.
+- **Per-public-state `legal_actions` cache.** *(landed; §6.4.2 note 6.)* The
+  raise-size enumeration behind `legal_actions` is memoised on the env keyed by
+  `_current_public_state()`, so every node visit, `step_in_place` validation, leaf
+  rollout, belief-update combo, and offline-training step pays it at most once per
+  public state. Self-validating by key (no `step_in_place`/`undo` bookkeeping),
+  invalidated only by the overlay mutators. Vector turn ≈481 → ≈331 ms/iter.
 - **Per-row strategy memoization.** *(deferred, row 9.2.)* Cache the regret-matched
   σ per `(public_key, hand_row)` rather than recomputing
   `calculate_strategy_from_row` on every node visit. Held back: §6.4.2 note 5

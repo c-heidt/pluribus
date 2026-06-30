@@ -159,3 +159,41 @@ class TestPolicyStateFor:
         np.testing.assert_array_equal(ps.valid_mask, ps_for.valid_mask)
         # Same combo as the actual hole → identical info_set too.
         assert ps.info_set == ps_for.info_set
+
+
+class TestPolicyPublicFields:
+    """The ``policy_public_fields`` / ``public=`` decomposition must be a pure
+    factoring: passing the precomputed public part can never change the result."""
+
+    def test_public_fields_are_combo_independent(self):
+        # The hoist's whole premise: the public fields don't depend on any combo.
+        env = _env()
+        _stub_lut(env)
+        pf = env.policy_public_fields()
+        assert pf.player_i == env.player_i
+        assert pf.betting_round == env.betting_round
+        assert pf.legal_actions == tuple(
+            a for a in env.legal_actions if a is not None
+        )
+        np.testing.assert_array_equal(pf.valid_mask, env.get_valid_mask())
+        # Returned mask is immutable (shared safely across the per-combo sweep).
+        assert pf.valid_mask.flags.writeable is False
+
+    @pytest.mark.parametrize("for_blueprint", [False, True])
+    def test_public_path_matches_recompute_for_every_combo(self, for_blueprint):
+        # policy_state_for(combo, public=fields) must equal policy_state_for(combo)
+        # field-by-field for every combo — the decomposition cannot diverge.
+        env = _env()
+        _stub_lut(env)
+        public = env.policy_public_fields()
+        for i in range(env.n_combos):
+            combo = tuple(sorted(int(c) for c in env.combo_cards[i]))
+            baseline = env.policy_state_for(combo, for_blueprint=for_blueprint)
+            hoisted = env.policy_state_for(
+                combo, for_blueprint=for_blueprint, public=public
+            )
+            assert hoisted.player_i == baseline.player_i
+            assert hoisted.betting_round == baseline.betting_round
+            assert hoisted.info_set == baseline.info_set
+            assert hoisted.legal_actions == baseline.legal_actions
+            np.testing.assert_array_equal(hoisted.valid_mask, baseline.valid_mask)

@@ -237,10 +237,16 @@ class SearchAgent:
             return sigma
 
         combo_cards = env_before.combo_cards
+        # The legal set + valid mask are combo-independent, so compute them once
+        # for this env state rather than per combo (the belief-update sweep calls
+        # ``sigma_blueprint`` ~1326×); only ``info_set`` varies per combo.
+        public = env_before.policy_public_fields()
 
         def sigma_blueprint(h: int) -> np.ndarray:
             state = env_before.policy_state_for(
-                tuple(int(c) for c in combo_cards[h]), for_blueprint=True
+                tuple(int(c) for c in combo_cards[h]),
+                for_blueprint=True,
+                public=public,
             )
             return self._blueprint.strategy(state, "none")
 

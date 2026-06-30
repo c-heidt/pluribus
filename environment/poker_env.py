@@ -18,7 +18,17 @@ import json
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Dict,
+    FrozenSet,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import numpy as np
 
@@ -69,6 +79,24 @@ class PolicyState:
     info_set: str
     valid_mask: np.ndarray
     legal_actions: Tuple[str, ...]
+
+
+class PublicPolicyFields(NamedTuple):
+    """The combo-independent part of a :class:`PolicyState`.
+
+    Every field of a :class:`PolicyState` except ``info_set`` is a pure function of
+    the public state — independent of the actor's hypothetical hole.  A caller that
+    builds many :class:`PolicyState` objects for the *same* env state but different
+    combos (e.g. the belief-update ``sigma_for_combo`` sweep over ~1326 combos) can
+    compute these **once** via :meth:`PokerEnv.policy_public_fields` and pass them to
+    :meth:`PokerEnv.policy_state_for` as ``public=`` so only the per-combo ``info_set``
+    is rebuilt per combo.
+    """
+
+    player_i: int
+    betting_round: int
+    legal_actions: Tuple[str, ...]
+    valid_mask: np.ndarray
 
 
 @dataclass
@@ -396,6 +424,12 @@ class PokerEnv:
         self._skip_counter: int = 0
         self._first_move_of_current_round: bool = True
         self._last_raise_amount: int = self.big_blind
+        # Memo of ``legal_actions`` keyed by public state (lazily filled — see
+        # :attr:`legal_actions`).  A sibling of ``_extra_legal_actions``: both are
+        # public-state-keyed and the overlay is ``legal_actions``' only mutable
+        # input beyond the public state, so the overlay mutators are the cache's
+        # sole invalidation points.
+        self._legal_actions_cache: Dict[Tuple, List[Optional[str]]] = {}
         self._reset_betting_round_state()
 
         # Mark the first player to act
@@ -451,6 +485,11 @@ class PokerEnv:
             "_terminal_contributions", "_terminal_board_len",
         ):
             object.__setattr__(new, attr, copy.deepcopy(getattr(self, attr), memo))
+        # The legal-action memo is a pure derived cache; start the copy empty and
+        # let it refill lazily.  Deliberately *not* shared by reference (unlike
+        # ``_extra_legal_actions``): an empty per-env memo can never carry stale
+        # entries across a config boundary (e.g. a copy taken to start a new hand).
+        object.__setattr__(new, "_legal_actions_cache", {})
         return new
 
     # ------------------------------------------------------------------
@@ -1198,6 +1237,10 @@ class PokerEnv:
         existing = self._extra_legal_actions.get(key, frozenset())
         if action not in existing:
             self._extra_legal_actions[key] = existing | {action}
+            # The overlay just widened the legal set at this public state, so drop
+            # its memo entry (computed before the injection); other states are
+            # unaffected.
+            self._legal_actions_cache.pop(key, None)
         return True
 
     def _raise_fraction_is_playable(self, fraction: float) -> bool:
@@ -1236,6 +1279,9 @@ class PokerEnv:
         tree at matching public states.
         """
         self._extra_legal_actions.clear()
+        # Clearing the overlay can narrow the legal set at any injected state, so
+        # drop the whole memo (overlay-bearing entries are now stale).
+        self._legal_actions_cache.clear()
 
     @property
     def has_overlay_at_current_node(self) -> bool:
@@ -1369,7 +1415,30 @@ class PokerEnv:
         seeds — important for subgame solver tables that build a
         per-node ``a_to_i`` mapping from ``env.legal_actions`` and
         rely on that mapping being stable across iterations and runs.
+
+        **Caching.**  The legal set is a pure function of the current public
+        state (plus the overlay, which is itself public-state-keyed), but
+        deriving it — notably the raise-size enumeration in
+        :meth:`_get_available_raise_sizes` — is the single hottest per-advance
+        cost in the search inner loop, where the same node is re-validated and
+        re-visited many times.  The result is therefore memoised in
+        ``_legal_actions_cache`` keyed by :meth:`_current_public_state`.  The key
+        *is* the validation: a lookup returns the value for exactly the current
+        state, so ``step_in_place`` / ``undo`` need no cache bookkeeping (the
+        public state they restore re-selects the right entry), and the overlay
+        mutators (:meth:`inject_action` / :meth:`reset_overlay`) are the only
+        invalidation points.  A defensive copy is returned so callers keep the
+        historical "fresh list each call" contract and can never corrupt the memo.
         """
+        key = self._current_public_state()
+        cached = self._legal_actions_cache.get(key)
+        if cached is None:
+            cached = self._compute_legal_actions(key)
+            self._legal_actions_cache[key] = cached
+        return list(cached)
+
+    def _compute_legal_actions(self, public_state: Tuple) -> List[Optional[str]]:
+        """Derive the legal-action list for ``public_state`` (the current state)."""
         if not self.current_player.is_active:
             return [None]
         biggest_bet = max(p.n_bet_chips for p in self.players)
@@ -1383,7 +1452,7 @@ class PokerEnv:
             actions.append("call")
             if self._n_raises < MAX_RAISES_PER_ROUND:
                 actions += self._get_available_raise_sizes()
-        overlay = self._extra_legal_actions.get(self._current_public_state())
+        overlay = self._extra_legal_actions.get(public_state)
         if overlay:
             seen = {a for a in actions if a is not None}
             # `sorted` is critical: `overlay` is a frozenset whose
@@ -1552,8 +1621,31 @@ class PokerEnv:
             legal_actions=legal,
         )
 
+    def policy_public_fields(self) -> PublicPolicyFields:
+        """The combo-independent fields of a :class:`PolicyState` at the current state.
+
+        ``legal_actions`` and ``valid_mask`` (plus ``player_i`` / ``betting_round``)
+        read only public state, so a caller sweeping many combos at the *same* env
+        state computes them once here and threads them into
+        :meth:`policy_state_for` via ``public=`` — only the per-combo ``info_set`` is
+        then rebuilt per combo.  The returned ``valid_mask`` is immutable.
+        """
+        legal = tuple(a for a in self.legal_actions if a is not None)
+        mask = self.get_valid_mask()
+        mask.setflags(write=False)
+        return PublicPolicyFields(
+            player_i=self.player_i,
+            betting_round=self.betting_round,
+            legal_actions=legal,
+            valid_mask=mask,
+        )
+
     def policy_state_for(
-        self, combo: Sequence[int], *, for_blueprint: bool = False
+        self,
+        combo: Sequence[int],
+        *,
+        for_blueprint: bool = False,
+        public: "Optional[PublicPolicyFields]" = None,
     ) -> PolicyState:
         """:class:`PolicyState` for the current actor under hypothetical hole ``combo``.
 
@@ -1575,21 +1667,27 @@ class PokerEnv:
             nearest on-tree node, §6.3) so a :class:`BlueprintPolicy`
             lookup resolves to a populated regret row instead of the
             uniform fallback.  A no-op on fully on-tree histories.
+        public : PublicPolicyFields, optional
+            Precomputed combo-independent fields from
+            :meth:`policy_public_fields` (the same env state).  When
+            given, the public part is reused instead of recomputed —
+            so a per-combo sweep skips re-deriving ``legal_actions`` /
+            ``valid_mask`` each combo.  When ``None`` it is computed
+            here, so the result is identical either way.
         """
-        legal = tuple(a for a in self.legal_actions if a is not None)
-        mask = self.get_valid_mask()
-        mask.setflags(write=False)
+        if public is None:
+            public = self.policy_public_fields()
         info_set = (
             self._blueprint_info_set(combo)
             if for_blueprint
             else self._compute_info_set(combo)
         )
         return PolicyState(
-            player_i=self.player_i,
-            betting_round=self.betting_round,
+            player_i=public.player_i,
+            betting_round=public.betting_round,
             info_set=info_set,
-            valid_mask=mask,
-            legal_actions=legal,
+            valid_mask=public.valid_mask,
+            legal_actions=public.legal_actions,
         )
 
     @property
