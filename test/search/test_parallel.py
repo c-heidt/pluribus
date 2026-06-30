@@ -300,12 +300,31 @@ class TestParallelSolve:
         assert len(res.state.regret) > 0
 
     def test_vector_regime_parallel_runs(self):
+        # The vector regime parallelizes like MCCFR (§6.7 row 11): W replicas each
+        # sample their own river substream, iterations pool, and the merged 3-D
+        # vregret/vstrat yield a valid policy.
         env = _turn_env(seed=1)
         assert env.betting_round == 2
         ctx = _ctx(env, seed=0)
         res = solve(env, ctx, _cfg(iters=6, workers=2))
         assert len(res.state.vregret) > 0
-        assert res.iterations_run == 2 * 6
+        assert res.iterations_run == 2 * 6           # pooled across replicas
+
+        pk = env.public_key
+        hr = int(env.combo_index[tuple(sorted(int(c) for c in env.players[0].cards))])
+        legal = [a for a in env.legal_actions if a is not None]
+        prob = np.asarray(res.average_policy.strategy_for(pk, hr, legal), dtype=float)
+        np.testing.assert_allclose(prob.sum(), 1.0, atol=1e-5)
+        assert (prob >= 0).all()
+
+    def test_vector_regime_parallel_reproducible_per_seed(self):
+        # Chance-sampled → stochastic, but (seed, workers) is reproducible.
+        env = _turn_env(seed=1)
+        a = solve(env, _ctx(_turn_env(seed=1), seed=0), _cfg(iters=8, workers=2))
+        b = solve(env, _ctx(_turn_env(seed=1), seed=0), _cfg(iters=8, workers=2))
+        assert set(a.state.vregret) == set(b.state.vregret)
+        for k in a.state.vregret:
+            np.testing.assert_array_equal(a.state.vregret[k], b.state.vregret[k])
 
     def test_warm_start_re_search_parallel(self):
         # A warm-started parallel re-search runs, keeps the baseline's frozen rows,

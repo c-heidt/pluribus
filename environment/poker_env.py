@@ -457,12 +457,23 @@ class PokerEnv:
     # Core CFR interface
     # ------------------------------------------------------------------
 
-    def _apply_action_in_place(self, action_str: Optional[str]) -> None:
+    def _apply_action_in_place(
+        self, action_str: Optional[str], settle_winners: bool = True
+    ) -> None:
         """Apply ``action_str`` by mutating ``self`` in place.
 
         The forward game-logic core used by :meth:`step_in_place` (which
         calls it on ``self`` after snapshotting an undo token).  Operates
         entirely on ``self``; undo bookkeeping is the caller's concern.
+
+        ``settle_winners`` (default ``True``) controls terminal settlement: when
+        a hand ends it normally ranks the concrete dealt hands and distributes
+        chips (:func:`dynamics.compute_winners`).  A caller that never reads the
+        concrete result — the vector regime values terminals over *ranges* via
+        :meth:`vector_payout` — passes ``False`` to skip the ranking/distribution
+        and only snapshot ``_terminal_contributions`` (the matched stake the
+        payout needs); ~15-17% of a vector iteration otherwise goes to a concrete
+        showdown whose result is discarded.
         """
         original_action = action_str
         if action_str not in self.legal_actions:
@@ -577,14 +588,27 @@ class PokerEnv:
                     # already complete (five cards).
                     if self._terminal_board_len is None:
                         self._terminal_board_len = board_len_at_action
-                    dynamics.compute_winners(self)
+                    if settle_winners:
+                        dynamics.compute_winners(self)
+                    else:
+                        # Lightweight terminal settlement for range-valued callers
+                        # (vector regime): capture the matched-stake contributions
+                        # that ``vector_payout`` reads, but skip the concrete
+                        # hand ranking + chip distribution it never uses.  Mirrors
+                        # the snapshot inside ``compute_winners`` (before its
+                        # ``pot.reset``), so ``_terminal_contributions`` is set
+                        # identically; the pot/stacks are simply left untouched
+                        # (the caller make/undo-traverses and never reads them).
+                        self._terminal_contributions = tuple(self.pot.capture())
                 break
 
         for player in self.players:
             player.is_turn = False
         self.current_player.is_turn = True
 
-    def step_in_place(self, action_str: Optional[str]) -> "UndoToken":
+    def step_in_place(
+        self, action_str: Optional[str], *, settle_winners: bool = True
+    ) -> "UndoToken":
         """Apply ``action_str`` by **mutating this env in place**, returning
         an :class:`UndoToken` that :meth:`undo` uses to restore the
         pre-action state.
@@ -596,9 +620,14 @@ class PokerEnv:
         ``undo`` leaves ``self`` field-identical to its pre-action state.
         A caller that needs the pre- and post-action env at once
         ``copy.deepcopy`` first.
+
+        ``settle_winners`` (default ``True``) keeps the normal concrete terminal
+        settlement; pass ``False`` from a range-valued traversal (vector regime)
+        to skip the discarded hand ranking/chip distribution — see
+        :meth:`_apply_action_in_place`.
         """
         token = self._capture_undo_token()
-        self._apply_action_in_place(action_str)
+        self._apply_action_in_place(action_str, settle_winners)
         return token
 
     def undo(self, token: "UndoToken") -> None:

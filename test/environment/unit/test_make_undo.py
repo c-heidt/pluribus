@@ -282,3 +282,63 @@ class TestHistoryRestoration:
         token = env.step_in_place("call")
         env.undo(token)
         assert {k: list(v) for k, v in env._history.items()} == hist_before
+
+
+class TestSettleWinnersFlag:
+    """``settle_winners=False`` skips the concrete terminal settlement (hand
+    ranking + chip distribution) that range-valued callers (vector regime)
+    discard, but still snapshots ``terminal_contributions`` (the stake the
+    vectorised payout reads).  Default ``True`` is unchanged."""
+
+    def _to_terminal_step(self, seed):
+        """Drive a HU env to a terminal; return the pre-terminal env (deepcopy)
+        and the action that ends the hand."""
+        env = _env(n_players=2, seed=seed)
+        prev, last = None, None
+        steps = 0
+        while not env.is_terminal and steps < 60:
+            a = "call" if "call" in env.legal_actions else "check"
+            prev, last = copy.deepcopy(env), a
+            env.step_in_place(a)
+            steps += 1
+        assert env.is_terminal and prev is not None
+        return prev, last
+
+    @pytest.mark.parametrize("seed", [0, 1, 2, 3])
+    def test_false_sets_contributions_but_skips_distribution(self, seed):
+        prev, action = self._to_terminal_step(seed)
+        e_true, e_false = copy.deepcopy(prev), copy.deepcopy(prev)
+        e_true.step_in_place(action, settle_winners=True)
+        e_false.step_in_place(action, settle_winners=False)
+
+        # Both reach the terminal and snapshot the *same* matched-stake stake.
+        assert e_true.is_terminal and e_false.is_terminal
+        assert e_false.terminal_contributions is not None
+        assert e_false.terminal_contributions == e_true.terminal_contributions
+
+        # settle_winners=True distributes (pot reset, winner paid); False does not.
+        assert e_true.pot.total == 0
+        assert e_false.pot.total > 0
+        true_chips = [p.n_chips for p in e_true.players]
+        false_chips = [p.n_chips for p in e_false.players]
+        assert true_chips != false_chips
+
+    @pytest.mark.parametrize("seed", [0, 1, 2, 3])
+    def test_false_still_round_trips_under_undo(self, seed):
+        prev, action = self._to_terminal_step(seed)
+        env = copy.deepcopy(prev)
+        token = env.step_in_place(action, settle_winners=False)
+        env.undo(token)
+        assert_env_equal(env, prev)
+
+    @pytest.mark.parametrize("seed", [0, 1, 2, 3])
+    def test_vector_payout_identical_regardless_of_flag(self, seed):
+        # The value the vector regime actually reads must not depend on the flag.
+        prev, action = self._to_terminal_step(seed)
+        e_true, e_false = copy.deepcopy(prev), copy.deepcopy(prev)
+        e_true.step_in_place(action, settle_winners=True)
+        e_false.step_in_place(action, settle_winners=False)
+        opp = np.ones(e_true.n_combos) / e_true.n_combos
+        vt = e_true.vector_payout(0, 1, opp, river=None)
+        vf = e_false.vector_payout(0, 1, opp, river=None)
+        np.testing.assert_array_equal(vt, vf)

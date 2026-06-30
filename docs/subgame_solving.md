@@ -728,22 +728,46 @@ freezing.
 
 Vector-form Linear CFR carrying a per-combo reach vector per player
 (`reach[p] = ctx.ranges[p]` at the root). **Every action is expanded at every
-decision node** (no action sampling); **one board runout is sampled per iteration**
-at the subgame's chance nodes, the tree then deterministic. The implementation does
-**alternating updates** — one tree pass per seat, the traverser's per-combo regret
-updated from opponent-reach-weighted counterfactual values (summed across the
-opponent's actions, since the opponent mixes per *its* combo), the strategy sum
-weighted by the traverser's own reach. The betting tree is hole- and card-independent,
-so a single make/undo env walk serves every combo at once; the **river is sampled
-from `ctx.rng`** over the ranges' candidate set (the cards not on the board) and the
-engine's own deal is ignored — the correct chance distribution over ranges, and free
-of any global-RNG dependence (the MCCFR path still deals via the engine's global
-`np.random`, §6.4.1). Regret / strategy-sum updates are reach-weighted per row
+decision node** (no action sampling); the river is an **explicit chance node,
+chance-sampled** — one river drawn per iteration (chance-sampled MCCFR), like the
+board outcomes the MCCFR regime samples. The implementation does **alternating
+updates** — one tree pass per seat, the traverser's per-combo regret updated from
+opponent-reach-weighted counterfactual values (summed across the opponent's actions,
+since the opponent mixes per *its* combo), the strategy sum weighted by the
+traverser's own reach. The turn betting tree is hole- and card-independent, so a
+single make/undo env walk serves every combo at once.
+
+**River conditioning (turn subgames).** A turn subgame's river is a chance node
+between turn betting and river betting. Because the river card is *public*, river
+betting must condition on it (as the blueprint and MCCFR do via the abstraction
+clusters, and the river subgame does via its fixed board); a river-*blind* river
+strategy is the equilibrium of a restricted game and is exploitable. The solver
+therefore stores river-stage regret/strategy matrices with a per-river axis
+(`(n_combos, n_rivers, width)` — one betting strategy per `(combo, river)`), but
+**visits one river per iteration**: at the turn→river crossing it draws the
+iteration's sampled river `r` (from `ctx.rng`), descends into that river's slice
+(walked as an ordinary 2-D `(n_combos, width)` node), and backs the value up with
+**no `1/R` factor** — chance sampling already gives the expectation, and over
+iterations every river's slice converges separately (the same river-conditioned
+equilibrium an exact enumeration reaches, at ~`1/sqrt(T)` and ~`T/R` updates per
+river). Per-`(combo, river)` **feasibility masking** zeroes impossible pairs (a combo
+holding the sampled river card) on *both* reach vectors at the chance node, not just
+at the terminal showdown. The whole turn-subgame river chance — including a turn
+all-in showdown reached directly — uses that one sampled river. Because the river is
+sampled (RNG), the regime parallelizes like MCCFR: `W` independent replicas drawing
+their own river substreams, summed once at the merge, which multiplies the effective
+samples per river by `W` and buys back the per-river sampling variance (§6.7).
+These river-conditioned nodes are **internal to the solve**: the bot
+plays the turn from the turn subgame and re-solves a fresh **river subgame** (already
+river-aware, board fixed) when the river lands, so `SearchPolicy` never reads a 3-D
+node (a guard enforces this). Regret / strategy-sum updates are reach-weighted per row
 (float64); opponent reach on combos conflicting with the acting combo is zeroed (card
-removal, idiom from `ranges._zero_conflicting`). The per-combo rows persist as
-`(n_combos, width)` matrices keyed by `public_key` in the shared `SolverState` (the
-combo axis is `combo_index`, lossless at every depth), and `solve()`'s Linear-CFR
-discount and `SearchPolicy` read them unchanged. These subgames extend to the **end of the game**, so
+removal). The per-combo rows persist keyed by `public_key` in the shared `SolverState`
+(combo axis = `combo_index`, lossless) — `(n_combos, width)` for turn-stage and
+river-subgame nodes, `(n_combos, n_rivers, width)` for a turn subgame's river-stage
+nodes; the action `width` is always the last axis, so `solve()`'s Linear-CFR discount
+and the regret-match are rank-agnostic, and `SearchPolicy` reads the 2-D nodes
+unchanged. These subgames extend to the **end of the game**, so
 their terminals are **showdowns**, evaluated by the env-owned **vectorised payout**
 `PokerEnv.vector_payout` on the sampled board (F2, settlement math in
 [`environment/range_showdown.py`](../environment/range_showdown.py)):
@@ -776,8 +800,15 @@ a vectorised/native evaluator (perf only) stays out of scope here. Heads-up only
 opponent → no opponent–opponent removal term, §10). `env.payout` is **not** used
 here — it scores a single concrete hand assignment, not a range; it remains the
 terminal source only in the MCCFR regime and inside `continuation_value`'s
-concrete-hand rollouts. The vector regime has **no** continuation meta-game
-(terminal leaves only).
+concrete-hand rollouts. Relatedly, because this regime never reads the engine's
+concrete terminal result, it walks with **`step_in_place(..., settle_winners=False)`**:
+at a terminal the env only snapshots `terminal_contributions` (the stake
+`vector_payout` needs) and **skips `compute_winners`** — the concrete dealt-hand
+ranking + chip distribution it would otherwise run on every terminal of the walk.
+That settlement is pure waste here (its result is discarded), and skipping it cuts
+~20-25 % off a vector iteration (full-deck turn: ~374 → ~284 ms/iter). MCCFR keeps
+the default `settle_winners=True` (it reads `env.payout`), and every other caller is
+unchanged. The vector regime has **no** continuation meta-game (terminal leaves only).
 
 ### 6.6 Search-aware agent (`agent.py`)
 
@@ -907,10 +938,22 @@ The supplement runs search across cores, sampling **one set of public board
 cards per thread**; the §2 non-goal is distribution across *machines*, not
 cores.
 
-- **Vector regime — one board per worker.** Each worker runs vector-form Linear
-  CFR on its own sampled board runout; the per-board strategies/regrets are
-  averaged. Embarrassingly parallel and naturally coarse-grained — the cheapest
-  real win, and a direct match to the paper's per-thread scheme.
+- **Vector regime — chance-sampled, river-conditioned.** A turn subgame's river is
+  an **explicit chance node, sampled one card per iteration** (chance-sampled MCCFR),
+  while each river keeps its own **conditioned** betting slice
+  (`(n_combos, n_rivers, width)` storage, one slice touched per iteration) — so river
+  betting conditions on the river card (which a single river-*blind* strategy cannot)
+  without paying the `R×` cost of enumerating every river each iteration. Because the
+  river is sampled, the regime parallelizes via the **row-11 replica scheme** just
+  like MCCFR: `W` replicas draw independent river substreams and the merge sums their
+  regrets, multiplying the effective samples per river by `W` (directly reducing the
+  per-river sampling variance). **One level of parallelism only** — replicas, not
+  nested intra-replica showdown evaluation: the showdown is ~25% of an iteration and
+  fine-grained (a ~80 µs sort/bincount over the combo axis, not BLAS), so by Amdahl
+  intra-replica parallelism caps at ~1.33× and would only contend with replicas for
+  the same cores, whereas replicas scale the whole iteration near-linearly. The lever
+  for *single-solve* latency (if ever needed) is cutting the ~65% serial Python
+  tree-walk/env overhead (a per-public-node memo), which composes with replicas.
 - **MCCFR regime — independent replicas, merged once** *(landed, row 11).* `W`
   worker processes each run the **full** external-sampling rotation — the
   traversing **player** (acting-order position, not seat identity) cycling through
@@ -957,14 +1000,14 @@ the serial result bit-for-bit; multi-worker runs fix per-worker substreams
 | 5.1 | Decision-free runout evaluator (§6.4.1) | `environment/poker_env.py` | **done** — `is_decision_free` + `runout_equity` (exact board-average over completions, side-pots via `Pot.compute_utility`, cap+MC fallback); pre-runout snapshot recorded at the force-resolve (`_runout_info`, undo/deepcopy round-tripped); brute-force tested. Shared by the leaf (5.2) and the solver's forced-runout terminals (row 6) | 0 |
 | 5.2 | Continuation values | `poker_ai/search/leaf.py` | **done** — `leaf_value` → `continuation_value(frontier_env, profile, ctx)`; fixed profile, per-seat scalar, rollout from concrete hands (no resampling); blueprint-canonical lookups; decision-free exact equity via 5.1 gated by `use_decision_free_equity`; obsolete hole-samplers deleted (joint sampler is the solver's, row 6) | 0, 4, 5.1 |
 | 6.1 | Vectorised range-vs-range showdown (F2) | `environment/range_showdown.py` (env-owned) | **done** — `rank_combos_on_board` + `showdown_cfv`/`reach_after_removal`; O(n log n) sorted card-removal sweep, heads-up winner-takes-pot `stake·(W−L)`, no n² matrix; board-keyed ranking cache; depends on the shared `default_evaluator` only. Brute-force tested + cross-validated against concrete `payout` to the chip. Surfaced as `PokerEnv.vector_payout`, called by the vector regime (6.2) | 0, 2, 3 |
-| 6.2 | Rest of solver (MCCFR + vector CFR loops) + `SearchPolicy` | `poker_ai/search/solver_state.py`, `mccfr.py`, `vector.py`, `solver.py`, `policy.py` | **done** — **both regimes + `SearchPolicy`** (composition: `SolverState` shared data+ops, `_MCCFRSolver` with joint root sampling, external-sampling traversal, meta-game-as-action leaf, freezing, warm-start widening; `solve()` orchestrator + regime selection + Linear-CFR discount + dual stop; forced-runout terminals via `runout_equity` under `use_decision_free_equity`). **Vector regime** (`_VectorSolver`, HU turn/river): alternating-updates vector-form Linear CFR carrying per-combo reach vectors, all-actions-expanded, **one river sampled per iteration from `ctx.rng`** (engine deal ignored → no global-RNG dependence); **all terminal settlement is delegated to the env-owned `PokerEnv.vector_payout`** (6.1) — the regime passes only the traverser seat, opponent reach, and sampled river, and does no stake/showdown/fold/ranking itself; per-combo rows persist as `(n_combos, width)` matrices keyed by `public_key` in the same `SolverState`, read unchanged by `SearchPolicy`. Unit + integration + fast convergence/stability tests for both. The exact-equilibrium **independent brute-force CFR cross-validation is landed** (§9; `test/search/brute_force_cfr.py` + `test_equilibrium_oracle.py`, `slow`): one oracle solves a HU-river subgame to exact Nash and both regimes match it on best-response exploitability (tight for vector) and game value (the hard gate for sampled MCCFR) | 0, 2, 3, 5.1, 5.2, 6.1 |
+| 6.2 | Rest of solver (MCCFR + vector CFR loops) + `SearchPolicy` | `poker_ai/search/solver_state.py`, `mccfr.py`, `vector.py`, `solver.py`, `policy.py` | **done** — **both regimes + `SearchPolicy`** (composition: `SolverState` shared data+ops, `_MCCFRSolver` with joint root sampling, external-sampling traversal, meta-game-as-action leaf, freezing, warm-start widening; `solve()` orchestrator + regime selection + Linear-CFR discount + dual stop; forced-runout terminals via `runout_equity` under `use_decision_free_equity`). **Vector regime** (`_VectorSolver`, HU turn/river): alternating-updates vector-form Linear CFR carrying per-combo reach vectors, all-actions-expanded; a turn subgame's river is an **explicit chance node, chance-sampled one card per iteration**, with a **per-river conditioned betting axis** (`(n_combos, n_rivers, width)` storage, one slice touched per iteration) — so river betting **conditions on the river card** (not river-blind) without the `R×` cost of enumerating every river; the sampled river's value is backed up with **no `1/R`** (chance sampling gives the expectation) and each river's slice converges separately; **all terminal settlement is delegated to the env-owned `PokerEnv.vector_payout`** (6.1); per-combo rows persist keyed by `public_key` in the same `SolverState` — 2-D for turn/river-subgame nodes (read unchanged by `SearchPolicy`), 3-D river-conditioned nodes internal to a turn solve (never read externally; guarded). Unit + integration + fast convergence/stability tests for both. The exact-equilibrium **independent brute-force CFR cross-validation is landed** (§9; `test/search/brute_force_cfr.py` + `test_equilibrium_oracle.py`, `slow`): a river oracle solves a HU-**river** subgame to exact Nash (both regimes match on exploitability + game value) and a river-**enumerating** **turn** oracle (turn betting → enumerated river chance → per-river river betting → showdown) validates the chance-sampled river-conditioned vector turn solve on the same gates | 0, 2, 3, 5.1, 5.2, 6.1 |
 | 7 | Search-aware agent | `poker_ai/search/agent.py` | **done** — `SearchAgent` orchestrates the per-hand lifecycle (Algorithm 2): `on_hand_start` / `on_board_update` / `on_observed_action` / `act`, with the round-boundary Bayes belief update (`sigma_for_combo` bridges `RangeTracker` to the blueprint or the last search's average policy), immediate `solve` at each new round, warm-started off-tree re-search with actual-hand freezing, and a **chip-free** round-1 search trigger (pot-relative fraction-gap vs. the canonical abstraction, replacing the paper's $100 measure). Unit-tested in `test/search/test_agent.py` (lifecycle, belief update, freezing, off-tree re-search, round-1 trigger). **Runner/play-loop wiring is still deferred** (the old `terminal/runner.py` is deprecated; a replacement runner will instantiate `SearchAgent` and drive its hooks) | 3, 4, 6.2 |
 | 8 | CLI, config, tests | `test/search/` | partial — search tests landed; the **CLI/play entry point is deferred** along with the new runner (the old Click runner under `terminal/` is deprecated) | 0–7 |
 | 9.1 | Make/undo traversal (`step_in_place` / `undo`) (Tier 1, §6.7) | `environment/poker_env.py` | **done** — the **sole** advance API (`apply_action` deleted); the blueprint CFR + strategy passes and the search solver all traverse via make/undo (the solver reuses one restored env across its regret and strategy passes); LIFO round-trip + no-leak tested | — |
 | 9.2 | Search-lifetime caches: leaf-value / forced-runout cache (Tier 1, §6.4.2, §6.7) | `poker_ai/search/solver_state.py`, `mccfr.py`, `leaf.py` | **done (data caches)** — two iteration-invariant memos hang on `SolverState` (the warm-start carrier, so they survive a within-round re-search and reset per boundary solve): `leaf_value_cache` keys `continuation_value` by `(leaf public_key, all-seat holes, profile)` (`_MCCFRSolver._leaf_value`); `runout_cache` keys exact `runout_equity` by `(all-seat holes, runout snapshot)` and is **shared across a leaf's four bias calls** (threaded into `continuation_value`) **and** the forced-runout terminal (`_terminal_value`) — the main round-1 win (profiling showed the meta-game recomputed identical runouts once per bias). `runout_cache` is exact/rng-independent → bit-identical to uncached; `leaf_value_cache` stores the first MC estimate and reuses it (§6.4.1), so the MCCFR trajectory differs from an uncached run but stays deterministic per seed (same-seed reproducibility + N-vs-2N convergence gate hold; the equilibrium oracle is river/vector, no leaves). Neither is scaled by `discount` (values are iteration-invariant). (Preflop already scores all-in terminals by `env.payout` to skip the 5-card-runout cap — landed in 6.2.) **Deferred:** the per-row σ memo — §6.4.2 note 5 finds info_set construction, not regret-matching, is the per-node cost that dominates, and the literal "invalidate on discount tick" serves stale σ; revisit only if a profiler on the real walk shows `calculate_strategy_from_row` is hot. | 6.2 |
 | 9.3 | **Optional** direct 7-card evaluator (Tier 1, §6.7) | `environment/evaluator.py` (consumed by `runout_equity` 5.1 + `rank_combos_on_board` 6.1) | **todo — optional** — replace the 21-subset batch path with a direct 7-card evaluator (TwoPlusTwo table or 7-card perfect hash) on the **order-only** paths (showdown/runout need *ordering*, not the exact `[1,7462]` rank), validated **order-equivalent** against the proven `Evaluator` (C(52,5) exhaustive core + large random 7-card argsort sample). Profiled as the dominant MC-path cost (~58–74%); est. **~5–10× on the evaluator, ~2× overall** (Amdahl), benefiting both CFR regimes and the leaf. ~1–2 days + a ~130 MB table artifact (or a smaller perfect-hash table). **Deferred until the complete pipeline can be evaluated**; pursue only if the evaluator is confirmed on the real-time critical path | 5.1, 6.1 |
 | 10 | Flat hot-loop state + `numba nogil` inner loop (Tier 1, §6.7) | `poker_ai/search/solver.py` | todo — optional; precondition for thread scaling | 9.1 |
-| 11 | Parallel search: independent replicas merged once — MCCFR + one-board-per-worker (vector) (Tier 2, §6.7) | `poker_ai/search/parallel.py`, `solver.py`, `solver_state.py` | **done (multiprocessing)** — `SolverConfig.workers` (`None`→cpu-based, `1`→serial bit-for-bit, `>1`→parallel); `solve()` keeps the unchanged serial loop for `workers==1` and otherwise runs `W` independent replicas via `parallel.run_parallel`. Each replica is a worker **process** (GIL ⇒ no thread scaling until the row-10 `nogil` loop; `multiprocessing` first per §6.7) running the full `_MCCFRSolver` rotation over its own `SeedSequence` substream + staggered starting traverser (`plan_workers`, offset `k mod n_live`); the vector regime samples its own river substream (one-board-per-worker). At the end of the budget `SolverState.accumulate` **sums** the replicas' `regret`/`strat_sum` (and `vregret`/`vstrat`) — a warm-start `baseline` is added once and replicas contribute only their delta. Heavy inputs (root env + LUT, ctx) reach workers by **fork** copy-on-write (only the per-worker seed/offset is pickled). Determinism: `workers==1` reproduces serial bit-for-bit; `(seed, workers)` is reproducible for `workers>1` (not identical to serial — the sampling trajectory diverges). **Deferred variant:** periodic cross-worker delta merge at each `discount_interval` (paper §6.7) — heavier IPC, revisit if replica variance matters. | 9.1 |
+| 11 | Parallel search: independent replicas merged once — MCCFR + one-board-per-worker (vector) (Tier 2, §6.7) | `poker_ai/search/parallel.py`, `solver.py`, `solver_state.py` | **done (multiprocessing)** — `SolverConfig.workers` (`None`→cpu-based, `1`→serial bit-for-bit, `>1`→parallel); `solve()` keeps the unchanged serial loop for `workers==1` and otherwise runs `W` independent replicas via `parallel.run_parallel`. Each replica is a worker **process** (GIL ⇒ no thread scaling until the row-10 `nogil` loop; `multiprocessing` first per §6.7) running the full CFR loop on its own `SeedSequence` substream — MCCFR rotates the traverser with a staggered starting offset (`plan_workers`, `k mod n_live`); the **vector regime parallelizes the same way** (`_build_solver` picks `_VectorSolver`), each replica sampling an independent **river** substream so the merge's regret sum multiplies the per-river samples by `W` and buys back the chance-sampling variance (**one level only** — replicas, not nested intra-replica showdown eval, which is Amdahl-capped at ~1.33× and would contend for the same cores). At the end of the budget `SolverState.accumulate` **sums** the replicas' `regret`/`strat_sum`/`vregret`/`vstrat` (3-D river tensors included) — a warm-start `baseline` is added once and replicas contribute only their delta. Heavy inputs (root env + LUT, ctx) reach workers by **fork** copy-on-write (only the per-worker seed/offset is pickled). Determinism: `workers==1` reproduces serial bit-for-bit; `(seed, workers)` is reproducible for `workers>1` (not identical to serial — the sampling trajectory diverges). **Deferred variant:** periodic cross-worker delta merge at each `discount_interval` (paper §6.7) — heavier IPC, revisit if replica variance matters. | 9.1 |
 
 ## 8. CLI
 
@@ -1131,6 +1174,21 @@ poker_ai play \
     triggers a fresh re-search, §5.) Game value is preferred over raw strategy
     equality because a zero-sum Nash is value-unique but not necessarily
     strategy-unique.
+  - **Turn oracle (river conditioning, §6.5)**: a second independent oracle
+    (`build_turn_subgame` / `BruteForceTurnCFR`) extends the reference to a HU
+    **turn** subgame — turn betting → the river as an **explicit enumerated chance
+    node** (uniform `1/R`, per-combo card removal) → **per-river** river betting
+    (infosets keyed by the river card) → showdown — with per-river payoffs read from
+    `env.payout` with the river **forced** into the deck. The oracle enumerates the
+    river exactly (the exact reference); the **chance-sampled** vector turn solve is
+    gated on matching it: exploitability `< 4%` of the chip scale and game value
+    within `2.5%` (a generous budget and slightly looser exploitability gate than the
+    exact oracle's own, since sampling converges at ~`1/sqrt(T)` with ~`T/R` updates
+    per river). This is the equilibrium gate that a river-*blind* strategy could not
+    pass (its single shared river strategy is a different, restricted game). Fast unit
+    checks complement it: the river-betting strategy genuinely **varies across the
+    river card**, the sampled solve is **reproducible** given the `ctx.rng` seed, and
+    infeasible `(combo, river)` rows carry zero strategy-sum (feasibility masking).
   - The MCCFR path remains additionally guarded by the **fast convergence/stability
     test** (`TestConvergence`): the root range-average drifts little between *N* and
     *2N* iterations (a genuine convergence property, no external oracle).

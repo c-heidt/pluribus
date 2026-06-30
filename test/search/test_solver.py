@@ -598,8 +598,8 @@ class TestVectorRegime:
         bc = np.asarray(ctx.board_compatible, dtype=np.float64)
         r0 = np.asarray(ctx.ranges[s0], np.float64) * bc
         r1 = np.asarray(ctx.ranges[s1], np.float64) * bc
-        v0 = _VectorSolver(env, SolverState.empty(), ctx, cfg, ctx.rng)._walk(env, s0, r0, r1)
-        v1 = _VectorSolver(env, SolverState.empty(), ctx, cfg, ctx.rng)._walk(env, s1, r1, r0)
+        v0 = _VectorSolver(env, SolverState.empty(), ctx, cfg, ctx.rng)._walk(env, s0, r0, r1, None)
+        v1 = _VectorSolver(env, SolverState.empty(), ctx, cfg, ctx.rng)._walk(env, s1, r1, r0, None)
         big = abs(float(r0 @ v0)) + abs(float(r1 @ v1)) + 1.0
         assert abs(float(r0 @ v0) + float(r1 @ v1)) < 1e-6 * big
 
@@ -613,6 +613,16 @@ class TestVectorRegime:
             res = solve(env, ctx, _cfg(ctx, iters=25))
             assert len(res.state.vregret) > 0
             for pk, legal in res.state.legal_at.items():
+                mat = res.state.vregret.get(pk)
+                if mat is not None and mat.ndim == 3:
+                    # River-conditioned turn-subgame node (§6.5): a per-river
+                    # betting strategy, internal to the solve (not externally
+                    # read — the river is played from a fresh river subgame).
+                    # Validate the per-(combo, river) regret-matched rows directly.
+                    sig = _regret_match_matrix(mat)
+                    assert sig.shape == (mat.shape[0], mat.shape[1], len(legal))
+                    np.testing.assert_allclose(sig.sum(axis=-1), 1.0, atol=1e-5)
+                    continue
                 for pol in (res.policy, res.average_policy):
                     d = pol.strategy_for(pk, 0, legal)
                     assert d.shape == (len(legal),)
@@ -675,6 +685,60 @@ class TestVectorRegime:
         np.testing.assert_allclose(
             res.policy.strategy_for(pk, ci, legal), frozen, atol=1e-6
         )
+
+    def test_turn_subgame_conditions_river_betting(self):
+        # The river-conditioned change (§6.5): a turn subgame builds 3-D river-stage
+        # nodes whose average river-betting strategy genuinely **differs across the
+        # river card** — the property a river-blind strategy could not represent.
+        # The river is chance-*sampled* (one per iteration), but each river keeps its
+        # own conditioned slice, so over iterations the per-river strategies diverge.
+        env = _late_env(2, seed=6)
+        ctx = _ctx(env)
+        res = solve(env, ctx, _cfg(ctx, iters=250))
+        river_nodes = [m for m in res.state.vstrat.values() if m.ndim == 3]
+        assert river_nodes, "expected river-conditioned 3-D river-betting nodes"
+        spread = 0.0
+        for m in river_nodes:
+            tot = m.sum(axis=-1, keepdims=True)
+            avg = np.where(tot > 0, m / np.where(tot > 0, tot, 1.0), 0.0)
+            mass = m.sum(axis=(1, 2)) > 0
+            if mass.any():
+                a0 = avg[mass, :, 0]  # action-0 prob per (combo, river)
+                spread = max(spread, float((a0.max(1) - a0.min(1)).max()))
+        assert spread > 0.0, "river betting did not condition on the river card"
+
+    def test_turn_sampling_is_reproducible_given_seed(self):
+        # The river chance node is sampled from ``ctx.rng`` (not the engine's
+        # global RNG), so two solves with the same seed draw the same river
+        # sequence and are bit-identical — reproducible despite the sampling.
+        def run():
+            env = _late_env(2, seed=2)
+            ctx = _ctx(env, seed=7)
+            return solve(env, ctx, _cfg(ctx, iters=50))
+
+        a, b = run(), run()
+        assert set(a.state.vregret) == set(b.state.vregret)
+        for k in a.state.vregret:
+            np.testing.assert_array_equal(a.state.vregret[k], b.state.vregret[k])
+
+    def test_infeasible_combo_river_rows_are_masked(self):
+        # A (combo, river) pair whose combo holds the river card is an impossible
+        # deal: feasibility masking at the chance node must leave it zero strat-sum
+        # (for a sampled river it is masked; an unsampled river stays all-zero).
+        env = _late_env(2, seed=6)
+        ctx = _ctx(env)
+        res = solve(env, ctx, _cfg(ctx, iters=60))
+        board = {int(c) for c in env.community_cards}
+        rivers = sorted({int(x) for x in np.unique(env.combo_cards)} - board)
+        cc = env.combo_cards
+        checked = False
+        for m in (m for m in res.state.vstrat.values() if m.ndim == 3):
+            for k, r in enumerate(rivers):
+                conflict = (cc[:, 0] == r) | (cc[:, 1] == r)
+                if conflict.any():
+                    assert np.all(m[conflict, k, :] == 0.0)
+                    checked = True
+        assert checked, "expected at least one infeasible (combo, river) row to check"
 
     def test_unequal_allin_stake_is_matched_not_max(self):
         # Heads-up unequal stacks: a short stack calls all-in for less against a

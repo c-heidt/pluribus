@@ -107,6 +107,13 @@ def solve(
     """
     regime = _select_regime(ctx)
     workers = resolve_workers(getattr(cfg, "workers", 1))
+    # Both regimes parallelize the same way (§6.7 row 11): W independent replicas,
+    # merged once.  The vector regime is chance-sampled (one river per iteration),
+    # so its replicas draw independent river substreams and summing their regrets
+    # multiplies the effective samples per river by W — directly buying back the
+    # per-river sampling variance.  (No nested intra-replica parallelism: the
+    # showdown is ~25% of an iteration and fine-grained, so replica-level scaling
+    # of the whole iteration dominates — see §6.7.)
 
     if workers > 1:
         # Parallel: W independent replicas, merged once at the end (§6.7 row 11).

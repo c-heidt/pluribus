@@ -209,20 +209,29 @@ class SolverState:
         legal_actions: Sequence[str],
         actor: int,
         n_combos: int,
+        n_rivers: "int | None" = None,
     ) -> None:
         """Register a public node and lazily allocate its vector-regime matrices.
 
         Like :meth:`ensure_node` (it delegates the ``legal_at``/``actor_at``
         bookkeeping and warm-start widening — which now also grows the matrix
-        **columns**), but additionally allocates the ``(n_combos, width)``
-        ``vregret``/``vstrat`` matrices for ``public_key`` on first visit.  The
-        combo axis is indexed by ``combo_index`` (lossless at every depth, §6.5).
+        **columns**), but additionally allocates the ``vregret``/``vstrat``
+        matrices for ``public_key`` on first visit.  The combo axis is indexed by
+        ``combo_index`` (lossless at every depth, §6.5).
+
+        ``n_rivers`` adds a **river axis** for the river-conditioned turn regime
+        (§6.5): a river-stage node below the turn→river chance node carries a
+        per-river strategy, so its matrices are ``(n_combos, n_rivers, width)``.
+        Turn-stage nodes (and every river-subgame node) pass ``None`` and stay
+        ``(n_combos, width)``.  The action ``width`` is always the **last** axis,
+        so the rest of the table ops (regret matching, widening) are axis-aware.
         """
         self.ensure_node(public_key, legal_actions, actor)
         if public_key not in self.vregret:
             width = len(self.legal_at[public_key])
-            self.vregret[public_key] = np.zeros((n_combos, width), dtype=np.float64)
-            self.vstrat[public_key] = np.zeros((n_combos, width), dtype=np.float64)
+            shape = (n_combos, width) if n_rivers is None else (n_combos, n_rivers, width)
+            self.vregret[public_key] = np.zeros(shape, dtype=np.float64)
+            self.vstrat[public_key] = np.zeros(shape, dtype=np.float64)
 
     def _grow_rows(
         self,
@@ -240,12 +249,14 @@ class SolverState:
                     grown = np.zeros(width, dtype=old.dtype)
                     grown[cols] = old
                     table[key] = grown
-        # Vector regime: grow the per-public-node matrices along the action axis.
+        # Vector regime: grow the per-public-node matrices along the **last**
+        # (action) axis — works for both 2-D ``(n_combos, width)`` turn/river
+        # nodes and 3-D ``(n_combos, n_rivers, width)`` river-conditioned nodes.
         for table in (self.vregret, self.vstrat):
             mat = table.get(public_key)
             if mat is not None:
-                grown = np.zeros((mat.shape[0], width), dtype=mat.dtype)
-                grown[:, cols] = mat
+                grown = np.zeros(mat.shape[:-1] + (width,), dtype=mat.dtype)
+                grown[..., cols] = mat
                 table[public_key] = grown
 
     # ------------------------------------------------------------------
@@ -270,6 +281,13 @@ class SolverState:
         """
         mat = self.vregret.get(key[0])
         if mat is not None:
+            if mat.ndim != 2:
+                raise ValueError(
+                    "sigma() read a river-conditioned vector node "
+                    f"{key[0]!r} (ndim={mat.ndim}); such turn-subgame river "
+                    "nodes are internal to the solve and must not be read "
+                    "externally (the river is played from a fresh river subgame)."
+                )
             return calculate_strategy_from_row(mat[key[1]])
         width = len(self.legal_at[key[0]])
         row = self.regret.get(key)
@@ -309,6 +327,13 @@ class SolverState:
         """
         mat = self.vstrat.get(key[0])
         if mat is not None:
+            if mat.ndim != 2:
+                raise ValueError(
+                    "average_sigma() read a river-conditioned vector node "
+                    f"{key[0]!r} (ndim={mat.ndim}); such turn-subgame river "
+                    "nodes are internal to the solve and must not be read "
+                    "externally."
+                )
             row = mat[key[1]]
         else:
             row = self.strat_sum.get(key)

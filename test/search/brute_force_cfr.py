@@ -323,3 +323,335 @@ def br_value(sub: Subgame, br_player: int, sigma_opp: Mapping[Infoset, np.ndarra
 def exploitability(sub: Subgame, sigma: Mapping[Infoset, np.ndarray]) -> float:
     """Best-response gap of ``sigma``: ``BR_0(σ_1) + BR_1(σ_0)`` (≥ 0; 0 at Nash)."""
     return br_value(sub, 0, sigma) + br_value(sub, 1, sigma)
+
+
+# =========================================================================== #
+# Turn subgame oracle — river as an explicit, enumerated chance node (§6.5)
+# =========================================================================== #
+#
+# A HU **turn** subgame is turn betting → **river chance** (uniform over the
+# candidate non-board cards, per-combo card removal) → **per-river river betting**
+# → showdown.  The river-conditioned vector regime must match the exact Nash of
+# this game, so this oracle models it independently: river-stage infosets are keyed
+# by the river card ``(seat, hole, public_key, river)`` (``river=None`` above the
+# chance node), and river-side terminal payoffs are read from the engine with the
+# river **forced** into the deck.  The chance measure matches the solver: weight
+# ``1/R`` over every candidate river, a river conflicting with either hole giving
+# zero (impossible deal) — so game value and exploitability are comparable.
+
+TInfoset = Tuple[int, int, Tuple, "int | None"]  # (seat, hole, pk, river|None)
+
+
+def _stage_river(env, river: int) -> None:
+    """Force ``river`` to be the next community card the engine deals.
+
+    The deck deals community cards from ``_cards[_idx]`` onward (``chance.Deck``);
+    swapping ``river`` (which must be undealt) into position ``_idx`` makes the
+    turn→river transition deal exactly ``river``.  Used on a fresh
+    ``with_hole_cards`` copy when reading a river-side terminal's concrete payoff.
+    """
+    deck = env.deck
+    idx = deck._idx
+    pos = int(np.where(deck._cards == int(river))[0][0])
+    if pos < idx:
+        raise ValueError(f"river {river} already dealt (pos {pos} < idx {idx}).")
+    deck._cards[idx], deck._cards[pos] = (
+        int(deck._cards[pos]),
+        int(deck._cards[idx]),
+    )
+
+
+@dataclass
+class TurnSubgame:
+    """Static tree + payoff tensors of one HU turn subgame (river enumerated).
+
+    ``root`` adds a ``{"type": "chance", "child": ...}`` node at each turn→river
+    crossing.  ``payoff[leaf]`` is keyed by ``(a, b)`` for a turn-side
+    (river-independent) terminal and by ``(a, b, river)`` for a river-side one.
+    """
+
+    root: dict
+    payoff: Dict[int, dict]
+    support: Dict[int, List[int]]
+    holes: Dict[int, Hole]
+    weight: Dict[Pair, float]
+    rivers: List[int]
+
+
+def _turn_terminal_needs_river(env) -> bool:
+    """A reached-directly turn terminal that the river still affects (showdown)."""
+    return env.players[0].is_active and env.players[1].is_active
+
+
+def build_turn_subgame(
+    env,
+    range0: Sequence[float],
+    range1: Sequence[float],
+    support0: Sequence[int],
+    support1: Sequence[int],
+) -> TurnSubgame:
+    """Capture the turn public tree (with river chance nodes) + payoff tensors.
+
+    ``env`` must be a heads-up **turn** state (4-card board, not terminal).  The
+    betting tree is river-independent in structure, so it is walked once via
+    make/undo; chance nodes are inserted where turn betting crosses into the river
+    (a continue into river betting, or a turn all-in showdown).  Payoffs are read
+    from concrete ``env.payout`` replays — with the river forced for river-side
+    terminals.
+    """
+    street = int(env.betting_round)
+    board = {int(c) for c in env.community_cards}
+    rivers = sorted({int(x) for x in np.unique(env.combo_cards)} - board)
+
+    holes: Dict[int, Hole] = {
+        idx: tuple(int(x) for x in env.combo_cards[idx])
+        for idx in set(support0) | set(support1)
+    }
+
+    leaves: List[Tuple[List[str], bool]] = []  # (line, river_side)
+
+    def build(e, line: List[str], river_stage: bool) -> dict:
+        if e.is_terminal:
+            leaf_id = len(leaves)
+            leaves.append((list(line), river_stage))
+            return {"type": "term", "leaf": leaf_id, "pk": e.public_key}
+        legal = [a for a in e.legal_actions if a is not None]
+        node = {
+            "type": "node",
+            "actor": e.player_i,
+            "pk": e.public_key,
+            "legal": legal,
+            "children": {},
+        }
+        for a in legal:
+            token = e.step_in_place(a)
+            wrap_chance = False
+            child_stage = river_stage
+            if not river_stage:
+                if e.is_terminal:
+                    if _turn_terminal_needs_river(e):
+                        wrap_chance, child_stage = True, True
+                elif e.betting_round > street:
+                    wrap_chance, child_stage = True, True
+            child = build(e, line + [a], child_stage)
+            node["children"][a] = {"type": "chance", "child": child} if wrap_chance else child
+            e.undo(token)
+        return node
+
+    root = build(env, [], False)
+
+    # --- Chance measure: joint hole deal over card-disjoint support pairs. ---
+    raw: Dict[Pair, float] = {}
+    for a in support0:
+        for b in support1:
+            if set(holes[a]) & set(holes[b]):
+                continue
+            raw[(a, b)] = float(range0[a]) * float(range1[b])
+    total = sum(raw.values())
+    if total <= 0.0:
+        raise ValueError("turn subgame has no card-disjoint support pairs with mass.")
+    weight = {pair: m / total for pair, m in raw.items()}
+
+    # --- Payoff tensors: replay each line per pair (+ per river for river-side). ---
+    payoff: Dict[int, dict] = {}
+    for leaf_id, (line, river_side) in enumerate(leaves):
+        row: dict = {}
+        for (a, b) in raw:
+            if river_side:
+                for r in rivers:
+                    if r in holes[a] or r in holes[b]:
+                        continue  # impossible deal (card removal)
+                    e2 = env.with_hole_cards([holes[a], holes[b]])
+                    _stage_river(e2, r)
+                    for action in line:
+                        if e2.is_terminal:
+                            break
+                        e2.step_in_place(action)
+                    row[(a, b, r)] = float(e2.payout[0])
+            else:
+                e2 = env.with_hole_cards([holes[a], holes[b]])
+                for action in line:
+                    if e2.is_terminal:
+                        break
+                    e2.step_in_place(action)
+                row[(a, b)] = float(e2.payout[0])
+        payoff[leaf_id] = row
+
+    return TurnSubgame(
+        root=root,
+        payoff=payoff,
+        support={0: list(support0), 1: list(support1)},
+        holes=holes,
+        weight=weight,
+        rivers=rivers,
+    )
+
+
+class BruteForceTurnCFR:
+    """Full-enumeration Linear CFR over a :class:`TurnSubgame` (river enumerated).
+
+    Mirrors :class:`BruteForceCFR` but threads a ``river`` context: above the
+    chance node it is ``None`` (river-independent turn betting); at a chance node
+    it enumerates every candidate river (uniform ``1/R``, card removal) and recurses
+    with that river fixed, so river-betting infosets and payoffs are per-river.
+    """
+
+    def __init__(self, subgame: TurnSubgame) -> None:
+        self.sub = subgame
+        self.regret: Dict[TInfoset, np.ndarray] = {}
+        self.strat: Dict[TInfoset, np.ndarray] = {}
+
+    def _row(self, table, key, width):
+        row = table.get(key)
+        if row is None:
+            row = np.zeros(width, dtype=np.float64)
+            table[key] = row
+        return row
+
+    def iterate(self, t: float) -> None:
+        for (a, b), w in self.sub.weight.items():
+            self._cfr(self.sub.root, a, b, 1.0, 1.0, w, t, None)
+
+    def _cfr(self, node, a, b, r0, r1, w, t, river) -> float:
+        ntype = node["type"]
+        if ntype == "term":
+            row = self.sub.payoff[node["leaf"]]
+            return row[(a, b)] if river is None else row.get((a, b, river), 0.0)
+        if ntype == "chance":
+            rivers = self.sub.rivers
+            inv = 1.0 / len(rivers)
+            val = 0.0
+            for r in rivers:
+                if r in self.sub.holes[a] or r in self.sub.holes[b]:
+                    continue  # impossible deal → contributes 0 (1/R convention)
+                val += inv * self._cfr(node["child"], a, b, r0, r1, w * inv, t, int(r))
+            return val
+        seat = node["actor"]
+        legal = node["legal"]
+        width = len(legal)
+        hole = a if seat == 0 else b
+        key = (seat, hole, node["pk"], river)
+        regret = self._row(self.regret, key, width)
+        sigma = _regret_match(regret)
+        util = np.empty(width, dtype=np.float64)
+        node_util = 0.0
+        for k, action in enumerate(legal):
+            child = node["children"][action]
+            if seat == 0:
+                u = self._cfr(child, a, b, r0 * sigma[k], r1, w, t, river)
+            else:
+                u = self._cfr(child, a, b, r0, r1 * sigma[k], w, t, river)
+            util[k] = u
+            node_util += sigma[k] * u
+        if seat == 0:
+            cf_reach, own_reach, sign = w * r1, r0, 1.0
+        else:
+            cf_reach, own_reach, sign = w * r0, r1, -1.0
+        regret += t * cf_reach * sign * (util - node_util)
+        self._row(self.strat, key, width)[:] += t * own_reach * sigma
+        return node_util
+
+    def solve(self, iterations: int) -> Dict[TInfoset, np.ndarray]:
+        for t in range(1, iterations + 1):
+            self.iterate(float(t))
+        out: Dict[TInfoset, np.ndarray] = {}
+        for key, row in self.strat.items():
+            total = row.sum()
+            out[key] = row / total if total > 0.0 else np.full(len(row), 1.0 / len(row))
+        return out
+
+
+def _turn_sigma_row(sigma, seat, hole, node, river) -> np.ndarray:
+    row = sigma.get((seat, hole, node["pk"], river))
+    if row is None:
+        n = len(node["legal"])
+        return np.full(n, 1.0 / n)
+    return row
+
+
+def turn_game_value(sub: TurnSubgame, sigma: Mapping[TInfoset, np.ndarray]) -> float:
+    """Expected value to seat 0 of ``sigma`` (river chance enumerated)."""
+
+    def ev(node, a, b, river) -> float:
+        ntype = node["type"]
+        if ntype == "term":
+            row = sub.payoff[node["leaf"]]
+            return row[(a, b)] if river is None else row.get((a, b, river), 0.0)
+        if ntype == "chance":
+            inv = 1.0 / len(sub.rivers)
+            v = 0.0
+            for r in sub.rivers:
+                if r in sub.holes[a] or r in sub.holes[b]:
+                    continue
+                v += inv * ev(node["child"], a, b, int(r))
+            return v
+        seat = node["actor"]
+        hole = a if seat == 0 else b
+        row = _turn_sigma_row(sigma, seat, hole, node, river)
+        total = 0.0
+        for k, action in enumerate(node["legal"]):
+            if row[k] != 0.0:
+                total += row[k] * ev(node["children"][action], a, b, river)
+        return total
+
+    return float(sum(w * ev(sub.root, a, b, None) for (a, b), w in sub.weight.items()))
+
+
+def turn_br_value(sub: TurnSubgame, br_player: int, sigma_opp: Mapping[TInfoset, np.ndarray]) -> float:
+    """Exact best-response value for ``br_player`` (river chance enumerated)."""
+    opp = 1 - br_player
+
+    def rec(node, my_hole, opp_reach, river) -> float:
+        ntype = node["type"]
+        if ntype == "term":
+            row = sub.payoff[node["leaf"]]
+            v = 0.0
+            for ob, r in opp_reach.items():
+                if br_player == 0:
+                    key = (my_hole, ob) if river is None else (my_hole, ob, river)
+                else:
+                    key = (ob, my_hole) if river is None else (ob, my_hole, river)
+                p0 = row.get(key)
+                if p0 is not None:
+                    v += r * (p0 if br_player == 0 else -p0)
+            return v
+        if ntype == "chance":
+            inv = 1.0 / len(sub.rivers)
+            v = 0.0
+            for rr in sub.rivers:
+                if rr in sub.holes[my_hole]:
+                    continue  # my hand cannot see its own card as the river
+                sub_reach = {ob: rv for ob, rv in opp_reach.items() if rr not in sub.holes[ob]}
+                if sub_reach:
+                    v += inv * rec(node["child"], my_hole, sub_reach, int(rr))
+            return v
+        seat = node["actor"]
+        legal = node["legal"]
+        if seat == br_player:
+            return max(rec(node["children"][a], my_hole, opp_reach, river) for a in legal)
+        v = 0.0
+        for k, action in enumerate(legal):
+            nxt: Dict[int, float] = {}
+            for ob, rv in opp_reach.items():
+                s = _turn_sigma_row(sigma_opp, seat, ob, node, river)[k]
+                if rv * s != 0.0:
+                    nxt[ob] = nxt.get(ob, 0.0) + rv * s
+            if nxt:
+                v += rec(node["children"][action], my_hole, nxt, river)
+        return v
+
+    total = 0.0
+    for my_hole in sub.support[br_player]:
+        opp_reach = {
+            ob: sub.weight[(my_hole, ob) if br_player == 0 else (ob, my_hole)]
+            for ob in sub.support[opp]
+            if ((my_hole, ob) if br_player == 0 else (ob, my_hole)) in sub.weight
+        }
+        if opp_reach:
+            total += rec(sub.root, my_hole, opp_reach, None)
+    return float(total)
+
+
+def turn_exploitability(sub: TurnSubgame, sigma: Mapping[TInfoset, np.ndarray]) -> float:
+    """Best-response gap of ``sigma`` for the turn subgame (≥ 0; 0 at Nash)."""
+    return turn_br_value(sub, 0, sigma) + turn_br_value(sub, 1, sigma)

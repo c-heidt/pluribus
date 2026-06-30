@@ -31,9 +31,13 @@ from poker_ai.search.solver_state import SolverConfig
 
 from test.search.brute_force_cfr import (
     BruteForceCFR,
+    BruteForceTurnCFR,
     build_subgame,
+    build_turn_subgame,
     exploitability,
     game_value,
+    turn_exploitability,
+    turn_game_value,
 )
 from test.search.test_solver import _ctx, _late_env
 
@@ -234,3 +238,154 @@ def test_mccfr_regime_reaches_equilibrium(_seeded):
 
     # Generous sanity: the sampled average is not grossly exploitable overall.
     assert exploitability(sub, sigma) < 0.10 * scale
+
+
+# --------------------------------------------------------------------------- #
+# Turn subgame: river-conditioned vector regime vs the river-enumerating oracle
+# --------------------------------------------------------------------------- #
+
+def _turn_subgame(seed: int, stacks=(200, 200)):
+    """Heads-up **turn** env + 2-combo-per-seat ranges over card-disjoint holes.
+
+    The mirror of :func:`_river_subgame` one street earlier: the board is four
+    cards and the river is still to come, so ``solve`` routes it to the vector
+    regime, which must condition river betting on the (sampled) river card.
+    Modest stacks keep the two-round (turn + river) betting tree small enough for
+    the oracle to enumerate exactly.
+    """
+    env = _late_env(2, stacks=stacks, seed=seed)
+    assert env.betting_round == 2 and not env.is_terminal
+    board = {int(c) for c in env.community_cards}
+    free = sorted({int(x) for x in env.combo_cards.reshape(-1)} - board)
+    assert len(free) >= 8, "need eight board-free cards for 2 combos per seat"
+
+    def combo(c0, c1):
+        return tuple(sorted((c0, c1)))
+
+    holes0 = [combo(free[0], free[1]), combo(free[2], free[3])]
+    holes1 = [combo(free[4], free[5]), combo(free[6], free[7])]
+    support0 = [env.combo_index[h] for h in holes0]
+    support1 = [env.combo_index[h] for h in holes1]
+    range0 = np.zeros(env.n_combos, dtype=np.float64)
+    range1 = np.zeros(env.n_combos, dtype=np.float64)
+    range0[support0] = 0.5
+    range1[support1] = 0.5
+    return env, range0, range1, support0, support1
+
+
+def _remap_row(src, legal_src, legal_dst):
+    idx = {a: i for i, a in enumerate(legal_src)}
+    out = np.zeros(len(legal_dst), dtype=np.float64)
+    for j, a in enumerate(legal_dst):
+        if a in idx:
+            out[j] = src[idx[a]]
+    s = out.sum()
+    return out / s if s > 0 else np.full(len(legal_dst), 1.0 / len(legal_dst))
+
+
+def _solver_turn_sigma(state, env, sub):
+    """Extract the solved turn ``SolverState`` into the turn oracle's infosets.
+
+    Turn-stage nodes (river ``None``) are read through :class:`SearchPolicy` as
+    usual.  River-stage nodes are **river-conditioned** — internal 3-D
+    ``(n_combos, n_rivers, width)`` ``vstrat`` tensors that are *not* exposed via
+    ``SearchPolicy`` (they are never played; the real river is re-solved) — so they
+    are read directly here, the solver's river axis aligning with the oracle's
+    sorted candidate-river order.  Keyed ``(seat, hole, pk, river)``.
+    """
+    policy = SearchPolicy(state, use_average=True)
+    sigma = {}
+
+    def walk(node, river):
+        ntype = node["type"]
+        if ntype == "term":
+            return
+        if ntype == "chance":
+            for r in sub.rivers:
+                walk(node["child"], int(r))
+            return
+        pk, seat, legal = node["pk"], node["actor"], node["legal"]
+        for hole_idx in sub.support[seat]:
+            hand_row = env.combo_index[sub.holes[hole_idx]]
+            if river is None:
+                row = np.asarray(policy.strategy_for(pk, hand_row, legal), dtype=np.float64)
+            else:
+                mat = state.vstrat.get(pk)
+                if mat is None or mat.ndim != 3:
+                    row = np.full(len(legal), 1.0 / len(legal))
+                else:
+                    k = sub.rivers.index(river)
+                    r_row = mat[hand_row, k]
+                    tot = r_row.sum()
+                    avg = r_row / tot if tot > 0 else np.full(len(r_row), 1.0 / len(r_row))
+                    row = _remap_row(avg, list(state.legal_at[pk]), legal)
+            sigma[(seat, hole_idx, pk, river)] = row
+        for a in legal:
+            walk(node["children"][a], river)
+
+    walk(sub.root, None)
+    return sigma
+
+
+def _turn_scale(sub) -> float:
+    return max(
+        abs(v)
+        for leaf in sub.payoff.values()
+        for v in (leaf.values() if isinstance(leaf, dict) else leaf)
+    )
+
+
+@pytest.mark.slow
+def test_turn_oracle_self_consistent(_seeded):
+    """The river-enumerating turn oracle converges to an (almost) exact Nash.
+
+    Sanity for the extended reference: full-enumeration Linear CFR over the turn
+    tree — with the river as an explicit enumerated chance node and per-river
+    river-betting infosets — drives its own best-response gap to ~0.
+    """
+    env, r0, r1, s0, s1 = _turn_subgame(_seeded)
+    sub = build_turn_subgame(env, r0, r1, s0, s1)
+    avg = BruteForceTurnCFR(sub).solve(4000)
+    expl = turn_exploitability(sub, avg)
+    scale = _turn_scale(sub)
+    assert expl >= -1e-9
+    assert expl < 0.01 * scale, f"turn oracle not converged: expl={expl:.4f} scale={scale}"
+
+
+@pytest.mark.slow
+def test_vector_turn_conditions_on_river_and_matches_oracle(_seeded):
+    """The river-conditioned vector turn solve matches the turn Nash oracle.
+
+    The decisive gate for the change (§6.5): a turn subgame solved by the vector
+    regime — river as a chance-*sampled* node (one river per iteration), per-river
+    conditioned river-betting strategies — must reach the same equilibrium as the
+    independent river-*enumerating* oracle.  Both the best-response gap and the
+    unique zero-sum game value are asserted.  Sampling converges at ~1/sqrt(T) and
+    each river's infoset sees only ~T/R updates, so the budget is generous and the
+    exploitability gate slightly looser than the (exact) oracle's own.
+    """
+    env, r0, r1, s0, s1 = _turn_subgame(_seeded)
+    sub = build_turn_subgame(env, r0, r1, s0, s1)
+    scale = _turn_scale(sub)
+    oracle_value = turn_game_value(sub, BruteForceTurnCFR(sub).solve(4000))
+
+    ranges = {0: r0.astype(np.float32), 1: r1.astype(np.float32)}
+    ctx = _ctx(env, ranges=ranges, seed=7)
+    cfg = SolverConfig(
+        leaf=ctx.leaf, max_iterations=8000, max_wall_seconds=120.0,
+        discount_interval=200,
+    )
+    res = solve(env, ctx, cfg)
+    assert res.state.vstrat, "expected the vector regime for a HU turn subgame"
+    # The change must have produced river-conditioned (3-D) river-betting nodes.
+    assert any(m.ndim == 3 for m in res.state.vstrat.values()), (
+        "expected river-conditioned 3-D river-betting nodes in a turn subgame"
+    )
+
+    sigma = _solver_turn_sigma(res.state, env, sub)
+    expl = turn_exploitability(sub, sigma)
+    value = turn_game_value(sub, sigma)
+    assert expl < 0.04 * scale, f"vector turn path exploitable: expl={expl:.4f} scale={scale}"
+    assert abs(value - oracle_value) < 0.025 * scale, (
+        f"vector turn game value {value:.4f} != oracle {oracle_value:.4f} (scale {scale})"
+    )
