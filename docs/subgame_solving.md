@@ -911,10 +911,17 @@ cores.
   CFR on its own sampled board runout; the per-board strategies/regrets are
   averaged. Embarrassingly parallel and naturally coarse-grained — the cheapest
   real win, and a direct match to the paper's per-thread scheme.
-- **MCCFR regime — batched parallel traversals.** Workers run batches of
-  external-sampling traversals against the shared regret tables, merging
-  per-worker accumulators at the `discount_interval` boundary (summed, then
-  discounted) to keep the merge lock-free.
+- **MCCFR regime — independent replicas, merged once** *(landed, row 11).* `W`
+  worker processes each run the **full** external-sampling rotation — the
+  traversing **player** (acting-order position, not seat identity) cycling through
+  all live players every iteration, staggered start per worker — on their own
+  `SolverState` replica seeded from an independent `SeedSequence` substream. At the
+  end of the budget the replicas sync once and their `regret`/`strat_sum` are
+  **summed** (`SolverState.accumulate`); a warm-start baseline is added a single
+  time. A replica must rotate through *all* players: pinning a worker to one
+  traverser would leave the others' regrets at uniform σ. The alternative —
+  per-`discount_interval` cross-worker delta merge (summed, then discounted) — is a
+  deferred variant with heavier IPC under `multiprocessing`.
 - **Leaf-value precompute.** The Tier-1 leaf cache is a pure function of
   `(leaf, hands, profile)` with no shared mutable state — fan it out across a
   pool ahead of / alongside the solve.
@@ -957,7 +964,7 @@ the serial result bit-for-bit; multi-worker runs fix per-worker substreams
 | 9.2 | Search-lifetime caches: leaf-value / forced-runout cache (Tier 1, §6.4.2, §6.7) | `poker_ai/search/solver_state.py`, `mccfr.py`, `leaf.py` | **done (data caches)** — two iteration-invariant memos hang on `SolverState` (the warm-start carrier, so they survive a within-round re-search and reset per boundary solve): `leaf_value_cache` keys `continuation_value` by `(leaf public_key, all-seat holes, profile)` (`_MCCFRSolver._leaf_value`); `runout_cache` keys exact `runout_equity` by `(all-seat holes, runout snapshot)` and is **shared across a leaf's four bias calls** (threaded into `continuation_value`) **and** the forced-runout terminal (`_terminal_value`) — the main round-1 win (profiling showed the meta-game recomputed identical runouts once per bias). `runout_cache` is exact/rng-independent → bit-identical to uncached; `leaf_value_cache` stores the first MC estimate and reuses it (§6.4.1), so the MCCFR trajectory differs from an uncached run but stays deterministic per seed (same-seed reproducibility + N-vs-2N convergence gate hold; the equilibrium oracle is river/vector, no leaves). Neither is scaled by `discount` (values are iteration-invariant). (Preflop already scores all-in terminals by `env.payout` to skip the 5-card-runout cap — landed in 6.2.) **Deferred:** the per-row σ memo — §6.4.2 note 5 finds info_set construction, not regret-matching, is the per-node cost that dominates, and the literal "invalidate on discount tick" serves stale σ; revisit only if a profiler on the real walk shows `calculate_strategy_from_row` is hot. | 6.2 |
 | 9.3 | **Optional** direct 7-card evaluator (Tier 1, §6.7) | `environment/evaluator.py` (consumed by `runout_equity` 5.1 + `rank_combos_on_board` 6.1) | **todo — optional** — replace the 21-subset batch path with a direct 7-card evaluator (TwoPlusTwo table or 7-card perfect hash) on the **order-only** paths (showdown/runout need *ordering*, not the exact `[1,7462]` rank), validated **order-equivalent** against the proven `Evaluator` (C(52,5) exhaustive core + large random 7-card argsort sample). Profiled as the dominant MC-path cost (~58–74%); est. **~5–10× on the evaluator, ~2× overall** (Amdahl), benefiting both CFR regimes and the leaf. ~1–2 days + a ~130 MB table artifact (or a smaller perfect-hash table). **Deferred until the complete pipeline can be evaluated**; pursue only if the evaluator is confirmed on the real-time critical path | 5.1, 6.1 |
 | 10 | Flat hot-loop state + `numba nogil` inner loop (Tier 1, §6.7) | `poker_ai/search/solver.py` | todo — optional; precondition for thread scaling | 9.1 |
-| 11 | Parallel search: one-board-per-worker (vector) + batched parallel traversals (MCCFR) (Tier 2, §6.7) | `poker_ai/search/solver.py` | todo — `multiprocessing` first; seed-deterministic | 9.1 |
+| 11 | Parallel search: independent replicas merged once — MCCFR + one-board-per-worker (vector) (Tier 2, §6.7) | `poker_ai/search/parallel.py`, `solver.py`, `solver_state.py` | **done (multiprocessing)** — `SolverConfig.workers` (`None`→cpu-based, `1`→serial bit-for-bit, `>1`→parallel); `solve()` keeps the unchanged serial loop for `workers==1` and otherwise runs `W` independent replicas via `parallel.run_parallel`. Each replica is a worker **process** (GIL ⇒ no thread scaling until the row-10 `nogil` loop; `multiprocessing` first per §6.7) running the full `_MCCFRSolver` rotation over its own `SeedSequence` substream + staggered starting traverser (`plan_workers`, offset `k mod n_live`); the vector regime samples its own river substream (one-board-per-worker). At the end of the budget `SolverState.accumulate` **sums** the replicas' `regret`/`strat_sum` (and `vregret`/`vstrat`) — a warm-start `baseline` is added once and replicas contribute only their delta. Heavy inputs (root env + LUT, ctx) reach workers by **fork** copy-on-write (only the per-worker seed/offset is pickled). Determinism: `workers==1` reproduces serial bit-for-bit; `(seed, workers)` is reproducible for `workers>1` (not identical to serial — the sampling trajectory diverges). **Deferred variant:** periodic cross-worker delta merge at each `discount_interval` (paper §6.7) — heavier IPC, revisit if replica variance matters. | 9.1 |
 
 ## 8. CLI
 
@@ -1067,10 +1074,17 @@ poker_ai play \
     once per `(holes, snapshot)` — shared across a leaf's four bias calls and the
     forced-runout terminal — and is bit-identical to the uncached value (exact /
     rng-independent); enabling the caches preserves same-seed determinism (regret
-    tables and cache key-sets reproduce). Determinism under parallelism: `--workers 1`
-    reproduces the serial result bit-for-bit; a fixed `(seed, n_workers)` is
-    reproducible across runs; the MCCFR per-worker accumulator merge equals a
-    serial run over the same total iteration count.
+    tables and cache key-sets reproduce). Parallelism (§6.7 row 11,
+    `test/search/test_parallel.py`): `SolverState.accumulate` sums replica
+    `regret`/`strat_sum`/`vregret`/`vstrat` over the key union, adds a warm-start
+    `baseline` exactly once (replicas contribute only their delta), and carries the
+    baseline's frozen rows; `plan_workers` staggers the traverser offset `k mod
+    n_live` and is reproducible from `base_seed`. End-to-end (fork): `workers==1`
+    reproduces the serial loop deterministically, a fixed `(seed, workers)` is
+    reproducible across runs, `workers>1` diverges from serial (sampling differs)
+    yet `iterations_run` pools to `W×` the per-replica budget and the merged average
+    policy is valid; both regimes run and a warm-started parallel re-search keeps
+    its frozen rows.
 - **Independent CFR cross-validation** (**done** — `test/search/brute_force_cfr.py`
   + `test/search/test_equilibrium_oracle.py`, marked `slow`; one oracle validates
   the MCCFR *and* vector paths). A **brute-force full-enumeration Linear CFR** —

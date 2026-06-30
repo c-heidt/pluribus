@@ -54,6 +54,11 @@ class SolverConfig:
     max_iterations: int = 10_000
     max_wall_seconds: float = 15.0
     discount_interval: int = 1_000  # Linear-CFR discount cadence (iterations)
+    # Parallel search (§6.7 row 11).  ``None`` → resolve to a cpu-based default;
+    # ``1`` → the serial loop (bit-for-bit identical to the pre-parallel solver);
+    # ``>1`` → that many independent MCCFR replicas, merged once at the end
+    # (:meth:`SolverState.accumulate`).  See :mod:`poker_ai.search.parallel`.
+    workers: "int | None" = 1
 
 
 def _hand_row(env: "PokerEnv", combo: Sequence[int], street_at_root: int) -> int:
@@ -106,6 +111,67 @@ class SolverState:
     @classmethod
     def empty(cls) -> "SolverState":
         return cls()
+
+    @classmethod
+    def accumulate(
+        cls,
+        states: Sequence["SolverState"],
+        *,
+        baseline: "SolverState | None" = None,
+    ) -> "SolverState":
+        """Fold independent-replica tables into one merged state (§6.7 row 11).
+
+        Each parallel MCCFR replica runs the full traverser rotation over its own
+        seeded substream and returns its :class:`SolverState`; this folds them into
+        a single state by **summing** the cumulative ``regret`` / ``strat_sum`` (and
+        the vector regime's ``vregret`` / ``vstrat``) over the union of keys.  Rows
+        for a given key share a width because the legal set is a deterministic
+        function of ``public_key`` and every replica inherits the same warm-start
+        widening, so the per-key arrays add directly.  ``average_sigma`` normalises
+        the summed ``strat_sum`` per node, so the merged average policy is a valid
+        reach-weighted average over all ``W × iterations``.
+
+        ``baseline`` is the warm-start state every replica was seeded from (``None``
+        for a fresh search).  When given it is added **exactly once** and each
+        replica contributes only its delta over it (``replica − baseline``) —
+        otherwise the shared warm-start regrets would be counted ``W`` times.  Its
+        ``frozen`` rows (pinned actual hands) and node structure carry through.  The
+        per-iteration leaf/runout value caches are dropped (recomputed on demand).
+
+        Note: a replica also discounts the baseline rows along with its own
+        accumulation, so ``replica − baseline`` is only approximately the replica's
+        fresh contribution under Linear-CFR; the fresh-search path (no baseline) is
+        exact, and a warm re-search is a short refinement where the drift is small.
+        """
+        _TABLES = ("regret", "strat_sum", "vregret", "vstrat")
+        out = cls()
+        if baseline is not None:
+            for pk, legal in baseline.legal_at.items():
+                out.legal_at[pk] = legal
+            for pk, actor in baseline.actor_at.items():
+                out.actor_at[pk] = actor
+            out.frozen = {k: v.copy() for k, v in baseline.frozen.items()}
+            for name in _TABLES:
+                dst = getattr(out, name)
+                for key, row in getattr(baseline, name).items():
+                    dst[key] = row.copy()
+        for st in states:
+            for pk, legal in st.legal_at.items():
+                out.legal_at.setdefault(pk, legal)
+            for pk, actor in st.actor_at.items():
+                out.actor_at.setdefault(pk, actor)
+            for name in _TABLES:
+                dst = getattr(out, name)
+                base = getattr(baseline, name) if baseline is not None else None
+                for key, row in getattr(st, name).items():
+                    b = base.get(key) if base is not None else None
+                    delta = row - b if b is not None else row
+                    acc = dst.get(key)
+                    if acc is None:
+                        dst[key] = delta.copy()
+                    else:
+                        acc += delta
+        return out
 
     # ------------------------------------------------------------------
     # Node registration (+ warm-start widening)

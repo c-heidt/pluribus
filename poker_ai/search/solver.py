@@ -21,6 +21,12 @@ from typing import Optional
 
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.mccfr import _MCCFRSolver
+from poker_ai.search.parallel import (
+    plan_workers,
+    resolve_workers,
+    run_loop,
+    run_parallel,
+)
 from poker_ai.search.policy import SearchPolicy
 from poker_ai.search.solver_state import SolverConfig, SolverState
 from poker_ai.search.vector import _VectorSolver
@@ -99,26 +105,29 @@ def solve(
     -------
     SearchResult
     """
-    state = warm_start if warm_start is not None else SolverState.empty()
     regime = _select_regime(ctx)
-    if regime == "vector":
-        solver = _VectorSolver(root_env, state, ctx, cfg, ctx.rng)
-    else:
-        solver = _MCCFRSolver(root_env, state, ctx, cfg, ctx.rng)
+    workers = resolve_workers(getattr(cfg, "workers", 1))
 
-    start = time.perf_counter()
-    delta = cfg.discount_interval
-    iterations = 0
-    for t in range(1, cfg.max_iterations + 1):
-        solver.iterate()
-        iterations = t
-        # Linear-CFR discount on the cadence: d = (t/Δ)/(t/Δ + 1) (§6.5).
-        if delta > 0 and t % delta == 0:
-            k = t / delta
-            state.discount(k / (k + 1.0))
-        if time.perf_counter() - start >= cfg.max_wall_seconds:
-            break
-    wall = time.perf_counter() - start
+    if workers > 1:
+        # Parallel: W independent replicas, merged once at the end (§6.7 row 11).
+        # The base seed is drawn from ctx.rng so a given (ctx.rng state, workers)
+        # is reproducible; the staggered traverser rotation balances across the
+        # live players (len(ctx.ranges)).
+        base_seed = int(ctx.rng.integers(0, 2 ** 63 - 1))
+        plan = plan_workers(workers, len(ctx.ranges), base_seed=base_seed)
+        state, iterations, wall = run_parallel(
+            root_env, ctx, cfg, warm_start, plan, regime
+        )
+    else:
+        # Serial: the original single-thread loop — bit-for-bit unchanged.
+        state = warm_start if warm_start is not None else SolverState.empty()
+        if regime == "vector":
+            solver = _VectorSolver(root_env, state, ctx, cfg, ctx.rng)
+        else:
+            solver = _MCCFRSolver(root_env, state, ctx, cfg, ctx.rng)
+        start = time.perf_counter()
+        iterations = run_loop(solver, state, cfg)
+        wall = time.perf_counter() - start
 
     return SearchResult(
         policy=SearchPolicy(state, use_average=False),
