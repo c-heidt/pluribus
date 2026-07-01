@@ -1,0 +1,803 @@
+# Evaluation & Experiment Logging
+
+Design for the offline evaluation harness of the real-time search component
+([docs/subgame_solving.md](subgame_solving.md)). Where the subgame document
+specifies *how the bot plays*, this document specifies *how we measure whether
+it plays well* and *how the measurements are stored for later analysis*.
+
+This document is deliberately staged. The **logging backbone** (§4–§7) and the
+**end-of-run summary** (§8) are the first things to build and are fully specified
+here. The **evaluation runner** (§10.1, time-budgeted games vs. blueprint-derived
+bots) and the **AIVAT** variance-reduced strength estimate (§10.2) are planned in
+detail but built after the backbone; genuinely-future work (heterogeneous opponents,
+exploitation solver, exploitability) is listed in §10.3.
+
+---
+
+## 1. Purpose and Scope
+
+The goal is to run **thousands of games against varying opponent
+configurations** on a single compute node and analyse the results in aggregate:
+strength by opponent, cost of search, which solver approach ran where, and the quality
+of the belief (range) tracking that feeds it.
+
+The workload is **write-once, read-analytically-many**: a long sequential run
+produces one record per game and many records per game (one per search
+invocation and belief update), and analysis happens afterwards with grouped
+queries ("mean chip delta by opponent config", "wall-clock by betting stage",
+"how often does range tracking rule out the true hand?").
+
+Games are played **sequentially on one node** so that all cores go to *solving*
+each subgame (§6.7 of the subgame document) rather than to running many games in
+parallel. This single-writer topology is what makes the storage decision in §4
+straightforward.
+
+## 2. Goals and Non-Goals
+
+### Goals
+
+- A structured, queryable record of every evaluation game and every search
+  invocation within it, comparable across runs and opponent configurations.
+- Capture of the solver-run metadata that is currently computed and discarded
+  (iterations, wall-clock, cache behaviour) plus problem-shape metadata that is
+  not computed today (tree size, node count) — see [the audit note](#appendix-a-current-logging-state).
+- Capture of **range-tracking quality** (§7): whether the tracked belief over
+  each opponent's hole cards resembles the hand that is actually revealed at
+  showdown. A belief that diverges from reality hurts the solve more than it
+  helps, and today nothing measures this.
+- A storage format and cluster I/O strategy that survive long runs and
+  preemption without corrupting data or dominating wall-clock.
+
+### Non-Goals
+
+- **Exploitability / best-response** is explicitly **deferred** (see subgame
+  document §9). It is a *computation* to build (no best-response walker exists in
+  the repo yet), not merely a metric to log, and it is expensive enough to belong
+  behind its own eval flag rather than the real-time loop. The schema (§6)
+  reserves nullable columns for it so it can be added without migration.
+- No live/interactive dashboards or per-iteration console verbosity. The subgame
+  runs already log human-readable status via the repository's `RichHandler`
+  config ([poker_ai/__init__.py](../poker_ai/__init__.py)); this document adds a
+  *machine-readable* sink alongside it, not a replacement for it.
+- No opponent modelling. Varying "opponent configuration" here means varying the
+  *opponent agents* we evaluate against — at the start, the blueprint and its
+  fold/call/raise-biased variants (§10.1); stronger opponents drop in later (§10.3) —
+  not adapting the bot to the opponent.
+- No new heavy dependencies (no wandb / tensorboard / mlflow). The chosen sink is
+  a single SQLite file from the standard library.
+
+## 3. What We Measure
+
+The game is **6-max**: one hero (the agent) and **five opponent seats**, which may
+run *different* agents. That makes per-seat opponent identity a first-class grain,
+not a heads-up afterthought.
+
+There are **four natural grains**. Keeping them separate (rather than flattening
+into one wide row per decision) avoids repeating table state on every row and keeps
+"group by opponent" unambiguous.
+
+| Grain | One row per | Carries |
+|---|---|---|
+| **Game / hand** | hand played | table-composition label, positions, seed, big blind, stack depth, provenance, hero chip outcome |
+| **Seat** | (game, seat) | which agent sat there — attributes results/range-quality to an opponent *type* |
+| **Decision / solve** | search invocation within a game | regime, iterations, wall-clock, stop reason, cache stats, node/tree size, `num_live`, action played |
+| **Range quality** | (game, opponent seat, belief snapshot) resolved at showdown | true-combo mass, rank, log-loss vs. uniform, collapse flag, entropy |
+
+All join on `game_id`; the seat and range-quality tables additionally carry `seat`.
+Exploitability, when built, attaches at the decision grain as nullable columns.
+
+## 4. Storage Format Decision
+
+**Decision: a single SQLite database file, written node-locally.**
+
+The single-writer, sequential-play topology (§1) removes the only reason to
+prefer append-only text files: there is no concurrent-writer contention to avoid.
+That makes SQLite the cleanest fit for a *read-analytically-many* workload —
+real SQL joins across the four grains, indexes on the columns we group by, and
+zero analysis tooling (pandas `read_sql`, DuckDB `ATTACH`, or the `sqlite3` CLI
+all read the file directly).
+
+Settings:
+
+- **WAL mode** (`PRAGMA journal_mode=WAL`) — lets an analysis query read the
+  file while a run is still writing.
+- **`PRAGMA synchronous=NORMAL`** — skips the per-commit `fsync` (syncing only at
+  checkpoint). On node-local disk this keeps logging cost negligible against the
+  seconds-to-tens-of-seconds each search takes, while remaining safe against
+  database *corruption*; the only exposure is losing the last transaction on an
+  OS/power-level crash.
+- **One transaction per game** — a game's `games` row and all of its `game_seats`,
+  `decisions`, and `range_quality` rows commit together. This is both the crash-safety
+  boundary (a killed run never leaves a half-written game) and the write-batching
+  mechanism (one commit per game, not per decision), so no in-application
+  buffering across games is needed or wanted — buffering would only move the
+  durability boundary out and risk losing more on a crash.
+
+### Rejected alternatives
+
+| Option | Why not |
+|---|---|
+| **CSV** | Cannot hold the nested action distribution / opponent-config blobs; untyped. |
+| **JSON-lines → Parquet** | The right choice *only* under parallel writers (append-only, contention-free). With a single writer it adds a compaction step and loses in-file SQL joins for no benefit. |
+| **Parquet as the write sink** | Immutable/batch-oriented; appending one record per solve is awkward. It is an *analysis* format, not a *capture* format. |
+| **SQLite on the network filesystem** | Network FS locking is unreliable and a known route to SQLite corruption, on top of per-transaction latency. Avoided by writing node-locally (§5). |
+
+## 5. Cluster Execution & Durability
+
+The database is written to **node-local scratch** (`$TMPDIR` / local SSD) during
+the run and **synced back to the permanent filesystem** on an interval and at the
+end — mirroring the blueprint training approach (LUTs staged local, checkpoints
+written local, synced back; see [scripts/training.sh](../scripts/training.sh)).
+Writing to the shared filesystem per hand would be slow and, for SQLite,
+unsafe (§4).
+
+- **Snapshot with `VACUUM INTO`, not `cp`.** In WAL mode a plain copy of the main
+  `.db` file while uncheckpointed WAL frames exist yields an inconsistent copy.
+  `VACUUM INTO 'permanent/…/experiment.sqlite'` produces a clean, single-file,
+  defragmented snapshot regardless of WAL state, and is safe to run while the
+  experiment keeps writing. This is the checkpoint-copy primitive.
+- **Periodic sync-back**, not only at the end. A `VACUUM INTO` to the permanent
+  filesystem every *N* games (or *T* minutes) bounds how much a node failure or
+  preemption can cost. Because it is one file, the copy is cheap — none of the
+  many-small-files overhead of the chunked table checkpoints.
+- **Final sync on SIGTERM / preemption.** Reuse the signal-handling pattern
+  already present in the blueprint runners
+  ([poker_ai/blueprint/multiprocess/server.py](../poker_ai/blueprint/multiprocess/server.py))
+  and `training.sh`: on graceful preemption, commit the current game's
+  transaction and run a final `VACUUM INTO` to the permanent filesystem so nothing
+  since the last periodic snapshot is lost.
+- **Analysis reads the permanent-FS snapshot**, never the live node-local file.
+
+## 6. Schema
+
+Concrete DDL sketch (types are SQLite affinities; JSON blobs are stored as `TEXT`
+and queried with `json_extract` / `->>` when needed).
+
+```sql
+-- One row per HAND (one deal). bb/100 is per-hand; "game" == "hand" here.
+CREATE TABLE games (
+    game_id            INTEGER PRIMARY KEY,
+    run_id             TEXT    NOT NULL,   -- groups games of one experiment batch
+    hand_index         INTEGER NOT NULL,   -- 0-based position within the run; the resume cursor (§10.1)
+    schema_version     INTEGER NOT NULL,   -- bump on schema change; lets analysis span runs
+    config_fingerprint TEXT    NOT NULL,   -- hash(solver + leaf + table composition)
+    table_label        TEXT    NOT NULL,   -- table-composition label, the top-line GROUP BY key
+    table_config       TEXT    NOT NULL,   -- full JSON blob (all seats' agents), for provenance
+    hero_seat          INTEGER NOT NULL,
+    button_seat        INTEGER NOT NULL,   -- position: hero_position derivable from the two
+    n_players          INTEGER NOT NULL,   -- 6 here; kept for generality
+    -- normalisation / slicing covariates -------------------------------------
+    big_blind          REAL    NOT NULL,   -- BB in chips; normalises delta to bb/100
+    starting_stack     REAL    NOT NULL,   -- effective stack in chips; /big_blind = depth in BB
+    -- reproducibility --------------------------------------------------------
+    deck_seed          INTEGER NOT NULL,   -- reproduces the deal
+    agent_seed         INTEGER,            -- reproduces the search sampling (MCCFR/vector RNG)
+    -- variance reduction -----------------------------------------------------
+    aivat_value        REAL,               -- AIVAT-adjusted hero outcome (§10.2); the low-variance
+                                           --   estimator once built; unbiased, ~same mean as
+                                           --   hero_chips_delta with far tighter CI
+    pairing_id         INTEGER,            -- seat-rotation set (optional; AIVAT largely subsumes it)
+    variant            TEXT,               -- rotation index within the set
+    -- outcome ----------------------------------------------------------------
+    hero_chips_delta   REAL,               -- raw primary outcome (chips); always logged
+    went_to_showdown   INTEGER,            -- 1/0; gates unbiased range-quality resolution (§7)
+    terminal_street    TEXT,               -- where the hand ended (preflop..river)
+    final_pot          REAL,
+    hero_hole          TEXT,               -- e.g. 'Ah Kd'; win rate by starting hand
+    final_board        TEXT,               -- board-texture slicing
+    -- provenance -------------------------------------------------------------
+    git_sha            TEXT,
+    hostname           TEXT,               -- which node produced this (cluster debugging)
+    started_at         TEXT                -- ISO-8601, passed in (not Date.now-style)
+);
+
+-- One row per seat per game: who sat where. The 6-max change — lets results and
+-- range quality be attributed to an opponent *type*, not just the table label.
+CREATE TABLE game_seats (
+    game_id     INTEGER NOT NULL REFERENCES games(game_id),
+    seat        INTEGER NOT NULL,
+    is_hero     INTEGER NOT NULL,          -- 1 for the agent's seat, else 0
+    agent_label TEXT    NOT NULL,          -- opponent type at this seat, the GROUP BY key
+    agent_config TEXT,                     -- per-seat config JSON, provenance
+    PRIMARY KEY (game_id, seat)
+);
+
+-- One row per HERO search invocation within a game. Only the agent is logged;
+-- opponents are simple bots that do not solve, so there is nothing to log for them.
+CREATE TABLE decisions (
+    decision_id     INTEGER PRIMARY KEY,
+    game_id         INTEGER NOT NULL REFERENCES games(game_id),
+    betting_stage   TEXT    NOT NULL,      -- preflop/flop/turn/river
+    regime          TEXT    NOT NULL,      -- 'mccfr' | 'vector' | 'blueprint'
+    leaf_mode       TEXT,                  -- 'sampled_runout' | 'decision_free' | 'exact_range' | NULL
+    -- (regime, leaf_mode) IS the solver approach: mccfr+sampled_runout ('mc'),
+    -- mccfr+decision_free ('mc decision-free'), vector+exact_range ('vectorized').
+    searched        INTEGER NOT NULL,      -- 0/1: did search fire, or blueprint play?
+    is_research     INTEGER,               -- 1 if a re-search triggered by an off-tree action
+    num_live        INTEGER,               -- players still in the hand (multiway vs HU slicing)
+    -- decision context (bet-size / spot analysis) ----------------------------
+    pot_before      REAL,
+    to_call         REAL,
+    hero_stack      REAL,
+    -- solver run -------------------------------------------------------------
+    iterations      INTEGER,
+    wall_seconds    REAL,
+    iters_per_sec   REAL,
+    stop_reason     TEXT,                  -- 'iteration_cap' | 'wall_cap' (the two budget caps)
+    node_count      INTEGER,               -- decision nodes visited (new counter)
+    unique_pubkeys  INTEGER,               -- distinct public_key (new counter)
+    cache_hits      INTEGER,               -- leaf/runout/legal_actions caches
+    cache_misses    INTEGER,
+    action_played   TEXT,                  -- the sampled action
+    action_dist     TEXT,                  -- JSON: root action distribution
+    exploitability  REAL,                  -- NULL until the exploitability evaluator exists (§10.3)
+    game_value      REAL                   -- NULL until then
+);
+
+-- One row per (opponent seat, belief snapshot), resolved at showdown (§7).
+CREATE TABLE range_quality (
+    id                INTEGER PRIMARY KEY,
+    game_id           INTEGER NOT NULL REFERENCES games(game_id),
+    seat              INTEGER NOT NULL,
+    betting_stage     TEXT    NOT NULL,    -- stage at which the belief was held
+    n_actions_replayed INTEGER,            -- belief updates folded in; error compounds with it
+    true_combo        INTEGER,             -- revealed hand index; slice quality by hand class
+    true_combo_mass   REAL,                -- belief weight on the revealed hand
+    true_combo_rank   REAL,                -- percentile of the true combo (0..1)
+    effective_support INTEGER,             -- nonzero combos; the uniform baseline's size
+    log_loss          REAL,                -- -log(true_combo_mass)
+    log_loss_uniform  REAL,                -- -log(1/effective_support): the baseline
+    net_info_gain     REAL,                -- log_loss_uniform - log_loss (>0 = helped)
+    collapsed_truth   INTEGER,             -- 1 if belief assigned ~0 to the truth
+    uniform_fallback  INTEGER,             -- 1 if _uniform_fallback fired this hand/seat
+    entropy           REAL,                -- concentration of the belief
+    resolved          INTEGER NOT NULL     -- 1 if truth was observed (showdown), else 0
+);
+
+CREATE INDEX idx_games_table      ON games(table_label);
+CREATE INDEX idx_games_run        ON games(run_id, hand_index);   -- resume cursor lookup
+CREATE INDEX idx_games_pairing    ON games(pairing_id);   -- variance-reduced pairing joins
+CREATE INDEX idx_seats_agent      ON game_seats(agent_label);  -- per-opponent-type slices
+CREATE INDEX idx_seats_lookup     ON game_seats(game_id, seat);
+CREATE INDEX idx_decisions_game   ON decisions(game_id);
+CREATE INDEX idx_decisions_stage  ON decisions(betting_stage);
+CREATE INDEX idx_range_game       ON range_quality(game_id);
+```
+
+Notes:
+
+- **Store the table config both ways** — a short `table_label` to `GROUP BY` for
+  the top line, and the full `table_config` JSON for provenance ("what exactly was
+  table B?"). Per-seat detail lives in `game_seats` so results attribute to the
+  opponent *type* at each seat, not just the table as a whole.
+- **`config_fingerprint`** is a stable hash of the solver config
+  (`SolverConfig` + `LeafConfig`) and the `table_policy`, so records group across
+  runs even as settings are tweaked over time. This identity does not exist today
+  and must be added.
+- **Do not store full belief vectors** in `range_quality`. `n_combos` is ~1300;
+  thousands of games × seats × streets × 1300 floats would bloat the file for no
+  analytical gain. Store the derived scalars. (Optionally dump the full vector for
+  a small *sampled* subset of hands to a side file for debugging.)
+- Timestamps are **passed in** by the runner, not generated inside any workflow
+  context that forbids wall-clock reads.
+
+The covariate columns exist to make the common slices one query each:
+
+- **Grain is one hand per row** (`game_id` == a single deal). bb/100 is a per-hand
+  rate; a match is just a `run_id` group. This is stated so nobody double-counts.
+- **Position** (`hero_seat`, `button_seat`) — poker results are strongly
+  position-dependent; without it, per-opponent win rates blur across positions. Log
+  both seats and derive `hero_position` in analysis.
+- **Effective stack depth** (`starting_stack / big_blind`) — as fundamental a slice
+  as the opponent itself; strategy and win rate shift sharply with depth. Logged in
+  chips, normalised at query time (same pattern as `big_blind`).
+- **Variance reduction is AIVAT** (`aivat_value`, §10.2) — the planned low-variance
+  estimator. It is unbiased (same mean as `hero_chips_delta`) with a far tighter CI,
+  and it works on *singly-played* hands, so it needs no deck replay. `hero_chips_delta`
+  is always logged raw; `aivat_value` is filled once the estimator exists (nullable
+  until then). **Seat rotation** (`pairing_id`, `variant`) is kept as an *optional*
+  fallback reducer — a rotation set replayed from rotated seats, averaged as the
+  sample unit — but AIVAT largely subsumes it, so the runner (§10.1) may skip
+  implementing rotation entirely. Both columns nullable.
+- **Cross-run key is `(run_id, game_id)`, not `game_id` alone.** `game_id` is an
+  autoincrement surrogate, unique only *within* one snapshot file — every run's
+  `games` restarts at 1. Merging snapshots (ATTACH/UNION across per-run files, §11)
+  on `game_id` alone collides and silently cross-joins run A's `decisions` onto run
+  B's game 1. Always carry `run_id` and treat `(run_id, game_id)` as the logical key;
+  the merge step namespaces or remaps `game_id` on import. This is what makes pooling
+  runs (and the future exploitation-solver comparison, §10.3) safe.
+- **Reproducibility needs two seeds** — `deck_seed` fixes the deal, `agent_seed`
+  fixes the search sampling (MCCFR/vector are stochastic). Both are required to
+  replay a surprising hand exactly.
+- **Per-seat opponent identity** is handled by `game_seats` (above): join it to
+  `range_quality.seat` to attribute belief quality to the opponent type at that
+  seat, and to `decisions`/positions to break strength down by *who* the hero faced
+  where. This is what makes heterogeneous 6-max tables analysable rather than a
+  single opaque "opponent".
+- **Multiway is the default, not the exception.** With five opponents most hands
+  see folds before showdown, so `range_quality.resolved` fires for fewer seats and
+  the resolved fraction runs lower than heads-up — report it prominently (§8) and
+  treat range aggregates as showdown-conditional (§11). Where the engine allows,
+  **force-reveal all live hands at showdown** in self-play so every seat that
+  reaches it is resolvable, not just the pot winner.
+
+## 7. Range-Tracking Quality
+
+**Motivation.** The solver conditions on a per-combo belief over every live
+seat's hole cards ([RangeTracker](../poker_ai/search/ranges.py)). If that belief
+does not resemble the hand actually held, the subgame is solved against a
+fiction: card-removal, leaf equities, and continuation choices are all skewed.
+Beyond a point this *hurts more than it helps* versus a plain uniform prior. The
+tracker already self-reports its worst failure — a belief that collapses below
+the numerical floor and resets to uniform emits a `RuntimeWarning`
+([ranges.py:245](../poker_ai/search/ranges.py#L245)) — but nothing quantifies the
+common, quieter case of a belief that is merely *wrong*.
+
+**Ground truth.** Opponent hole cards are revealed at **showdown**. At each belief
+snapshot (a round-boundary update, [ranges.py:160](../poker_ai/search/ranges.py#L160)),
+buffer the seat's belief vector in memory; when the hand ends and holes are
+revealed, compute the metrics below against the true combo and write the
+`range_quality` rows inside the game's transaction (§4). Folded hands that never
+reach showdown are unverifiable — record them with `resolved = 0` and exclude
+them from quality aggregates (see the sampling-bias caveat in §11).
+
+**Metrics** (all derived from the belief vector `w` and the true combo index `h*`):
+
+- **True-combo mass** `w[h*]` — belief weight on reality. Higher is better.
+- **Log-loss** `-log(w[h*])` — penalises assigning low mass to the truth; infinite
+  when the truth was zeroed. The single most informative scalar.
+- **Log-loss vs. uniform** `-log(1/|support|)` — the belief the tracker *would*
+  have had with no updates (uniform over board-compatible combos), i.e. the
+  baseline it must beat.
+- **Net information gain** = `log_loss_uniform − log_loss`. **This is the headline
+  metric that answers the user's question**: averaged over resolved hands, a
+  positive value means tracking helps, negative means it hurts. Break it down by
+  `betting_stage` to see whether error compounds as more actions are replayed.
+- **True-combo rank / percentile** — calibration-free ordering check: where does
+  the true combo fall in the belief's sorted order? Robust when masses are tiny.
+- **Collapsed-truth indicator** — did the belief assign ~0 to the true combo
+  (`w[h*] < floor`)? This is the catastrophic case: the solve ruled out reality.
+  Track its **rate**, not just its occurrence.
+- **Uniform-fallback count** — how often `_uniform_fallback` fired
+  ([ranges.py:244](../poker_ai/search/ranges.py#L244)); today only a warning, here
+  a counted signal that the belief self-destructed.
+- **Entropy / effective support** — concentration of the belief. A confidently
+  *wrong* belief (low entropy, low true-combo mass) is the most damaging; a diffuse
+  belief is close to the uniform prior and relatively harmless. Entropy contextualises
+  the log-loss.
+
+**Interpretation.** The evaluation should be able to answer, per opponent type
+and per street: *is the mean net information gain positive?* If it is negative for
+a given opponent/street, range tracking is net-harmful there and the mitigation
+levers (belief flooring, earlier fallback, cluster-bucketed ranges — subgame doc
+§10) come into play. This is the concrete decision the metric exists to inform.
+
+The **end-of-run summary** (§8) surfaces the headline of this section — mean net
+information gain per stage — so a net-harmful belief announces itself without
+anyone querying the table.
+
+## 8. Experiment Summary (end-of-run sanity check)
+
+A single command — `python -m evaluation.summarize <snapshot.sqlite>` — runs
+**automatically when the experiment ends** (as the last step of the runner and of
+the cluster script, *after* the final `VACUUM INTO` sync-back in §5, reading the
+permanent-filesystem snapshot, never the live node-local file). It prints a
+compact human summary to the log and writes a `summary.json` next to the snapshot
+for programmatic comparison across runs. Its job is a **quick sanity check** — "is
+the bot winning, did search stay in budget, is range tracking helping?" — not deep
+analysis.
+
+It reads only the four tables (§6); every number below is one grouped query.
+
+### What it prints
+
+```
+experiment  run_id=2026-07-01_6max_mix   git=d64a49b   6000 hands   6-max
+────────────────────────────────────────────────────────────────────────────
+STRENGTH (hero bb/100, 95% CI)
+  table=all_blueprint          +14.8 ± 5.1   (3600 hands)   ✓ winning
+  table=random_bias             -1.9 ± 7.2   (2400 hands)   ~ inconclusive
+  overall                       +8.1 ± 4.2   (6000 hands)
+  by position (overall)  BTN +31  CO +18  MP +6  UTG -9  SB -22  BB -14   (bb/100)
+
+RANGE TRACKING BY OPPONENT TYPE (resolved at showdown: 18.4% of seat-snapshots)
+  net info gain    +0.31 nats  overall            ✓ helps
+    by opponent    bp +0.44   bp_call +0.05   bp_raise -0.12  ⚠
+    by stage       flop +0.52   turn +0.21   river -0.06   ⚠ harmful on river
+  collapsed truth  3.1% of resolved   uniform fallback 1.2% of seat-hands
+
+SOLVER APPROACH  (share of searches · mean wall · wall-cap rate · mean iters)
+  mc (sampled_runout)        71%   7.9s   48% wall-cap   6240 it   ✓ routed OK
+  mc decision-free           14%   9.6s   63% wall-cap   5010 it   ⚠ mostly wall-bound
+  vectorized                 15%   2.1s    4% wall-cap   9900 it   ✓ routed OK
+  routing check: each approach fired only in its intended spots ✓
+
+SEARCH COST / BUDGET
+  fired            68.0% of decisions (12190 / 17930)
+  wall / search    mean 7.1s   p95 14.9s   vs 15.0s cap
+  stop reason      wall_cap 41%   iteration_cap 59%   ⚠ 41% wall-bound
+  iterations       mean 7180   iters/s 1010   cache hit rate 93.6%
+
+FLAGS
+  ⚠ range tracking net-harmful vs bp_raise (-0.12) and on the river (-0.06)
+  ⚠ 41% of searches hit the wall cap — search is budget-bound
+  ⚠ mc decision-free hits the wall cap 63% of the time — most budget-bound approach
+  ⓘ resolved fraction 18% — range aggregates are showdown-conditional (5 opponents fold often)
+```
+
+### The queries
+
+**Strength — the headline.** Hero win rate in **bb/100** (chip delta normalised by
+the big blind, ×100) with a 95% CI, grouped by table composition. Sign + CI answers
+"am I winning, and is it significant?"
+
+```sql
+WITH g AS (                                  -- per-hand win rate in bb/100
+    SELECT table_label,
+           100.0 * hero_chips_delta / big_blind AS bb100
+    FROM games
+)
+SELECT table_label,
+       COUNT(*)                               AS hands,
+       AVG(bb100)                             AS mean_bb100,
+       1.96 * (  -- normal-approx 95% CI half-width
+         SQRT( AVG(bb100*bb100) - AVG(bb100)*AVG(bb100) )
+         / SQRT(COUNT(*)) )                    AS ci95
+FROM g
+GROUP BY table_label;
+```
+
+`big_blind` is stored per hand (§6), so this holds even if the blind level varies.
+A CI straddling zero → *inconclusive*, not *bad*; flag it as such rather than as a
+loss. Two 6-max-specific breakdowns matter alongside the top line:
+
+- **By position** — group the same `bb100` by `hero_position` (derived from
+  `hero_seat` − `button_seat` mod `n_players`). In 6-max, aggregate strength hides
+  large per-position swings; a positive overall with a bleeding blind defence is a
+  real finding, not noise.
+- **Variance reduction** — when `aivat_value` is populated (§10.2), report the CI on
+  it instead of `hero_chips_delta`: same mean (AIVAT is unbiased), far tighter
+  interval, so small edges become detectable. The summary prefers `aivat_value` when
+  present and falls back to the raw query above when it is not. (Seat-rotation
+  pairing is an optional secondary fallback, §6.)
+
+**Search cost / budget health.** Are searches firing, and do they fit the budget?
+
+```sql
+SELECT regime,
+       AVG(searched)                          AS fire_rate,
+       AVG(wall_seconds)                      AS mean_wall,
+       MAX(wall_seconds)                      AS max_wall,     -- p95 in the script
+       AVG(iterations)                        AS mean_iters,
+       AVG(iters_per_sec)                     AS mean_ips,
+       CAST(SUM(cache_hits) AS REAL)
+         / NULLIF(SUM(cache_hits + cache_misses), 0) AS cache_hit_rate
+FROM decisions
+WHERE searched = 1
+GROUP BY regime;
+```
+
+(Percentiles like p95 are computed in the script from the pulled column, since
+SQLite has no native percentile function.)
+
+**Solver approach — which one runs, how often, and is it behaving.**
+`(regime, leaf_mode)` is the approach (§6). Two things: the **usage mix** and a light
+**health signal** that each approach is doing what it should — no deep quality
+ranking.
+
+```sql
+SELECT regime, leaf_mode,
+       COUNT(*)                                   AS searches,
+       CAST(COUNT(*) AS REAL)
+         / (SELECT COUNT(*) FROM decisions WHERE searched=1) AS share,      -- usage mix
+       AVG(wall_seconds)                          AS mean_wall,
+       AVG(iterations)                            AS mean_iters,
+       AVG(stop_reason = 'wall_cap')              AS wallcap_rate           -- budget health
+FROM decisions
+WHERE searched = 1
+GROUP BY regime, leaf_mode
+ORDER BY searches DESC;
+```
+
+Reading the health signal — "is this approach correct and doing what it should":
+
+- **Routing (the correctness signal)** — each approach should fire only in its
+  intended spots (vector → heads-up turn/river, decision-free → all-in showdowns,
+  mc → the rest; subgame doc §6.4.1 / §6.7). A one-line check that `betting_stage` /
+  `num_live` match the expected envelope per approach catches a mis-routed solver — a
+  correctness bug the usage mix alone would hide.
+- **Budget** — `wallcap_rate` near 1 (or `mean_iters` pinned at the cap) means the
+  approach almost always exhausts the wall budget rather than the iteration budget:
+  it is the slow/expensive one in the spots it owns. A cost signal, not a
+  correctness one. (Whether it has actually *converged* by then is a separate story
+  — no convergence test exists in the solve loop today, so it is not measured here.)
+
+Note the mix reflects *how often each spot arises*, not which approach is better —
+approaches run in different situations, so this is a usage-and-health view, not a
+head-to-head. (A true quality comparison would need the deferred exploitability
+oracle; not in scope here.)
+
+**Range-tracking health — the second headline.** Is the belief helping versus a
+uniform prior, and where does it break down? Joined to `game_seats` so it breaks
+down **by the opponent type at the seat** — the 6-max question of *which* opponent
+the tracker models well.
+
+```sql
+SELECT s.agent_label      AS opponent,     -- who sat at this seat
+       rq.betting_stage,
+       AVG(rq.resolved)                          AS resolved_frac,
+       AVG(rq.net_info_gain)  FILTER (WHERE rq.resolved) AS mean_net_gain,
+       AVG(rq.collapsed_truth) FILTER (WHERE rq.resolved) AS collapse_rate,
+       AVG(rq.uniform_fallback)                  AS fallback_rate,
+       COUNT(*)                                  AS snapshots
+FROM range_quality rq
+JOIN game_seats s ON s.game_id = rq.game_id AND s.seat = rq.seat
+GROUP BY s.agent_label, rq.betting_stage;
+```
+
+`mean_net_gain > 0` means tracking beats the uniform prior for that opponent/stage;
+`< 0` means it *hurts more than it helps* there (§7) and is a flag. The
+`resolved_frac` runs lower than heads-up — with five opponents most seats fold
+before showdown — so report it alongside every quality number (§11).
+
+### Automated flags
+
+The script turns a few thresholds into explicit warnings so a bad run announces
+itself without anyone reading the tables:
+
+| Flag | Condition | Reading |
+|---|---|---|
+| range net-harmful | `mean_net_gain < 0` for any stage | tracking hurts there; revisit flooring / fallback / bucketing (subgame §10) |
+| budget-bound | high share of `stop_reason = 'wall_cap'` | search exhausts the wall budget rather than the iteration budget — raise the cap or shrink the tree (exact now that `stop_reason` is logged, not a p95 heuristic) |
+| search silent | overall `fire_rate ≈ 0` | search never triggered — likely a trigger/config error |
+| high collapse | `collapse_rate` above a set threshold | belief routinely rules out reality — card-removal / replay bug or too-aggressive updates |
+| thin resolution | `resolved_frac` very low | range metrics rest on few showdowns — treat as weak evidence (§11 sampling bias) |
+| losing | strength CI entirely below 0 for an opponent | genuine loss vs. that opponent, not noise |
+
+Thresholds live in one place in the script so they are easy to tune; the summary
+prints the numbers regardless, and only the flag lines are threshold-gated.
+
+### Entry point (sketch)
+
+```python
+# evaluation/summarize.py  —  python -m evaluation.summarize <snapshot.sqlite>
+def summarize(db_path: str) -> dict:
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)  # read-only
+    report = {
+        "strength":      _query_strength(con),      # per table + position + overall
+        "approach":      _query_approach(con),       # usage mix + routing/budget health
+        "search":        _query_search_cost(con),   # + p95 computed in python
+        "range_quality": _query_range_health(con),  # joined to game_seats, per opponent
+    }
+    report["flags"] = _evaluate_flags(report)       # the table above
+    _print_human(report)                            # the block shown above
+    return report                                   # also dumped to summary.json
+```
+
+It has no search-package dependency — it reads the schema, nothing else — so it
+also runs standalone against any past snapshot for a retrospective check.
+
+## 9. Implementation Steps
+
+Ordered so each step yields something usable before the next.
+
+1. **Counters (cheap, enables everything).** Add cache hit/miss/size accessors on
+   [SolverState](../poker_ai/search/solver_state.py)'s three caches (`legal_at`,
+   `leaf_value_cache`, `runout_cache` — none track hits today) and a `node_count` /
+   `unique_pubkeys` tally in the walk. Add a `config_fingerprint` hash over
+   `SolverConfig` + `LeafConfig` + `table_policy`. Surface the already-computed
+   `SearchResult.wall_seconds` / `iterations_run`, and the per-decision `stop_reason`
+   / `leaf_mode`.
+2. **The SQLite sink.** A small `evaluation/logging` module owning the DB
+   connection: `open(path)` (applies the WAL / `synchronous` pragmas and creates
+   the schema in §6), `log_game(...)`, `log_seats(...)`, `log_decision(...)`,
+   `log_range_quality(...)`, a `snapshot(dest)` wrapping `VACUUM INTO`, and a
+   per-game transaction context manager. No search-package dependency beyond the
+   result objects.
+3. **Evaluation runner (§10.1).** The time-budgeted game loop: blueprint-derived
+   opponents (`bp` + bias variants), `table_policy` seat assignment, hero/button
+   rotation, deterministic `(run_seed, hand_index)` seeding, the `(run_id,
+   hand_index)` resume cursor, and one logging transaction per hand. This is what
+   actually produces games; the later steps observe it.
+4. **Range-quality hook (§7).** Buffer belief snapshots per seat during a hand; at
+   showdown resolve them against revealed holes into `range_quality` rows. The one
+   step that reaches inside the play loop (to observe revealed holes) rather than
+   pure additive logging.
+5. **Cluster I/O.** Point the DB at node-local scratch; add periodic + on-SIGTERM
+   `VACUUM INTO` sync-back to the permanent filesystem (§5), plus the SLURM wrapper
+   (§10.1).
+6. **Summary command (§8).** `evaluation/summarize.py` reading the four tables into
+   the headline block and `summary.json`. Read-only; no search-package dependency,
+   so it also runs standalone against any past snapshot. Wired to run automatically
+   at the end of the run, after the final sync-back.
+7. **Smoke test.** A short time-budgeted run against two `table_policy` settings,
+   end-to-end: confirm the four tables populate, the join queries work, resume
+   continues cleanly after a kill, the sync-back snapshot is readable, and the
+   summary prints and writes `summary.json`.
+8. **Scale.** First real experiments, reported on raw `hero_chips_delta` (bb/100).
+9. **AIVAT (§10.2).** Layer on the variance-reduced estimator: value-function
+   accessor, per-hand online correction accumulator, `aivat_value` populated, and
+   the **unbiasedness + variance-drop test**. Switches the summary's strength CI onto
+   `aivat_value`; unblocks the small-edge comparisons. Cross-run merge tooling
+   (`(run_id, game_id)` keying, DuckDB `ATTACH`+`UNION`) follows once there is more
+   than one run to compare.
+
+## 10. Planned Components
+
+The logging backbone (§4–§9) is specified to build now. The two components below —
+the **runner** that generates the games and **AIVAT** that makes small-edge
+comparisons statistically feasible — are specified here in enough detail to
+implement; both are **not yet built**. §10.3 lists genuinely-future work.
+
+### 10.1 Evaluation Runner
+
+Drives the time-budgeted sequential game loop, calls the §9 logging module per hand,
+and runs the §8 summary at the end.
+
+**Opponents (start scope) — blueprint and its bias variants.** The five non-hero
+seats are filled by **blueprint-derived bots**: the unaltered blueprint policy, or
+one of the fold-/call-/raise-biased variants — the *same* inference-time
+reweightings already used for the continuation strategies at MC leaves (subgame doc
+§4). The hook already exists: `BlueprintPolicy.strategy(state, bias=…)`
+([policy.py](../poker_ai/search/policy.py)) returns the regret-matched σ with the
+bias class applied, so a runner samples an opponent action straight from it — no
+search, no new artifacts, a cheap per-decision sampler. Two properties the design
+leans on:
+
+- **Cheap** — opponents add negligible cost, so the run's compute goes to the hero's
+  search.
+- **Known policy** — each opponent's action distribution is computable *exactly*
+  (blueprint σ + the bias transform). This is precisely what lets AIVAT (§10.2)
+  correct opponent actions, not just the hero's.
+
+`game_seats.agent_label` vocabulary for the start scope: `bp`, `bp_fold`, `bp_call`,
+`bp_raise` (extensible). The opponent is just "an agent exposing `action_probs(env,
+seat)` and `sample(...)`", so heterogeneous/stronger opponents drop in later (§10.3)
+without touching the runner or schema.
+
+**Table-composition policy — the per-run knob.** The run config picks how the five
+opponent seats are populated; the runner samples an assignment per hand and records
+it in `game_seats`:
+
+- `all_blueprint` — all five unaltered `bp`.
+- `random` — each seat draws i.i.d. from {`bp`, `bp_fold`, `bp_call`, `bp_raise`}.
+- `fixed` — an explicit seat→variant map.
+
+You choose the policy per experiment run; the schema captures whatever was assigned,
+so analysis slices by opponent type regardless of the policy.
+
+**Hero.** The search agent under test occupies one seat, **rotated by hand** (with
+button rotation) so all six positions are covered evenly — position is a first-order
+strength factor (§6).
+
+**The loop — time-budgeted, like blueprint training.**
+
+```
+hand_index = 1 + max(games.hand_index WHERE run_id = ...)   # resume cursor, else 0
+while wall_elapsed < time_budget and not SIGTERM:
+    deck_seed  = derive(run_seed, hand_index)               # reproducible + resumable
+    agent_seed = derive(run_seed, hand_index, "agent")
+    seats      = assign(table_policy, hand_index)           # opp variants + hero/button rotation
+    play the hand:
+        hero decision   -> search agent; log a `decisions` row; buffer belief snapshots
+        opp decision    -> blueprint(+bias) sample
+        accumulate AIVAT corrections online (§10.2)
+    resolve `range_quality` vs revealed holes (§7)
+    write games + game_seats + decisions + range_quality  in ONE transaction (§4)
+    every N hands / T minutes: VACUUM INTO snapshot -> permanent FS (§5)
+    hand_index += 1
+final VACUUM INTO; run the §8 summary
+```
+
+- **Time budget** mirrors blueprint training's `max_runtime_hours`: simulate until
+  the budget ends, stopping only at a **hand boundary** (never mid-hand) so every
+  `games` row is complete. No fixed hand count — the run fills the budget.
+- **Resume / idempotency** via the `(run_id, hand_index)` cursor (§6): a restarted or
+  preempted run reads the max completed `hand_index` and continues from the next.
+  Deterministic `derive(run_seed, hand_index)` seeding makes the continuation
+  **identical** to an uninterrupted run — no replayed or skipped hands. The per-game
+  transaction (§4) guarantees each hand is either fully logged or absent, which is
+  what makes the cursor exact.
+- **Config persisted** as `config.yaml` next to the snapshot (mirrors the blueprint
+  runner); `config_fingerprint = hash(solver + leaf + table_policy)`.
+
+**Run config fields:** `run_id`, `run_seed`, `table_policy`, `time_budget`,
+`big_blind`, `starting_stack`, `n_players = 6`, `sync_interval`, scratch/permanent
+paths.
+
+**Cluster launch script** — the SLURM (or equivalent) wrapper around the runner:
+stages the node-local scratch path, sets `sync_interval`, wires SIGTERM to the final
+`VACUUM INTO`, and points analysis at the permanent-FS snapshot. Mirrors
+[scripts/training.sh](../scripts/training.sh); added under `scripts/`.
+
+### 10.2 AIVAT (variance-reduced strength estimate)
+
+Fills `games.aivat_value` (§6). Per-hand chip variance is huge (~100 bb/100 std), so
+raw bb/100 has a wide CI (§11); AIVAT gives the **same mean with far smaller
+variance**, which is what makes the small-edge comparisons (approach vs approach, and
+the future exploitation solver) detectable.
+
+**Estimator.** For a played hand with hero utility `u(z)`:
+
+```
+aivat_value = u(z)  −  Σ correction_terms
+```
+
+Each correction term has **zero expectation** by construction, so
+`E[aivat_value] = E[u(z)]` for *any* value function — the estimator is **unbiased**;
+a better value function only shrinks the variance further, it can never skew the
+mean. Corrections are taken at:
+
+- **every action node of a known-policy player** — here *all* of them, since both the
+  hero and the blueprint bots have known policies: `term = v(child_sampled) −
+  Σ_a π(a)·v(child_a)`, with `π` = the hero's played strategy at hero nodes
+  (`SearchResult.policy`, the logged `action_dist`) and the opponent's
+  `BlueprintPolicy.strategy(state, bias)` at opponent nodes — both exact, no
+  estimation. (Correcting the opponents too — possible
+  only because their policies are known — is the "gift" of the start-scope bots and
+  gives *full*-AIVAT reduction rather than the hero-only partial case.)
+- **every chance node** (hole deal, board cards) — the MIVAT term `v(realized) −
+  Σ_c P(c)·v(child_c)`, with `P` range-aware (card removal).
+
+**Value function `v`.** Reuse the search's own value machinery — the solved subgame's
+root/leaf values ([leaf.py](../poker_ai/search/leaf.py)) give a public-state value
+under the current ranges. Any consistent `v` is unbiased; pick the best cheap one at
+build time (candidate: the blueprint's expected value / rollout equity at the public
+state given ranges). Better `v` ⇒ more variance reduction, never a correctness risk.
+
+**Computed online, stored as one scalar.** Accumulate corrections during the hand,
+while the env, ranges, and values are live, and store only `aivat_value` — no
+per-node blob in the DB. The extra cost is evaluating `v` at the sibling actions and
+cards *not* taken (make/undo makes those states reachable); it is bounded by
+branching × cost(`v`) and lands in the experiment's time budget, not the real-time
+search budget.
+
+**Acceptance test = unbiasedness + variance drop.** Over many hands,
+`mean(aivat_value)` must equal `mean(hero_chips_delta)` within CI (unbiased), while
+`var(aivat_value) ≪ var(hero_chips_delta)`. This single gate catches a sign error or
+an information leak in the corrections — the main implementation risk — and confirms
+the payoff. Budget the effort in this test, not the arithmetic.
+
+**Sequencing.** The backbone logs raw `hero_chips_delta` first; AIVAT layers on using
+data already captured (`action_dist`, values, ranges). Adopting it lets the runner
+skip seat rotation (§6). Medium effort, well-bounded.
+
+### 10.3 Future (not planned in detail)
+
+- **Heterogeneous / stronger opponents** — drop in via the agent interface (§10.1);
+  no schema change (`game_seats.agent_label` already carries per-seat identity).
+- **Opponent-exploitation solver** — a second, exploitative hero agent, compared
+  **across runs** by `run_id` / `config_fingerprint` (strength delta vs. the same
+  opponent tables), not a per-decision approach within a run. Forward-compatible; no
+  columns needed now.
+- **Exploitability evaluator** (subgame doc §9) — fills the reserved nullable
+  `exploitability` / `game_value` columns in `decisions` once built.
+
+## 11. Risks and Open Questions
+
+| Risk / question | Note |
+|---|---|
+| **Showdown sampling bias** — range quality is only verifiable at showdown, a non-random subset of hands (hands that fold early are never checked). | Report quality with the resolved-fraction alongside it; treat aggregates as conditional on reaching showdown, not unconditional. Do not silently drop unresolved hands without reporting how many. |
+| **Logging perturbs timing measurements.** | Keep the write off the hot path (per-game transaction, `synchronous=NORMAL`, node-local disk); record wall-clock around the solve only, excluding the commit. |
+| **Node death between periodic snapshots.** | Bounded by the sync-back interval (§5); tune the interval against game throughput. Accept loss of at most one interval's games. |
+| **`config_fingerprint` instability** (dict ordering, float formatting). | Canonicalise before hashing (sorted keys, fixed float repr) so identical configs across runs collide as intended. |
+| **Belief-vector buffering memory** for range quality. | Only per-live-seat vectors for the current hand are held; freed at hand end. Bounded by `n_seats × n_combos`. |
+| **Schema evolution** as new metrics are added. | SQLite `ALTER TABLE ADD COLUMN` with nullable columns (the exploitability columns are the first planned use); analysis tolerates NULLs. |
+| **Under-powered experiment** — per-hand chip variance is huge (~100 bb/100 std), so raw bb/100 CI ≈ `1000/sqrt(N)`: ±28 at 5k hands, ±6 at 100k. Small edges (approach A vs B, exploitation solver) are undetectable at modest N. | AIVAT (§10.2) is the primary mitigation — same mean, far tighter CI, so plan around the AIVAT-adjusted interval. Do the power calc (target edge → required N) *before* the run. Prefer a bootstrap CI over normal-approx (chip outcomes are heavy-tailed). |
+| **Cross-run merge corruption** — `game_id` is unique only within a snapshot; unioning files on it alone collides and cross-joins child rows. | Logical key is `(run_id, game_id)` (§6); the merge namespaces/remaps `game_id` on import. DuckDB `ATTACH` + `UNION ALL` is the analysis path; `schema_version` handles column drift. |
+
+---
+
+## Appendix A: Current Logging State
+
+Baseline at the time of writing (see the audit that motivated this document): the
+search stack is effectively un-instrumented. The repository has a centralised
+`RichHandler` logging config ([poker_ai/__init__.py](../poker_ai/__init__.py),
+fixed at `INFO`), but `poker_ai/search/` uses it only for two rare warnings — the
+MCCFR joint-sampler fallback ([mccfr.py:152](../poker_ai/search/mccfr.py#L152))
+and the range collapse ([ranges.py:245](../poker_ai/search/ranges.py#L245)).
+`wall_seconds` and `iterations_run` are computed and returned on `SearchResult`
+([solver.py](../poker_ai/search/solver.py)) but never logged; `_decision_log` in
+the tracker is buffered but never consumed. There is no structured sink, no
+per-run metadata, no cache/tree statistics, and no verbosity or output
+configuration. This document defines the sink and the metadata that fills it.
