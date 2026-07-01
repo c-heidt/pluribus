@@ -3,6 +3,7 @@ import click
 from poker_ai.blueprint.runner import train
 from information_abstraction.build.runner import build_abstraction
 from poker_ai.terminal.runner import run_terminal_app
+from evaluation.runner import evaluate
 
 
 @click.group()
@@ -21,3 +22,4 @@ def cli():
 cli.add_command(train, name="train")
 cli.add_command(build_abstraction, name="build-abstraction")
 cli.add_command(run_terminal_app, name="play")
+cli.add_command(evaluate, name="evaluate")

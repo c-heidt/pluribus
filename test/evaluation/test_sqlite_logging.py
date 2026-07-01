@@ -21,6 +21,7 @@ from evaluation.sqlite_logging import (
     DecisionRow,
     ExperimentLog,
     GameRow,
+    HandFailureRow,
     RangeQualityRow,
     SeatRow,
 )
@@ -246,3 +247,29 @@ class TestSnapshotAndResume:
         assert log.next_hand_index("A") == 3        # 1 + max(0,1,2)
         assert log.next_hand_index("B") == 10       # per-run cursor, independent
         assert log.next_hand_index("C") == 0
+
+
+class TestFailures:
+
+    def test_log_failure_persists_outside_a_game_txn(self, log):
+        # Autocommitted, so it survives even though the failed game rolled back.
+        rid = log.log_failure(HandFailureRow(
+            run_id="X", hand_index=4, deck_seed=99, agent_seed=7, hero_seat=2,
+            error_type="RuntimeError", error="boom", traceback="Traceback...",
+            git_sha="abc", hostname="node01", failed_at="2026-07-01T00:00:00",
+        ))
+        row = log._con.execute(
+            "SELECT run_id, hand_index, deck_seed, error_type, error FROM hand_failures "
+            "WHERE id=?", (rid,),
+        ).fetchone()
+        assert row == ("X", 4, 99, "RuntimeError", "boom")
+
+    def test_cursor_counts_failed_hands(self, log):
+        # A run whose only record is a failure still advances past it (no retry loop).
+        log.log_failure(HandFailureRow(run_id="X", hand_index=0))
+        assert log.next_hand_index("X") == 1
+        # Max across BOTH games and failures.
+        with log.game():
+            log.log_game(_game(run_id="X", hand_index=1))
+        log.log_failure(HandFailureRow(run_id="X", hand_index=2))
+        assert log.next_hand_index("X") == 3        # max(games=1, failures=2) + 1

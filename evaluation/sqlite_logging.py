@@ -136,6 +136,26 @@ CREATE TABLE IF NOT EXISTS range_quality (
     resolved           INTEGER NOT NULL
 );
 
+-- One row per HAND that raised while being played (§9.3).  Kept out of `games`
+-- so that grain stays "complete hands only" — the per-game transaction rolls a
+-- failed hand's partial writes back — while the failure is still recorded (not
+-- silently skipped), with the seeds needed to reproduce it.  The resume cursor
+-- counts these too, so a deterministically-failing hand is not retried forever.
+CREATE TABLE IF NOT EXISTS hand_failures (
+    id           INTEGER PRIMARY KEY,
+    run_id       TEXT    NOT NULL,
+    hand_index   INTEGER NOT NULL,
+    deck_seed    INTEGER,
+    agent_seed   INTEGER,
+    hero_seat    INTEGER,
+    error_type   TEXT,
+    error        TEXT,
+    traceback    TEXT,
+    git_sha      TEXT,
+    hostname     TEXT,
+    failed_at    TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_games_table     ON games(table_label);
 CREATE INDEX IF NOT EXISTS idx_games_run       ON games(run_id, hand_index);
 CREATE INDEX IF NOT EXISTS idx_games_pairing   ON games(pairing_id);
@@ -144,6 +164,7 @@ CREATE INDEX IF NOT EXISTS idx_seats_lookup    ON game_seats(game_id, seat);
 CREATE INDEX IF NOT EXISTS idx_decisions_game  ON decisions(game_id);
 CREATE INDEX IF NOT EXISTS idx_decisions_stage ON decisions(betting_stage);
 CREATE INDEX IF NOT EXISTS idx_range_game      ON range_quality(game_id);
+CREATE INDEX IF NOT EXISTS idx_failures_run    ON hand_failures(run_id, hand_index);
 """
 
 
@@ -255,6 +276,27 @@ class RangeQualityRow:
     entropy: Optional[float] = None
 
 
+@dataclass
+class HandFailureRow:
+    """One hand that raised while being played (§6 ``hand_failures``, §9.3).
+
+    ``deck_seed`` / ``agent_seed`` are carried so the failing hand can be replayed
+    exactly for debugging; ``error`` / ``traceback`` are the diagnostic.
+    """
+
+    run_id: str
+    hand_index: int
+    deck_seed: Optional[int] = None
+    agent_seed: Optional[int] = None
+    hero_seat: Optional[int] = None
+    error_type: Optional[str] = None
+    error: Optional[str] = None
+    traceback: Optional[str] = None
+    git_sha: Optional[str] = None
+    hostname: Optional[str] = None
+    failed_at: Optional[str] = None
+
+
 def _insert(con: sqlite3.Connection, table: str, row, **extra) -> int:
     """Insert a row-dataclass into ``table``; return the new rowid.
 
@@ -348,6 +390,14 @@ class ExperimentLog:
         """Insert one ``range_quality`` row; return its ``id``."""
         return _insert(self._con, "range_quality", row, game_id=game_id)
 
+    def log_failure(self, row: HandFailureRow) -> int:
+        """Insert one ``hand_failures`` row; return its ``id`` (§9.3).
+
+        Its own autocommitted insert — a failure is recorded **after** the game's
+        transaction has already rolled back (§4), so it must not be inside one.
+        """
+        return _insert(self._con, "hand_failures", row)
+
     # ------------------------------------------------------------------
     # Snapshot (§5 — the checkpoint-copy primitive)
     # ------------------------------------------------------------------
@@ -372,10 +422,17 @@ class ExperimentLog:
 
         The per-hand transaction makes each hand fully logged or absent, so the
         max completed ``hand_index`` is an exact cursor — a restarted run reads it
-        and continues from the next (§10.1).
+        and continues from the next (§10.1).  Failed hands (``hand_failures``) count
+        too: a hand that raises is deterministic, so advancing past it avoids
+        retrying the same failure on every restart.
         """
         cur = self._con.execute(
-            "SELECT MAX(hand_index) FROM games WHERE run_id = ?", (run_id,)
+            "SELECT MAX(hand_index) FROM ("
+            "  SELECT hand_index FROM games         WHERE run_id = :r "
+            "  UNION ALL "
+            "  SELECT hand_index FROM hand_failures WHERE run_id = :r"
+            ")",
+            {"r": run_id},
         )
         row = cur.fetchone()
         return 0 if row is None or row[0] is None else int(row[0]) + 1
@@ -393,5 +450,6 @@ __all__ = [
     "SeatRow",
     "DecisionRow",
     "RangeQualityRow",
+    "HandFailureRow",
     "open",
 ]

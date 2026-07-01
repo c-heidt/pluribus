@@ -587,18 +587,18 @@ Ordered so each step yields something usable before the next.
    `unique_pubkeys` tally in the walk. Add a `config_fingerprint` hash over
    `SolverConfig` + `LeafConfig` + `table_policy`. Surface the already-computed
    `SearchResult.wall_seconds` / `iterations_run`, and the per-decision `stop_reason`
-   / `leaf_mode`.
+   / `leaf_mode`. *done*
 2. **The SQLite sink.** A small `evaluation/logging` module owning the DB
    connection: `open(path)` (applies the WAL / `synchronous` pragmas and creates
    the schema in §6), `log_game(...)`, `log_seats(...)`, `log_decision(...)`,
    `log_range_quality(...)`, a `snapshot(dest)` wrapping `VACUUM INTO`, and a
    per-game transaction context manager. No search-package dependency beyond the
-   result objects.
+   result objects. *done*
 3. **Evaluation runner (§10.1).** The time-budgeted game loop: blueprint-derived
    opponents (`bp` + bias variants), `table_policy` seat assignment, hero/button
    rotation, deterministic `(run_seed, hand_index)` seeding, the `(run_id,
    hand_index)` resume cursor, and one logging transaction per hand. This is what
-   actually produces games; the later steps observe it.
+   actually produces games; the later steps observe it. *done*
 4. **Range-quality hook (§7).** Buffer belief snapshots per seat during a hand; at
    showdown resolve them against revealed holes into `range_quality` rows. The one
    step that reaches inside the play loop (to observe revealed holes) rather than
