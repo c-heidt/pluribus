@@ -123,6 +123,11 @@ class RangeTracker:
         # the pre-fold belief.
         self._folded_ranges: Dict[int, np.ndarray] = {}
         self._decision_log: List[Tuple[int, str, str]] = []
+        # Per-seat count of how many times :meth:`_uniform_fallback` fired this
+        # hand — the belief self-destructed and reset to uniform.  Today only a
+        # ``RuntimeWarning``; surfaced here as a counted signal for the evaluation
+        # harness's range-quality metric (docs/evaluation.md §7).
+        self._fallback_counts: Dict[int, int] = {}
 
     def _initial_for_seat(self, seat: int) -> np.ndarray:
         """Uniform initial range for ``seat`` over the current board.
@@ -241,6 +246,38 @@ class RangeTracker:
         """
         return {seat: w.copy() for seat, w in self._folded_ranges.items()}
 
+    def fallback_count(self, seat: int) -> int:
+        """How many times ``seat``'s belief collapsed to uniform this hand.
+
+        A counted view of the ``_uniform_fallback`` warnings (docs/evaluation.md
+        §7): ``0`` means the belief never self-destructed for this seat.
+        """
+        return self._fallback_counts.get(int(seat), 0)
+
+    def replay_count(self, seat: int) -> int:
+        """Number of observed actions Bayes-replayed into ``seat``'s belief.
+
+        Derived from the replay log (:meth:`on_action` appends one entry per
+        replayed action), so it counts folded seats too — the range-quality
+        metric (docs/evaluation.md §7) uses it to see whether error compounds as
+        more actions are folded in.
+        """
+        s = int(seat)
+        return sum(1 for logged_seat, _, _ in self._decision_log if logged_seat == s)
+
+    def baseline_support(self, seat: int) -> int:
+        """Size of ``seat``'s no-update uniform prior over the current board.
+
+        The number of combos compatible with the current board (and, for an
+        opponent, with the bot's known hole — card removal) — i.e. the support of
+        the range the tracker *would* have with no action-replay updates.  This is
+        the range-quality baseline the tracked belief must beat (docs/evaluation.md
+        §7: ``-log(1/|support|)``, "uniform over board-compatible combos"); Bayes
+        replay can only zero combos, never add them, so it is ``>=`` the tracked
+        belief's live support.
+        """
+        return int(np.count_nonzero(self._initial_for_seat(int(seat))))
+
     def _uniform_fallback(self, seat: int) -> None:
         warnings.warn(
             f"Range for seat {seat} collapsed below floor; "
@@ -248,4 +285,5 @@ class RangeTracker:
             RuntimeWarning,
             stacklevel=2,
         )
+        self._fallback_counts[seat] = self._fallback_counts.get(seat, 0) + 1
         self._ranges[seat] = self._initial_for_seat(seat)

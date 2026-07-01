@@ -20,9 +20,15 @@ Structure (a testable core + a thin CLI):
   seeding, the ``(run_id, hand_index)`` resume cursor, hero/position rotation, and
   the time / SIGTERM budget (stops only at a hand boundary).
 
-Out of scope here (later steps): the ``range_quality`` rows (§7, step 4), the
-periodic / on-SIGTERM ``VACUUM INTO`` sync-back and SLURM wrapper (§5, step 5), the
-end-of-run summary (§8, step 6), and ``aivat_value`` (§10.2, step 9).
+Range-tracking quality (§7, step 4) is captured here too: :func:`play_hand` buffers
+each live opponent's belief at every round boundary via a
+:class:`~evaluation.range_quality.RangeQualityRecorder` and resolves them against the
+holes revealed at showdown into ``range_quality`` rows, logged in the same per-hand
+transaction.
+
+Out of scope here (later steps): the periodic / on-SIGTERM ``VACUUM INTO`` sync-back
+and SLURM wrapper (§5, step 5), the end-of-run summary (§8, step 6), and
+``aivat_value`` (§10.2, step 9).
 """
 
 from __future__ import annotations
@@ -47,11 +53,13 @@ from evaluation.opponents import (
     BlueprintOpponent,
     assign_seats,
 )
+from evaluation.range_quality import RangeQualityRecorder
 from evaluation.sqlite_logging import (
     DecisionRow,
     ExperimentLog,
     GameRow,
     HandFailureRow,
+    RangeQualityRow,
     SeatRow,
 )
 from poker_ai.search.agent import SearchAgent
@@ -178,7 +186,7 @@ def derive_seeds(
 
 @dataclass
 class HandOutcome:
-    """Result of one played hand — the ``games`` outcome fields + its decisions."""
+    """Result of one played hand — the ``games`` outcome fields + its child rows."""
 
     hero_chips_delta: float
     went_to_showdown: int
@@ -187,6 +195,7 @@ class HandOutcome:
     hero_hole: str
     final_board: str
     decisions: List[DecisionRow]
+    range_quality: List[RangeQualityRow]
 
 
 def _to_call(env: PokerEnv) -> int:
@@ -278,9 +287,15 @@ def play_hand(
     solve), ``on_observed_action`` for **every** action (deep-copying the pre-action
     env, as the agent's contract requires), and ``act`` at the hero's decisions.
     Opponents sample the (biased) blueprint at their nodes.
+
+    At each round boundary — after the agent's belief update, before the hero acts —
+    every live opponent's belief is buffered for the range-quality resolution at
+    showdown (§7, step 4), but only while the hero is still live: once it folds the
+    tracker stops updating, so its belief would be stale.
     """
     hero.on_hand_start(env, hero_seat)
     decisions: List[DecisionRow] = []
+    recorder = RangeQualityRecorder(hero_seat, opponents.keys())
     seen_board = {int(c) for c in env.community_cards}
     prev_round = env.betting_round
 
@@ -294,6 +309,12 @@ def play_hand(
             hero.on_board_update(env, new_cards)
             seen_board = {int(c) for c in env.community_cards}
             prev_round = r
+            # Buffer the just-updated opponent beliefs for showdown resolution — but
+            # only while the hero drives the tracker (folded ⇒ dormant ⇒ stale).
+            if env.players[hero_seat].is_active and hero.tracker is not None:
+                recorder.capture(
+                    hero.tracker, _STAGE.get(env.betting_stage, env.betting_stage)
+                )
 
         seat = env.player_i
         env_before = copy.deepcopy(env)          # act/sample don't step, so this is
@@ -307,11 +328,14 @@ def play_hand(
         hero.on_observed_action(env_before, seat, action)
         env.step_in_place(action)
 
-    return _finish_hand(env, hero_seat, decisions)
+    return _finish_hand(env, hero_seat, decisions, recorder)
 
 
 def _finish_hand(
-    env: PokerEnv, hero_seat: int, decisions: List[DecisionRow]
+    env: PokerEnv,
+    hero_seat: int,
+    decisions: List[DecisionRow],
+    recorder: RangeQualityRecorder,
 ) -> HandOutcome:
     """Read the terminal env into a :class:`HandOutcome` (§6 games outcome cols)."""
     hero_delta = float(env.payout[hero_seat])
@@ -334,6 +358,8 @@ def _finish_hand(
         hero_hole=hero_hole,
         final_board=final_board,
         decisions=decisions,
+        # Resolve buffered opponent beliefs vs. the holes revealed at showdown (§7).
+        range_quality=recorder.resolve(env, went_to_showdown),
     )
 
 
@@ -554,6 +580,8 @@ def _play_and_log_one(
             )
             for decision in outcome.decisions:
                 log.log_decision(game_id, decision)
+            for rq in outcome.range_quality:
+                log.log_range_quality(game_id, rq)
     except Exception as exc:  # isolated bad hand → log + skip, don't kill the run
         logger.warning(
             "hand_index %d (run %s) failed: %s: %s",

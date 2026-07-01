@@ -184,6 +184,50 @@ class TestRun:
             log.close()
         assert n_showdown and n_showdown >= 1     # would be 0 under the old check
 
+    def test_range_quality_rows_populate_and_resolve(self, tmp_path):
+        # Step 4: a run buffers opponent beliefs per street and resolves them at
+        # showdown.  An all-in/call HU policy forces showdowns, so at least some
+        # snapshots resolve with the full metric block (net_info_gain non-NULL);
+        # every row carries a stage and an opponent (non-hero) seat.
+        class _AllIn(UniformPolicy):
+            def strategy(self, state, bias="none"):
+                legal = list(state.legal_actions)
+                w = np.array(
+                    [1.0 if a in ("all_in", "call", "check") else 0.0 for a in legal],
+                    dtype=np.float32,
+                )
+                return w / w.sum() if w.sum() > 0 else np.full(
+                    len(legal), 1.0 / len(legal), dtype=np.float32
+                )
+
+        session = _stub_session(n_players=2, starting_stack=1000, blueprint=_AllIn())
+        log = ExperimentLog.open(tmp_path / "run.sqlite")
+        try:
+            run_evaluation(log=log, session=session, max_hands=12)
+            rows = _rows(
+                log._con,
+                "SELECT rq.seat, rq.betting_stage, rq.resolved, rq.net_info_gain, "
+                "g.hero_seat FROM range_quality rq JOIN games g ON g.game_id=rq.game_id"
+            )
+            resolved = _rows(
+                log._con, "SELECT COUNT(*) FROM range_quality WHERE resolved=1"
+            )[0][0]
+            # Resolved rows must carry the full metric block; unresolved must not.
+            bad = _rows(
+                log._con,
+                "SELECT COUNT(*) FROM range_quality "
+                "WHERE (resolved=1) != (net_info_gain IS NOT NULL)"
+            )[0][0]
+        finally:
+            log.close()
+        assert rows, "no range_quality rows were logged"
+        for seat, stage, res, gain, hero_seat in rows:
+            assert seat != hero_seat                      # opponent seats only
+            assert stage in ("flop", "turn", "river")
+            assert res in (0, 1)
+        assert resolved >= 1                              # showdowns did resolve
+        assert bad == 0                                   # metrics ⇔ resolved
+
     def test_blueprint_round1_decisions_logged(self, tmp_path):
         session = _stub_session(n_players=2, starting_stack=1000)
         log = ExperimentLog.open(tmp_path / "run.sqlite")
