@@ -2111,6 +2111,25 @@ class PokerEnv:
         return self._current_public_state()
 
     @property
+    def canonical_public_key(self) -> Tuple[str, Tuple[str, ...]]:
+        """:meth:`public_key` with off-tree raise sizes in the history snapped to
+        the blueprint grid via deterministic pseudo-harmonic translation (§7).
+
+        Byte-identical to :meth:`public_key` when every raise in the history is
+        already on-tree (the common case — :meth:`_canonicalize_history` is a strict
+        no-op there).  Lets a caller that chose *not* to inject a near-canonical
+        off-tree raise resolve the node in the canonical-abstraction subgame the
+        solver actually built, instead of missing the tree entirely.
+        """
+        return (
+            self._betting_stage,
+            tuple(
+                (stage, tuple(actions))
+                for stage, actions in self._canonicalize_history(self._history)
+            ),
+        )
+
+    @property
     def n_raises_this_round(self) -> int:
         """Number of raises made so far in the current betting round.
 

@@ -149,7 +149,7 @@ def test_vector_regime_reaches_equilibrium(_seeded):
     ctx = _ctx(env, ranges=ranges, seed=7)
     cfg = SolverConfig(
         leaf=ctx.leaf, max_iterations=2000, max_wall_seconds=90.0,
-        discount_interval=200,
+        discount_interval=200, workers=1,
     )
     res = solve(env, ctx, cfg)
     assert res.state.vstrat, "expected the vector regime to be selected for HU river"
@@ -201,7 +201,7 @@ def test_mccfr_regime_reaches_equilibrium(_seeded):
     ctx = _ctx(env, ranges=ranges, seed=11)
     cfg = SolverConfig(
         leaf=ctx.leaf, max_iterations=20000, max_wall_seconds=120.0,
-        discount_interval=2000,
+        discount_interval=2000, workers=1,
     )
 
     state = SolverState.empty()
@@ -373,7 +373,7 @@ def test_vector_turn_conditions_on_river_and_matches_oracle(_seeded):
     ctx = _ctx(env, ranges=ranges, seed=7)
     cfg = SolverConfig(
         leaf=ctx.leaf, max_iterations=8000, max_wall_seconds=120.0,
-        discount_interval=200,
+        discount_interval=200, workers=1,
     )
     res = solve(env, ctx, cfg)
     assert res.state.vstrat, "expected the vector regime for a HU turn subgame"

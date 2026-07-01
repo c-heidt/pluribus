@@ -43,12 +43,18 @@ class LeafConfig:
         acting seat.
     n_rollouts : int
         Monte-Carlo rollout count per :func:`continuation_value` call (default
-        8).  Each rollout re-randomises the board runout; the hands are fixed.
-        Leaf eval is ~97% of a 6p MCCFR iteration and scales linearly with this,
-        so it is the primary knob trading per-iteration cost for leaf-value
-        variance; 8 is an early-testing balance (paper uses 20).  Decision-free
-        all-in runouts are scored exactly (``use_decision_free_equity``), so this
-        only affects the sampled action-line / non-all-in variance.
+        1).  Each rollout re-randomises the board runout; the hands are fixed.
+        The leaf value is memoised per ``(leaf public_key, holes, profile)``, so
+        ``1`` scores each leaf-profile by a **single sampled playout** — matching
+        the paper's design (one action sampled per infoset; stochasticity recovered
+        in aggregate across CFR's per-iteration hole draws, not by per-leaf
+        averaging).  ``>1`` averages per leaf: an over-the-paper variance reduction
+        that costs proportionally more per iteration (the rollout walk scales
+        linearly with this) and thus buys fewer iterations under a fixed wall
+        budget.  In the low-iteration 6p regime, spending that compute on more
+        iterations (better hole coverage) generally beats per-leaf averaging.
+        Decision-free all-in runouts are scored exactly (``use_decision_free_equity``),
+        so this only affects the sampled action-line / non-all-in variance.
     use_decision_free_equity : bool
         A/B toggle for the over-the-paper improvement (§6.4).  ``True`` (default)
         replaces an all-in showdown's single sampled board with the exact
@@ -59,7 +65,7 @@ class LeafConfig:
     """
 
     policies: Mapping[BiasClass, Policy]
-    n_rollouts: int = 8
+    n_rollouts: int = 1
     use_decision_free_equity: bool = True
 
 
@@ -120,9 +126,9 @@ def continuation_value(
     if cfg.n_rollouts <= 0:
         return np.zeros(n, dtype=np.float64)
 
-    # Concrete holes are fixed; re-applying them via ``with_hole_cards`` per
-    # rollout reshuffles only the undealt board, so each rollout draws a fresh
-    # runout while the hands stay put.
+    # Concrete holes are fixed across the rollouts; the env below is built with
+    # them once and reused (rewound between rollouts), the undealt board reshuffled
+    # per rollout so each draws a fresh runout while the hands stay put.
     holes: List[Tuple[int, int]] = [
         tuple(int(c) for c in frontier_env.players[i].cards) for i in range(n)
     ]
@@ -139,8 +145,19 @@ def continuation_value(
     # board cards (the exact path), so the cached value is rng-independent.
     cache = runout_cache if runout_cache is not None else {}
     holes_key = tuple(holes)
-    for _ in range(cfg.n_rollouts):
-        e = frontier_env.with_hole_cards(holes)
+    # Pay the env construction **once**: build the holes-applied env before the
+    # loop and rewind it after each rollout via the make/undo path instead of
+    # deepcopying per rollout (``step_in_place`` returns an ``UndoToken``; ``undo``
+    # restores the deck cursor, board, pot and terminal snapshot).  The holes are
+    # fixed across the rollouts, so only ``shuffle_undealt`` need vary the board —
+    # each rollout still draws an independent runout, but the ~O(n_rollouts)
+    # deepcopies collapse to one.  ``with_hole_cards`` already shuffles the undealt
+    # deck once (used by rollout 0); later rollouts reshuffle after rewinding.
+    e = frontier_env.with_hole_cards(holes)
+    for r in range(cfg.n_rollouts):
+        if r > 0:
+            e.deck.shuffle_undealt()
+        tokens: List = []
         while not e.is_terminal:
             seat = e.player_i
             if seat not in profile:
@@ -161,7 +178,7 @@ def continuation_value(
             probs = np.asarray(probs, dtype=np.float64)
             probs /= probs.sum()
             idx = int(rng.choice(len(state.legal_actions), p=probs))
-            e.step_in_place(state.legal_actions[idx])
+            tokens.append(e.step_in_place(state.legal_actions[idx]))
         # Decision-free all-in showdown over an incomplete board: take the
         # exact board-average instead of the single dealt runout (§6.4),
         # unless the A/B toggle reproduces the sampled-runout baseline.
@@ -176,4 +193,7 @@ def continuation_value(
         else:
             for i in range(n):
                 accum[i] += float(e.payout[i])
+        # Rewind to the frontier (strict LIFO) so the next rollout starts clean.
+        for tok in reversed(tokens):
+            e.undo(tok)
     return accum / cfg.n_rollouts

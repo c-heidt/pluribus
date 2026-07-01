@@ -112,7 +112,7 @@ def _ctx(env, *, n_rollouts=2, seed=0, ranges=None, folded=None) -> SubgameConte
 def _cfg(env_ctx, *, iters=60, discount=20) -> SolverConfig:
     return SolverConfig(
         leaf=env_ctx.leaf, max_iterations=iters, max_wall_seconds=30.0,
-        discount_interval=discount,
+        discount_interval=discount, workers=1,
     )
 
 

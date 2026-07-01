@@ -10,8 +10,10 @@ the leaf evaluator) into a per-hand play lifecycle.  It owns no game dynamics an
   seat's range, then immediately solves the new round's subgame (so the search is
   ready *before* the bot is asked to act).
 - ``on_observed_action`` buffers each observed action for the next boundary update
-  and, on rounds 2–4, re-searches the same root (warm-started) whenever an
-  opponent takes an action outside the subgame's action abstraction.
+  and, on rounds 2–4, re-searches the same root (warm-started) when an opponent
+  takes an action far enough outside the subgame's action abstraction (pot-fraction
+  gap > ``offtree_threshold``); a near-canonical off-tree raise is translated onto
+  the solved canonical branch (pseudo-harmonic) instead, at no re-solve cost.
 - ``act`` plays the blueprint on round 1 (unless a round-1 search was triggered)
   and the searched final-iteration strategy on rounds 2–4, pinning the bot's
   actual-hand action so a re-search keeps it fixed.
@@ -47,6 +49,7 @@ class SearchAgent:
         *,
         round1_offtree_threshold: float = 0.25,
         round1_max_players: int = 4,
+        offtree_threshold: float = 0.25,
     ) -> None:
         # --- session-static ---
         self._leaf_policies = leaf_policies     # the four §4 variants (== cfg.leaf.policies)
@@ -55,6 +58,11 @@ class SearchAgent:
         self._rng = rng
         self._round1_threshold = float(round1_offtree_threshold)
         self._round1_max_players = int(round1_max_players)
+        # Rounds 2-4: an off-tree opponent raise within this pot-fraction of a
+        # canonical size is *translated* (pseudo-harmonic, via the solved
+        # canonical branch) instead of triggering a warm re-search — bounding
+        # re-search frequency at a negligible exploitability cost (§7).
+        self._offtree_threshold = float(offtree_threshold)
 
         # --- per-hand (initialised in on_hand_start) ---
         self.my_seat: int = -1
@@ -118,8 +126,11 @@ class SearchAgent:
         bot fold puts the agent dormant for the rest of the hand.  On rounds 2–4 a
         genuinely off-abstraction opponent raise (one the runtime injected into the
         shared overlay, so legal here yet off the canonical set) triggers a
-        warm-started re-search of the same root; on round 1 it may trigger a
-        round-1 search.
+        warm-started re-search of the same root **only when it is far enough off
+        the canonical grid** (pot-fraction gap > ``offtree_threshold``); a
+        near-canonical off-tree raise is instead translated onto the solved
+        canonical branch at read time (§7), so it costs no re-solve.  On round 1 it
+        may trigger a round-1 search.
         """
         if self._folded:
             return
@@ -131,10 +142,15 @@ class SearchAgent:
         if self.last_search is not None:
             # Re-search only when an off-canonical opponent raise was actually
             # injected into the tree (present in ``legal_actions`` via the overlay,
-            # yet off the canonical set) — so an unplayable/uninjected size is a
-            # no-op, not a wasted full re-solve.  Same root + ctx; the injection is
-            # visible via the shared overlay.
-            if self._is_off_tree(env_before, action) and action in env_before.legal_actions:
+            # yet off the canonical set) AND is far enough off-grid to matter — a
+            # near-canonical size is translated (pseudo-harmonic) onto the existing
+            # canonical branch by ``_solved_public_key`` instead of paying a full
+            # re-solve.  Same root + ctx; the injection is visible via the overlay.
+            if (
+                self._is_off_tree(env_before, action)
+                and action in env_before.legal_actions
+                and self._offtree_gap(env_before, action) > self._offtree_threshold
+            ):
                 self.last_search = solve(
                     self._root_env, self._ctx, self._cfg,
                     warm_start=self.last_search.state,
@@ -154,7 +170,7 @@ class SearchAgent:
             prob = self._blueprint.strategy(state, "none")
             return self._sample(prob, list(state.legal_actions))
 
-        pk = env.public_key
+        pk = self._solved_public_key(env)
         hr = self._hand_row(env)
         legal = [a for a in env.legal_actions if a is not None]
         prob = np.asarray(
@@ -227,7 +243,7 @@ class SearchAgent:
         ``policy.py``; the agent owns this bridge.
         """
         if self._searched_this_round and self.last_search is not None:
-            pk = env_before.public_key
+            pk = self._solved_public_key(env_before)
             legal = [a for a in env_before.legal_actions if a is not None]
             avg = self.last_search.average_policy
 
@@ -269,9 +285,7 @@ class SearchAgent:
             return
         if not self._is_off_tree(env_before, action):
             return
-        f_obs = float(action.split(":", 1)[1])
-        sizes = env_before.canonical_raise_fractions()
-        gap = min((abs(f_obs - a) for a in sizes), default=float("inf"))
+        gap = self._offtree_gap(env_before, action)
         n_live = sum(1 for p in env_before.players if p.is_active)
         if gap > self._round1_threshold and n_live <= self._round1_max_players:
             self.search_round1()
@@ -294,6 +308,36 @@ class SearchAgent:
             return False
         canonical = {f"raise:{f}" for f in env_before.canonical_raise_fractions()}
         return action not in canonical
+
+    def _offtree_gap(self, env_before: PokerEnv, action: str) -> float:
+        """Pot-fraction distance from an off-tree ``raise:<f>`` to the nearest
+        canonical size (``inf`` if no canonical raise is playable).
+
+        The chip-free trigger shared by the round-1 and rounds-2–4 off-tree gates:
+        a small gap means the size is near-canonical (translate), a large one means
+        it is genuinely off-grid (inject + re-search).
+        """
+        f_obs = float(action.split(":", 1)[1])
+        sizes = env_before.canonical_raise_fractions()
+        return min((abs(f_obs - a) for a in sizes), default=float("inf"))
+
+    def _solved_public_key(self, env: PokerEnv):
+        """Public key under which to read the solved policy for ``env``'s node.
+
+        Prefers the **raw** key: on-tree nodes and injected (re-searched) off-tree
+        branches live in the solved tree under their exact history.  Falls back to
+        the **pseudo-harmonic canonical** key (:attr:`PokerEnv.canonical_public_key`)
+        so a *translated* — near-canonical, un-injected — off-tree raise resolves to
+        the canonical branch the solver built.  If neither is present (e.g. a mixed
+        line with both an injected and a translated off-tree raise), returns the raw
+        key and the policy reader uniform-falls-back.
+        """
+        pk = env.public_key
+        state = self.last_search.state
+        if pk in state.legal_at:
+            return pk
+        canon = env.canonical_public_key
+        return canon if canon in state.legal_at else pk
 
     def _sample(self, prob, legal: List[str]) -> str:
         """Sample a legal action from ``prob`` (renormalised in float64)."""

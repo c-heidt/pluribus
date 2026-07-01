@@ -138,7 +138,7 @@ class TestLeafConfig:
         assert cfg.n_rollouts == 3
 
     def test_default_n_rollouts(self):
-        assert LeafConfig(policies=_policies()).n_rollouts == 8
+        assert LeafConfig(policies=_policies()).n_rollouts == 1
 
     def test_default_use_decision_free_equity_true(self):
         assert LeafConfig(policies=_policies()).use_decision_free_equity is True

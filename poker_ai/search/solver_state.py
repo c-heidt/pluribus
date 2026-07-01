@@ -52,13 +52,20 @@ class SolverConfig:
 
     leaf: "LeafConfig"
     # Defaults tuned for a 6-player game on a ~48-core node, early-testing grade
-    # (not paper-accurate).  For 6p subgames each MCCFR iteration is ~0.3-0.5 s
-    # (leaf-eval dominated), so wall time — not the iteration cap — is the binding
-    # stop; ``max_iterations`` is left as a generous safety cap that only bites on
-    # the cheap late / heads-up subgames.
+    # (not paper-accurate).  At ``LeafConfig.n_rollouts == 1`` an MCCFR iteration is
+    # ~35 ms on a multiway flop and ~5 ms on late/heads-up subgames, so wall time —
+    # not the iteration cap — is still the binding stop: within ``max_wall_seconds``
+    # a replica reaches ~285 (flop) to ~2000 (late) iterations, and ``max_iterations``
+    # stays a generous, effectively-inert safety cap.  (Cutting rollouts 8→1 banks
+    # as ~5× more iterations at the same wall — better hole coverage — rather than a
+    # shorter wall; lower ``max_wall_seconds`` if you want turnaround over coverage.)
     max_iterations: int = 5_000
-    max_wall_seconds: float = 10.0  # per-search budget; keeps test cycles snappy
-    discount_interval: int = 100  # Linear-CFR discount cadence (iterations)
+    max_wall_seconds: float = 10.0  # per-search wall budget (the binding stop)
+    # Linear-CFR discount cadence.  Kept well below the per-replica iteration count
+    # of the *expensive* subgames (multiway flop ~285/replica) so the discount fires
+    # several times there — at the old 100 it barely engaged on those (and never at
+    # n_rollouts=8, ~50 iters/replica).  Cheap late subgames just discount more often.
+    discount_interval: int = 50
     # Parallel search (§6.7 row 11).  ``None`` → resolve to a cpu-based default
     # (cpu_count-1, SLURM-aware) — the sanctioned way to spend the wall budget is W
     # independent replicas merged once, so on a 48-core node this fans out to ~47

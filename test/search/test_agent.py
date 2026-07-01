@@ -42,7 +42,8 @@ def _env(n_players=2, stacks=None, low=11, high=14) -> PokerEnv:
 
 def _cfg(leaf, iters=20) -> SolverConfig:
     return SolverConfig(
-        leaf=leaf, max_iterations=iters, max_wall_seconds=30.0, discount_interval=20
+        leaf=leaf, max_iterations=iters, max_wall_seconds=30.0, discount_interval=20,
+        workers=1,
     )
 
 
@@ -301,7 +302,7 @@ def test_act_writes_frozen_row_aligned(_seeded):
 
 def test_frozen_survives_off_tree_research(_seeded, monkeypatch):
     env = _env(stacks=[1000, 1000])
-    agent = _agent()
+    agent = _agent(offtree_threshold=0.0)  # isolate the re-search mechanism from the gap gate
     agent.on_hand_start(env, my_seat=0)
     agent.on_board_update(env, _to_flop(env))
     _advance_to_my_turn(env, 0, 1)
@@ -356,7 +357,7 @@ def test_off_tree_triggers_research_on_tree_does_not(_seeded, monkeypatch):
     # 1000 stacks gives a non-empty canonical raise set.
     log = _count_solves(monkeypatch)
     env = _env(stacks=[1000, 1000])
-    agent = _agent()
+    agent = _agent(offtree_threshold=0.0)  # any off-tree raise re-searches (gate off)
     agent.on_hand_start(env, my_seat=0)
     agent.on_board_update(env, _to_flop(env))   # boundary solve
     base = len(log)
@@ -373,6 +374,28 @@ def test_off_tree_triggers_research_on_tree_does_not(_seeded, monkeypatch):
     agent.on_observed_action(eb, 1, off)
     assert len(log) == base + 1
     assert log[-1] is agent.last_search.state
+
+
+@pytest.mark.parametrize("threshold,expect_research", [(10.0, 0), (0.0, 1)])
+def test_offtree_gap_gate(_seeded, monkeypatch, threshold, expect_research):
+    """Rounds 2-4: the *same* injected off-canonical raise is translated (no
+    re-search) under a large ``offtree_threshold`` and re-searched under a zero
+    one — the pot-fraction gap gate deciding inject-vs-translate, independent of
+    the specific canonical grid at this layout.
+    """
+    log = _count_solves(monkeypatch)
+    env = _env(stacks=[1000, 1000])
+    agent = _agent(offtree_threshold=threshold)
+    agent.on_hand_start(env, my_seat=0)
+    agent.on_board_update(env, _to_flop(env))   # boundary solve
+    base = len(log)
+    eb = copy.deepcopy(env)
+    off = _inject_off_canonical(eb)
+    agent.on_observed_action(eb, 1, off)
+    assert len(log) == base + expect_research
+    # A translated raise leaves the prior search in place (nothing to warm-start).
+    if not expect_research:
+        assert agent.last_search is not None
 
 
 # --------------------------------------------------------------------------- #

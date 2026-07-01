@@ -236,6 +236,27 @@ def _stub_and_return(env):
     return env
 
 
+class TestCanonicalPublicKey:
+    """``canonical_public_key``: the public-state key with off-tree raise sizes in
+    the history snapped to the blueprint grid (pseudo-harmonic); a strict no-op
+    when the history is already on-tree.  Lets a caller that *translated* (did not
+    inject) a near-canonical off-tree raise resolve the node in the canonical
+    subgame the solver built."""
+
+    def test_no_op_on_tree(self):
+        env = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.5")
+        assert env.canonical_public_key == env.public_key
+
+    def test_off_tree_snaps_to_canonical_neighbour(self):
+        # The off-tree (0.6) env's canonical key equals the raw key of the env
+        # that actually played the canonical neighbour (0.6 -> 0.5).
+        off = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.6")
+        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.5")
+        assert off.canonical_public_key == on.public_key
+        # The raw key still differs — the off-tree fraction is present verbatim.
+        assert off.public_key != on.public_key
+
+
 class _KeyedTable:
     """Returns ``row`` only for one specific info_set key, else None —
     so a lookup 'hits' only when the key matches exactly."""
