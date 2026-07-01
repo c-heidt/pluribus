@@ -602,7 +602,7 @@ Ordered so each step yields something usable before the next.
 4. **Range-quality hook (§7).** Buffer belief snapshots per seat during a hand; at
    showdown resolve them against revealed holes into `range_quality` rows. The one
    step that reaches inside the play loop (to observe revealed holes) rather than
-   pure additive logging.
+   pure additive logging. *done*
 5. **Cluster I/O.** Point the DB at node-local scratch; add periodic + on-SIGTERM
    `VACUUM INTO` sync-back to the permanent filesystem (§5), plus the SLURM wrapper
    (§10.1).

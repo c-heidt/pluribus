@@ -194,6 +194,10 @@ def solve(
     else:
         # Serial: the original single-thread loop — bit-for-bit unchanged.
         state = warm_start if warm_start is not None else SolverState.empty()
+        if warm_start is not None:
+            # Re-search: the reused state carries the prior solve's cumulative
+            # counters — zero them so this invocation's stats are its own (§9.1).
+            state.reset_counters()
         if regime == "vector":
             solver = _VectorSolver(root_env, state, ctx, cfg, ctx.rng)
         else:

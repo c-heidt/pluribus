@@ -160,6 +160,12 @@ def _run_replica(payload: Tuple[int, np.random.SeedSequence, int]):
     rng = np.random.default_rng(seed_seq)
     wctx = dataclasses.replace(ctx, rng=rng)
     state = copy.deepcopy(warm) if warm is not None else SolverState.empty()
+    if warm is not None:
+        # Each replica deep-copies the warm baseline, so it also inherits the
+        # baseline's cumulative walk/cache counters; zero them so the per-replica
+        # snapshot (summed in ``run_parallel``) counts only this re-search's work —
+        # otherwise the baseline counters are multiplied by the replica count (§9.1).
+        state.reset_counters()
     solver = _build_solver(root_env, state, wctx, cfg, rng, regime)
     # Stagger the MCCFR traverser rotation; the vector regime has no per-iteration
     # traverser (it samples a river instead), so the offset is inert there.

@@ -229,8 +229,13 @@ def _capture_hero_decision(
 
     if hero.last_search is not None:
         res = hero.last_search
-        pk = env.public_key
-        hr = int(env.combo_index[hero.my_hole])
+        # Read the played distribution under the SAME key the agent sampled from in
+        # ``act`` (agent._solved_public_key): a translated near-canonical off-tree
+        # node resolves to the canonical branch, so the raw ``env.public_key`` would
+        # miss the solved tree and ``strategy_for`` would log a uniform fallback.
+        # (Currently on-tree for blueprint opponents, but robust for off-tree ones.)
+        pk = hero._solved_public_key(env)
+        hr = hero._hand_row(env)
         dist = np.asarray(res.policy.strategy_for(pk, hr, legal), dtype=np.float64)
         wall = float(res.wall_seconds)
         stats = res.stats

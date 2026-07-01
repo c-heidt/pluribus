@@ -401,6 +401,25 @@ class TestSolveIntegration:
         assert second.state is first.state                 # reused in place
         assert keys_before <= set(second.state.regret)     # rows preserved/extended
 
+    def test_warm_start_resets_per_search_counters(self):
+        # Regression: the walk/cache tallies live on the reused SolverState, so a
+        # warm re-search must report only ITS work — like iterations_run, which is
+        # counted fresh per solve().  Without the reset every re-searched `decisions`
+        # row would inflate node_count/cache stats cumulatively over the hand.
+        env = _flop_env(seed=9)
+        ctx = _ctx(env, seed=2)
+        first = solve(env, ctx, _cfg(ctx, iters=20))
+        n1 = first.stats.node_count
+        assert n1 > 0 and first.stats.legal_at_misses > 0
+        env2 = _flop_env(seed=9)
+        ctx2 = _ctx(env2, seed=3)
+        second = solve(env2, ctx2, _cfg(ctx2, iters=20), warm_start=first.state)
+        # Same tree + same iters → per-search node count, NOT ~2x (cumulative).
+        assert second.stats.node_count < 1.5 * n1
+        # Most nodes already registered by the first solve → far fewer "new key"
+        # misses this re-search than the fresh solve had (cumulative would be ≥).
+        assert second.stats.legal_at_misses < first.stats.legal_at_misses
+
     def test_runout_terminal_flag_changes_values(self):
         # Flag on (exact equity) vs off (sampled payout) should generally differ on
         # a subgame that reaches all-in runouts; both must produce valid strategies.

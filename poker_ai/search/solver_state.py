@@ -233,6 +233,31 @@ class SolverState:
     def empty(cls) -> "SolverState":
         return cls()
 
+    def reset_counters(self) -> None:
+        """Zero the per-search walk / cache tallies, preserving tables + caches.
+
+        The instrumentation counters (``node_count``, ``legal_at`` hits/misses, and
+        the two value caches' hit/miss tallies) are cumulative over a state's
+        lifetime.  A **warm-started re-search** reuses the state for a *new* search
+        invocation whose ``decisions`` row (eval doc §6, §9.1) must report only that
+        invocation's work — matching ``iterations_run``, which ``run_loop`` counts
+        fresh per ``solve()`` call.  Without this reset a re-search's snapshot would
+        report its own work *plus* every prior solve on the same state (serial), or
+        the warm baseline's counters multiplied by the replica count (parallel).
+
+        Only the tallies reset: ``legal_at`` / ``regret`` / ``strat_sum`` / ``frozen``
+        and the cache **contents** are preserved, so a value cached by the prior
+        solve correctly scores as a *hit* for the re-search.  ``unique_pubkeys`` is
+        read from ``len(legal_at)`` (the whole widened tree), so it is unaffected.
+        """
+        self.node_count = 0
+        self.legal_at_hits = 0
+        self.legal_at_misses = 0
+        for cache in (self.leaf_value_cache, self.runout_cache):
+            if hasattr(cache, "hits"):
+                cache.hits = 0
+                cache.misses = 0
+
     @classmethod
     def accumulate(
         cls,
