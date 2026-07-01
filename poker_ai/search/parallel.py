@@ -42,7 +42,7 @@ import numpy as np
 
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.mccfr import _MCCFRSolver
-from poker_ai.search.solver_state import SolverConfig, SolverState
+from poker_ai.search.solver_state import SearchStats, SolverConfig, SolverState
 from poker_ai.search.vector import _VectorSolver
 
 
@@ -104,17 +104,22 @@ def plan_workers(
 # ----------------------------------------------------------------------
 
 
-def run_loop(solver, state: SolverState, cfg: SolverConfig) -> int:
-    """Drive ``solver`` under the dual stop, returning iterations executed.
+def run_loop(solver, state: SolverState, cfg: SolverConfig) -> Tuple[int, str]:
+    """Drive ``solver`` under the dual stop; return ``(iterations, stop_reason)``.
 
     This *is* the orchestrator's serial loop (Linear-CFR discount on the
     ``discount_interval`` cadence, stop on ``max_iterations`` **or**
     ``max_wall_seconds``); :func:`solve` and every replica share it so the
-    single-worker path stays bit-for-bit identical.
+    single-worker path stays bit-for-bit identical.  ``stop_reason`` is which of
+    the two budget caps ended the loop (eval doc §6 ``decisions.stop_reason``):
+    ``'wall_cap'`` if the wall-clock check broke early, else ``'iteration_cap'``
+    (the loop ran the full ``max_iterations``, including the degenerate 0-iteration
+    case).
     """
     start = time.perf_counter()
     delta = cfg.discount_interval
     iterations = 0
+    stop_reason = "iteration_cap"
     for t in range(1, cfg.max_iterations + 1):
         solver.iterate()
         iterations = t
@@ -122,8 +127,9 @@ def run_loop(solver, state: SolverState, cfg: SolverConfig) -> int:
             k = t / delta
             state.discount(k / (k + 1.0))
         if time.perf_counter() - start >= cfg.max_wall_seconds:
+            stop_reason = "wall_cap"
             break
-    return iterations
+    return iterations, stop_reason
 
 
 # ----------------------------------------------------------------------
@@ -159,8 +165,8 @@ def _run_replica(payload: Tuple[int, np.random.SeedSequence, int]):
     # traverser (it samples a river instead), so the offset is inert there.
     if regime != "vector":
         solver._iter = int(start_offset)
-    iterations = run_loop(solver, state, cfg)
-    return state, iterations
+    iterations, stop_reason = run_loop(solver, state, cfg)
+    return state, iterations, stop_reason
 
 
 def run_parallel(
@@ -170,10 +176,15 @@ def run_parallel(
     warm_start: Optional[SolverState],
     plan: WorkerPlan,
     regime: str,
-) -> Tuple[SolverState, int, float]:
+) -> Tuple[SolverState, int, float, str, SearchStats]:
     """Run ``plan.n_workers`` replicas and merge them once.
 
-    Returns ``(merged_state, iterations_total, wall_seconds)``.
+    Returns ``(merged_state, iterations_total, wall_seconds, stop_reason, stats)``.
+    ``stop_reason`` is ``'wall_cap'`` if *any* replica hit the wall budget (they
+    share one wall budget and run concurrently, so they broadly agree), else
+    ``'iteration_cap'``.  ``stats`` sums the per-replica walk/cache counters (eval
+    doc §9.1); ``unique_pubkeys`` is taken from the *merged* ``legal_at`` (the true
+    distinct-key count — replicas walk the same tree) rather than summed.
     """
     global _SHARED
     _SHARED = {
@@ -194,12 +205,25 @@ def run_parallel(
     start = time.perf_counter()
     try:
         with mp_ctx.Pool(processes=plan.n_workers) as pool:
-            results: List[Tuple[SolverState, int]] = pool.map(_run_replica, payloads)
+            results: List[Tuple[SolverState, int, str]] = pool.map(
+                _run_replica, payloads
+            )
     finally:
         _SHARED = {}
     wall = time.perf_counter() - start
 
-    states = [st for st, _ in results]
-    iterations_total = sum(n for _, n in results)
+    states = [st for st, _, _ in results]
+    iterations_total = sum(n for _, n, _ in results)
+    stop_reason = (
+        "wall_cap"
+        if any(sr == "wall_cap" for _, _, sr in results)
+        else "iteration_cap"
+    )
     merged = SolverState.accumulate(states, baseline=warm_start)
-    return merged, iterations_total, wall
+    # Aggregate the per-replica counters; take distinct-key count from the merged
+    # tree (summing replicas would double-count the shared nodes).
+    stats = SearchStats()
+    for st in states:
+        stats = stats.combined_with(st.stats_snapshot())
+    stats.unique_pubkeys = len(merged.legal_at)
+    return merged, iterations_total, wall, stop_reason, stats

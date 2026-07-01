@@ -15,9 +15,11 @@ SolverState, SearchResult``.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.mccfr import _MCCFRSolver
@@ -28,7 +30,7 @@ from poker_ai.search.parallel import (
     run_parallel,
 )
 from poker_ai.search.policy import SearchPolicy
-from poker_ai.search.solver_state import SolverConfig, SolverState
+from poker_ai.search.solver_state import SearchStats, SolverConfig, SolverState
 from poker_ai.search.vector import _VectorSolver
 
 __all__ = [
@@ -36,7 +38,9 @@ __all__ = [
     "SolverConfig",
     "SolverState",
     "SearchResult",
+    "SearchStats",
     "SearchPolicy",
+    "config_fingerprint",
 ]
 
 
@@ -53,9 +57,21 @@ class SearchResult:
     state : SolverState
         The solved tables; the warm-start carrier and freeze store for re-search.
     iterations_run : int
-        Number of CFR iterations actually executed (≤ ``cfg.max_iterations``).
+        Number of CFR iterations actually executed (≤ ``cfg.max_iterations``); the
+        pooled sum across replicas on the parallel path.
     wall_seconds : float
-        Wall-clock time spent in the iteration loop.
+        Wall-clock time spent in the iteration loop (excludes result packaging).
+    regime : str
+        Which CFR regime ran: ``'mccfr'`` or ``'vector'`` (eval doc §6).
+    leaf_mode : str
+        Depth-limit leaf handling — ``'sampled_runout'`` | ``'decision_free'``
+        (MCCFR) or ``'exact_range'`` (vector).  Together ``(regime, leaf_mode)`` is
+        the "solver approach" the evaluation groups on (eval doc §6, §8).
+    stop_reason : str
+        Which budget cap ended the search: ``'iteration_cap'`` or ``'wall_cap'``.
+    stats : SearchStats
+        Walk/cache instrumentation counters (node/tree size, cache hit/miss),
+        snapshotted for the ``decisions`` grain (eval doc §9.1).
     """
 
     policy: SearchPolicy
@@ -63,6 +79,10 @@ class SearchResult:
     state: SolverState
     iterations_run: int
     wall_seconds: float
+    regime: str
+    leaf_mode: str
+    stop_reason: str
+    stats: SearchStats = field(default_factory=SearchStats)
 
 
 def _select_regime(ctx: SubgameContext) -> str:
@@ -75,6 +95,52 @@ def _select_regime(ctx: SubgameContext) -> str:
     if len(ctx.ranges) == 2 and ctx.street_at_root in (2, 3):
         return "vector"
     return "mccfr"
+
+
+def _leaf_mode(regime: str, ctx: SubgameContext, cfg: SolverConfig) -> str:
+    """Depth-limit leaf handling for ``(regime, ctx, cfg)`` (eval doc §6).
+
+    The vector regime values leaves over the full range (``'exact_range'``).  MCCFR
+    scores decision-free all-in terminals either by the exact board-average
+    (``'decision_free'``) or the paper's single sampled runout (``'sampled_runout'``)
+    — mirroring :attr:`_MCCFRSolver._use_equity`, which forces sampling on a preflop
+    root regardless of the flag (a 5-card runout blows past the exact path).
+    """
+    if regime == "vector":
+        return "exact_range"
+    use_equity = bool(cfg.leaf.use_decision_free_equity) and ctx.street_at_root != 0
+    return "decision_free" if use_equity else "sampled_runout"
+
+
+def config_fingerprint(
+    cfg: SolverConfig, table_policy: Optional[Any] = None
+) -> str:
+    """Stable short hash of the solver identity (eval doc §6, §9.1).
+
+    Canonicalises the ``SolverConfig`` + its ``LeafConfig`` scalar knobs (and, when
+    the runner supplies one, the ``table_policy``) and returns a 16-hex-char SHA-256
+    digest, so records group across runs even as unrelated settings are tweaked.
+    Sorted keys + JSON's fixed float formatting give the canonicalisation the risk
+    note (§11) calls for.  The un-hashable ``LeafConfig.policies`` fleet is
+    represented by its set of bias-class keys (the fleet's *shape*, not object
+    identity — two runs with the same four §4 variants fingerprint alike).
+    """
+    payload = {
+        "solver": {
+            "max_iterations": cfg.max_iterations,
+            "max_wall_seconds": cfg.max_wall_seconds,
+            "discount_interval": cfg.discount_interval,
+            "workers": cfg.workers,
+        },
+        "leaf": {
+            "n_rollouts": cfg.leaf.n_rollouts,
+            "use_decision_free_equity": bool(cfg.leaf.use_decision_free_equity),
+            "policies": sorted(str(k) for k in cfg.leaf.policies),
+        },
+        "table_policy": table_policy,
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
 def solve(
@@ -122,7 +188,7 @@ def solve(
         # live players (len(ctx.ranges)).
         base_seed = int(ctx.rng.integers(0, 2 ** 63 - 1))
         plan = plan_workers(workers, len(ctx.ranges), base_seed=base_seed)
-        state, iterations, wall = run_parallel(
+        state, iterations, wall, stop_reason, stats = run_parallel(
             root_env, ctx, cfg, warm_start, plan, regime
         )
     else:
@@ -133,8 +199,9 @@ def solve(
         else:
             solver = _MCCFRSolver(root_env, state, ctx, cfg, ctx.rng)
         start = time.perf_counter()
-        iterations = run_loop(solver, state, cfg)
+        iterations, stop_reason = run_loop(solver, state, cfg)
         wall = time.perf_counter() - start
+        stats = state.stats_snapshot()
 
     return SearchResult(
         policy=SearchPolicy(state, use_average=False),
@@ -142,4 +209,8 @@ def solve(
         state=state,
         iterations_run=iterations,
         wall_seconds=wall,
+        regime=regime,
+        leaf_mode=_leaf_mode(regime, ctx, cfg),
+        stop_reason=stop_reason,
+        stats=stats,
     )

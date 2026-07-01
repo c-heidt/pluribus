@@ -51,14 +51,21 @@ class SolverConfig:
     """
 
     leaf: "LeafConfig"
-    max_iterations: int = 10_000
-    max_wall_seconds: float = 15.0
-    discount_interval: int = 1_000  # Linear-CFR discount cadence (iterations)
-    # Parallel search (§6.7 row 11).  ``None`` → resolve to a cpu-based default;
-    # ``1`` → the serial loop (bit-for-bit identical to the pre-parallel solver);
-    # ``>1`` → that many independent MCCFR replicas, merged once at the end
+    # Defaults tuned for a 6-player game on a ~48-core node, early-testing grade
+    # (not paper-accurate).  For 6p subgames each MCCFR iteration is ~0.3-0.5 s
+    # (leaf-eval dominated), so wall time — not the iteration cap — is the binding
+    # stop; ``max_iterations`` is left as a generous safety cap that only bites on
+    # the cheap late / heads-up subgames.
+    max_iterations: int = 5_000
+    max_wall_seconds: float = 10.0  # per-search budget; keeps test cycles snappy
+    discount_interval: int = 100  # Linear-CFR discount cadence (iterations)
+    # Parallel search (§6.7 row 11).  ``None`` → resolve to a cpu-based default
+    # (cpu_count-1, SLURM-aware) — the sanctioned way to spend the wall budget is W
+    # independent replicas merged once, so on a 48-core node this fans out to ~47
+    # replicas.  ``1`` → the serial loop (bit-for-bit identical to the pre-parallel
+    # solver); ``>1`` → that many independent MCCFR replicas, merged once at the end
     # (:meth:`SolverState.accumulate`).  See :mod:`poker_ai.search.parallel`.
-    workers: "int | None" = 1
+    workers: "int | None" = None
 
 
 def _hand_row(env: "PokerEnv", combo: Sequence[int], street_at_root: int) -> int:
@@ -73,6 +80,105 @@ def _hand_row(env: "PokerEnv", combo: Sequence[int], street_at_root: int) -> int
     if env.betting_round == street_at_root:
         return int(env.combo_index[c])
     return int(env.cluster_for(c))
+
+
+class _CountingCache:
+    """A dict-backed memo that counts ``get`` hits and misses (eval doc §6, §9.1).
+
+    Wraps the two search-lifetime caches (``leaf_value_cache`` / ``runout_cache``)
+    so their hit/miss rate can be logged without threading counters through every
+    call site: the leaf evaluator (:mod:`poker_ai.search.leaf`) receives the
+    ``runout_cache`` as a bare mapping, and its ``.get`` / ``[]`` accesses count
+    automatically.  Only the operations the caches (and the tests) actually use
+    are implemented — ``get``/``[]``/``in``/``len``/iteration — so a plain
+    ``dict`` stays a valid drop-in wherever counting is not wanted (leaf's
+    standalone per-call memo when no shared cache is supplied).  ``__slots__``
+    keeps it deepcopy-/pickle-friendly for the parallel replicas (§6.7).
+    """
+
+    __slots__ = ("_data", "hits", "misses")
+
+    def __init__(self) -> None:
+        self._data: Dict = {}
+        self.hits: int = 0
+        self.misses: int = 0
+
+    def get(self, key, default=None):
+        if key in self._data:
+            self.hits += 1
+            return self._data[key]
+        self.misses += 1
+        return default
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __setitem__(self, key, value) -> None:
+        self._data[key] = value
+
+    def __contains__(self, key) -> bool:
+        return key in self._data
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __iter__(self):
+        return iter(self._data)
+
+
+@dataclass
+class SearchStats:
+    """Per-search instrumentation counters (eval doc §6 ``decisions`` grain, §9.1).
+
+    Snapshotted off a solved :class:`SolverState` (:meth:`SolverState.stats_snapshot`)
+    and carried on :class:`~poker_ai.search.solver.SearchResult` so the evaluation
+    logger (doc §9.2) can persist tree shape (``node_count`` / ``unique_pubkeys``)
+    and cache behaviour without reaching into solver internals.  ``cache_hits`` /
+    ``cache_misses`` roll the three caches together for the single schema columns of
+    the same name; the per-cache fields stay available for finer analysis.
+    """
+
+    node_count: int = 0           # decision-node visits over the whole search
+    unique_pubkeys: int = 0       # distinct public keys (== len(legal_at))
+    legal_at_hits: int = 0        # node revisits (legal set already registered)
+    legal_at_misses: int = 0      # first registrations (== unique_pubkeys)
+    leaf_cache_hits: int = 0
+    leaf_cache_misses: int = 0
+    leaf_cache_size: int = 0
+    runout_cache_hits: int = 0
+    runout_cache_misses: int = 0
+    runout_cache_size: int = 0
+
+    @property
+    def cache_hits(self) -> int:
+        """All three caches' hits, for the ``decisions.cache_hits`` column."""
+        return self.legal_at_hits + self.leaf_cache_hits + self.runout_cache_hits
+
+    @property
+    def cache_misses(self) -> int:
+        """All three caches' misses, for the ``decisions.cache_misses`` column."""
+        return self.legal_at_misses + self.leaf_cache_misses + self.runout_cache_misses
+
+    def combined_with(self, other: "SearchStats") -> "SearchStats":
+        """Sum two snapshots (parallel replicas, §6.7 row 11).
+
+        Additive counters (visits, hits/misses, cache sizes) sum; ``unique_pubkeys``
+        does **not** — distinct-key counts overlap across replicas that walk the
+        same tree, so the caller sets it from the merged state's ``legal_at``.
+        """
+        merged = SearchStats(
+            node_count=self.node_count + other.node_count,
+            unique_pubkeys=max(self.unique_pubkeys, other.unique_pubkeys),
+            legal_at_hits=self.legal_at_hits + other.legal_at_hits,
+            legal_at_misses=self.legal_at_misses + other.legal_at_misses,
+            leaf_cache_hits=self.leaf_cache_hits + other.leaf_cache_hits,
+            leaf_cache_misses=self.leaf_cache_misses + other.leaf_cache_misses,
+            leaf_cache_size=self.leaf_cache_size + other.leaf_cache_size,
+            runout_cache_hits=self.runout_cache_hits + other.runout_cache_hits,
+            runout_cache_misses=self.runout_cache_misses + other.runout_cache_misses,
+            runout_cache_size=self.runout_cache_size + other.runout_cache_size,
+        )
+        return merged
 
 
 @dataclass
@@ -105,8 +211,16 @@ class SolverState:
     #   ``runout_cache`` — exact decision-free ``runout_equity`` keyed by
     #     ``(all-seat holes, runout snapshot)``; shared by the leaf rollouts
     #     (a leaf's four bias calls) and the forced-runout terminal (§6.4.2).
-    leaf_value_cache: Dict = field(default_factory=dict)
-    runout_cache: Dict = field(default_factory=dict)
+    leaf_value_cache: _CountingCache = field(default_factory=_CountingCache)
+    runout_cache: _CountingCache = field(default_factory=_CountingCache)
+    # Walk instrumentation (eval doc §9.1) — cumulative over the search; the
+    # legal-action cache (``legal_at``) is a plain dict, so its hit/miss and the
+    # node-visit tally are counted explicitly in :meth:`ensure_node` rather than by
+    # a ``_CountingCache`` wrapper (``legal_at`` is also read incidentally by the
+    # policy reader and strategy ops, which must not count as node visits).
+    node_count: int = 0
+    legal_at_hits: int = 0
+    legal_at_misses: int = 0
 
     @classmethod
     def empty(cls) -> "SolverState":
@@ -195,10 +309,17 @@ class SolverState:
         """
         legal = tuple(legal_actions)
         prev = self.legal_at.get(public_key)
+        # Node-visit + legal_at hit/miss tally (eval doc §9.1): a first
+        # registration is a miss (and a new distinct public key), a revisit — even
+        # a widening re-search — is a hit.  ``node_count`` == hits + misses is the
+        # decision-node-visit count; ``len(legal_at)`` == misses is unique_pubkeys.
+        self.node_count += 1
         if prev is None:
+            self.legal_at_misses += 1
             self.legal_at[public_key] = legal
             self.actor_at[public_key] = actor
             return
+        self.legal_at_hits += 1
         if prev != legal:
             self._grow_rows(public_key, prev, legal)
             self.legal_at[public_key] = legal
@@ -343,3 +464,27 @@ class SolverState:
         if total <= 0.0:
             return None
         return (row / total).astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Instrumentation snapshot (eval doc §9.1)
+    # ------------------------------------------------------------------
+
+    def stats_snapshot(self) -> "SearchStats":
+        """Read the walk / cache counters off this state into a :class:`SearchStats`.
+
+        ``getattr(..., 0)`` guards a cache that a caller replaced with a plain
+        ``dict`` (no counters) — the leaf/runout caches default to
+        :class:`_CountingCache`, but the accessor stays robust either way.
+        """
+        return SearchStats(
+            node_count=self.node_count,
+            unique_pubkeys=len(self.legal_at),
+            legal_at_hits=self.legal_at_hits,
+            legal_at_misses=self.legal_at_misses,
+            leaf_cache_hits=getattr(self.leaf_value_cache, "hits", 0),
+            leaf_cache_misses=getattr(self.leaf_value_cache, "misses", 0),
+            leaf_cache_size=len(self.leaf_value_cache),
+            runout_cache_hits=getattr(self.runout_cache, "hits", 0),
+            runout_cache_misses=getattr(self.runout_cache, "misses", 0),
+            runout_cache_size=len(self.runout_cache),
+        )

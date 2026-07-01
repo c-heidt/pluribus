@@ -43,7 +43,12 @@ class LeafConfig:
         acting seat.
     n_rollouts : int
         Monte-Carlo rollout count per :func:`continuation_value` call (default
-        20).  Each rollout re-randomises the board runout; the hands are fixed.
+        8).  Each rollout re-randomises the board runout; the hands are fixed.
+        Leaf eval is ~97% of a 6p MCCFR iteration and scales linearly with this,
+        so it is the primary knob trading per-iteration cost for leaf-value
+        variance; 8 is an early-testing balance (paper uses 20).  Decision-free
+        all-in runouts are scored exactly (``use_decision_free_equity``), so this
+        only affects the sampled action-line / non-all-in variance.
     use_decision_free_equity : bool
         A/B toggle for the over-the-paper improvement (§6.4).  ``True`` (default)
         replaces an all-in showdown's single sampled board with the exact
@@ -54,7 +59,7 @@ class LeafConfig:
     """
 
     policies: Mapping[BiasClass, Policy]
-    n_rollouts: int = 20
+    n_rollouts: int = 8
     use_decision_free_equity: bool = True
 
 
