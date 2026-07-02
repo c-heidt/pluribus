@@ -11,10 +11,14 @@
 # snapshot, never the live node-local file.
 #
 # RESOURCE FOOTPRINT (real-time search loads both artifacts on the node):
-#   * Node-local disk (--tmp): the LUT (~250 GB) and the blueprint (~150 GB) are
-#     both rsync'd to $TMPDIR, so the job needs ~420 GB of local scratch (the two
-#     staged copies + the small SQLite db).  --tmp requests it; a preflight check
-#     below aborts early if the node cannot hold both.
+#   * Node-local disk: the LUT (~250 GB) and the blueprint (~150 GB) are both
+#     rsync'd to $TMPDIR, so the job needs ~420 GB of local scratch (the two staged
+#     copies + the small SQLite db).  We deliberately do NOT `#SBATCH --tmp=...` for
+#     it — like training.sh, staging goes to whatever $TMPDIR the node provides, and
+#     the runtime preflight `df` check below aborts early if the node cannot hold
+#     both.  (A hard `--tmp` reservation is rejected at submit time — "Temporary disk
+#     specification can not be satisfied" — on clusters that don't advertise that
+#     much schedulable TmpDisk; the preflight gives the same protection without it.)
 #   * RAM (--mem): the blueprint's per-street regret/strategy chunks are restored
 #     into /dev/shm (tmpfs, RAM-backed) by CFRTables, so ~150 GB of the blueprint
 #     is *resident* in addition to the working set of the solver and the LUT page
@@ -39,7 +43,6 @@
 #SBATCH --time=72:00:00
 #SBATCH --cpus-per-task=48
 #SBATCH --mem=200000mb
-#SBATCH --tmp=460000
 #SBATCH --signal=SIGTERM@300
 #SBATCH --mail-type=All
 
