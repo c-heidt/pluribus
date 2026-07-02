@@ -32,8 +32,11 @@ permanent FS, :meth:`~evaluation.sqlite_logging.ExperimentLog.sync_to`) on a
 periodic cadence and once more at the end / on SIGTERM.  The SLURM wrapper that
 stages scratch and forwards SIGTERM is ``scripts/evaluation.sh``.
 
-Out of scope here (later steps): the end-of-run summary (§8, step 6) and
-``aivat_value`` (§10.2, step 9).
+The end-of-run summary (§8, step 6) runs automatically at the end of the CLI
+``run`` command, after the final sync-back, against the permanent snapshot
+(:func:`evaluation.summarize.summarize`).
+
+Out of scope here (later steps): ``aivat_value`` (§10.2, step 9).
 """
 
 from __future__ import annotations
@@ -893,6 +896,17 @@ def _cli():
             log.close()
         dest = sync_path if sync_path is not None else db_path
         click.echo(f"played {n} hands for run_id={cfg.run_id} → {dest}")
+
+        # End-of-run summary (§8, step 6): runs after the final sync-back, against
+        # the permanent-FS snapshot (never the live node-local file).  A summary
+        # failure must not fail the run — the data is already safely committed and
+        # synced — so it is logged, not raised.
+        from evaluation.summarize import summarize
+
+        try:
+            summarize(dest)
+        except Exception:
+            logger.exception("end-of-run summary failed for run %s", cfg.run_id)
 
     return evaluate
 

@@ -129,23 +129,45 @@ the run and **synced back to the permanent filesystem** on an interval and at th
 end — mirroring the blueprint training approach (LUTs staged local, checkpoints
 written local, synced back; see [scripts/training.sh](../scripts/training.sh)).
 Writing to the shared filesystem per hand would be slow and, for SQLite,
-unsafe (§4).
+unsafe (§4). The SLURM wrapper that stages scratch and forwards SIGTERM is
+[scripts/evaluation.sh](../scripts/evaluation.sh).
 
 - **Snapshot with `VACUUM INTO`, not `cp`.** In WAL mode a plain copy of the main
   `.db` file while uncheckpointed WAL frames exist yields an inconsistent copy.
   `VACUUM INTO 'permanent/…/experiment.sqlite'` produces a clean, single-file,
   defragmented snapshot regardless of WAL state, and is safe to run while the
-  experiment keeps writing. This is the checkpoint-copy primitive.
+  experiment keeps writing. This is the checkpoint-copy primitive
+  (`ExperimentLog.snapshot`).
+- **The sync-back is atomic-replace, because `VACUUM INTO` refuses to overwrite.**
+  The periodic sync-back rewrites the *same* permanent path every interval, but
+  `VACUUM INTO` errors if its target file already exists. `ExperimentLog.sync_to`
+  therefore snapshots to a sibling temp file (`dest.tmp.<pid>`) and `os.replace`s it
+  over `dest` — atomic on one filesystem, so an analysis reader (or a crash
+  mid-sync) never sees a half-written snapshot and the previous good snapshot
+  survives until the new one is complete. A failed `VACUUM INTO` leaves `dest`
+  untouched; the stale temp is cleaned on the next attempt.
 - **Periodic sync-back**, not only at the end. A `VACUUM INTO` to the permanent
-  filesystem every *N* games (or *T* minutes) bounds how much a node failure or
-  preemption can cost. Because it is one file, the copy is cheap — none of the
-  many-small-files overhead of the chunked table checkpoints.
-- **Final sync on SIGTERM / preemption.** Reuse the signal-handling pattern
-  already present in the blueprint runners
-  ([poker_ai/blueprint/multiprocess/server.py](../poker_ai/blueprint/multiprocess/server.py))
-  and `training.sh`: on graceful preemption, commit the current game's
-  transaction and run a final `VACUUM INTO` to the permanent filesystem so nothing
-  since the last periodic snapshot is lost.
+  filesystem every *N* games (`sync_interval_hands`, default 500) or *T* minutes
+  (`sync_interval_minutes`) bounds how much a node failure or preemption can cost.
+  Because it is one file, the copy is cheap — none of the many-small-files overhead
+  of the chunked table checkpoints. Periodic syncs are **best-effort** (a transient
+  FS hiccup is logged and retried next interval, never fatal — bounded loss).
+- **Final sync on SIGTERM / preemption.** The runner polls a SIGTERM/SIGINT event
+  at each hand boundary (the signal-handling pattern already in the blueprint
+  runners, [poker_ai/blueprint/multiprocess/server.py](../poker_ai/blueprint/multiprocess/server.py),
+  and `training.sh`); on stop it finishes the current hand's transaction and runs a
+  final `VACUUM INTO` so nothing since the last periodic snapshot is lost. The final
+  sync is **strict** — it *is* the run's product, so a failure there propagates
+  rather than silently leaving stale permanent data.
+- **The blueprint and LUT are both staged node-local, not just the DB.** Real-time
+  search hits the blueprint on the hot path (its per-street LMDB info-set index is
+  queried on every leaf-fleet / opponent / hero lookup), so `evaluation.sh` rsyncs
+  both artifacts to `$TMPDIR`. This is a real resource footprint: the LUT (~250 GB)
+  and blueprint (~150 GB) together need **~420 GB of node-local disk** (`--tmp`),
+  and — because `CFRTables` restores the blueprint's regret/strategy chunks into
+  `/dev/shm` (tmpfs) — **~150 GB of the blueprint is resident in RAM** (`--mem`),
+  on top of the solver working set and LUT page cache. The wrapper runs a preflight
+  free-space check and aborts before staging if the node cannot hold both.
 - **Analysis reads the permanent-FS snapshot**, never the live node-local file.
 
 ## 6. Schema
@@ -577,6 +599,17 @@ def summarize(db_path: str) -> dict:
 It has no search-package dependency — it reads the schema, nothing else — so it
 also runs standalone against any past snapshot for a retrospective check.
 
+As built ([evaluation/summarize.py](../evaluation/summarize.py)), two portability
+choices differ from the sketch above: the queries use **`CASE`-based conditional
+aggregation, not the `FILTER` clause** shown in §8 (so the summary runs against
+older SQLite on whatever box does the analysis), and the CI / percentile helpers
+are **self-contained Python** (no numpy dependency in the standalone path). The CLI
+is `argparse` (`python -m evaluation.summarize <snapshot> [--no-json]`). Strength
+prefers `aivat_value` when every game carries it and falls back to raw
+`hero_chips_delta` otherwise. The runner (§10.1) calls `summarize(dest)` after the
+final sync-back against the permanent snapshot, wrapped so a summary failure is
+logged rather than failing the already-committed run.
+
 ## 9. Implementation Steps
 
 Ordered so each step yields something usable before the next.
@@ -609,7 +642,7 @@ Ordered so each step yields something usable before the next.
 6. **Summary command (§8).** `evaluation/summarize.py` reading the four tables into
    the headline block and `summary.json`. Read-only; no search-package dependency,
    so it also runs standalone against any past snapshot. Wired to run automatically
-   at the end of the run, after the final sync-back.
+   at the end of the run, after the final sync-back. *done*
 7. **Smoke test.** A short time-budgeted run against two `table_policy` settings,
    end-to-end: confirm the four tables populate, the join queries work, resume
    continues cleanly after a kill, the sync-back snapshot is readable, and the
@@ -627,7 +660,9 @@ Ordered so each step yields something usable before the next.
 The logging backbone (§4–§9) is specified to build now. The two components below —
 the **runner** that generates the games and **AIVAT** that makes small-edge
 comparisons statistically feasible — are specified here in enough detail to
-implement; both are **not yet built**. §10.3 lists genuinely-future work.
+implement. The **runner is now built** ([evaluation/runner.py](../evaluation/runner.py),
+§9 steps 3–6); **AIVAT is not yet built** (§9 step 9). §10.3 lists genuinely-future
+work.
 
 ### 10.1 Evaluation Runner
 
@@ -705,10 +740,16 @@ final VACUUM INTO; run the §8 summary
 `big_blind`, `starting_stack`, `n_players = 6`, `sync_interval`, scratch/permanent
 paths.
 
-**Cluster launch script** — the SLURM (or equivalent) wrapper around the runner:
-stages the node-local scratch path, sets `sync_interval`, wires SIGTERM to the final
-`VACUUM INTO`, and points analysis at the permanent-FS snapshot. Mirrors
-[scripts/training.sh](../scripts/training.sh); added under `scripts/`.
+**Cluster launch script** ([scripts/evaluation.sh](../scripts/evaluation.sh)) — the
+SLURM (or equivalent) wrapper around the runner: stages the LUT **and blueprint** to
+node-local scratch (both are on the real-time-search hot path, §5), points
+`--db-path` at node-local scratch and `--sync-path` at the permanent FS, sets the
+sync interval, forwards SIGTERM to the runner (so it writes the final `VACUUM INTO`
+before the wall-clock `SIGKILL`), and points analysis at the permanent snapshot. It
+requests the ~420 GB local disk (`--tmp`) and RAM (`--mem`) the two staged artifacts
+need (§5), runs a preflight free-space check, and — on restart — seeds the
+node-local DB from the existing permanent snapshot so the `(run_id, hand_index)`
+cursor resumes cleanly. Mirrors [scripts/training.sh](../scripts/training.sh).
 
 ### 10.2 AIVAT (variance-reduced strength estimate)
 
