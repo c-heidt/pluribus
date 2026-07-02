@@ -39,6 +39,7 @@ Design points carried straight from the doc:
 from __future__ import annotations
 
 import dataclasses
+import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -412,6 +413,25 @@ class ExperimentLog:
         sync-back to the permanent filesystem.
         """
         self._con.execute("VACUUM INTO ?", (str(dest),))
+
+    def sync_to(self, dest) -> None:
+        """Atomically refresh the permanent-FS snapshot at ``dest`` (§5 sync-back).
+
+        The periodic + on-SIGTERM sync-back writes the **same** permanent path
+        repeatedly, but ``VACUUM INTO`` refuses to overwrite an existing file, so
+        it cannot target ``dest`` directly.  Snapshot to a sibling temp file and
+        ``os.replace`` it over ``dest`` — atomic on one filesystem, so an analysis
+        reader (or a crash mid-sync) never sees a half-written snapshot and the
+        previous good snapshot survives until the new one is complete.  The temp is
+        a sibling of ``dest`` so the replace stays on the destination filesystem
+        (a cross-device ``os.replace`` would raise).
+        """
+        dest = os.fspath(dest)
+        tmp = f"{dest}.tmp.{os.getpid()}"
+        if os.path.exists(tmp):
+            os.remove(tmp)  # a stale temp from a killed prior sync (pid reuse)
+        self.snapshot(tmp)
+        os.replace(tmp, dest)
 
     # ------------------------------------------------------------------
     # Resume cursor (§10.1) — a read on the schema, so it belongs to the sink.

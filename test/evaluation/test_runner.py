@@ -18,6 +18,7 @@ import pytest
 from evaluation.runner import (
     EvalConfig,
     EvalSession,
+    _sync_due,
     derive_seeds,
     run_evaluation,
 )
@@ -382,6 +383,161 @@ class TestFailureHandling:
         finally:
             log.close()
         assert n_fail == 3                         # each logged before the abort
+
+
+# --------------------------------------------------------------------------- #
+# Cluster I/O sync-back (§5, step 5)
+# --------------------------------------------------------------------------- #
+
+class TestSyncBack:
+
+    def test_periodic_and_final_sync_fire(self, tmp_path):
+        # sync_interval_hands=2 over 5 hands → periodic at hands 2 and 4, plus the
+        # final sync after the loop = 3 calls.
+        session = _stub_session(n_players=3)
+        session.config.sync_interval_hands = 2
+        calls = {"n": 0}
+        log = ExperimentLog.open(tmp_path / "run.sqlite")
+        try:
+            run_evaluation(log=log, session=session, max_hands=5,
+                           sync_fn=lambda: calls.__setitem__("n", calls["n"] + 1))
+        finally:
+            log.close()
+        assert calls["n"] == 3                    # 2 periodic + 1 final
+
+    def test_only_final_sync_when_interval_zero(self, tmp_path):
+        session = _stub_session(n_players=3)
+        session.config.sync_interval_hands = 0    # 0 → only the final sync
+        session.config.sync_interval_minutes = 0.0
+        calls = {"n": 0}
+        log = ExperimentLog.open(tmp_path / "run.sqlite")
+        try:
+            run_evaluation(log=log, session=session, max_hands=4,
+                           sync_fn=lambda: calls.__setitem__("n", calls["n"] + 1))
+        finally:
+            log.close()
+        assert calls["n"] == 1                    # final sync only
+
+    def test_no_sync_fn_is_a_noop(self, tmp_path):
+        # Backwards compatible: without a sync_fn the loop behaves exactly as before.
+        session = _stub_session(n_players=3)
+        log = ExperimentLog.open(tmp_path / "run.sqlite")
+        try:
+            n = run_evaluation(log=log, session=session, max_hands=3)
+        finally:
+            log.close()
+        assert n == 3
+
+    def test_periodic_sync_failure_does_not_abort_run(self, tmp_path):
+        # A transient permanent-FS hiccup on a periodic sync is best-effort: logged,
+        # not fatal — the run finishes and the final (strict) sync still runs.
+        session = _stub_session(n_players=3)
+        session.config.sync_interval_hands = 1
+        calls = {"n": 0}
+
+        def flaky_sync():
+            calls["n"] += 1
+            if calls["n"] <= 2:                   # first two (periodic) calls fail
+                raise OSError("permanent FS hiccup")
+
+        log = ExperimentLog.open(tmp_path / "run.sqlite")
+        try:
+            n = run_evaluation(log=log, session=session, max_hands=3,
+                               sync_fn=flaky_sync)
+        finally:
+            log.close()
+        assert n == 3                             # run completed despite sync errors
+
+    def test_final_sync_runs_on_should_stop(self, tmp_path, monkeypatch):
+        # A SIGTERM (should_stop) breaks the loop at a hand boundary and still syncs.
+        session = _stub_session(n_players=3)
+        session.config.sync_interval_hands = 1000  # never periodic in this short run
+        calls = {"n": 0}
+        stop = {"go": False}
+
+        # Stop after the first hand: flip the flag from a play_hand wrapper.
+        import evaluation.runner as R
+        real = R.play_hand
+
+        def once(*a, **kw):
+            out = real(*a, **kw)
+            stop["go"] = True
+            return out
+
+        monkeypatch.setattr(R, "play_hand", once)
+        log = ExperimentLog.open(tmp_path / "run.sqlite")
+        try:
+            run_evaluation(log=log, session=session, max_hands=50,
+                           should_stop=lambda: stop["go"],
+                           sync_fn=lambda: calls.__setitem__("n", calls["n"] + 1))
+        finally:
+            log.close()
+        assert calls["n"] == 1                    # final sync fired after the stop
+
+    def test_final_sync_failure_propagates(self, tmp_path):
+        # The final sync is STRICT: the permanent snapshot is the run's product, so
+        # a failure there must propagate (not be silently swallowed like a periodic).
+        session = _stub_session(n_players=3)
+        session.config.sync_interval_hands = 0    # 0 → the only sync is the final one
+
+        def boom():
+            raise OSError("permanent FS full at final sync")
+
+        log = ExperimentLog.open(tmp_path / "run.sqlite")
+        try:
+            with pytest.raises(OSError, match="final sync"):
+                run_evaluation(log=log, session=session, max_hands=3, sync_fn=boom)
+        finally:
+            log.close()
+
+    def test_circuit_breaker_syncs_before_aborting(self, tmp_path, monkeypatch):
+        # A best-effort sync must fire before the circuit-breaker re-raises, so the
+        # hands logged before a systematic failure are preserved on the permanent FS.
+        import evaluation.runner as R
+
+        def always_fail(*a, **kw):
+            raise ValueError("systematic")
+
+        monkeypatch.setattr(R, "play_hand", always_fail)
+        session = _stub_session(run_id="CB", n_players=2)   # default interval → no periodic
+        calls = {"n": 0}
+        log = ExperimentLog.open(tmp_path / "run.sqlite")
+        try:
+            with pytest.raises(RuntimeError, match="consecutive"):
+                run_evaluation(log=log, session=session, max_hands=100,
+                               max_consecutive_failures=3,
+                               sync_fn=lambda: calls.__setitem__("n", calls["n"] + 1))
+        finally:
+            log.close()
+        assert calls["n"] == 1                    # one best-effort sync, before abort
+
+
+class TestSyncDue:
+    """Unit coverage for the §5 sync cadence (both the hands and minutes paths)."""
+
+    def _cfg(self, **kw):
+        return EvalConfig(run_id="x", **kw)
+
+    def test_hands_cadence(self):
+        cfg = self._cfg(sync_interval_hands=10, sync_interval_minutes=0.0)
+        assert _sync_due(cfg, 9, 0.0) is False
+        assert _sync_due(cfg, 10, 0.0) is True     # >= boundary
+        assert _sync_due(cfg, 11, 0.0) is True
+
+    def test_minutes_cadence(self):
+        cfg = self._cfg(sync_interval_hands=0, sync_interval_minutes=5.0)
+        assert _sync_due(cfg, 0, 4 * 60.0) is False
+        assert _sync_due(cfg, 0, 5 * 60.0) is True  # 5 min reached
+        assert _sync_due(cfg, 0, 9 * 60.0) is True
+
+    def test_either_trigger_fires(self):
+        cfg = self._cfg(sync_interval_hands=10, sync_interval_minutes=5.0)
+        assert _sync_due(cfg, 10, 0.0) is True      # hands alone
+        assert _sync_due(cfg, 0, 5 * 60.0) is True  # minutes alone
+
+    def test_both_zero_disables(self):
+        cfg = self._cfg(sync_interval_hands=0, sync_interval_minutes=0.0)
+        assert _sync_due(cfg, 10_000, 10_000.0) is False
 
 
 # --------------------------------------------------------------------------- #

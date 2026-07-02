@@ -235,6 +235,57 @@ class TestSnapshotAndResume:
             log.log_game(_game(hand_index=1))
         assert log._con.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 2
 
+    def test_sync_to_creates_and_overwrites_atomically(self, log, tmp_path):
+        # First sync creates the permanent snapshot; a second sync to the SAME path
+        # overwrites it (VACUUM INTO alone would raise "output file already exists").
+        dest = tmp_path / "perm" / "experiment.sqlite"
+        dest.parent.mkdir()
+        with log.game():
+            log.log_game(_game(hand_index=0))
+        log.sync_to(dest)
+        assert dest.exists()
+        with log.game():
+            log.log_game(_game(hand_index=1))
+        log.sync_to(dest)                                   # must not raise
+        con = sqlite3.connect(f"file:{dest}?mode=ro", uri=True)
+        try:
+            assert con.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 2
+        finally:
+            con.close()
+
+    def test_sync_to_leaves_no_temp_file(self, log, tmp_path):
+        dest = tmp_path / "experiment.sqlite"
+        with log.game():
+            log.log_game(_game())
+        log.sync_to(dest)
+        # The snapshot-to-temp + os.replace must leave only the final file behind.
+        leftovers = [p.name for p in tmp_path.iterdir() if ".tmp." in p.name]
+        assert leftovers == []
+
+    def test_sync_to_preserves_dest_when_snapshot_fails(self, log, tmp_path, monkeypatch):
+        # Atomicity: if VACUUM INTO the temp fails, os.replace is never reached, so
+        # the previous good snapshot at dest survives intact (never half-written)
+        # and no orphan temp is left in the destination dir.
+        dest = tmp_path / "experiment.sqlite"
+        with log.game():
+            log.log_game(_game(hand_index=0))
+        log.sync_to(dest)                              # good snapshot: 1 game
+        with log.game():
+            log.log_game(_game(hand_index=1))          # a second game, not yet synced
+
+        def boom(_tmp):
+            raise OSError("permanent FS full")
+
+        monkeypatch.setattr(log, "snapshot", boom)
+        with pytest.raises(OSError):
+            log.sync_to(dest)
+        con = sqlite3.connect(f"file:{dest}?mode=ro", uri=True)
+        try:
+            assert con.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 1
+        finally:
+            con.close()
+        assert [p.name for p in tmp_path.iterdir() if ".tmp." in p.name] == []
+
     def test_next_hand_index_empty_run_is_zero(self, log):
         assert log.next_hand_index("fresh") == 0
 

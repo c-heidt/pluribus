@@ -26,8 +26,13 @@ each live opponent's belief at every round boundary via a
 holes revealed at showdown into ``range_quality`` rows, logged in the same per-hand
 transaction.
 
-Out of scope here (later steps): the periodic / on-SIGTERM ``VACUUM INTO`` sync-back
-and SLURM wrapper (§5, step 5), the end-of-run summary (§8, step 6), and
+Cluster I/O (§5, step 5) is wired here: the db is written to node-local scratch and
+:func:`run_evaluation` calls an injected ``sync_fn`` (a ``VACUUM INTO`` to the
+permanent FS, :meth:`~evaluation.sqlite_logging.ExperimentLog.sync_to`) on a
+periodic cadence and once more at the end / on SIGTERM.  The SLURM wrapper that
+stages scratch and forwards SIGTERM is ``scripts/evaluation.sh``.
+
+Out of scope here (later steps): the end-of-run summary (§8, step 6) and
 ``aivat_value`` (§10.2, step 9).
 """
 
@@ -100,6 +105,12 @@ class EvalConfig:
     # Deck bounds — full deck (2..14) for the real game, a small deck for tests.
     low_card_rank: int = 2
     high_card_rank: int = 14
+    # Cluster I/O sync-back cadence (§5).  The run writes the db to node-local
+    # scratch and VACUUM-INTOs a permanent-FS snapshot every ``sync_interval_hands``
+    # hands (0 → only the final sync) and/or every ``sync_interval_minutes`` minutes
+    # (0 → disabled).  Both are inert unless the runner is given a ``sync_fn``.
+    sync_interval_hands: int = 500
+    sync_interval_minutes: float = 0.0
 
     def fingerprint_table_policy(self) -> Dict[str, object]:
         """The table-composition identity folded into ``config_fingerprint`` (§6)."""
@@ -414,6 +425,33 @@ def _validate_config(cfg: EvalConfig) -> None:
             )
 
 
+def _sync_due(cfg: EvalConfig, hands_since_sync: int, seconds_since_sync: float) -> bool:
+    """Whether a periodic sync-back is due under the §5 cadence (hands or minutes)."""
+    if cfg.sync_interval_hands > 0 and hands_since_sync >= cfg.sync_interval_hands:
+        return True
+    if (
+        cfg.sync_interval_minutes > 0
+        and seconds_since_sync >= cfg.sync_interval_minutes * 60.0
+    ):
+        return True
+    return False
+
+
+def _best_effort_sync(sync_fn: Callable[[], None], run_id: str) -> None:
+    """Run a *periodic* sync-back, swallowing failures (§5 bounded-loss).
+
+    A transient permanent-FS hiccup mid-run must not kill a long evaluation: the
+    periodic snapshot is a bounded-loss checkpoint, and the next interval (or the
+    strict final sync) retries.  The failure is logged loudly, never silent.
+    """
+    try:
+        sync_fn()
+    except Exception:
+        logger.exception(
+            "periodic sync-back failed for run %s (retrying next interval)", run_id
+        )
+
+
 def run_evaluation(
     session: EvalSession,
     log: ExperimentLog,
@@ -422,6 +460,7 @@ def run_evaluation(
     git_sha: Optional[str] = None,
     hostname: Optional[str] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    sync_fn: Optional[Callable[[], None]] = None,
     max_hands: Optional[int] = None,
     max_consecutive_failures: Optional[int] = 20,
 ) -> int:
@@ -447,8 +486,17 @@ def run_evaluation(
         Provenance passed onto each ``games`` / ``hand_failures`` row (timestamps
         are *passed in*, §6).
     should_stop
-        Polled at each hand boundary — the SIGTERM hook wires it (§5); the
-        ``VACUUM INTO`` sync-back on stop is a later step.
+        Polled at each hand boundary — the SIGTERM hook wires it (§5), so a
+        preempted run stops with a complete final hand and then syncs back.
+    sync_fn
+        The permanent-FS sync-back (``VACUUM INTO`` via
+        :meth:`ExperimentLog.sync_to`), called on the §5 cadence
+        (``EvalConfig.sync_interval_hands`` / ``_minutes``) and once more at the
+        end — including after a ``should_stop`` (SIGTERM) break, so nothing since
+        the last periodic snapshot is lost.  Periodic calls are best-effort
+        (bounded loss); the final call is strict (it *is* the run's product, so a
+        failure there propagates).  ``None`` → no sync-back (the node-local db is
+        the only artifact — a local run with no separate permanent path).
     max_hands
         Optional hard cap on hands this call (tests; ``None`` → budget-bound only).
     """
@@ -461,6 +509,8 @@ def run_evaluation(
     n_attempted = 0
     n_failed = 0
     consecutive_failures = 0
+    hands_since_sync = 0
+    last_sync = time.monotonic()
 
     while True:
         if should_stop is not None and should_stop():
@@ -474,6 +524,7 @@ def run_evaluation(
         )
         hand_index += 1
         n_attempted += 1
+        hands_since_sync += 1
         if ok:
             consecutive_failures = 0
         else:
@@ -483,17 +534,35 @@ def run_evaluation(
                 max_consecutive_failures is not None
                 and consecutive_failures >= max_consecutive_failures
             ):
+                # Preserve everything logged so far before aborting (best-effort;
+                # the run is dying anyway, so a sync failure here must not mask the
+                # circuit-breaker error the operator needs to see).
+                if sync_fn is not None:
+                    _best_effort_sync(sync_fn, cfg.run_id)
                 raise RuntimeError(
                     f"aborting run {cfg.run_id!r}: {consecutive_failures} consecutive "
                     f"hand failures (through hand_index {hand_index - 1}) — a "
                     "systematic error, not bad luck; see the hand_failures table."
                 )
+        # Periodic VACUUM INTO sync-back to the permanent FS (§5) — bounds how much
+        # a node failure between snapshots can cost; the final sync below is strict.
+        if sync_fn is not None and _sync_due(
+            cfg, hands_since_sync, time.monotonic() - last_sync
+        ):
+            _best_effort_sync(sync_fn, cfg.run_id)
+            hands_since_sync = 0
+            last_sync = time.monotonic()
 
     if n_failed:
         logger.warning(
             "run %s: %d of %d hands failed this session (see hand_failures)",
             cfg.run_id, n_failed, n_attempted,
         )
+    # Final sync-back — on normal budget end and on a SIGTERM (should_stop) break
+    # alike (§5).  Strict: the permanent snapshot is the run's product, so a
+    # failure here propagates rather than silently leaving stale permanent data.
+    if sync_fn is not None:
+        sync_fn()
     return n_attempted
 
 
@@ -723,6 +792,26 @@ def _cli():
     @evaluate.command(name="run")
     @click.option("--run-id", required=True, help="Groups games of one experiment batch.")
     @click.option("--db-path", required=True, help="SQLite sink path (node-local, §5).")
+    @click.option(
+        "--sync-path",
+        default=None,
+        help="Permanent-FS snapshot path (VACUUM INTO sync-back, §5). Omit for a "
+        "local run where --db-path is the only artifact.",
+    )
+    @click.option(
+        "--sync-interval-hands",
+        default=500,
+        type=int,
+        show_default=True,
+        help="Sync-back cadence in hands (0 → only the final sync).",
+    )
+    @click.option(
+        "--sync-interval-minutes",
+        default=0.0,
+        type=float,
+        show_default=True,
+        help="Sync-back cadence in minutes (0 → disabled).",
+    )
     @click.option("--blueprint-path", required=True, help="Trained blueprint directory.")
     @click.option("--lut-path", required=True, help="Card-info LUT directory.")
     @click.option("--run-seed", default=0, type=int, show_default=True)
@@ -762,11 +851,21 @@ def _cli():
             big_blind=opts["big_blind"],
             small_blind=opts["small_blind"],
             starting_stack=opts["starting_stack"],
+            sync_interval_hands=opts["sync_interval_hands"],
+            sync_interval_minutes=opts["sync_interval_minutes"],
         )
         db_path = Path(opts["db_path"])
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(db_path.parent / "config.yaml", "w") as fh:
-            yaml.dump(opts, fh)  # provenance, mirrors the blueprint runner
+        sync_path = Path(opts["sync_path"]) if opts["sync_path"] else None
+        if sync_path is not None:
+            sync_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # config.yaml lives next to the permanent snapshot when syncing back (that
+        # dir is what analysis reads, §5/§8) — the node-local dir is ephemeral;
+        # otherwise next to the db.  Mirrors the blueprint runner.
+        config_dir = sync_path.parent if sync_path is not None else db_path.parent
+        with open(config_dir / "config.yaml", "w") as fh:
+            yaml.dump(opts, fh)
 
         session = build_blueprint_session(
             cfg,
@@ -778,6 +877,9 @@ def _cli():
         )
         should_stop = _install_sigterm_stop()
         log = ExperimentLog.open(db_path)
+        # Periodic + on-SIGTERM + final VACUUM INTO sync-back to the permanent FS
+        # (§5); None when no --sync-path (the node-local db is the only artifact).
+        sync_fn = (lambda: log.sync_to(sync_path)) if sync_path is not None else None
         try:
             n = run_evaluation(
                 session,
@@ -785,10 +887,12 @@ def _cli():
                 git_sha=_git_sha(),
                 hostname=socket.gethostname(),
                 should_stop=should_stop,
+                sync_fn=sync_fn,
             )
         finally:
             log.close()
-        click.echo(f"played {n} hands for run_id={cfg.run_id} → {db_path}")
+        dest = sync_path if sync_path is not None else db_path
+        click.echo(f"played {n} hands for run_id={cfg.run_id} → {dest}")
 
     return evaluate
 

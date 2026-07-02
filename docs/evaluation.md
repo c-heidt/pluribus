@@ -605,7 +605,7 @@ Ordered so each step yields something usable before the next.
    pure additive logging. *done*
 5. **Cluster I/O.** Point the DB at node-local scratch; add periodic + on-SIGTERM
    `VACUUM INTO` sync-back to the permanent filesystem (§5), plus the SLURM wrapper
-   (§10.1).
+   (§10.1). *done*
 6. **Summary command (§8).** `evaluation/summarize.py` reading the four tables into
    the headline block and `summary.json`. Read-only; no search-package dependency,
    so it also runs standalone against any past snapshot. Wired to run automatically
