@@ -36,7 +36,11 @@ The end-of-run summary (§8, step 6) runs automatically at the end of the CLI
 ``run`` command, after the final sync-back, against the permanent snapshot
 (:func:`evaluation.summarize.summarize`).
 
-Out of scope here (later steps): ``aivat_value`` (§10.2, step 9).
+AIVAT (§10.2, step 9) is wired here too, behind the opt-in ``EvalConfig.aivat``
+flag: :func:`play_hand` feeds an :class:`~evaluation.aivat.AivatAccumulator` the
+known-policy action nodes (hero + opponents) and the terminal all-in runout, and
+the resulting ``aivat_value`` scalar is logged on the ``games`` row.  A dedicated
+RNG sub-stream keeps it from perturbing the played hand.
 """
 
 from __future__ import annotations
@@ -55,6 +59,7 @@ import numpy as np
 from environment.player import Player
 from environment.poker_env import PokerEnv
 from environment.utils import card_str
+from evaluation.aivat import AivatAccumulator, LeafValue
 from evaluation.opponents import (
     HERO_LABEL,
     OPPONENT_LABELS,
@@ -114,6 +119,13 @@ class EvalConfig:
     # (0 → disabled).  Both are inert unless the runner is given a ``sync_fn``.
     sync_interval_hands: int = 500
     sync_interval_minutes: float = 0.0
+    # AIVAT variance-reduced strength estimate (§10.2, step 9).  Off by default —
+    # it adds per-hand cost (in the experiment budget, off the search hot path) and
+    # is driven by a dedicated RNG sub-stream, so a hand's raw ``hero_chips_delta``
+    # is identical whether AIVAT is on or off.  ``aivat_hole_samples`` is the number
+    # of belief hole-draws averaged per value-function evaluation.
+    aivat: bool = False
+    aivat_hole_samples: int = 6
 
     def fingerprint_table_policy(self) -> Dict[str, object]:
         """The table-composition identity folded into ``config_fingerprint`` (§6)."""
@@ -175,22 +187,31 @@ class EvalSession:
 def derive_seeds(
     run_seed: int, hand_index: int
 ) -> Tuple[
-    int, int, np.random.SeedSequence, np.random.SeedSequence, np.random.SeedSequence
+    int,
+    int,
+    np.random.SeedSequence,
+    np.random.SeedSequence,
+    np.random.SeedSequence,
+    np.random.SeedSequence,
 ]:
-    """``(deck_seed, agent_seed, hero_seq, opp_seq, table_seq)`` for one hand.
+    """``(deck_seed, agent_seed, hero_seq, opp_seq, table_seq, aivat_seq)`` per hand.
 
     Everything is a pure function of ``(run_seed, hand_index)`` via one
     :class:`numpy.random.SeedSequence`, so a resumed run reproduces each hand
     bit-for-bit (§10.1).  ``deck_seed`` seeds the global RNG for the deal;
     ``agent_seed`` (logged) seeds the hero's search sampling; the returned
-    sub-sequences seed the hero, opponent-sampling, and seat-assignment RNGs.
+    sub-sequences seed the hero, opponent-sampling, seat-assignment, and AIVAT
+    RNGs.  The AIVAT sub-sequence is spawned as a **5th** child (index 4): because
+    ``SeedSequence.spawn`` children are determined by their spawn index, the first
+    four are byte-identical to the previous four-child layout — turning AIVAT on
+    does not shift the deck / hero / opponent / table streams.
     """
-    deck_ss, hero_ss, opp_ss, table_ss = np.random.SeedSequence(
+    deck_ss, hero_ss, opp_ss, table_ss, aivat_ss = np.random.SeedSequence(
         [int(run_seed), int(hand_index)]
-    ).spawn(4)
+    ).spawn(5)
     deck_seed = int(deck_ss.generate_state(1, dtype=np.uint32)[0])
     agent_seed = int(hero_ss.generate_state(1, dtype=np.uint32)[0])
-    return deck_seed, agent_seed, hero_ss, opp_ss, table_ss
+    return deck_seed, agent_seed, hero_ss, opp_ss, table_ss, aivat_ss
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +231,7 @@ class HandOutcome:
     final_board: str
     decisions: List[DecisionRow]
     range_quality: List[RangeQualityRow]
+    aivat_value: Optional[float] = None       # §10.2 estimate; None unless AIVAT on
 
 
 def _to_call(env: PokerEnv) -> int:
@@ -291,6 +313,39 @@ def _capture_hero_decision(
     )
 
 
+def _hero_played_dist(
+    hero: SearchAgent, env: PokerEnv, blueprint_policy: Policy
+) -> Tuple[List[str], np.ndarray]:
+    """The hero's just-played action distribution ``(legal, probs)`` at ``env``.
+
+    Mirrors :meth:`SearchAgent.act` branch-for-branch so the returned ``probs`` are
+    the *exact* distribution the hero sampled from — the searched final-iteration σ
+    (read under the same ``_solved_public_key`` / ``_hand_row`` key ``act`` froze the
+    played row at, so post-``act`` it returns the pinned played mix) on rounds 2–4,
+    or the round-1 blueprint σ.  ``legal`` is the same list ``act`` sampled over
+    (env-filtered on searched rounds, ``state.legal_actions`` on round 1), so the
+    sampled action is always a member — this is the ``π`` AIVAT corrects with (§10.2)
+    and it matches the logged ``decisions.action_dist``.
+    """
+    if hero.last_search is not None:
+        pk = hero._solved_public_key(env)
+        hr = hero._hand_row(env)
+        legal = [a for a in env.legal_actions if a is not None]
+        probs = np.asarray(
+            hero.last_search.policy.strategy_for(pk, hr, legal), dtype=np.float64
+        )
+    else:
+        state = env.policy_state_for(hero.my_hole, for_blueprint=True)
+        legal = list(state.legal_actions)
+        probs = np.asarray(blueprint_policy.strategy(state, "none"), dtype=np.float64)
+    total = probs.sum()
+    if total > 0:
+        probs = probs / total
+    elif legal:
+        probs = np.full(len(legal), 1.0 / len(legal))
+    return legal, probs
+
+
 def play_hand(
     env: PokerEnv,
     hero_seat: int,
@@ -298,6 +353,8 @@ def play_hand(
     opponents: Mapping[int, BlueprintOpponent],
     opp_rng: np.random.Generator,
     blueprint_policy: Policy,
+    *,
+    aivat: Optional[AivatAccumulator] = None,
 ) -> HandOutcome:
     """Play one full hand; return its outcome + per-hero-decision rows.
 
@@ -311,6 +368,12 @@ def play_hand(
     every live opponent's belief is buffered for the range-quality resolution at
     showdown (§7, step 4), but only while the hero is still live: once it folds the
     tracker stops updating, so its belief would be stale.
+
+    When an ``aivat`` accumulator is passed (step 9, §10.2) every known-policy action
+    node — the hero's plays and the opponents' — contributes a control-variate
+    correction, and the terminal all-in runout a chance correction; the resulting
+    ``aivat_value`` is returned on the :class:`HandOutcome`.  ``None`` → AIVAT off
+    (the default), and the loop is byte-for-byte the prior behaviour.
     """
     hero.on_hand_start(env, hero_seat)
     decisions: List[DecisionRow] = []
@@ -342,12 +405,27 @@ def play_hand(
             decisions.append(
                 _capture_hero_decision(hero, env, action, blueprint_policy)
             )
+            # AIVAT action-node correction at the hero's known-policy node (§10.2):
+            # the played σ is the exact control-variate weighting.
+            if aivat is not None:
+                legal, probs = _hero_played_dist(hero, env, blueprint_policy)
+                aivat.correct_action(env_before, seat, action, legal, probs)
+        elif aivat is not None:
+            # Sample the opponent from its exact known policy AND correct that node.
+            # Replicating sample() (one opp_rng draw over the same probs) keeps the
+            # played action bit-identical to the AIVAT-off path.  Corrections stop
+            # once the hero has folded — its outcome is then fixed, so the terms are
+            # ~0 and the (dormant) tracker belief would be stale.
+            legal, probs = opponents[seat].action_probs(env, seat)
+            action = legal[int(opp_rng.choice(len(legal), p=probs))]
+            if env.players[hero_seat].is_active:
+                aivat.correct_action(env_before, seat, action, legal, probs)
         else:
             action = opponents[seat].sample(env, seat, opp_rng)
         hero.on_observed_action(env_before, seat, action)
         env.step_in_place(action)
 
-    return _finish_hand(env, hero_seat, decisions, recorder)
+    return _finish_hand(env, hero_seat, decisions, recorder, aivat)
 
 
 def _finish_hand(
@@ -355,6 +433,7 @@ def _finish_hand(
     hero_seat: int,
     decisions: List[DecisionRow],
     recorder: RangeQualityRecorder,
+    aivat: Optional[AivatAccumulator] = None,
 ) -> HandOutcome:
     """Read the terminal env into a :class:`HandOutcome` (§6 games outcome cols)."""
     hero_delta = float(env.payout[hero_seat])
@@ -379,6 +458,9 @@ def _finish_hand(
         decisions=decisions,
         # Resolve buffered opponent beliefs vs. the holes revealed at showdown (§7).
         range_quality=recorder.resolve(env, went_to_showdown),
+        # AIVAT scalar for the hand (u(z) − Σ corrections), incl. the all-in runout
+        # chance correction taken at the terminal (§10.2); None when AIVAT is off.
+        aivat_value=aivat.finalize(env) if aivat is not None else None,
     )
 
 
@@ -587,7 +669,7 @@ def _play_and_log_one(
     / ``hero_seat`` are derived up front (deterministic, cannot fail) so they are
     available for the failure row even if play raises immediately.
     """
-    deck_seed, agent_seed, hero_ss, opp_ss, table_ss = derive_seeds(
+    deck_seed, agent_seed, hero_ss, opp_ss, table_ss, aivat_ss = derive_seeds(
         cfg.run_seed, hand_index
     )
     hero_seat = hand_index % cfg.n_players           # position rotation (§10.1)
@@ -608,10 +690,21 @@ def _play_and_log_one(
             if lbl != HERO_LABEL
         }
 
+        # AIVAT accumulator (§10.2) — a dedicated RNG sub-stream so the value
+        # function's belief sampling / rollouts never perturb the played hand.
+        aivat = None
+        if cfg.aivat:
+            aivat_rng = np.random.default_rng(aivat_ss)
+            value_fn = LeafValue(
+                hero, session.solver_cfg.leaf, aivat_rng,
+                n_hole_samples=cfg.aivat_hole_samples,
+            )
+            aivat = AivatAccumulator(hero_seat, value_fn, aivat_rng)
+
         started_at = now_fn()
         outcome = play_hand(
             env, hero_seat, hero, opponents, np.random.default_rng(opp_ss),
-            session.blueprint_policy,
+            session.blueprint_policy, aivat=aivat,
         )
         button_seat = _dealer_seat(env)
 
@@ -633,6 +726,7 @@ def _play_and_log_one(
                     starting_stack=float(cfg.starting_stack),
                     deck_seed=deck_seed,
                     agent_seed=agent_seed,
+                    aivat_value=outcome.aivat_value,
                     hero_chips_delta=outcome.hero_chips_delta,
                     went_to_showdown=outcome.went_to_showdown,
                     terminal_street=outcome.terminal_street,
@@ -839,6 +933,20 @@ def _cli():
     @click.option("--max-iterations", default=5_000, type=int, show_default=True)
     @click.option("--max-wall-seconds", default=10.0, type=float, show_default=True)
     @click.option("--workers", default=None, type=int, help="Solver replicas (§6.7).")
+    @click.option(
+        "--aivat/--no-aivat",
+        default=False,
+        show_default=True,
+        help="Compute the AIVAT variance-reduced strength estimate (§10.2). Adds "
+        "per-hand cost (experiment budget); the strength summary auto-switches to it.",
+    )
+    @click.option(
+        "--aivat-hole-samples",
+        default=6,
+        type=int,
+        show_default=True,
+        help="Belief hole-draws averaged per AIVAT value-function evaluation.",
+    )
     def run(**opts):
         """Play a time-budgeted evaluation run, logging one transaction per hand."""
         fixed_seats = None
@@ -856,6 +964,8 @@ def _cli():
             starting_stack=opts["starting_stack"],
             sync_interval_hands=opts["sync_interval_hands"],
             sync_interval_minutes=opts["sync_interval_minutes"],
+            aivat=opts["aivat"],
+            aivat_hole_samples=opts["aivat_hole_samples"],
         )
         db_path = Path(opts["db_path"])
         db_path.parent.mkdir(parents=True, exist_ok=True)

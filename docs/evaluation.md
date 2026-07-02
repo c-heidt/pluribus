@@ -653,7 +653,9 @@ Ordered so each step yields something usable before the next.
    the **unbiasedness + variance-drop test**. Switches the summary's strength CI onto
    `aivat_value`; unblocks the small-edge comparisons. Cross-run merge tooling
    (`(run_id, game_id)` keying, DuckDB `ATTACH`+`UNION`) follows once there is more
-   than one run to compare.
+   than one run to compare. *done — action-node scope; see §10.2. Built:*
+   [evaluation/aivat.py](../evaluation/aivat.py), wired into the runner behind the
+   opt-in `--aivat` flag.
 
 ## 10. Planned Components
 
@@ -661,8 +663,8 @@ The logging backbone (§4–§9) is specified to build now. The two components b
 the **runner** that generates the games and **AIVAT** that makes small-edge
 comparisons statistically feasible — are specified here in enough detail to
 implement. The **runner is now built** ([evaluation/runner.py](../evaluation/runner.py),
-§9 steps 3–6); **AIVAT is not yet built** (§9 step 9). §10.3 lists genuinely-future
-work.
+§9 steps 3–6), and **AIVAT is now built** ([evaluation/aivat.py](../evaluation/aivat.py),
+§9 step 9) in its action-node scope (see §10.2). §10.3 lists genuinely-future work.
 
 ### 10.1 Evaluation Runner
 
@@ -802,6 +804,50 @@ the payoff. Budget the effort in this test, not the arithmetic.
 **Sequencing.** The backbone logs raw `hero_chips_delta` first; AIVAT layers on using
 data already captured (`action_dist`, values, ranges). Adopting it lets the runner
 skip seat rotation (§6). Medium effort, well-bounded.
+
+**As built** ([evaluation/aivat.py](../evaluation/aivat.py)), the scope is
+**action-node AIVAT (hero + opponents) plus the terminal all-in runout**; the general
+per-street chance (MIVAT) term is **deferred**. The engine has no steppable /
+enumerable per-street chance node — hole cards are dealt in `PokerEnv.__init__` and
+board cards *inside* `_apply_action_in_place` off a shuffled deck, with no "re-deal a
+specific alternative card down the same betting line" primitive — so the per-street
+`v(realized) − Σ_c P(c)·v(child_c)` cannot be taken exactly without a new engine
+primitive. What *is* taken:
+
+- **Action nodes** — at every hero and opponent decision, `term = v(child_sampled) −
+  Σ_a π(a)·v(child_a)`, with the siblings enumerated by the engine's make/undo
+  (`step_in_place`/`undo`) on the runner's existing pre-action env copy. `π` is the
+  hero's played σ (the exact vector logged as `decisions.action_dist`) or the
+  opponent's `BlueprintOpponent.action_probs` — both exact known policies (§10.1).
+- **The terminal all-in runout** — the one chance event the engine *can* integrate
+  exactly: at a decision-free all-in terminal the realised single board is replaced
+  by `runout_equity` (`term = u(z) − runout_equity[hero]`), collapsing `aivat_value`
+  to `runout_equity − Σ action_terms`. The highest-variance chance event, removed for
+  free.
+
+**The value function `v`** reuses the leaf machinery
+([leaf.py](../poker_ai/search/leaf.py) `continuation_value`) under a fixed
+all-blueprint continuation profile: it materialises a card-disjoint joint hole
+assignment sampled from the tracker's belief — the hero seat filled with its *known*
+hole — and averages the hero-seat continuation value over a few (`--aivat-hole-samples`,
+default 6) such draws. Any consistent `v` is unbiased, so the internal hole sampling
+uses cheap sequential-with-removal rather than the exact conditioned joint. **The
+information-leak rule** (the main correctness trap): `v` integrates only over the
+*observer's* belief and never reads an opponent's concrete hole; `π` at an opponent
+node may condition on that opponent's own hole (it is exactly the distribution the
+action was sampled from). AIVAT is **passive** — its value evaluations reshuffle the
+undealt deck via the *global* `np.random` (as the search does), so the module
+snapshots and restores that global state around each evaluation, leaving the played
+hand's deck stream untouched; a hand's raw `hero_chips_delta` is byte-identical with
+AIVAT on or off, and AIVAT runs on its own RNG sub-stream (a 5th `derive_seeds`
+child). Gated behind the opt-in `EvalConfig.aivat` / `--aivat` flag (extra per-hand
+cost, in the experiment budget, off the real-time search hot path). The
+**acceptance test** ([test/evaluation/test_aivat.py](../test/evaluation/test_aivat.py))
+gates the §10.2 property — paired `mean(aivat) ≈ mean(hero_chips_delta)` within CI
+and `var(aivat) < var(hero_chips_delta)` (measured ~2× reduction on the stub) — plus
+the deterministic term/finalize algebra and a no-leak belief-sampling check. The
+summary's strength CI switches onto `aivat_value` automatically once every game
+carries it (§8, no code change).
 
 ### 10.3 Future (not planned in detail)
 

@@ -37,7 +37,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=72:00:00
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=48
 #SBATCH --mem=200000mb
 #SBATCH --tmp=460000
 #SBATCH --signal=SIGTERM@300
@@ -71,9 +71,15 @@ STARTING_STACK=${STARTING_STACK:-10000}
 MAX_ITERATIONS=${MAX_ITERATIONS:-5000}
 MAX_WALL_SECONDS=${MAX_WALL_SECONDS:-10.0}
 WORKERS=${WORKERS:-}                               # solver replicas (§6.7); empty → auto
+# AIVAT variance-reduced strength estimate (§10.2).  ON by default — it fills
+# games.aivat_value (the summary auto-switches its strength CI onto it) at extra
+# per-hand cost that stays in the experiment budget, off the search hot path, and
+# never perturbs the played hand.  Set AIVAT=false for the raw-only baseline.
+AIVAT=${AIVAT:-true}                                # true | false
+AIVAT_HOLE_SAMPLES=${AIVAT_HOLE_SAMPLES:-6}         # belief draws per value eval
 # Sync-back cadence (§5): every SYNC_INTERVAL_HANDS hands and/or SYNC_INTERVAL_MINUTES.
 SYNC_INTERVAL_HANDS=${SYNC_INTERVAL_HANDS:-500}
-SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES:-15}
+SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES:-20}
 LUT_PATH=${LUT_PATH:-"$WORKSPACE/exact"}
 
 # Permanent-FS destination for the snapshot + config.yaml (analysis reads this).
@@ -199,6 +205,7 @@ echo "  - Starting stack:         $STARTING_STACK"
 echo "  - Max iterations:         $MAX_ITERATIONS"
 echo "  - Max wall seconds:       $MAX_WALL_SECONDS"
 echo "  - Workers:                ${WORKERS:-(auto)}"
+echo "  - AIVAT:                  $AIVAT (hole samples: $AIVAT_HOLE_SAMPLES)"
 echo "  - Sync interval (hands):  $SYNC_INTERVAL_HANDS"
 echo "  - Sync interval (mins):   $SYNC_INTERVAL_MINUTES"
 echo "  - LUT path:               $LUT_PATH"
@@ -213,6 +220,12 @@ echo "  - CPUs:                   ${SLURM_CPUS_PER_TASK:-(unset)}"
 EXTRA_ARGS=()
 [ -n "$WORKERS" ]      && EXTRA_ARGS+=(--workers "$WORKERS")
 [ -n "$FIXED_SEATS" ]  && EXTRA_ARGS+=(--fixed-seats "$FIXED_SEATS")
+# AIVAT (§10.2): a boolean --aivat/--no-aivat flag + the belief-sample count.
+if [ "$AIVAT" = "true" ]; then
+  EXTRA_ARGS+=(--aivat --aivat-hole-samples "$AIVAT_HOLE_SAMPLES")
+else
+  EXTRA_ARGS+=(--no-aivat)
+fi
 
 # Run the runner in the background so this shell can forward slurm's grace-period
 # SIGTERM to the python process (same pattern as training.sh: a batch job's signal

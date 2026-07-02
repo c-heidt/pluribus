@@ -1,0 +1,215 @@
+"""Tests for AIVAT — variance-reduced strength estimate (evaluation/aivat.py, §10.2).
+
+Three levels, mirroring the doc's "budget the effort in the acceptance test":
+
+- **Deterministic arithmetic** — the :class:`AivatAccumulator` term / finalize sign
+  against a fake value function, so the control-variate algebra
+  (``u(z) − Σ(v(sampled) − Σπ·v(a))`` and the all-in runout term) is pinned exactly.
+- **Belief / no-leak** — :meth:`LeafValue._sample_joint` draws opponent holes only
+  from the tracked belief, never the opponent's revealed cards (the #1 correctness
+  trap).
+- **Statistical acceptance** — a full stub run with AIVAT on gates the two
+  properties §10.2 specifies: ``mean(aivat) ≈ mean(hero_chips_delta)`` (unbiased,
+  paired CI) and ``var(aivat) ≪ var(hero_chips_delta)`` (the payoff, and the
+  sign-error trap).  Plus the plumbing (column populated iff on) and the passive
+  guarantee (AIVAT's RNG isolation leaves the played hand's chip delta unchanged).
+
+All fast: small deck, heads-up, tiny solver budget — no ``slow`` / ``requires_lut``.
+"""
+
+import math
+
+import numpy as np
+import pytest
+
+from evaluation.aivat import AivatAccumulator, LeafValue, _board_compatible
+from evaluation.runner import run_evaluation
+from evaluation.sqlite_logging import ExperimentLog
+from poker_ai.search.agent import SearchAgent
+from poker_ai.search.leaf import LeafConfig
+from poker_ai.search.solver import SolverConfig
+from test.evaluation.test_runner import _stub_session
+from test.search.test_solver import UniformPolicy, _flop_env, _policies
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic arithmetic (fake value function)
+# --------------------------------------------------------------------------- #
+
+class _FakeValue:
+    """Returns a fixed hero-seat value per action, ignoring the env."""
+
+    def __init__(self, table):
+        self._table = table
+
+    def child_values(self, env_before, legal):
+        return {a: self._table[a] for a in legal}
+
+
+class _FakeTerminal:
+    def __init__(self, payout, *, decision_free=False, runout=None):
+        self._payout = payout
+        self._df = decision_free
+        self._runout = runout
+
+    @property
+    def payout(self):
+        return self._payout
+
+    @property
+    def is_decision_free(self):
+        return self._df
+
+    def runout_equity(self, *, rng=None):
+        return self._runout
+
+
+class TestAccumulatorArithmetic:
+
+    def test_action_term_and_finalize_sign(self):
+        v = _FakeValue({"call": 10.0, "fold": -2.0})
+        acc = AivatAccumulator(0, v, np.random.default_rng(0))
+        # π = (0.25 call, 0.75 fold), sampled "call".
+        acc.correct_action(None, 0, "call", ["call", "fold"], [0.25, 0.75])
+        baseline = 0.25 * 10.0 + 0.75 * (-2.0)          # = 1.0
+        term = 10.0 - baseline                           # = 9.0
+        # No showdown → finalize is just u(z) − Σ terms.
+        val = acc.finalize(_FakeTerminal({0: 30.0}))
+        assert math.isclose(val, 30.0 - term)
+
+    def test_multiple_terms_accumulate(self):
+        v = _FakeValue({"a": 4.0, "b": 0.0})
+        acc = AivatAccumulator(0, v, np.random.default_rng(0))
+        acc.correct_action(None, 0, "a", ["a", "b"], [0.5, 0.5])   # term = 4 - 2 = 2
+        acc.correct_action(None, 1, "b", ["a", "b"], [0.5, 0.5])   # term = 0 - 2 = -2
+        val = acc.finalize(_FakeTerminal({0: 7.0}))
+        assert math.isclose(val, 7.0 - (2.0 + (-2.0)))            # = 7.0
+
+    def test_action_not_in_legal_is_skipped(self):
+        v = _FakeValue({"a": 4.0, "b": 0.0})
+        acc = AivatAccumulator(0, v, np.random.default_rng(0))
+        acc.correct_action(None, 0, "raise:1.0", ["a", "b"], [0.5, 0.5])  # bogus action
+        val = acc.finalize(_FakeTerminal({0: 5.0}))
+        assert math.isclose(val, 5.0)                             # no term applied
+
+    def test_allin_runout_chance_correction(self):
+        # Decision-free terminal: aivat collapses to runout_equity − Σ action terms.
+        acc = AivatAccumulator(0, _FakeValue({}), np.random.default_rng(0))
+        val = acc.finalize(
+            _FakeTerminal({0: 100.0}, decision_free=True, runout={0: 60.0})
+        )
+        # chance_term = 100 − 60 = 40 → aivat = 100 − 0 − 40 = 60 (the exact average).
+        assert math.isclose(val, 60.0)
+
+
+# --------------------------------------------------------------------------- #
+# Belief / no-leak (LeafValue._sample_joint)
+# --------------------------------------------------------------------------- #
+
+def _hero_on_flop(seed=0, low=11, high=14, stacks=(300, 300)):
+    """A heads-up flop env + a hero SearchAgent whose tracker is initialised."""
+    env = _flop_env(low=low, high=high, stacks=stacks, seed=seed)
+    leaf = LeafConfig(policies=_policies(), n_rollouts=1)
+    cfg = SolverConfig(leaf=leaf, max_iterations=4, max_wall_seconds=30.0,
+                       discount_interval=20, workers=1)
+    hero_seat = env.player_i
+    hero = SearchAgent(_policies(), UniformPolicy(), cfg, np.random.default_rng(seed))
+    hero.on_hand_start(env, hero_seat)
+    return env, hero
+
+
+class TestBeliefSampling:
+
+    def test_sampler_draws_only_from_belief_support(self):
+        # Force the opponent's belief onto a single board-compatible combo; every
+        # sampled opponent hole must be that combo — proving the sampler reads the
+        # belief, never the opponent's actual (revealed) cards (no information leak).
+        env, hero = _hero_on_flop(seed=3)
+        opp = next(s for s in hero.tracker.snapshot() if s != hero.my_seat)
+        w = hero.tracker._ranges[opp]
+        board_ok = _board_compatible(env)
+        my = set(hero.my_hole)
+        cc = env.combo_cards
+        # A nonzero, board-compatible combo disjoint from the hero's known hole.
+        idx = next(
+            i for i in np.nonzero(w)[0]
+            if board_ok[i] and not (my & {int(cc[i, 0]), int(cc[i, 1])})
+        )
+        w[:] = 0.0
+        w[idx] = 1.0
+        target = (int(cc[idx, 0]), int(cc[idx, 1]))
+
+        vf = LeafValue(hero, hero._cfg.leaf, np.random.default_rng(0), n_hole_samples=1)
+        for _ in range(40):
+            holes = vf._sample_joint(env)
+            assert holes[hero.my_seat] == tuple(sorted(hero.my_hole)) or \
+                set(holes[hero.my_seat]) == set(hero.my_hole)   # hero = own hole
+            assert holes[opp] == target                          # belief respected
+
+    def test_child_values_are_finite_per_action(self):
+        env, hero = _hero_on_flop(seed=5)
+        legal = [a for a in env.legal_actions if a is not None]
+        vf = LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1), n_hole_samples=3)
+        vals = vf.child_values(env, legal)
+        assert set(vals) == set(legal)
+        assert all(np.isfinite(v) for v in vals.values())
+
+
+# --------------------------------------------------------------------------- #
+# Statistical acceptance + plumbing (full stub run)
+# --------------------------------------------------------------------------- #
+
+def _run(tmp_path, *, aivat, run_id="A", n=120, seed=13, hole_samples=4):
+    session = _stub_session(run_id=run_id, run_seed=seed, n_players=2,
+                            starting_stack=400)
+    session.config.aivat = aivat
+    session.config.aivat_hole_samples = hole_samples
+    log = ExperimentLog.open(tmp_path / f"{run_id}.sqlite")
+    try:
+        run_evaluation(log=log, session=session, max_hands=n)
+        rows = log._con.execute(
+            "SELECT hand_index, aivat_value, hero_chips_delta FROM games "
+            "ORDER BY hand_index"
+        ).fetchall()
+    finally:
+        log.close()
+    return rows
+
+
+class TestAcceptance:
+
+    def test_unbiased_and_reduces_variance(self, tmp_path):
+        rows = _run(tmp_path, aivat=True, n=140)
+        aiv = np.array([r[1] for r in rows], dtype=float)
+        dl = np.array([r[2] for r in rows], dtype=float)
+        assert not np.isnan(aiv).any()                    # every hand populated
+
+        # Unbiasedness (paired): aivat = delta − Σterms, so d = aivat − delta has
+        # zero expectation.  |mean(d)| must sit inside a 4σ band (non-flaky, and
+        # a mean-shifting bug — a dropped/double-counted term — breaks it).
+        d = aiv - dl
+        se = d.std(ddof=1) / math.sqrt(len(d))
+        assert abs(d.mean()) <= 4.0 * se + 1e-9
+
+        # Variance drop (the payoff, and the sign-error trap: a flipped correction
+        # anti-correlates the control variate and *inflates* variance).
+        assert aiv.var() < dl.var()
+
+    def test_column_populated_iff_enabled(self, tmp_path):
+        off = _run(tmp_path, aivat=False, run_id="OFF", n=6)
+        on = _run(tmp_path, aivat=True, run_id="ON", n=6)
+        assert all(r[1] is None for r in off)            # NULL when off
+        assert all(r[1] is not None for r in on)         # populated when on
+
+    def test_aivat_is_passive_on_the_played_hand(self, tmp_path):
+        # The RNG-isolation guard (_preserve_global_random) must leave the played
+        # hand untouched: the raw hero_chips_delta is identical with AIVAT on or off.
+        off = _run(tmp_path, aivat=False, run_id="P0", n=20, seed=21)
+        on = _run(tmp_path, aivat=True, run_id="P1", n=20, seed=21)
+        assert [r[2] for r in off] == [r[2] for r in on]
+
+    def test_reproducible(self, tmp_path):
+        a = _run(tmp_path, aivat=True, run_id="R1", n=20, seed=8)
+        b = _run(tmp_path, aivat=True, run_id="R2", n=20, seed=8)
+        # Same seed → identical aivat_value and delta (deterministic AIVAT sampling).
+        assert [(r[1], r[2]) for r in a] == [(r[1], r[2]) for r in b]
