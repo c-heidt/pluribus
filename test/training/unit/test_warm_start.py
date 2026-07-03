@@ -90,12 +90,15 @@ def _make_source_blueprint(
         np.save(cp / "regret_0_chunk_000000.npy", np.zeros(4, dtype=np.int32))
         np.save(cp / "strategy_0_chunk_000000.npy", np.zeros(4, dtype=np.int32))
 
+    from environment.poker_env import INFO_SET_ENCODING
+
     state = {
         "n_players": n_players,
         "t": saved_t,
         "n_chunks_per_street": n_chunks_per_street,
         "chunk_size": 4_000_000,
         "discount_active": False,
+        "info_set_encoding": INFO_SET_ENCODING,
     }
     joblib.dump(state, cp / "server_state.pkl")
     return cp
@@ -172,14 +175,31 @@ class TestApplyWarmStart:
         src.mkdir()
         cp = src / f"checkpoint_{int(time.time())}"
         cp.mkdir()
+        from environment.poker_env import INFO_SET_ENCODING
         joblib.dump(
             {"n_players": 6, "t": 1, "n_chunks_per_street": {r: 0 for r in range(4)},
-             "chunk_size": 4_000_000, "discount_active": False},
+             "chunk_size": 4_000_000, "discount_active": False,
+             "info_set_encoding": INFO_SET_ENCODING},
             cp / "server_state.pkl",
         )
         dst = tmp_path / "biased"
 
         with pytest.raises(FileNotFoundError, match="lmdb_index"):
+            apply_warm_start(dst, src, expected_n_players=6)
+
+    def test_legacy_encoding_raises(self, tmp_path):
+        """A base blueprint without the info_set_encoding marker (or with a
+        stale one) is rejected — its keys were written under a different
+        encoding and would silently 100%-miss."""
+        src = tmp_path / "base"
+        _make_source_blueprint(src, n_players=6)
+        # Overwrite server_state.pkl to drop the encoding marker.
+        cp = sorted(src.glob("checkpoint_[0-9]*"))[-1]
+        state = joblib.load(cp / "server_state.pkl")
+        state.pop("info_set_encoding", None)
+        joblib.dump(state, cp / "server_state.pkl")
+        dst = tmp_path / "biased"
+        with pytest.raises(ValueError, match="info_set_encoding"):
             apply_warm_start(dst, src, expected_n_players=6)
 
 

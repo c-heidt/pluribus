@@ -57,12 +57,18 @@ _NEXT_ROW_KEY: bytes = b"\x00__next_row__"
 _STR_PREFIX: bytes = b"\x00__str__"
 
 
-def hash_info_set_128(info_set: str) -> Tuple[int, int]:
+def hash_info_set_128(info_set: Union[bytes, str]) -> Tuple[int, int]:
     """Return a 128-bit hash of *info_set* as a pair of unsigned 64-bit ints.
 
     Uses xxhash.xxh3_128 when available (fast path, ~10x faster than blake2b)
     and falls back to hashlib.blake2b (16-byte digest) otherwise.
+
+    Production keys are compact ``bytes`` (see
+    :func:`environment.poker_env.encode_info_set`); a ``str`` is accepted and
+    utf-8 encoded so unit-test doubles that use plain string labels still work.
     """
+    if isinstance(info_set, str):
+        info_set = info_set.encode("utf-8")
     try:
         import xxhash
         digest_int: int = xxhash.xxh3_128(info_set).intdigest()
@@ -70,14 +76,12 @@ def hash_info_set_128(info_set: str) -> Tuple[int, int]:
         low = digest_int & 0xFFFF_FFFF_FFFF_FFFF
         return high, low
     except ImportError:
-        digest: bytes = hashlib.blake2b(
-            info_set.encode("utf-8"), digest_size=16
-        ).digest()
+        digest: bytes = hashlib.blake2b(info_set, digest_size=16).digest()
         high, low = struct.unpack("<QQ", digest)
         return high, low
 
 
-def hash_info_set_bytes(info_set: str) -> bytes:
+def hash_info_set_bytes(info_set: Union[bytes, str]) -> bytes:
     """Return the 16-byte (128-bit) raw digest for *info_set*.
 
     This is the canonical key format used when storing hashes in LMDB.
@@ -205,6 +209,13 @@ class InfosetIndex:
         )
         self._map_size: int = resolved_map_size
 
+        # Optional shared-memory read cache (attached post-construction by
+        # CFRTables via :meth:`set_cache`).  When present, ``get`` is served
+        # entirely from shm — no LMDB read txn per node — and ``get_or_create``
+        # inserts newly-allocated rows into it.  ``None`` = legacy LMDB-only
+        # path (standalone indexes, tests, cache disabled).
+        self._cache = None
+
         # Shared counter mirroring __next_row__ in LMDB.  Initialised here
         # (pre-fork, safe to read LMDB) so any process can query the row
         # count without an LMDB transaction (which triggers MDB_BAD_RSLOT
@@ -231,22 +242,46 @@ class InfosetIndex:
         """Total number of rows allocated so far, lock-free safe to read."""
         return self._n_allocated_mp.value
 
-    def get(self, info_set: str) -> Optional[int]:
+    def set_cache(self, cache) -> None:
+        """Attach a :class:`~poker_ai.tables.shm_index_cache.ShmIndexCache`.
+
+        Must be called in the parent before workers fork (so the shm mmap and
+        lock are inherited) and after any resume/warm-start restore has
+        populated LMDB, then followed by :meth:`prewarm_cache`.
+        """
+        self._cache = cache
+
+    def prewarm_cache(self) -> int:
+        """Load the attached cache from this index's LMDB (no-op if none)."""
+        if self._cache is None:
+            return 0
+        return self._cache.prewarm_from_cursor(self._env)
+
+    def get(self, info_set) -> Optional[int]:
         """Look up *info_set* and return its flat row number.
+
+        With a cache attached this is a lock-free shm probe with **no LMDB
+        transaction** (the hot path).  A cache miss returns ``None`` without
+        consulting LMDB — the cache is prewarmed from LMDB and kept current on
+        every allocation, so a miss means the key is genuinely unseen (or was
+        allocated in the microscopic window before its cache insert, which the
+        caller's unseen→uniform fallback handles safely).
 
         Parameters
         ----------
-        info_set : str
-            Information-set string (typically a JSON-encoded
-            cluster+history).
+        info_set : bytes or str
+            Information-set key (compact bytes in production; str accepted for
+            test doubles).
 
         Returns
         -------
         int or None
-            Flat row number if *info_set* was previously allocated,
-            otherwise ``None``.  Callers that need allocate-on-miss
-            should use :meth:`get_or_create` instead.
+            Flat row number if allocated, else ``None``.  Callers that need
+            allocate-on-miss should use :meth:`get_or_create`.
         """
+        if self._cache is not None:
+            low, high = hash_info_set_128(info_set)
+            return self._cache.probe(low, high)
         key = hash_info_set_bytes(info_set)
         with self._env.begin() as txn:
             val = txn.get(key)
@@ -254,26 +289,36 @@ class InfosetIndex:
             return None
         return struct.unpack("<Q", val)[0]
 
-    def get_or_create(self, info_set: str) -> tuple:
+    def get_or_create(self, info_set) -> tuple:
         """Return ``(flat_row, is_new)`` for *info_set*, allocating on miss.
 
-        The allocation is performed inside a single write transaction
-        so concurrent callers observe a consistent mapping — LMDB
+        With a cache attached, a cache hit returns immediately with no LMDB
+        access.  On a cache miss the row is allocated through LMDB (still the
+        authoritative allocator + persistence) and then inserted into the
+        cache.  The allocation is performed inside a single LMDB write
+        transaction so concurrent callers observe a consistent mapping — LMDB
         serialises writers at the environment level.  On
-        :class:`~lmdb.MapFullError`, the method automatically doubles
-        the ``map_size`` and retries.
-
-        Parameters
-        ----------
-        info_set : str
-            Information-set string.
+        :class:`~lmdb.MapFullError`, the method automatically doubles the
+        ``map_size`` and retries.
 
         Returns
         -------
         tuple[int, bool]
-            ``(flat_row, is_new)`` where ``is_new`` is ``True`` iff
-            the row was allocated by this call.
+            ``(flat_row, is_new)`` where ``is_new`` is ``True`` iff the row was
+            allocated by this call.
         """
+        if self._cache is not None:
+            low, high = hash_info_set_128(info_set)
+            row = self._cache.probe(low, high)
+            if row is not None:
+                return row, False
+            flat_row, is_new = self._lmdb_get_or_create(info_set)
+            self._cache.insert(low, high, flat_row)
+            return flat_row, is_new
+        return self._lmdb_get_or_create(info_set)
+
+    def _lmdb_get_or_create(self, info_set) -> tuple:
+        """LMDB-only get-or-create with the map-full retry loop."""
         while True:
             try:
                 return self._get_or_create_once(info_set)
@@ -532,15 +577,16 @@ class InfosetIndex:
                 self._n_allocated_mp.value = next_row + 1
 
             if self._debug:
+                raw = info_set if isinstance(info_set, bytes) else info_set.encode("utf-8")
                 shadow_key = _STR_PREFIX + key
                 existing_str = txn.get(shadow_key)
-                if existing_str is not None and existing_str != info_set.encode():
+                if existing_str is not None and existing_str != raw:
                     raise AssertionError(
                         f"128-bit hash collision detected!\n"
-                        f"  info_set A (existing): {existing_str.decode()!r}\n"
+                        f"  info_set A (existing): {existing_str!r}\n"
                         f"  info_set B (new):      {info_set!r}\n"
                         f"  hash key: {key.hex()}"
                     )
-                txn.put(shadow_key, info_set.encode())
+                txn.put(shadow_key, raw)
 
         return next_row, True

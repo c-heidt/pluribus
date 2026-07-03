@@ -53,7 +53,7 @@ class TestPolicyState:
         ps = env.policy_state
         assert isinstance(ps.player_i, int)
         assert isinstance(ps.betting_round, int)
-        assert isinstance(ps.info_set, str)
+        assert isinstance(ps.info_set, bytes)
         assert isinstance(ps.valid_mask, np.ndarray)
         assert ps.valid_mask.dtype == bool
         assert isinstance(ps.legal_actions, tuple)

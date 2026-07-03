@@ -82,6 +82,32 @@ def _startup_signal_handler(signum: int, frame) -> None:
     sys.exit(143 if signum == signal.SIGTERM else 130)
 
 
+def _read_persisted_index_capacities(save_path) -> Optional[Dict[int, int]]:
+    """Return the index-cache capacities saved in the latest checkpoint, if any.
+
+    Read *before* :class:`CFRTables` is constructed so a resume rebuilds the
+    same-size shm index cache the original run used (see
+    :func:`poker_ai.tables.cfr_tables._cache_capacity`).  Returns ``None`` on a
+    fresh run (no checkpoint) or an older checkpoint without the field.
+    """
+    import joblib
+
+    checkpoints = sorted(Path(save_path).glob("checkpoint_[0-9]*"))
+    for cp in reversed(checkpoints):
+        state_file = cp / "server_state.pkl"
+        if not state_file.exists():
+            continue
+        try:
+            state = joblib.load(state_file)
+        except Exception:
+            continue
+        caps = state.get("index_cache_capacity")
+        if caps:
+            return {int(k): int(v) for k, v in caps.items()}
+        return None
+    return None
+
+
 class WorkerError(RuntimeError):
     """Raised by the server loop when a worker has reported a fatal error.
 
@@ -348,12 +374,24 @@ class Server:
         self._lmdb_runtime_dir = lmdb_runtime_dir
         self._lmdb_persistent_dir = lmdb_persistent_dir
 
+        # Shared-memory index cache (on by default): serves the per-node
+        # info-set lookup from shm instead of an LMDB read txn.  On resume the
+        # capacity persisted in the checkpoint is reused (so the cache never
+        # shrinks below the original run and overflows); on a fresh run the
+        # size comes from PLURIBUS_INDEX_CAPACITY / existing rows (see
+        # CFRTables).
+        enable_index_cache = os.environ.get("PLURIBUS_INDEX_CACHE", "1") == "1"
+        persisted_caps = _read_persisted_index_capacities(self._save_path)
         self._tables = CFRTables(
             index_path=lmdb_runtime_dir,
             shm_dir=shm_dir,
             lmdb_map_size=lmdb_map_size,
             actions_per_street=MAX_ACTIONS_PER_STREET,
+            enable_index_cache=enable_index_cache,
+            index_capacities=persisted_caps,
         )
+        if enable_index_cache:
+            self._warn_index_cache_budget()
         self._locks: Dict[str, mp.synchronize.Lock] = {}
         self._error_event: mp.Event = mp.Event()  # type: ignore
         self._current_t: int = self._start_t
@@ -566,6 +604,37 @@ class Server:
         self._checkpoint_manager.shutdown()
         self._tables.close()
 
+    def _warn_index_cache_budget(self) -> None:
+        """Log the shm index-cache footprint and warn if it is a large share
+        of the node's memory budget.
+
+        The caches plus the chunk mmaps share the node's RAM; an oversized
+        capacity can OOM the run.  This surfaces the footprint at startup —
+        *before* compute is committed — using ``SLURM_MEM_PER_NODE`` (MiB)
+        when available.
+        """
+        total_bytes = self._tables.index_cache_total_bytes()
+        mem_mb = os.environ.get("SLURM_MEM_PER_NODE")
+        if mem_mb:
+            frac = total_bytes / (float(mem_mb) * 1024 ** 2)
+            msg = (
+                f"Index caches use {total_bytes / 1024 ** 3:.2f} GiB "
+                f"({frac:.0%} of the {float(mem_mb) / 1024:.1f} GiB node budget); "
+                f"chunk mmaps need the rest."
+            )
+            if frac > 0.40:
+                log.warning(
+                    "%s — consider lowering PLURIBUS_INDEX_CAPACITY or raising "
+                    "--mem so the chunk tables still fit.", msg
+                )
+            else:
+                log.info(msg)
+        else:
+            log.info(
+                "Index caches use %.2f GiB (set SLURM_MEM_PER_NODE for a "
+                "budget check).", total_bytes / 1024 ** 3
+            )
+
     def _start_workers(self, n_processes: int):
         """Construct and start *n_processes* worker processes.
 
@@ -593,6 +662,12 @@ class Server:
                 bias_magnitude=self._bias_magnitude,
             )
             workers.append(worker)
+        # Prewarm the shm index caches from LMDB before the fork so every
+        # worker inherits a warm, consistent cache (the mmap is shared, so
+        # this happens exactly once).  Must precede close_envs() — it reads
+        # each index's LMDB env.  No-op when the cache is disabled.
+        self._tables.prewarm_caches()
+
         # Close every LMDB env in the parent immediately before
         # forking the workers.  python-lmdb (1.3) appears to hold
         # transaction state that survives env.close() / reopen in the
@@ -635,9 +710,12 @@ class Server:
             Flat dict with path-like values converted to absolute
             strings so the checkpoint is portable between CWDs.
         """
+        from environment.poker_env import INFO_SET_ENCODING
+
         t_val = t if t is not None else self._current_t
         config = dict(
             t=t_val,
+            info_set_encoding=INFO_SET_ENCODING,
             strategy_interval=self._strategy_interval,
             max_runtime_hours=self._max_runtime_hours,
             discount_duration_cycles=self._discount_state.duration_cycles,
@@ -655,6 +733,10 @@ class Server:
             start_timestep=self._start_t,
             n_chunks_per_street=self._tables.n_chunks_per_street(),
             chunk_size=_CHUNK_SIZE,
+            # Not structural — persisted so a resume rebuilds the same-size
+            # shm index cache instead of auto-shrinking below this run's
+            # capacity and overflowing as it keeps allocating.
+            index_cache_capacity=self._tables.index_cache_capacities(),
         )
         return {
             k: os.path.abspath(str(v)) if isinstance(v, Path) else v

@@ -81,6 +81,17 @@ def run_terminal_app(
         # for a future improvement
         del offline_strategy_dict["pre_flop_strategy"]
         del offline_strategy_dict["regret"]
+        # ``state.info_set`` is now a compact ``bytes`` key (v2 encoding);
+        # legacy strategy artifacts are keyed by the old JSON strings, so a
+        # lookup would silently miss (→ uniform play).  Warn loudly rather
+        # than pretend the offline bot is using its trained strategy.
+        if offline_strategy and any(isinstance(k, str) for k in offline_strategy):
+            log.info(term.red(
+                "WARNING: offline strategy artifact is keyed by legacy "
+                "string info-sets, but this build uses compact binary keys — "
+                "every lookup will miss and the bot will play uniformly. "
+                "Regenerate the artifact under this build."
+            ))
     else:
         offline_strategy = {}
     user_results: UserResults = UserResults()

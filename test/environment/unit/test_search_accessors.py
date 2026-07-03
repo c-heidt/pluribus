@@ -127,7 +127,7 @@ class TestClusterFor:
         combo = (int(env.players[0].cards[0]), int(env.players[0].cards[1]))
         lookup = tuple(sorted(combo) + sorted(env.community_cards))
         env.card_info_lut = {env._betting_stage: {lookup: 13}}
-        embedded = json.loads(env._compute_info_set(combo))["cards_cluster"]
+        embedded, _history = env.info_set_fields(combo)
         assert env.cluster_for(combo) == embedded == 13
 
     def test_returns_python_int(self):

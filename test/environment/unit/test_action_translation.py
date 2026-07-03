@@ -151,34 +151,36 @@ class TestCanonicalizeHistory:
         env = _env()
         hist = {
             "pre_flop": ["call", "raise:0.5", "call"],
-            "flop": ["raise:0.33", "call"],
+            "flop": ["raise:0.75", "call"],
         }
         out = env._canonicalize_history(hist)
         assert out == [
             ("pre_flop", ["call", "raise:0.5", "call"]),
-            ("flop", ["raise:0.33", "call"]),
+            ("flop", ["raise:0.75", "call"]),
         ]
 
     def test_off_tree_raise_snaps_deterministically(self):
-        # flop first_raise grid [0.33,0.75,1.5]; 0.6 in (0.33, 0.75):
-        # P_A = ((0.75-0.6)(1+0.33)) / ((0.75-0.33)(1+0.6)) ≈ 0.297 < 0.5
-        # -> B = 0.75.
+        # flop first_raise grid [0.5,0.75,1.0,1.5]; 0.6 in (0.5, 0.75):
+        # P_A = ((0.75-0.6)(1+0.5)) / ((0.75-0.5)(1+0.6)) ≈ 0.5625 >= 0.5
+        # -> A = 0.5.
         env = _env()
         out = env._canonicalize_history({"flop": ["raise:0.6"]})
-        assert out == [("flop", ["raise:0.75"])]
+        assert out == [("flop", ["raise:0.5"])]
 
     def test_raise_index_advances_to_subsequent_grid(self):
-        # 0.33 is in flop first_raise but NOT in subsequent_raise
-        # ([1.0]); so the 2nd raise's 0.33 is off-tree and snaps
-        # (below-grid -> 1.0), proving the index advanced.
+        # 0.75 is in flop first_raise but NOT in subsequent_raise
+        # ([0.5, 1.0]); so the 2nd raise's 0.75 is off-tree and snaps
+        # (0.75 in (0.5,1.0): P_A≈0.429 < 0.5 -> 1.0), proving the index
+        # advanced.
         env = _env()
-        out = env._canonicalize_history({"flop": ["raise:0.33", "raise:0.33"]})
-        assert out == [("flop", ["raise:0.33", "raise:1.0"])]
+        out = env._canonicalize_history({"flop": ["raise:0.75", "raise:0.75"]})
+        assert out == [("flop", ["raise:0.75", "raise:1.0"])]
 
     def test_all_in_advances_raise_index(self):
+        # subsequent_raise on flop is [0.5, 1.0]; 0.33 is below-grid -> 0.5.
         env = _env()
         out = env._canonicalize_history({"flop": ["all_in", "raise:0.33"]})
-        assert out == [("flop", ["all_in", "raise:1.0"])]
+        assert out == [("flop", ["all_in", "raise:0.5"])]
 
     def test_fold_call_skip_pass_through(self):
         env = _env()
@@ -214,9 +216,9 @@ class TestBlueprintInfoSet:
 
     def test_off_tree_resolves_to_on_tree_key(self):
         # An off-tree raise:0.6 flop history must yield the SAME blueprint
-        # key as the env where the canonical neighbour (0.75) was played.
+        # key as the env where the canonical neighbour (0.5) was played.
         off = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.6")
-        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.75")
+        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.5")
         combo = (int(off.combo_cards[0, 0]), int(off.combo_cards[0, 1]))
         assert off._blueprint_info_set(combo) == on._compute_info_set(combo)
         # And the non-canonicalised key differs (off-tree fraction present).
@@ -250,9 +252,9 @@ class TestCanonicalPublicKey:
 
     def test_off_tree_snaps_to_canonical_neighbour(self):
         # The off-tree (0.6) env's canonical key equals the raw key of the env
-        # that actually played the canonical neighbour (0.6 -> 0.75).
+        # that actually played the canonical neighbour (0.6 -> 0.5).
         off = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.6")
-        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.75")
+        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.5")
         assert off.canonical_public_key == on.public_key
         # The raw key still differs — the off-tree fraction is present verbatim.
         assert off.public_key != on.public_key
@@ -286,7 +288,7 @@ class TestBlueprintLookupHit:
 
     def test_for_blueprint_hits_populated_row(self):
         off = _play_to_flop_with(_stub_and_return(_env(seed=3)), "raise:0.6")
-        on = _play_to_flop_with(_stub_and_return(_env(seed=3)), "raise:0.75")
+        on = _play_to_flop_with(_stub_and_return(_env(seed=3)), "raise:0.5")
         combo = (int(off.combo_cards[0, 0]), int(off.combo_cards[0, 1]))
         r = 1
         key = on._compute_info_set(combo)

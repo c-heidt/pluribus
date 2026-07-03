@@ -547,6 +547,7 @@ class CheckpointManager:
         "prune_threshold",
         "c",
         "chunk_size",
+        "info_set_encoding",
     )
     """Hyperparameters whose values must match between the saved state
     and the current :class:`Server` for a resume to be safe.  Changing
@@ -581,6 +582,9 @@ class CheckpointManager:
             if key == "chunk_size":
                 from poker_ai.tables.chunk_store import CHUNK_SIZE
                 return CHUNK_SIZE
+            if key == "info_set_encoding":
+                from environment.poker_env import INFO_SET_ENCODING
+                return INFO_SET_ENCODING
             return getattr(self._server, "_" + key)
 
         mismatches = []

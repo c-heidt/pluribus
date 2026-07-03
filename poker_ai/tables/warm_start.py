@@ -93,6 +93,29 @@ def _validate_n_players(state_dict: dict, expected_n_players: int) -> int:
     return int(saved)
 
 
+def _validate_info_set_encoding(state_dict: dict) -> None:
+    """Assert the base blueprint uses the current info-set key encoding.
+
+    The info-set key encoding is an implicit part of the on-disk contract:
+    the LMDB index and chunk rows a warm-start copies were written under one
+    encoding, and opening them under a different one makes every lookup miss
+    (→ uniform strategy everywhere, a silent catastrophe that looks like an
+    untrained blueprint).  A ``server_state.pkl`` written before the marker
+    existed is treated as the legacy JSON encoding and rejected — unlike the
+    other structural keys, an *absent* encoding is a mismatch, not a skip.
+    """
+    from environment.poker_env import INFO_SET_ENCODING
+
+    saved = state_dict.get("info_set_encoding", "v1-json")
+    if saved != INFO_SET_ENCODING:
+        raise ValueError(
+            f"Warm-start info_set_encoding mismatch: warm_start={saved!r} "
+            f"vs current={INFO_SET_ENCODING!r}. The base blueprint's index "
+            f"and chunks were written under a different key encoding and "
+            f"cannot be reused — re-train the base under the current encoding."
+        )
+
+
 def apply_warm_start(
     save_path: Path,
     warm_start_path: Path,
@@ -137,6 +160,7 @@ def apply_warm_start(
     src_cp = _latest_checkpoint(warm_start_path)
     state_dict = joblib.load(src_cp / "server_state.pkl")
     _validate_n_players(state_dict, expected_n_players)
+    _validate_info_set_encoding(state_dict)
 
     src_lmdb = warm_start_path / "lmdb_index"
     if not src_lmdb.exists():
@@ -167,11 +191,16 @@ def apply_warm_start(
     # and skipped silently — that is how we let the user reconfigure
     # operational and bias hyperparameters without tripping the
     # structural-mismatch check.
+    from environment.poker_env import INFO_SET_ENCODING
+
     new_state = {
         "t": 0,
         "discount_active": True,
         "n_chunks_per_street": _extract_n_chunks(state_dict),
         "n_players": int(state_dict["n_players"]),
+        # Carry the (validated) encoding forward so the staged checkpoint
+        # keeps satisfying the structural-config check on later resumes.
+        "info_set_encoding": INFO_SET_ENCODING,
     }
     # Only forward chunk_size when the source actually had one — a
     # ``None`` value would trip the structural-config check in
@@ -214,6 +243,7 @@ def stage_warm_start_lmdb(
     src_cp = _latest_checkpoint(warm_start_path)
     state_dict = joblib.load(src_cp / "server_state.pkl")
     _validate_n_players(state_dict, expected_n_players)
+    _validate_info_set_encoding(state_dict)
 
     src_lmdb = warm_start_path / "lmdb_index"
     if not src_lmdb.exists():

@@ -367,11 +367,11 @@ class TestInfoSet:
         with pytest.raises(ValueError):
             _ = fresh_game.info_set
 
-    def test_info_set_returns_string_at_terminal(self, two_player_game):
+    def test_info_set_returns_bytes_at_terminal(self, two_player_game):
         env = copy.deepcopy(two_player_game); env.step_in_place("fold")
         assert env.is_terminal
         result = env.info_set
-        assert isinstance(result, str)
+        assert isinstance(result, bytes)
 
 
 # ---------------------------------------------------------------------------

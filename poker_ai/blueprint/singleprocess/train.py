@@ -168,11 +168,13 @@ def simple_search(
             warm_start_path=Path(warm_start),
             expected_n_players=n_players,
         )
+    enable_index_cache = os.environ.get("PLURIBUS_INDEX_CACHE", "1") == "1"
     tables = CFRTables(
         index_path=save_path / "lmdb_index",
         shm_dir=str(shm_dir),
         lmdb_map_size=lmdb_map_size_for_players(n_players),
         actions_per_street=MAX_ACTIONS_PER_STREET,
+        enable_index_cache=enable_index_cache,
     )
     # Only restore chunks when we actually staged the LMDB this run —
     # otherwise the loaded chunks would belong to the warm-start's
@@ -184,6 +186,9 @@ def simple_search(
             warm_start_path=Path(warm_start),
             expected_n_players=n_players,
         )
+    # Prewarm the shm index caches from LMDB now that any warm-start /
+    # resume mapping is in place (single process → no fork to precede).
+    tables.prewarm_caches()
     discount_state = DiscountState(
         duration_cycles=discount_duration_cycles,
         discount_interval=discount_interval,

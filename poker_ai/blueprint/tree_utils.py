@@ -96,7 +96,7 @@ def get_legal_actions(state: PokerState) -> List[str]:
 def get_node_strategy(
     tables: CFRTables,
     state: PokerState,
-) -> Tuple[np.ndarray, int, Dict[str, int], np.ndarray, str]:
+) -> Tuple[np.ndarray, int, Dict[str, int], np.ndarray, bytes]:
     """Compute the current mixed strategy at *state* via regret matching.
 
     Looks up the cumulative regret row for the current information set
@@ -126,11 +126,11 @@ def get_node_strategy(
     regret_row : np.ndarray
         Int32 cumulative regret vector, either the live row from the
         table or a fresh zero vector when the infoset is unseen.
-    info_set : str
+    info_set : bytes
         The information-set key used for the lookup.  Returned so
         callers that write back to the tables at the same node reuse
         it instead of re-deriving it — :attr:`PokerEnv.info_set`
-        re-serialises the full action history on every read and is
+        re-encodes the full action history on every read and is
         one of the hottest per-node costs in a traversal.
     """
     r = state.betting_round

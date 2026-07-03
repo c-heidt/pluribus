@@ -65,8 +65,9 @@ class PolicyState:
         as :attr:`PokerEnv.player_i`).
     betting_round : int
         0=pre_flop, 1=flop, 2=turn, 3=river.
-    info_set : str
-        JSON-encoded info-set key (cluster + history).
+    info_set : bytes
+        Compact binary info-set key (cluster + history); see
+        :func:`encode_info_set`.  Opaque — hashed by the index/cache.
     valid_mask : numpy.ndarray
         Boolean mask over the canonical action set; immutable.
     legal_actions : tuple[str, ...]
@@ -76,7 +77,7 @@ class PolicyState:
 
     player_i: int
     betting_round: int
-    info_set: str
+    info_set: bytes
     valid_mask: np.ndarray
     legal_actions: Tuple[str, ...]
 
@@ -176,12 +177,12 @@ class _NumpyJSONEncoder(json.JSONEncoder):
 # axis to give up.
 RAISE_SIZES_BY_STAGE: Dict[str, Dict[str, List[float]]] = {
     "pre_flop": {
-        "first_raise":      [0.5, 1.0, 2.0, 3.0],
-        "subsequent_raise": [1.0, 2.0],
+        "first_raise":      [0.5, 1.0, 1.5, 2.0, 3.0],
+        "subsequent_raise": [0.5, 1.0, 1.5],
     },
     "flop": {
-        "first_raise":      [0.33, 0.75, 1.5],
-        "subsequent_raise": [1.0],
+        "first_raise":      [0.5, 0.75, 1.0, 1.5],
+        "subsequent_raise": [0.5, 1.0],
     },
     "turn": {
         "first_raise":      [0.5, 1.0],
@@ -194,6 +195,122 @@ RAISE_SIZES_BY_STAGE: Dict[str, Dict[str, List[float]]] = {
 }
 
 MAX_RAISES_PER_ROUND: int = 3
+
+
+# ---------------------------------------------------------------------------
+# Compact info-set key encoding (v2)
+# ---------------------------------------------------------------------------
+# The info-set key is an opaque hash pre-image everywhere it is consumed
+# (it is immediately fed to xxh3-128 by the LMDB index / shm cache; no
+# consumer parses it in the CFR or search hot loop).  Historically it was
+# ``json.dumps({"cards_cluster": C, "history": H})``, rebuilt from scratch
+# at every visited node — an O(history) list rebuild + JSON encode per node,
+# i.e. O(depth^2) per traversal and one of the two dominant inner-loop
+# costs.  ``encode_info_set`` replaces that with an injective, compact
+# ``bytes`` encoding built with single-byte appends.
+#
+# Injectivity: ``varint(cluster)`` then, per stage in play order,
+# ``STAGE_ID`` byte + ``varint(len(actions))`` (frames the block) + one
+# alphabet byte per action token.  The length prefix makes each stage block
+# uniquely decodable, so distinct ``(cluster, history)`` map to distinct
+# bytes.
+#
+# Canonicalisation equivalence (the load-bearing inference invariant): an
+# off-tree ``raise:<f>`` and its on-tree pseudo-harmonic neighbour must map
+# to the SAME key so a blueprint lookup on an off-tree line hits the row
+# on-tree play wrote.  This holds by construction because
+# ``get_canonical_actions``, ``_get_available_raise_sizes`` and
+# ``_canonicalize_history`` all format raises via the identical
+# ``f"raise:{f}"`` over the same ``RAISE_SIZES_BY_STAGE`` floats — so the
+# canonicalised token string equals the on-tree token string and hits the
+# same alphabet byte.  ``_blueprint_info_set`` therefore differs from
+# ``_compute_info_set`` only in passing ``_canonicalize_history(...)``.
+INFO_SET_ENCODING: str = "v2-compact-bytes"
+"""Version tag for the info-set key encoding.
+
+Persisted in ``server_state.pkl`` and checked as a structural key on
+resume / warm-start so a blueprint written under a different encoding can
+never be silently opened under this one (every lookup would miss → uniform
+strategy everywhere, a silent catastrophe that looks like "untrained").
+"""
+
+_STAGE_ID: Dict[str, int] = {"pre_flop": 0, "flop": 1, "turn": 2, "river": 3}
+_RAW_TOKEN_MARK: int = 0xFF
+"""Prefix for a token absent from the per-stage alphabet — a length-framed
+raw-bytes fallback that keeps the encoding injective (and crash-free) if the
+action grid ever drifts.  Never fires for a valid canonicalised token."""
+
+_INFO_SET_DEFAULT: bytes = b"\x00__default__"
+"""Sentinel key returned when the hole+board is missing from the LUT at a
+terminal / show-down node (mirrors the old JSON sentinel string)."""
+
+
+def _canonical_action_tokens(stage: str) -> List[str]:
+    """Canonical action tokens for ``stage`` (mirrors ``get_canonical_actions``).
+
+    Built from :data:`RAISE_SIZES_BY_STAGE` with the identical ordering and
+    ``f"raise:{f}"`` formatting used by
+    :meth:`PokerEnv.get_canonical_actions`; a unit test asserts the two agree
+    so the alphabet can never silently drift from the canonical action set.
+    """
+    cfg = RAISE_SIZES_BY_STAGE[stage]
+    fracs = sorted(
+        set(cfg.get("first_raise", [])) | set(cfg.get("subsequent_raise", []))
+    )
+    return ["fold", "call", "all_in"] + [f"raise:{f}" for f in fracs]
+
+
+# Per-stage ``token -> 1-byte code``.  ``"skip"`` reserved as 0; canonical
+# actions occupy 1..k (k <= 3 + len(grid), always one byte).
+_ACTION_BYTE: Dict[str, Dict[str, int]] = {
+    stage: {"skip": 0, **{a: i + 1 for i, a in enumerate(_canonical_action_tokens(stage))}}
+    for stage in _STAGE_ID
+}
+
+
+def _put_uvarint(buf: bytearray, value: int) -> None:
+    """Append ``value`` (a non-negative int) to ``buf`` as unsigned LEB128."""
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"info-set varint requires non-negative, got {value}")
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            buf.append(byte | 0x80)
+        else:
+            buf.append(byte)
+            return
+
+
+def encode_info_set(cluster: int, history_items) -> bytes:
+    """Return the compact injective ``bytes`` key for ``(cluster, history)``.
+
+    Parameters
+    ----------
+    cluster : int
+        Card-cluster id for the acting hand (from the LUT).
+    history_items : Iterable[tuple[str, Sequence[str]]]
+        ``(stage, actions)`` pairs in play order — typically
+        ``self._history.items()`` (raw) or
+        ``self._canonicalize_history(self._history)`` (blueprint lookups).
+    """
+    buf = bytearray()
+    _put_uvarint(buf, int(cluster))
+    for stage, actions in history_items:
+        buf.append(_STAGE_ID[stage])
+        _put_uvarint(buf, len(actions))
+        table = _ACTION_BYTE[stage]
+        for token in actions:
+            code = table.get(token)
+            if code is None:
+                raw = str(token).encode("utf-8")
+                buf.append(_RAW_TOKEN_MARK)
+                _put_uvarint(buf, len(raw))
+                buf += raw
+            else:
+                buf.append(code)
+    return bytes(buf)
 
 
 # ---------------------------------------------------------------------------
@@ -1474,13 +1591,13 @@ class PokerEnv:
             actions += sorted(a for a in overlay if a not in seen)
         return actions
 
-    def _compute_info_set(self, cards: Sequence[int]) -> str:
-        """Build the info-set string for the current actor under ``cards``.
+    def _compute_info_set(self, cards: Sequence[int]) -> bytes:
+        """Build the compact info-set key for the current actor under ``cards``.
 
         Factored out of :attr:`info_set` so :meth:`policy_state_for`
         can compute the info-set under a *hypothetical* hole without
         reading any seat's actual cards — the leak-free path used by
-        a future ``sigma_for_combo`` driver.
+        the ``sigma_for_combo`` driver.
 
         Parameters
         ----------
@@ -1490,8 +1607,9 @@ class PokerEnv:
 
         Returns
         -------
-        str
-            JSON info-set key, identical in format to :attr:`info_set`.
+        bytes
+            Compact info-set key (see :func:`encode_info_set`), identical
+            in format to :attr:`info_set`.
 
         Raises
         ------
@@ -1505,17 +1623,8 @@ class PokerEnv:
         except KeyError:
             if self._betting_stage not in {"terminal", "show_down"}:
                 raise ValueError("Cards missing from LUT — load it correctly.")
-            return "default info set, please ensure you load it correctly"
-        info_set_dict = {
-            "cards_cluster": cards_cluster,
-            "history": [
-                {stage: list(actions)}
-                for stage, actions in self._history.items()
-            ],
-        }
-        return json.dumps(
-            info_set_dict, separators=(",", ":"), cls=_NumpyJSONEncoder
-        )
+            return _INFO_SET_DEFAULT
+        return encode_info_set(cards_cluster, self._history.items())
 
     def _canonicalize_history(
         self, history: "Mapping[str, Sequence[str]]"
@@ -1534,7 +1643,7 @@ class PokerEnv:
         Strict no-op when every raise is already on-tree (the universal
         offline case): the returned ``(stage, actions)`` pairs preserve
         ``history`` order and content, so :meth:`_blueprint_info_set`
-        produces a string byte-identical to :meth:`_compute_info_set`.
+        produces a key byte-identical to :meth:`_compute_info_set`.
         """
         out: List[Tuple[str, List[str]]] = []
         for stage, actions in history.items():
@@ -1563,7 +1672,7 @@ class PokerEnv:
             out.append((stage, rewritten))
         return out
 
-    def _blueprint_info_set(self, cards: Sequence[int]) -> str:
+    def _blueprint_info_set(self, cards: Sequence[int]) -> bytes:
         """Like :meth:`_compute_info_set`, but with the action history
         canonicalised (off-tree raises snapped to the nearest on-tree
         node via deterministic pseudo-harmonic translation) so a
@@ -1571,7 +1680,9 @@ class PokerEnv:
 
         A strict no-op versus :meth:`_compute_info_set` whenever the
         history contains no off-tree raises (see
-        :meth:`_canonicalize_history`).
+        :meth:`_canonicalize_history`) — the canonicalised tokens are
+        byte-identical to the on-tree ones and hit the same alphabet
+        bytes, so the two keys are equal.
         """
         lookup_cards = tuple(sorted(cards) + sorted(self.community_cards))
         try:
@@ -1579,31 +1690,51 @@ class PokerEnv:
         except KeyError:
             if self._betting_stage not in {"terminal", "show_down"}:
                 raise ValueError("Cards missing from LUT — load it correctly.")
-            return "default info set, please ensure you load it correctly"
-        info_set_dict = {
-            "cards_cluster": cards_cluster,
-            "history": [
-                {stage: list(actions)}
-                for stage, actions in self._canonicalize_history(self._history)
-            ],
-        }
-        return json.dumps(
-            info_set_dict, separators=(",", ":"), cls=_NumpyJSONEncoder
+            return _INFO_SET_DEFAULT
+        return encode_info_set(
+            cards_cluster, self._canonicalize_history(self._history)
         )
 
+    def info_set_fields(
+        self, cards: Optional[Sequence[int]] = None
+    ) -> Optional[Tuple[int, List[Tuple[str, List[str]]]]]:
+        """Structured view of the info-set: ``(cluster, [(stage, actions), ...])``.
+
+        The pre-encoding fields behind :attr:`info_set` / :meth:`_compute_info_set`,
+        exposed for human-readable dumps and tests that previously parsed the
+        JSON key (the key itself is now opaque compact :func:`encode_info_set`
+        ``bytes``).  ``cards`` defaults to the current actor's hole.  Returns
+        ``None`` at a terminal / show-down node whose hole+board is missing
+        from the LUT (the case :meth:`_compute_info_set` maps to
+        :data:`_INFO_SET_DEFAULT`).
+        """
+        if cards is None:
+            cards = self.current_player._cards
+        lookup_cards = tuple(sorted(cards) + sorted(self.community_cards))
+        try:
+            cluster = int(self.card_info_lut[self._betting_stage][lookup_cards])
+        except KeyError:
+            if self._betting_stage not in {"terminal", "show_down"}:
+                raise ValueError("Cards missing from LUT — load it correctly.")
+            return None
+        history = [(stage, list(actions)) for stage, actions in self._history.items()]
+        return cluster, history
+
     @property
-    def info_set(self) -> str:
-        """JSON-encoded information set string for the current player.
+    def info_set(self) -> bytes:
+        """Compact binary information-set key for the current player.
 
         The information set captures everything the current player
         knows: the card cluster for their hole cards and the community
         cards, plus the full action history for all betting stages.
-        Used as the key into the CFR strategy tables.
+        Used as the (opaque, hashed) key into the CFR strategy tables.
+        See :func:`encode_info_set`; use :meth:`info_set_fields` for a
+        human-readable structured view.
 
         Returns
         -------
-        str
-            JSON string with ``"cards_cluster"`` and ``"history"`` keys.
+        bytes
+            Compact key encoding ``(cards_cluster, history)``.
 
         Raises
         ------

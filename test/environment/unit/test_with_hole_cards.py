@@ -111,9 +111,11 @@ class TestWithHoleCards:
         info_before = env.info_set
         new_env = env.with_hole_cards(_holes_with(env, env.player_i, replacement))
         info_after = new_env.info_set
+        # info_set is now an opaque compact key; the cluster is exposed via
+        # the structured accessor instead of a parseable JSON substring.
         assert info_before != info_after
-        assert '"cards_cluster":111' in info_before
-        assert '"cards_cluster":222' in info_after
+        assert env.info_set_fields()[0] == 111
+        assert new_env.info_set_fields()[0] == 222
 
 
 class TestValidation:

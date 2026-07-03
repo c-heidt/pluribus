@@ -14,7 +14,7 @@
 #SBATCH --ntasks=1
 #SBATCH --time=72:00:00
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=50000mb
+#SBATCH --mem=100000mb
 #SBATCH --signal=SIGTERM@300
 #SBATCH --mail-type=All
 
@@ -31,13 +31,13 @@ fi
 
 # Training parameters (cycle-based options are counted in sync cycles = N * sync_interval iterations)
 N_PLAYERS=${N_PLAYERS:-6}
-MAX_RUNTIME_HOURS=${MAX_RUNTIME_HOURS:-71.5}
+MAX_RUNTIME_HOURS=${MAX_RUNTIME_HOURS:-71.5} 
 SYNC_INTERVAL=${SYNC_INTERVAL:-500}
 DISCOUNT_INTERVAL=${DISCOUNT_INTERVAL:-50}
 DISCOUNT_DURATION_CYCLES=${DISCOUNT_DURATION_CYCLES:-2000}
 UPDATE_THRESHOLD=${UPDATE_THRESHOLD:-200}
 STRATEGY_INTERVAL=${STRATEGY_INTERVAL:-5}
-CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-150}
+CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-200}
 PRUNE_THRESHOLD=${PRUNE_THRESHOLD:-500000}
 C=${C:--300000000}
 PICKLE_DIR=${PICKLE_DIR:-false}
@@ -66,6 +66,17 @@ export PLURIBUS_CFR_BATCH_SIZE=${PLURIBUS_CFR_BATCH_SIZE:-5}
 # average-strategy table.
 export PLURIBUS_STRATEGY_BATCH_SIZE=${PLURIBUS_STRATEGY_BATCH_SIZE:-128}
 export PLURIBUS_CHUNK_SIZE=${PLURIBUS_CHUNK_SIZE:-4000000}
+# Shared-memory index cache: serves the per-node info-set lookup from shm
+# instead of an LMDB read txn (the dominant inner-loop cost).  Capacities are
+# per-street SLOT counts (pre_flop,flop,turn,river), each 24 bytes; a street
+# holds up to capacity*0.5 infosets before it overflows.  These MUST cover the
+# run's saturation — the mmap cannot grow once workers fork, so an undersized
+# street fails LOUDLY and early (before real compute is spent), telling you to
+# raise the value and restart.  The chosen sizes are persisted in the
+# checkpoint so a resume reuses them.  Defaults ≈ 21 GiB of shm; raise --mem
+# accordingly (chunk tables need the rest of RAM).
+export PLURIBUS_INDEX_CACHE=${PLURIBUS_INDEX_CACHE:-1}
+export PLURIBUS_INDEX_CAPACITY=${PLURIBUS_INDEX_CAPACITY:-"67108864,268435456,268435456,268435456"}
 
 mkdir -p "$PROJECT_DIR/logs"
 mkdir -p "$(dirname "$NICKNAME")"
@@ -166,6 +177,8 @@ echo "  - Warm start:                  ${WARM_START:-(none)}"
 echo "  - CPUs:                        $SLURM_CPUS_PER_TASK"
 echo "  - PLURIBUS_CFR_BATCH_SIZE:     $PLURIBUS_CFR_BATCH_SIZE"
 echo "  - PLURIBUS_STRATEGY_BATCH_SIZE:$PLURIBUS_STRATEGY_BATCH_SIZE"
+echo "  - PLURIBUS_INDEX_CACHE:        $PLURIBUS_INDEX_CACHE"
+echo "  - PLURIBUS_INDEX_CAPACITY:     $PLURIBUS_INDEX_CAPACITY"
 echo "  - PLURIBUS_CHUNK_SIZE:         $PLURIBUS_CHUNK_SIZE"
 echo "  - STAGE_LUT_LOCALLY:           $STAGE_LUT_LOCALLY"
 echo "  - STAGE_LMDB_LOCALLY:          $STAGE_LMDB_LOCALLY"
