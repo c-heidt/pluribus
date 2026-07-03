@@ -293,7 +293,7 @@ def _traverse(
     if not legal_actions:
         return float(state.payout[i])
 
-    sigma, r, a_to_i, regret_row = get_node_strategy(tables, state)
+    sigma, r, a_to_i, regret_row, info_set = get_node_strategy(tables, state)
 
     if state.player_i == i:
         # Traversing player: iterate over explore_fn-filtered actions.
@@ -313,13 +313,13 @@ def _traverse(
             if _debug:
                 log.debug(
                     "Added to Node EV for ACTION: %s INFOSET: %s\nSTRATEGY: %s: %s",
-                    action, state.info_set,
+                    action, info_set,
                     sigma[a_to_i[action]], sigma[a_to_i[action]] * voa[action],
                 )
         if _debug:
-            log.debug("Updated EV at %s: %s", state.info_set, vo)
+            log.debug("Updated EV at %s: %s", info_set, vo)
         # Only explored actions (those in voa) receive regret updates.
-        accumulate_regrets(local_delta, r, state.info_set, voa, vo, a_to_i)
+        accumulate_regrets(local_delta, r, info_set, voa, vo, a_to_i)
         return vo
     else:
         # Opponent node: external sampling — descend one sampled branch.
@@ -376,7 +376,7 @@ def _traverse_biased(
     if not legal_actions:
         return float(state.payout[i]) + bias_magnitude * bias_count
 
-    sigma, r, a_to_i, regret_row = get_node_strategy(tables, state)
+    sigma, r, a_to_i, regret_row, info_set = get_node_strategy(tables, state)
 
     if state.player_i == i:
         vo = 0.0
@@ -394,7 +394,7 @@ def _traverse_biased(
             )
             state.undo(token)
             vo += sigma[a_to_i[action]] * voa[action]
-        accumulate_regrets(local_delta, r, state.info_set, voa, vo, a_to_i)
+        accumulate_regrets(local_delta, r, info_set, voa, vo, a_to_i)
         return vo
     else:
         action = sample_action(legal_actions, sigma, a_to_i)

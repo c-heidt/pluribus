@@ -9,11 +9,12 @@ regrets) — slots into the same ABC once the solver in §6.5 lands.
 
 The four §4 continuation strategies are not separate artifacts: they are
 inference-time reweightings of the single base blueprint.  The base
-distribution σ is computed by regret matching; the biased variants
-multiply the probability of one action class by ``bias_multiplier`` (5)
-and renormalize.  All implementations share the same bias-mask and
-reweighting helpers; the only per-implementation logic is *where the
-regret row comes from*.
+distribution σ is the blueprint's normalised *average strategy* (with a
+regret-matching fallback for under-sampled rows — see
+:class:`BlueprintPolicy`); the biased variants multiply the probability
+of one action class by ``bias_multiplier`` (5) and renormalize.  All
+implementations share the same bias-mask and reweighting helpers; the
+only per-implementation logic is *where the base row comes from*.
 """
 
 from __future__ import annotations
@@ -136,12 +137,20 @@ class Policy(ABC):
 
 
 class BlueprintPolicy(Policy):
-    """Reads the regret row for ``state.info_set`` from a base blueprint.
+    """Reads the blueprint strategy for ``state.info_set`` from a base blueprint.
 
-    The base distribution σ is computed by regret matching; the §4
-    continuation variants multiply the requested action class's
-    probability by ``bias_multiplier`` and renormalize at query time.
-    A single blueprint on disk backs all four variants.
+    The base distribution σ is the blueprint's **average strategy** —
+    the normalised visit counts accumulated by the strategy-sampling
+    traversal (:mod:`poker_ai.blueprint.strategy`).  In CFR only the
+    time-averaged strategy converges to equilibrium; the per-iteration
+    regret-matched strategy oscillates and tends toward near-pure
+    play, so it is used only as a *fallback* for infosets whose
+    average-strategy row carries too little visit mass to be a
+    meaningful estimate (fewer than ``min_strategy_mass`` visits over
+    the legal actions).  The §4 continuation variants multiply the
+    requested action class's probability by ``bias_multiplier`` and
+    renormalize at query time.  A single blueprint on disk backs all
+    four variants.
 
     Parameters
     ----------
@@ -151,11 +160,25 @@ class BlueprintPolicy(Policy):
         Reweighting factor applied to the biased action class; only
         takes effect when :meth:`strategy` is called with
         ``bias != "none"`` (§4 uses 5.0).
+    min_strategy_mass : int
+        Minimum visit mass over the *legal* actions for the
+        average-strategy row to be trusted.  A row visited once is a
+        single categorical sample — reading it verbatim yields a pure
+        action drawn from one early training iterate, which is worse
+        than regret matching over the (much more heavily updated)
+        regret row.  Below this threshold the policy falls back to
+        regret matching.
     """
 
-    def __init__(self, tables: CFRTables, bias_multiplier: float = 5.0) -> None:
+    def __init__(
+        self,
+        tables: CFRTables,
+        bias_multiplier: float = 5.0,
+        min_strategy_mass: int = 10,
+    ) -> None:
         self._tables = tables
         self._bias_multiplier = float(bias_multiplier)
+        self._min_strategy_mass = int(min_strategy_mass)
 
     def reopen_after_fork(self) -> None:
         """Reopen the backing blueprint LMDB indexes in a forked process.
@@ -171,10 +194,15 @@ class BlueprintPolicy(Policy):
 
     def strategy(self, state: PolicyState, bias: BiasClass = "none") -> np.ndarray:
         r = state.betting_round
-        regret_row = self._tables.regret[r].get_row_if_exists(state.info_set)
-        if regret_row is None:
-            regret_row = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
-        sigma = calculate_strategy_from_row(regret_row, state.valid_mask)
+        sigma = self._average_strategy(r, state)
+        if sigma is None:
+            # Fallback: regret-match the cumulative regret row (the
+            # pre-fix behaviour) when the average strategy has no
+            # trustworthy estimate for this infoset.
+            regret_row = self._tables.regret[r].get_row_if_exists(state.info_set)
+            if regret_row is None:
+                regret_row = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
+            sigma = calculate_strategy_from_row(regret_row, state.valid_mask)
         bias_mask = self._bias_mask(CANONICAL_ACTIONS[r], bias)
         full = self._reweight_bias(sigma, bias_mask, self._bias_multiplier)
         legal = state.legal_actions
@@ -199,6 +227,28 @@ class BlueprintPolicy(Policy):
         else:
             probs[:] = 1.0 / len(legal)
         return probs
+
+    def _average_strategy(
+        self, r: int, state: PolicyState
+    ) -> "np.ndarray | None":
+        """Normalised average-strategy row, or ``None`` if not trustworthy.
+
+        Masks the visit-count row to the legal actions before both the
+        mass check and the normalisation, so counts recorded for
+        actions that are illegal at *this* node (the strategy tables
+        are keyed by info set, which on later streets can admit
+        different legal sets across stack configurations) never leak
+        probability.
+        """
+        row = self._tables.strategy[r].get_row_if_exists(state.info_set)
+        if row is None:
+            return None
+        masked = row.astype(np.float32)
+        masked[~state.valid_mask] = 0.0
+        total = float(masked.sum())
+        if total < self._min_strategy_mass:
+            return None
+        return masked / total
 
 
 class SearchPolicy:

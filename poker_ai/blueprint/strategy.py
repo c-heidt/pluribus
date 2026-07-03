@@ -83,12 +83,12 @@ def update_strategy(
     if not legal_actions:
         return
 
-    sigma, r, a_to_i, _ = get_node_strategy(tables, state)
+    sigma, r, a_to_i, _, info_set = get_node_strategy(tables, state)
     action = sample_action(legal_actions, sigma, a_to_i)
 
     if state.player_i == i:
         log.debug("ACTION SAMPLED: ph %s ACTION: %s", state.player_i, action)
-        tables.strategy[r].update_row(state.info_set, a_to_i[action], 1)
+        tables.strategy[r].update_row(info_set, a_to_i[action], 1)
 
     # Single sampled action: descend in place and restore on the way back,
     # so this function leaves its ``state`` argument unchanged (the same

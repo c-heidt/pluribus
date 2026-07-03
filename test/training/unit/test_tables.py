@@ -380,10 +380,25 @@ class TestChunkedTableDiscount:
             cfr_tables.regret[0].get_row(f"disc_is_{k}")[:] = initial
         cfr_tables.apply_discount(0.5)
         for k in range(3):
-            expected = [int(v * 0.5) for v in initial]
+            # Discounting rounds to nearest (rint) rather than
+            # truncating toward zero — truncation would bleed ~0.5 per
+            # entry per application, which zeroes unit-scale strategy
+            # counts.
+            expected = np.rint(np.array(initial, dtype=np.float32) * 0.5)
             np.testing.assert_array_equal(
                 cfr_tables.regret[0].get_row(f"disc_is_{k}"), expected
             )
+
+    def test_small_strategy_counts_survive_mild_discount(self, cfr_tables):
+        """A visit count of 1 must survive a late-window discount factor.
+
+        With truncation, ``int(1 * 0.9) == 0`` erased every count
+        written since the previous discount application; rounding keeps
+        it alive (regression test for the strategy-mass wipe-out).
+        """
+        cfr_tables.strategy[0].get_row("tiny_mass")[:] = 1
+        cfr_tables.apply_discount(0.9)
+        assert np.all(cfr_tables.strategy[0].get_row("tiny_mass") == 1)
 
     def test_regret_floor_applied(self, cfr_tables):
         row = cfr_tables.regret[0].get_row("floor_is_0")

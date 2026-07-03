@@ -124,6 +124,7 @@ class Server:
         start_timestep: int = 0,
         n_processes: Optional[int] = None,
         batch_size: Optional[int] = None,
+        strategy_batch_size: Optional[int] = None,
         bias: BiasClass = "none",
         bias_magnitude: float = 0.0,
         warm_start: Optional[Union[str, Path]] = None,
@@ -192,6 +193,21 @@ class Server:
             pressure at the cost of longer per-job wall time.
             Defaults to the ``PLURIBUS_CFR_BATCH_SIZE`` environment
             variable if set, else ``5``.
+        strategy_batch_size : int, optional
+            Number of strategy-sampling traversals executed per
+            ``update_strategy`` queue item.  Each strategy-update
+            firing dispatches ``workers_per_player`` such items per
+            player, so the average-strategy table receives
+            ``workers_per_player * strategy_batch_size`` sampled
+            playthroughs per player per firing instead of one.  A
+            single playthrough is orders of magnitude cheaper than a
+            CFR traversal (one sampled line, no branching), so a large
+            batch here is close to free relative to the CFR work
+            between firings — and without it the average-strategy
+            table accumulates only a few visit counts per firing,
+            which can never populate a full-size blueprint.  Defaults
+            to the ``PLURIBUS_STRATEGY_BATCH_SIZE`` environment
+            variable if set, else ``128``.
         """
         # Install a minimal SIGTERM/SIGINT handler immediately so a
         # signal that arrives during the slow startup phases (LUT
@@ -223,6 +239,16 @@ class Server:
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         self._batch_size = batch_size
+
+        if strategy_batch_size is None:
+            strategy_batch_size = int(
+                os.environ.get("PLURIBUS_STRATEGY_BATCH_SIZE", 128)
+            )
+        if strategy_batch_size < 1:
+            raise ValueError(
+                f"strategy_batch_size must be >= 1, got {strategy_batch_size}"
+            )
+        self._strategy_batch_size = strategy_batch_size
 
         # workers_per_player saturates the worker pool: every worker
         # processes one queue item at a time regardless of batch_size,
@@ -362,8 +388,10 @@ class Server:
            job so workers flush their accumulated deltas, then
            re-drains the queue.
         3. At sync barriers that satisfy the strategy-interval
-           schedule, dispatches one ``update_strategy`` job per
-           player and waits for them all to complete.
+           schedule, dispatches ``workers_per_player`` batched
+           ``update_strategy`` jobs per player (each running
+           ``strategy_batch_size`` sampled playthroughs) and waits
+           for them all to complete.
         4. At sync barriers that satisfy the discount schedule,
            applies an LCFR discount to the shared tables.
         5. At sync barriers that satisfy the checkpoint schedule,
@@ -420,8 +448,18 @@ class Server:
                     if should_update_strategy(
                         sync_step, self._strategy_interval, self._update_threshold
                     ):
+                        # Saturate the pool exactly like the cfr dispatch:
+                        # workers_per_player batched jobs per player.  One
+                        # sampled playthrough per player per firing (the
+                        # old behaviour) starves the average-strategy
+                        # table — see ``strategy_batch_size`` in __init__.
                         for i in range(self._n_players):
-                            self._send_job("update_strategy", i=i)
+                            for _ in range(self._workers_per_player):
+                                self._send_job(
+                                    "update_strategy",
+                                    i=i,
+                                    batch=self._strategy_batch_size,
+                                )
                         self._join_queue()
                         if sigterm.is_set():
                             break

@@ -160,24 +160,25 @@ class TestCanonicalizeHistory:
         ]
 
     def test_off_tree_raise_snaps_deterministically(self):
-        # flop first_raise grid [0.33,0.5,0.75,1.0,1.5,2.0]; 0.6 -> A=0.5
-        # (P_A=0.5625 >= 0.5).
+        # flop first_raise grid [0.33,0.75,1.5]; 0.6 in (0.33, 0.75):
+        # P_A = ((0.75-0.6)(1+0.33)) / ((0.75-0.33)(1+0.6)) ≈ 0.297 < 0.5
+        # -> B = 0.75.
         env = _env()
         out = env._canonicalize_history({"flop": ["raise:0.6"]})
-        assert out == [("flop", ["raise:0.5"])]
+        assert out == [("flop", ["raise:0.75"])]
 
     def test_raise_index_advances_to_subsequent_grid(self):
         # 0.33 is in flop first_raise but NOT in subsequent_raise
-        # ([0.5,0.75,1.0,1.5]); so the 2nd raise's 0.33 is off-tree and
-        # snaps (below-grid -> 0.5), proving the index advanced.
+        # ([1.0]); so the 2nd raise's 0.33 is off-tree and snaps
+        # (below-grid -> 1.0), proving the index advanced.
         env = _env()
         out = env._canonicalize_history({"flop": ["raise:0.33", "raise:0.33"]})
-        assert out == [("flop", ["raise:0.33", "raise:0.5"])]
+        assert out == [("flop", ["raise:0.33", "raise:1.0"])]
 
     def test_all_in_advances_raise_index(self):
         env = _env()
         out = env._canonicalize_history({"flop": ["all_in", "raise:0.33"]})
-        assert out == [("flop", ["all_in", "raise:0.5"])]
+        assert out == [("flop", ["all_in", "raise:1.0"])]
 
     def test_fold_call_skip_pass_through(self):
         env = _env()
@@ -207,15 +208,15 @@ class TestBlueprintInfoSet:
     def test_no_op_equals_compute_info_set_on_tree(self):
         env = _env()
         _stub_lut(env)
-        _play_to_flop_with(env, "raise:0.5")  # on-tree
+        _play_to_flop_with(env, "raise:0.75")  # on-tree
         combo = (int(env.combo_cards[0, 0]), int(env.combo_cards[0, 1]))
         assert env._blueprint_info_set(combo) == env._compute_info_set(combo)
 
     def test_off_tree_resolves_to_on_tree_key(self):
         # An off-tree raise:0.6 flop history must yield the SAME blueprint
-        # key as the env where the canonical neighbour (0.5) was played.
+        # key as the env where the canonical neighbour (0.75) was played.
         off = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.6")
-        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.5")
+        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.75")
         combo = (int(off.combo_cards[0, 0]), int(off.combo_cards[0, 1]))
         assert off._blueprint_info_set(combo) == on._compute_info_set(combo)
         # And the non-canonicalised key differs (off-tree fraction present).
@@ -244,14 +245,14 @@ class TestCanonicalPublicKey:
     subgame the solver built."""
 
     def test_no_op_on_tree(self):
-        env = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.5")
+        env = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.75")
         assert env.canonical_public_key == env.public_key
 
     def test_off_tree_snaps_to_canonical_neighbour(self):
         # The off-tree (0.6) env's canonical key equals the raw key of the env
-        # that actually played the canonical neighbour (0.6 -> 0.5).
+        # that actually played the canonical neighbour (0.6 -> 0.75).
         off = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.6")
-        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.5")
+        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.75")
         assert off.canonical_public_key == on.public_key
         # The raw key still differs — the off-tree fraction is present verbatim.
         assert off.public_key != on.public_key
@@ -271,6 +272,11 @@ class _KeyedTable:
 class _KeyedTables:
     def __init__(self, rows_by_round):
         self.regret = {r: t for r, t in rows_by_round.items()}
+        # No average-strategy rows: every lookup misses, so the policy
+        # exercises its regret-matching fallback (what these tests target).
+        self.strategy = {
+            r: _KeyedTable(None, None) for r in rows_by_round
+        }
 
 
 class TestBlueprintLookupHit:
@@ -280,7 +286,7 @@ class TestBlueprintLookupHit:
 
     def test_for_blueprint_hits_populated_row(self):
         off = _play_to_flop_with(_stub_and_return(_env(seed=3)), "raise:0.6")
-        on = _play_to_flop_with(_stub_and_return(_env(seed=3)), "raise:0.5")
+        on = _play_to_flop_with(_stub_and_return(_env(seed=3)), "raise:0.75")
         combo = (int(off.combo_cards[0, 0]), int(off.combo_cards[0, 1]))
         r = 1
         key = on._compute_info_set(combo)

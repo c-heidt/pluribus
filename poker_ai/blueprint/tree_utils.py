@@ -96,7 +96,7 @@ def get_legal_actions(state: PokerState) -> List[str]:
 def get_node_strategy(
     tables: CFRTables,
     state: PokerState,
-) -> Tuple[np.ndarray, int, Dict[str, int], np.ndarray]:
+) -> Tuple[np.ndarray, int, Dict[str, int], np.ndarray, str]:
     """Compute the current mixed strategy at *state* via regret matching.
 
     Looks up the cumulative regret row for the current information set
@@ -126,6 +126,12 @@ def get_node_strategy(
     regret_row : np.ndarray
         Int32 cumulative regret vector, either the live row from the
         table or a fresh zero vector when the infoset is unseen.
+    info_set : str
+        The information-set key used for the lookup.  Returned so
+        callers that write back to the tables at the same node reuse
+        it instead of re-deriving it — :attr:`PokerEnv.info_set`
+        re-serialises the full action history on every read and is
+        one of the hottest per-node costs in a traversal.
     """
     r = state.betting_round
     legal_actions = get_legal_actions(state)
@@ -133,14 +139,15 @@ def get_node_strategy(
     legal_set = set(legal_actions)
     valid_mask = np.array([a in legal_set for a in canonical], dtype=bool)
 
-    row = tables.regret[r].get_row_if_exists(state.info_set)
+    info_set = state.info_set
+    row = tables.regret[r].get_row_if_exists(info_set)
     regret_row = (
         row if row is not None
         else np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
     )
     sigma = calculate_strategy_from_row(regret_row, valid_mask)
     a_to_i = ACTION_TO_IDX[r]
-    return sigma, r, a_to_i, regret_row
+    return sigma, r, a_to_i, regret_row, info_set
 
 
 def sample_action(

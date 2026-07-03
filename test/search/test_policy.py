@@ -105,10 +105,20 @@ class _FakeTable:
 
 
 class _FakeTables:
-    """Stand-in for CFRTables; only exposes ``regret[r]``."""
+    """Stand-in for CFRTables exposing ``regret[r]`` and ``strategy[r]``.
 
-    def __init__(self, rows_by_round):
+    ``strategy_rows_by_round`` defaults to no strategy rows at all, so
+    tests built around regret matching exercise the policy's fallback
+    path unchanged.
+    """
+
+    def __init__(self, rows_by_round, strategy_rows_by_round=None):
         self.regret = {r: _FakeTable(row) for r, row in rows_by_round.items()}
+        strategy_rows_by_round = strategy_rows_by_round or {}
+        self.strategy = {
+            r: _FakeTable(strategy_rows_by_round.get(r))
+            for r in rows_by_round
+        }
 
 
 def _state(betting_round, legal_actions, info_set="X", player_i=0):
@@ -222,6 +232,81 @@ class TestBlueprintPolicy:
         )
         expected /= expected.sum()
         np.testing.assert_allclose(sigma, expected, atol=1e-6)
+
+
+class TestBlueprintPolicyAverageStrategy:
+    """The blueprint's base σ is the normalised average strategy; the
+    regret-matched strategy is only a fallback for rows whose visit
+    mass over legal actions is below ``min_strategy_mass``."""
+
+    def test_reads_average_strategy_when_mass_sufficient(self):
+        r = 1
+        legal = _legal_for(r)
+        state = _state(r, legal)
+        # Regrets would concentrate on legal[0]; the strategy table
+        # instead holds a mixed 3:1 count on the first two legal
+        # actions and must win.
+        regret_row = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
+        regret_row[ACTION_TO_IDX[r][legal[0]]] = 100
+        strat_row = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
+        strat_row[ACTION_TO_IDX[r][legal[0]]] = 30
+        strat_row[ACTION_TO_IDX[r][legal[1]]] = 10
+        tables = _FakeTables({r: regret_row}, {r: strat_row})
+        sigma = BlueprintPolicy(tables, min_strategy_mass=10).strategy(state)
+        assert sigma[0] == pytest.approx(0.75)
+        assert sigma[1] == pytest.approx(0.25)
+        np.testing.assert_allclose(sigma[2:], 0.0)
+
+    def test_falls_back_to_regret_matching_below_mass_threshold(self):
+        r = 1
+        legal = _legal_for(r)
+        state = _state(r, legal)
+        regret_row = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
+        regret_row[ACTION_TO_IDX[r][legal[0]]] = 100
+        # A single visit — one categorical sample — must not be read
+        # verbatim.
+        strat_row = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
+        strat_row[ACTION_TO_IDX[r][legal[1]]] = 1
+        tables = _FakeTables({r: regret_row}, {r: strat_row})
+        sigma = BlueprintPolicy(tables, min_strategy_mass=10).strategy(state)
+        assert sigma[0] == pytest.approx(1.0)
+
+    def test_illegal_action_counts_do_not_leak(self):
+        r = 1
+        # Restrict legality to fold/call only; plant strategy mass on a
+        # raise column that is illegal at this node.
+        legal = ["fold", "call"]
+        state = _state(r, legal)
+        strat_row = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
+        strat_row[ACTION_TO_IDX[r]["fold"]] = 10
+        strat_row[ACTION_TO_IDX[r]["call"]] = 30
+        strat_row[3] = 1_000  # some raise column, illegal here
+        tables = _FakeTables(
+            {r: np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)},
+            {r: strat_row},
+        )
+        sigma = BlueprintPolicy(tables, min_strategy_mass=10).strategy(state)
+        assert sigma[legal.index("fold")] == pytest.approx(0.25)
+        assert sigma[legal.index("call")] == pytest.approx(0.75)
+
+    def test_bias_applies_to_average_strategy(self):
+        r = 0
+        legal = _legal_for(r)
+        state = _state(r, legal)
+        strat_row = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
+        for a in legal:
+            strat_row[ACTION_TO_IDX[r][a]] = 10  # uniform over legal
+        tables = _FakeTables(
+            {r: np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)},
+            {r: strat_row},
+        )
+        biased = BlueprintPolicy(tables, bias_multiplier=5.0).strategy(
+            state, bias="fold"
+        )
+        fold_i = legal.index("fold")
+        assert biased[fold_i] == pytest.approx(
+            5.0 / (5.0 + (len(legal) - 1))
+        )
 
 
 class TestBlueprintPolicyOverlay:

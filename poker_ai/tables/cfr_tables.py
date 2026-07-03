@@ -364,16 +364,26 @@ class CFRTables:
                     n_entries - chunk_id * CHUNK_SIZE, CHUNK_SIZE
                 )
 
-                # Regret: discount + floor clamp.
+                # Regret: discount + floor clamp.  ``rint`` (round half to
+                # even) rather than a plain int cast: the cast truncates
+                # toward zero, which systematically bleeds ~0.5 per entry
+                # per application — negligible for chip-scale regrets but
+                # fatal for the unit-scale strategy counts below, so both
+                # use the same unbiased rounding.
                 rview = self.regret[r].store.view(chunk_id)[:valid_rows]
-                rresult = (rview.astype(np.float32) * factor32).astype(np.int32)
+                rresult = np.rint(rview.astype(np.float32) * factor32).astype(np.int32)
                 np.maximum(rresult, REGRET_FLOOR, out=rresult)
                 rview[:] = rresult
                 self.regret[r].store.mark_dirty(chunk_id)
 
                 # Strategy: discount only (non-negative visit counts).
+                # Truncation here zeroed any count of 1 on every discount
+                # application, erasing the strategy mass accumulated inside
+                # the discount window; rounding keeps small counts alive
+                # under the mild late-window factors while still applying
+                # the intended linear down-weighting.
                 sview = self.strategy[r].store.view(chunk_id)[:valid_rows]
-                sview[:] = (sview.astype(np.float32) * factor32).astype(np.int32)
+                sview[:] = np.rint(sview.astype(np.float32) * factor32).astype(np.int32)
                 self.strategy[r].store.mark_dirty(chunk_id)
 
     # ------------------------------------------------------------------

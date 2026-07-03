@@ -220,7 +220,8 @@ class TestGetLegalActions:
 class TestGetNodeStrategy:
     def test_uniform_on_unseen_infoset(self, tmp_tables):
         state = _MockState(player_i=0, info_set="unseen_IS", actions=["fold", "call"])
-        sigma, r, a_to_i, regret_row = get_node_strategy(tmp_tables, state)
+        sigma, r, a_to_i, regret_row, info_set = get_node_strategy(tmp_tables, state)
+        assert info_set == "unseen_IS"
         assert abs(sigma.sum() - 1.0) < 1e-5
         n_legal = len(state.legal_actions)
         for action in state.legal_actions:
@@ -234,5 +235,5 @@ class TestGetNodeStrategy:
         from environment.action_space import ACTION_TO_IDX
         row[ACTION_TO_IDX[0]["call"]] = 10_000
         row[ACTION_TO_IDX[0]["fold"]] = 0
-        sigma, _, a_to_i, _ = get_node_strategy(tmp_tables, state)
+        sigma, _, a_to_i, _, _ = get_node_strategy(tmp_tables, state)
         assert sigma[a_to_i["call"]] > sigma[a_to_i["fold"]]

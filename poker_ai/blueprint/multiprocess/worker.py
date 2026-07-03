@@ -18,9 +18,10 @@ The worker understands four job names:
   :attr:`_local_delta` buffer across the full batch.
 - ``"sync"`` — flush :attr:`_local_delta` into the shared regret
   tables via :meth:`_flush_delta`.
-- ``"update_strategy"`` — run one strategy-update traversal for
-  player ``kwargs["i"]``.  No accumulator is involved; visit counts
-  are written directly through the stripe-locked table API.
+- ``"update_strategy"`` — run ``kwargs["batch"]`` strategy-update
+  traversals for player ``kwargs["i"]`` (defaults to ``1``).  No
+  accumulator is involved; visit counts are written directly
+  through the stripe-locked table API.
 - ``"terminate"`` — flush any remaining delta, then exit the dispatch
   loop.  Sent by :meth:`Server.terminate` during shutdown.
 
@@ -217,10 +218,18 @@ class Worker(mp.Process):
                 elif name == "sync":
                     self._flush_delta()
                 elif name == "update_strategy":
-                    game_state = state.new_game(
-                        self._n_players, self._info_set_lut,
-                    )
-                    strategy_step(self._tables, game_state, kwargs["i"])
+                    # Like "cfr", one queue item carries ``batch``
+                    # traversals.  Each is a fresh deal walked as a
+                    # single sampled line, so a batch is cheap relative
+                    # to one CFR traversal; the batch is what gives the
+                    # average-strategy table enough visit mass to be a
+                    # usable play-time artifact.
+                    batch = kwargs.get("batch", 1)
+                    for _ in range(batch):
+                        game_state = state.new_game(
+                            self._n_players, self._info_set_lut,
+                        )
+                        strategy_step(self._tables, game_state, kwargs["i"])
                 else:
                     raise ValueError(f"Unrecognised job name: {name}")
             except Exception:

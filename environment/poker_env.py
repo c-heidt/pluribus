@@ -162,14 +162,26 @@ class _NumpyJSONEncoder(json.JSONEncoder):
 # ---------------------------------------------------------------------------
 # Raise sizes as fractions of the current pot, by betting stage.
 # Based on the Pluribus blueprint strategy design.
+#
+# Deliberately coarse: the number of distinct betting histories — and with
+# it the infoset count and the per-traversal branching of CFR — grows
+# multiplicatively in the per-node raise count, so every extra size is
+# paid for across the whole tree.  A 6-max run with the previous 9/7
+# preflop grid allocated ~1B infosets at only ~10M iterations per player
+# (≈5M betting contexts per 200-bucket street), leaving the vast majority
+# of regret rows with a handful of noisy updates.  Off-tree sizes at play
+# time are handled by pseudo-harmonic action translation
+# (:meth:`PokerEnv._translate_fraction`), and real-time search re-adds
+# granularity where it matters, so blueprint coarseness here is the cheap
+# axis to give up.
 RAISE_SIZES_BY_STAGE: Dict[str, Dict[str, List[float]]] = {
     "pre_flop": {
-        "first_raise":      [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0],
-        "subsequent_raise": [0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0],
+        "first_raise":      [0.5, 1.0, 2.0, 3.0],
+        "subsequent_raise": [1.0, 2.0],
     },
     "flop": {
-        "first_raise":      [0.33, 0.5, 0.75, 1.0, 1.5, 2.0],
-        "subsequent_raise": [0.5, 0.75, 1.0, 1.5],
+        "first_raise":      [0.33, 0.75, 1.5],
+        "subsequent_raise": [1.0],
     },
     "turn": {
         "first_raise":      [0.5, 1.0],

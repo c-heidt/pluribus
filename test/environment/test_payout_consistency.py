@@ -126,7 +126,7 @@ def test_vector_payout_matches_concrete_settlement(stacks, seed):
     assert checked_lines >= 2  # exercised multiple terminal types
 
 
-def _river_env_with_folded_seat(seed, stacks=(300, 300, 300)):
+def _river_env_with_folded_seat(seed, stacks=(600, 600, 600)):
     """3-player env driven to the river root with seat 2 folded on the flop.
 
     Seat 2 calls preflop (contributing chips) and folds to a flop raise, so the
@@ -192,7 +192,11 @@ def test_vector_payout_includes_dead_money(seed):
     mispricing the pot (wrong pot odds) in any hand where a third seat
     contributed before folding, which in multiway play is nearly all of them.
     """
-    stacks = (300, 300, 300)
+    # Deep enough that a flop raise exists under the (coarse) blueprint
+    # grid: after three preflop calls pot=300, so the smallest legal
+    # flop raise is 0.75x pot = 225 chips, which must fit in the
+    # remaining stack.
+    stacks = (600, 600, 600)
     root = _river_env_with_folded_seat(seed, stacks)
     board = set(int(c) for c in root.community_cards)
     cc = root.combo_cards

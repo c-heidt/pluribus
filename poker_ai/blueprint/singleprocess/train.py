@@ -83,6 +83,7 @@ def simple_search(
     bias: BiasClass = "none",
     bias_magnitude: float = 0.0,
     warm_start: Optional[Union[str, Path]] = None,
+    strategy_batch_size: Optional[int] = None,
 ):
     """Run a single-process CFR training loop for *n_iterations* iterations.
 
@@ -133,11 +134,29 @@ def simple_search(
         cycle-based parameter.
     discount_interval : int
         Period (in sync cycles) between LCFR discount applications.
+    strategy_batch_size : int, optional
+        Sampled playthroughs per player per strategy-update firing —
+        the same knob as the multi-process server's
+        ``strategy_batch_size`` (one queue item's worth; the server
+        additionally multiplies by ``workers_per_player``).  Defaults
+        to the ``PLURIBUS_STRATEGY_BATCH_SIZE`` environment variable
+        if set, else ``128``.
     """
+    import os
+
     from poker_ai.tables.index import lmdb_map_size_for_players
     from information_abstraction import load_info_set_lut
 
     _LOG_INTERVAL_SECS = 60.0
+
+    if strategy_batch_size is None:
+        strategy_batch_size = int(
+            os.environ.get("PLURIBUS_STRATEGY_BATCH_SIZE", 128)
+        )
+    if strategy_batch_size < 1:
+        raise ValueError(
+            f"strategy_batch_size must be >= 1, got {strategy_batch_size}"
+        )
 
     seed(42)
     shm_dir = save_path / "shm"
@@ -190,8 +209,9 @@ def simple_search(
 
             if should_update_strategy(sync_step, strategy_interval, update_threshold):
                 for i in range(n_players):
-                    state = new_game(n_players, card_info_lut)
-                    strategy_step(tables, state, i)
+                    for _ in range(strategy_batch_size):
+                        state = new_game(n_players, card_info_lut)
+                        strategy_step(tables, state, i)
 
             if should_discount(sync_step, discount_interval):
                 discount_state.apply(tables, sync_step)

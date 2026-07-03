@@ -59,6 +59,12 @@ fi
 # Efficiency knobs honoured by the trainer (env-driven so they can be
 # overridden per submission without editing code).
 export PLURIBUS_CFR_BATCH_SIZE=${PLURIBUS_CFR_BATCH_SIZE:-5}
+# Sampled playthroughs per update_strategy queue item.  Each strategy
+# firing runs workers_per_player * this many playthroughs per player;
+# playthroughs are single sampled lines, so this is cheap relative to
+# the CFR work between firings but is what actually populates the
+# average-strategy table.
+export PLURIBUS_STRATEGY_BATCH_SIZE=${PLURIBUS_STRATEGY_BATCH_SIZE:-128}
 export PLURIBUS_CHUNK_SIZE=${PLURIBUS_CHUNK_SIZE:-4000000}
 
 mkdir -p "$PROJECT_DIR/logs"
@@ -159,6 +165,7 @@ fi
 echo "  - Warm start:                  ${WARM_START:-(none)}"
 echo "  - CPUs:                        $SLURM_CPUS_PER_TASK"
 echo "  - PLURIBUS_CFR_BATCH_SIZE:     $PLURIBUS_CFR_BATCH_SIZE"
+echo "  - PLURIBUS_STRATEGY_BATCH_SIZE:$PLURIBUS_STRATEGY_BATCH_SIZE"
 echo "  - PLURIBUS_CHUNK_SIZE:         $PLURIBUS_CHUNK_SIZE"
 echo "  - STAGE_LUT_LOCALLY:           $STAGE_LUT_LOCALLY"
 echo "  - STAGE_LMDB_LOCALLY:          $STAGE_LMDB_LOCALLY"
