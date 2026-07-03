@@ -52,6 +52,10 @@ _POSITION_NAMES = {
 }
 
 
+# games.hu_from_street values → street names (betting_round indices).
+_STREET_NAME = {0: "preflop", 1: "flop", 2: "turn", 3: "river"}
+
+
 def _position_name(hero_seat: int, button_seat: int, n_players: int) -> str:
     """Offset-from-button position label (``BTN``/``SB``/…); generic fallback."""
     offset = (int(hero_seat) - int(button_seat)) % int(n_players)
@@ -280,6 +284,48 @@ def _query_approach(con: sqlite3.Connection) -> dict:
     }
 
 
+def _query_hu_coverage(con: sqlite3.Connection) -> dict:
+    """HU coverage (opponent-modeling doc §11.4): where B-HU could have fired.
+
+    ``games.hu_from_street`` is the earliest street at which a betting round began
+    heads-up with the hero.  ``eligible`` (street ≥ 2, turn or later) is the B-HU
+    activation predicate (design doc §4.2b); coverage-restricted A-vs-B
+    comparisons slice on it.  Logged for every condition, so the same query serves
+    them all.  Older snapshots (schema v1) lack the column → ``available: False``.
+    """
+    have = {r[1] for r in con.execute("PRAGMA table_info(games)")}
+    if "hu_from_street" not in have:
+        return {"available": False}
+    n_hands = _scalar(con, "SELECT COUNT(*) FROM games") or 0
+    by_street = {
+        int(r["hu_from_street"]): r["n"]
+        for r in _rows(
+            con,
+            "SELECT hu_from_street, COUNT(*) AS n FROM games "
+            "WHERE hu_from_street IS NOT NULL GROUP BY hu_from_street",
+        )
+    }
+    n_hu = sum(by_street.values())
+    n_eligible = sum(n for s, n in by_street.items() if s >= 2)
+    per_table = {
+        r["table_label"]: (r["elig"] / r["n"]) if r["n"] else None
+        for r in _rows(
+            con,
+            "SELECT table_label, COUNT(*) AS n, "
+            "SUM(CASE WHEN hu_from_street >= 2 THEN 1 ELSE 0 END) AS elig "
+            "FROM games GROUP BY table_label",
+        )
+    }
+    return {
+        "available": True,
+        "n_hands": int(n_hands),
+        "hu_frac": (n_hu / n_hands) if n_hands else None,
+        "eligible_frac": (n_eligible / n_hands) if n_hands else None,
+        "by_street": by_street,
+        "eligible_frac_by_table": per_table,
+    }
+
+
 def _query_search_cost(con: sqlite3.Connection) -> dict:
     """Search fire rate, wall (mean + p95), stop-reason split, cache hit rate (§8)."""
     n_decisions = _scalar(con, "SELECT COUNT(*) FROM decisions") or 0
@@ -457,6 +503,25 @@ def _print_human(report: dict) -> str:
     L.append(f"  collapsed truth  {_fmt(ov['collapse_rate'],'.1%')} of resolved   "
              f"uniform fallback {_fmt(ov['fallback_rate'],'.1%')} of seat-snapshots")
 
+    hc = report["hu_coverage"]
+    if hc.get("available"):
+        L.append("")
+        L.append("HU COVERAGE (B-HU eligibility: heads-up with hero from turn+)")
+        streets = "  ".join(
+            f"{_STREET_NAME.get(s, s)} {n}" for s, n in sorted(hc["by_street"].items())
+        )
+        L.append(
+            f"  HU-with-hero     {_fmt(hc['hu_frac'],'.1%')} of hands   "
+            f"eligible (turn+) {_fmt(hc['eligible_frac'],'.1%')}"
+        )
+        if streets:
+            L.append(f"    first HU street  {streets}")
+        if hc["eligible_frac_by_table"]:
+            per = "   ".join(
+                f"{k} {_fmt(v,'.0%')}" for k, v in hc["eligible_frac_by_table"].items()
+            )
+            L.append(f"    eligible by table  {per}")
+
     L.append("")
     L.append("SOLVER APPROACH  (share · mean wall · wall-cap rate · mean iters)")
     for a in ap["approaches"]:
@@ -499,6 +564,7 @@ def build_report(con: sqlite3.Connection) -> dict:
         "meta": _query_meta(con),
         "strength": _query_strength(con),
         "range_quality": _query_range_health(con),
+        "hu_coverage": _query_hu_coverage(con),
         "approach": _query_approach(con),
         "search": _query_search_cost(con),
     }

@@ -23,15 +23,18 @@ shrinks variance, it can never skew the mean.  Two families of term are taken:
   bias)`` at opponent nodes.
 
 - **The terminal all-in runout** (a chance node the engine *can* integrate
-  exactly).  When the hand ends as a decision-free all-in over an incomplete board,
-  the single dealt board is one draw of a chance event whose exact mean the engine
-  already computes via :meth:`PokerEnv.runout_equity`::
+  exactly).  When the hand ends as a decision-free all-in with **≤2 board cards to
+  come** (a flop/turn all-in), the single dealt board is one draw of a chance event
+  whose exact mean the engine already computes via :meth:`PokerEnv.runout_equity`::
 
       term = u(z) − runout_equity[hero]
 
   Subtracting it replaces the realised single-board payout with the exact
-  board-average — the highest-variance chance event, removed for free.  (General
-  per-street MIVAT chance corrections are **not** taken: this engine has no
+  board-average — a high-variance chance event, removed for free.  A **pre-flop**
+  all-in (5 cards to come) is **skipped**: its exact runout exceeds
+  ``runout_equity``'s enumeration cap and would Monte-Carlo sample thousands of
+  boards per hand, so those hands keep only their action-node corrections.  (General
+  per-street MIVAT chance corrections are **not** taken either: this engine has no
   steppable/enumerable per-street chance node — board cards are dealt inside
   ``_apply_action_in_place`` off a shuffled deck, with no "re-deal a specific
   alternative card down the same betting line" primitive — so only the terminal
@@ -75,6 +78,14 @@ from environment.poker_env import PokerEnv
 from poker_ai.search.leaf import LeafConfig, continuation_value
 
 logger = logging.getLogger(__name__)
+
+# Max board cards still to come for the terminal all-in chance correction to run.
+# ≤2 (a flop/turn all-in) is always under ``runout_equity``'s exact-enumeration cap,
+# so the correction is exact and cheap.  A pre-flop all-in (5 to come) would exceed
+# the cap and fall back to Monte-Carlo *sampling thousands of boards* per hand — an
+# expensive, log-noisy operation — so it is skipped (the hand keeps its action-node
+# corrections), mirroring the solver's own ``street_at_root != 0`` equity guard.
+_MAX_RUNOUT_CARDS = 2
 
 
 @contextlib.contextmanager
@@ -339,15 +350,33 @@ class AivatAccumulator:
         """Return ``aivat_value`` for the finished hand.
 
         ``u(z)`` is the hero's realised chip delta (identical to
-        ``HandOutcome.hero_chips_delta``).  At a decision-free all-in terminal the
-        realised single board is replaced by the exact runout average (a zero-mean
-        chance correction) — the holes are revealed at this showdown, so reading
-        them for the runout integration is not a leak.
+        ``HandOutcome.hero_chips_delta``).  At a decision-free all-in terminal with a
+        **cheap** runout (≤ ``_MAX_RUNOUT_CARDS`` board cards to come — a flop/turn
+        all-in) the realised single board is replaced by the exact runout average (a
+        zero-mean chance correction) — the holes are revealed at this showdown, so
+        reading them for the integration is not a leak.  A **pre-flop** all-in (5
+        cards to come) is skipped: its exact runout exceeds ``runout_equity``'s cap
+        and would Monte-Carlo sample thousands of boards per hand, so the hand keeps
+        only its action-node corrections.  Unbiased either way.
         """
         hero_delta = float(terminal_env.payout[self._hero_seat])
         chance_term = 0.0
-        if terminal_env.is_decision_free:
+        if terminal_env.is_decision_free and self._cheap_runout(terminal_env):
             with _preserve_global_random():
                 eq = terminal_env.runout_equity(rng=self._rng)
             chance_term = hero_delta - float(eq[self._hero_seat])
         return hero_delta - self._sum_terms - chance_term
+
+    @staticmethod
+    def _cheap_runout(terminal_env: PokerEnv) -> bool:
+        """Whether the terminal all-in's runout is on ``runout_equity``'s exact path.
+
+        True iff at most ``_MAX_RUNOUT_CARDS`` board cards remain (a flop/turn all-in
+        — ``C(deck, ≤2)`` is always under the enumeration cap).  A pre-flop all-in (0
+        board cards ⇒ 5 to come) returns False, and an unknown board length is
+        treated as expensive (skip) — the safe default.
+        """
+        board_len = terminal_env.terminal_board_len
+        if board_len is None:
+            return False
+        return (5 - int(board_len)) <= _MAX_RUNOUT_CARDS

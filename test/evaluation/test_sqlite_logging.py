@@ -18,6 +18,7 @@ import pytest
 
 from evaluation.sqlite_logging import (
     SCHEMA_VERSION,
+    _SCHEMA_DDL,
     DecisionRow,
     ExperimentLog,
     GameRow,
@@ -88,6 +89,43 @@ class TestOpen:
         lg2 = ExperimentLog.open(path)
         assert lg2._con.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 1
         lg2.close()
+
+    def test_v1_db_migrates_hu_from_street(self, tmp_path):
+        """Opening a schema-v1 DB adds ``games.hu_from_street`` (additive migration).
+
+        A v1 file has the games table *without* the column; ``CREATE TABLE IF NOT
+        EXISTS`` alone would leave it missing and the name-based insert would then
+        fail.  ``open`` must ALTER it in, old rows read back NULL, and new rows
+        round-trip the value.
+        """
+        path = tmp_path / "old.sqlite"
+        v1_ddl = _SCHEMA_DDL.replace("    hu_from_street     INTEGER,\n", "")
+        assert "hu_from_street" not in v1_ddl  # the replace actually removed it
+        con = sqlite3.connect(str(path))
+        con.executescript(v1_ddl)
+        con.execute(
+            "INSERT INTO games (run_id, hand_index, schema_version, "
+            "config_fingerprint, table_label, table_config, hero_seat, "
+            "button_seat, n_players, big_blind, starting_stack, deck_seed) "
+            "VALUES ('old', 0, 1, 'f', 't', '{}', 0, 1, 3, 100.0, 600.0, 7)"
+        )
+        con.commit()
+        con.close()
+
+        lg = ExperimentLog.open(path)
+        cols = {r[1] for r in lg._con.execute("PRAGMA table_info(games)")}
+        assert "hu_from_street" in cols
+        # Pre-migration row reads back NULL; a new row round-trips the value.
+        assert lg._con.execute(
+            "SELECT hu_from_street FROM games WHERE run_id = 'old'"
+        ).fetchone()[0] is None
+        with lg.game():
+            lg.log_game(_game(run_id="new", hu_from_street=2))
+        got = lg._con.execute(
+            "SELECT hu_from_street FROM games WHERE run_id = 'new'"
+        ).fetchone()[0]
+        assert got == 2
+        lg.close()
 
 
 # --------------------------------------------------------------------------- #

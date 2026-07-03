@@ -233,13 +233,18 @@ def showdown_cfv(
     combo_cards: np.ndarray,
     opp_reach: np.ndarray,
     stake: float,
+    dead: float = 0.0,
     removal: Optional[Tuple[np.ndarray, np.ndarray, int]] = None,
 ) -> np.ndarray:
     """Counterfactual value per acting combo vs an opponent reach-weighted range.
 
-    Implements ``v_i = stake * (W_i - L_i)`` with exact card removal in
-    O(n_combos log n_combos) — fully vectorised (sort + ``bincount`` + ``cumsum``
-    over rank groups), never forming an n^2 matrix and with no per-group loop.
+    Implements ``v_i = stake * (W_i - L_i) + dead * (W_i + T_i / 2)`` with exact
+    card removal in O(n_combos log n_combos) — fully vectorised (sort +
+    ``bincount`` + ``cumsum`` over rank groups), never forming an n^2 matrix and
+    with no per-group loop.  ``W/L/T`` are the opponent reach the combo beats /
+    loses to / ties: the winner collects the opponent's matched stake **plus**
+    the dead money, the loser forfeits only its stake, and a chopped pot splits
+    the dead money.
 
     Parameters
     ----------
@@ -253,7 +258,13 @@ def showdown_cfv(
         are ignored (re-zeroed internally for safety).
     stake : float
         Each player's matched contribution to the contested pot — the amount the
-        winner gains and the loser forfeits (heads-up, winner-takes-pot).
+        winner gains from the opponent and the loser forfeits (heads-up,
+        winner-takes-pot).
+    dead : float
+        Chips in the pot contributed by seats **outside** the heads-up contest
+        (folded players' blinds and abandoned bets).  They carry no side-pot
+        claim: the winner collects them in full, a chop splits them evenly.
+        ``0`` for a pot with no third-party contributions.
     removal : optional
         Precomputed :func:`removal_index` for ``combo_cards``.  Pass it when
         settling many terminals on the same deck to skip the per-call densify.
@@ -306,6 +317,15 @@ def showdown_cfv(
     beats = upper_total[g] - upper_card[g, s0] - upper_card[g, s1]
 
     v = stake * (beats - loses)
+    if dead != 0.0 and n_groups:
+        # Dead money goes to the winner (half each on a chop): + dead per unit of
+        # beaten reach, + dead/2 per unit of tied reach.  Tied reach = available
+        # reach (card removal, with the own-combo add-back — cf.
+        # :func:`reach_after_removal`) minus the strictly-stronger/-weaker parts.
+        card_total = M_cum[-1]
+        avail = gt_cum[-1] - card_total[s0] - card_total[s1] + w
+        ties = avail - beats - loses
+        v = v + dead * (beats + 0.5 * ties)
     v[~valid] = 0.0
     return v
 
@@ -316,12 +336,14 @@ def showdown_values(
     reach_a: np.ndarray,
     reach_b: np.ndarray,
     stake: float,
+    dead: float = 0.0,
     evaluator=None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Heads-up showdown: per-combo CFV for both players on a completed board.
 
     Ranks the board once, then settles each player against the *other* player's
-    reach.
+    reach.  ``dead`` is third-party (folded seats') pot money, per
+    :func:`showdown_cfv`.
 
     Returns
     -------
@@ -330,6 +352,10 @@ def showdown_values(
     """
     ranks, valid = rank_combos_on_board(combo_cards, board, evaluator)
     removal = removal_index(combo_cards)
-    cfv_a = showdown_cfv(ranks, valid, combo_cards, reach_b, stake, removal=removal)
-    cfv_b = showdown_cfv(ranks, valid, combo_cards, reach_a, stake, removal=removal)
+    cfv_a = showdown_cfv(
+        ranks, valid, combo_cards, reach_b, stake, dead=dead, removal=removal
+    )
+    cfv_b = showdown_cfv(
+        ranks, valid, combo_cards, reach_a, stake, dead=dead, removal=removal
+    )
     return cfv_a, cfv_b

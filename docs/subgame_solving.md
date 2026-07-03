@@ -801,10 +801,15 @@ even on an early fold, so `len(community_cards)` cannot tell a turn-side fold fr
 a river-side one — `PokerEnv.terminal_board_len` (the board length captured before
 that force-deal) does, and a pre-river fold therefore does card removal against the
 shorter board it saw (not the dealt-out completion, and not the sampled river it
-never reached). The value of acting combo `i` is `v_i = stake · (W_i − L_i)`,
-where `W_i` (resp. `L_i`) is the opponent reach on combos `i` beats (resp. loses
-to) and `stake` is each player's matched contribution — heads-up showdown is
-winner-takes-pot, so ties net zero and there are **no side pots**. The win/tie/lose
+never reached). The value of acting combo `i` is
+`v_i = stake · (W_i − L_i) + dead · (W_i + T_i/2)`, where `W_i` / `L_i` / `T_i` are
+the opponent reach on combos `i` beats / loses to / ties, `stake` is each player's
+matched contribution, and `dead` is the folded seats' pot contributions — heads-up
+settlement is winner-takes-pot with **no side pots** (every non-contesting seat has
+folded), so the winner also collects the dead money and a chop splits it. (`dead`
+was originally omitted — `v = stake·(W−L)` — which mispriced every pot containing a
+folded seat's chips; fixed and regression-tested against the concrete settlement in
+`test_payout_consistency.py`.) The win/tie/lose
 aggregation is the sorted-rank trick of ref. 42, implemented **fully vectorised**
 (one `argsort` into rank groups, then `bincount`/`cumsum` prefix-and-suffix sums —
 no per-group Python loop, **no n² matrix**): card removal between the two ranges is

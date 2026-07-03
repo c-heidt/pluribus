@@ -18,6 +18,7 @@ import pytest
 from evaluation.runner import (
     EvalConfig,
     EvalSession,
+    _hu_street,
     _sync_due,
     derive_seeds,
     run_evaluation,
@@ -115,6 +116,52 @@ class TestRun:
         assert all(g[5] for g in games)                   # config_fingerprint set
         assert seats[0][0] == 4 * 3                        # one seat row per (game, seat)
         assert decisions[0][0] >= 1                        # at least one hero decision
+
+    def test_hu_from_street_semantics(self):
+        """``_hu_street``: street iff exactly two active seats incl. the hero.
+
+        HU coverage for B-HU (opponent-modeling doc §11.4): the earliest round
+        start that is heads-up *with the hero* counts; a table that is heads-up
+        without the hero (hero folded) does not.
+        """
+        import collections
+
+        from environment.player import Player
+        from environment.poker_env import PokerEnv
+
+        np.random.seed(0)
+        env = PokerEnv(players=[Player(i, 600) for i in range(3)],
+                       low_card_rank=11, high_card_rank=14)
+        env.card_info_lut = collections.defaultdict(
+            lambda: collections.defaultdict(lambda: 0)
+        )
+        # Three active seats: not heads-up for anyone.
+        assert _hu_street(env, 0, env.betting_round) is None
+        # Fold the current actor: exactly two remain.
+        folder = env.player_i
+        env.step_in_place("fold")
+        survivors = [i for i in range(3) if i != folder]
+        street = env.betting_round
+        for hero in survivors:
+            assert _hu_street(env, hero, street) == street
+        assert _hu_street(env, folder, street) is None    # hero folded ⇒ no coverage
+
+    def test_hu_from_street_logged_and_sane(self, tmp_path):
+        """Every ``games.hu_from_street`` is NULL or a street a 3-max hand can
+        first turn heads-up on (flop/turn/river — never preflop, which starts
+        3-active), and the column is populated by the run loop."""
+        session = _stub_session(n_players=3)
+        log = ExperimentLog.open(tmp_path / "run.sqlite")
+        try:
+            n = run_evaluation(log=log, session=session, max_hands=6,
+                               now_fn=lambda: "2026-07-01T00:00:00",
+                               git_sha="abc1234", hostname="node01")
+            rows = _rows(log._con, "SELECT hu_from_street FROM games")
+        finally:
+            log.close()
+        assert n == 6 and len(rows) == 6
+        vals = [r[0] for r in rows]
+        assert all(v is None or v in (1, 2, 3) for v in vals)
 
     def test_hero_seat_rotates_by_hand(self, tmp_path):
         session = _stub_session(n_players=3)

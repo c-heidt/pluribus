@@ -127,6 +127,26 @@ class CFRTables:
         }
 
     # ------------------------------------------------------------------
+    # Process-fork safety
+    # ------------------------------------------------------------------
+
+    def reopen_after_fork(self) -> None:
+        """Reopen every per-street LMDB index in the current (forked) process.
+
+        The four :class:`InfosetIndex` LMDB environments are **not** safe to share
+        across a ``fork`` — a child that reuses the parent's inherited reader-lock
+        slot trips ``mdb_txn_renew: MDB_BAD_RSLOT`` on its first read
+        (:meth:`InfosetIndex.reopen_after_fork`).  A forked worker that will *read*
+        these tables (e.g. a parallel search replica querying a blueprint at a
+        depth-limit leaf) must call this once, before its first lookup.  The chunk
+        stores are read-only ``/dev/shm`` mmaps shared copy-on-write, so only the
+        indexes need reopening; both table families reference the same index object
+        per street, so reopening the index fixes their reads too.
+        """
+        for index in self._indexes.values():
+            index.reopen_after_fork()
+
+    # ------------------------------------------------------------------
     # Checkpoint I/O
     # ------------------------------------------------------------------
 

@@ -2002,7 +2002,9 @@ class PokerEnv:
         (aligned to :attr:`combo_cards`) for ``seat`` against ``opp_reach`` (the
         ``opp_seat`` reach-weighted range).  The counterpart of :attr:`payout`
         (one dealt hand) and :meth:`runout_equity` (board-average); all three
-        rank hands with the one shared evaluator, so they agree to the chip.
+        rank hands with the one shared evaluator, so they agree to the chip —
+        including **dead money**: folded seats' contributions go to the winner
+        (split on a chop), exactly as the concrete settlement pays them.
 
         The env owns the settlement entirely — the caller supplies only the
         search quantities it owns:
@@ -2032,6 +2034,12 @@ class PokerEnv:
         # contributions (winner-takes; the larger stack's excess is uncalled).
         tc = self._terminal_contributions
         stake = float(min(tc[seat], tc[opp_seat]))
+        # Dead money: every other seat's contribution.  This settlement is only
+        # called with exactly two contesting (non-folded) seats — the vector
+        # regime's precondition — so the remaining seats have all folded, their
+        # chips carry no side-pot claim, and the winner collects them in full
+        # (half each on a chopped pot).
+        dead = float(sum(tc) - tc[seat] - tc[opp_seat])
         low, high = self._low_card_rank, self._high_card_rank
         combo_cards = self.combo_cards
         removal = range_showdown.removal_for(low, high)
@@ -2043,7 +2051,7 @@ class PokerEnv:
             board = community[:4] + [int(river)] if river is not None else community
             ranks, valid = range_showdown.ranked_board(low, high, board)
             return range_showdown.showdown_cfv(
-                ranks, valid, combo_cards, opp_reach, stake, removal=removal
+                ranks, valid, combo_cards, opp_reach, stake, dead=dead, removal=removal
             )
 
         # Fold: the still-active contesting seat wins; value is rank-independent.
@@ -2068,7 +2076,10 @@ class PokerEnv:
         valid = range_showdown.board_valid_mask(low, high, board)
         opp = np.where(valid, opp_reach, 0.0)
         avail = range_showdown.reach_after_removal(combo_cards, opp, removal)
-        return sign * stake * np.where(valid, avail, 0.0)
+        # The fold's winner collects the loser's matched stake plus the dead
+        # money; the folder forfeits only its own (matched) contribution.
+        gain = stake + dead if winner == seat else stake
+        return sign * gain * np.where(valid, avail, 0.0)
 
     @property
     def deck_size(self) -> int:

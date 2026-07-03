@@ -46,7 +46,8 @@ from dataclasses import dataclass, field
 from typing import Iterable, Iterator, List, Optional
 
 # Bump on any schema change (games.schema_version); lets analysis span runs (§6).
-SCHEMA_VERSION = 1
+# v2: + games.hu_from_street (HU coverage for B-HU, opponent-modeling doc §11.4).
+SCHEMA_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +76,7 @@ CREATE TABLE IF NOT EXISTS games (
     hero_chips_delta   REAL,
     went_to_showdown   INTEGER,
     terminal_street    TEXT,
+    hu_from_street     INTEGER,
     final_pot          REAL,
     hero_hole          TEXT,
     final_board        TEXT,
@@ -200,6 +202,7 @@ class GameRow:
     hero_chips_delta: Optional[float] = None     # raw primary outcome (chips)
     went_to_showdown: Optional[int] = None
     terminal_street: Optional[str] = None
+    hu_from_street: Optional[int] = None         # earliest round start HU-with-hero
     final_pot: Optional[float] = None
     hero_hole: Optional[str] = None
     final_board: Optional[str] = None
@@ -338,6 +341,14 @@ class ExperimentLog:
         con.execute("PRAGMA synchronous=NORMAL")
         con.execute("PRAGMA foreign_keys=ON")
         con.executescript(_SCHEMA_DDL)
+        # Additive migrations for DBs created before a column existed —
+        # ``CREATE TABLE IF NOT EXISTS`` does not extend an existing table, and
+        # the name-based ``_insert`` would then fail on the new column.  Rows
+        # written before the migration keep NULL (schema_version tells them
+        # apart, §6).
+        have = {r[1] for r in con.execute("PRAGMA table_info(games)")}
+        if "hu_from_street" not in have:  # v1 → v2
+            con.execute("ALTER TABLE games ADD COLUMN hu_from_street INTEGER")
         return cls(con)
 
     def close(self) -> None:

@@ -148,6 +148,27 @@ def _build_solver(root_env, state, ctx, cfg, rng, regime):
     return _MCCFRSolver(root_env, state, ctx, cfg, rng)
 
 
+def _reopen_forked_lmdb(ctx: SubgameContext) -> None:
+    """Reopen any LMDB-backed leaf policy in this forked worker (§6.7).
+
+    The pool is forked (copy-on-write) with the leaf fleet's blueprint tables
+    inherited from the parent.  Those tables are per-street LMDB indexes whose
+    reader-lock slots are **not** fork-safe: the first read in a child that reused
+    the parent's slot trips ``mdb_txn_renew: MDB_BAD_RSLOT``.  A depth-limit leaf
+    evaluates the continuation value by querying these policies, so every replica
+    must reopen them before iterating.  Policies without an LMDB backend (the
+    in-memory ``UniformPolicy`` in tests, a ``SearchPolicy``) expose no
+    ``reopen_after_fork`` and are skipped; the four §4 bias variants share one
+    blueprint object, so it is reopened once (deduped by identity).
+    """
+    seen: set = set()
+    for policy in ctx.leaf.policies.values():
+        reopen = getattr(policy, "reopen_after_fork", None)
+        if reopen is not None and id(policy) not in seen:
+            seen.add(id(policy))
+            reopen()
+
+
 def _run_replica(payload: Tuple[int, np.random.SeedSequence, int]):
     """Run one replica from the fork-inherited :data:`_SHARED` inputs."""
     _idx, seed_seq, start_offset = payload
@@ -156,6 +177,9 @@ def _run_replica(payload: Tuple[int, np.random.SeedSequence, int]):
     cfg: SolverConfig = _SHARED["cfg"]
     warm: Optional[SolverState] = _SHARED["warm"]
     regime: str = _SHARED["regime"]
+
+    # Reopen fork-inherited blueprint LMDB envs before any leaf query (MDB_BAD_RSLOT).
+    _reopen_forked_lmdb(ctx)
 
     rng = np.random.default_rng(seed_seq)
     wctx = dataclasses.replace(ctx, rng=rng)

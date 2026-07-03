@@ -47,10 +47,12 @@ class _FakeValue:
 
 
 class _FakeTerminal:
-    def __init__(self, payout, *, decision_free=False, runout=None):
+    # board_len defaults to 3 (a flop all-in → cheap runout, chance correction on).
+    def __init__(self, payout, *, decision_free=False, runout=None, board_len=3):
         self._payout = payout
         self._df = decision_free
         self._runout = runout
+        self._board_len = board_len
 
     @property
     def payout(self):
@@ -59,6 +61,10 @@ class _FakeTerminal:
     @property
     def is_decision_free(self):
         return self._df
+
+    @property
+    def terminal_board_len(self):
+        return self._board_len
 
     def runout_equity(self, *, rng=None):
         return self._runout
@@ -93,13 +99,36 @@ class TestAccumulatorArithmetic:
         assert math.isclose(val, 5.0)                             # no term applied
 
     def test_allin_runout_chance_correction(self):
-        # Decision-free terminal: aivat collapses to runout_equity − Σ action terms.
+        # Cheap (flop, board_len=3 → 2 cards to come) decision-free terminal: aivat
+        # collapses to runout_equity − Σ action terms.
         acc = AivatAccumulator(0, _FakeValue({}), np.random.default_rng(0))
         val = acc.finalize(
-            _FakeTerminal({0: 100.0}, decision_free=True, runout={0: 60.0})
+            _FakeTerminal({0: 100.0}, decision_free=True, runout={0: 60.0}, board_len=3)
         )
         # chance_term = 100 − 60 = 40 → aivat = 100 − 0 − 40 = 60 (the exact average).
         assert math.isclose(val, 60.0)
+
+    def test_preflop_allin_skips_expensive_runout(self):
+        # A pre-flop all-in (board_len=0 → 5 cards to come) must NOT sample boards:
+        # runout_equity is never called; the hand keeps only its action corrections.
+        class _Boom(_FakeTerminal):
+            def runout_equity(self, *, rng=None):
+                raise AssertionError("runout_equity must not run for a preflop all-in")
+
+        acc = AivatAccumulator(0, _FakeValue({}), np.random.default_rng(0))
+        val = acc.finalize(_Boom({0: 100.0}, decision_free=True, board_len=0))
+        assert math.isclose(val, 100.0)         # no chance term applied
+
+    def test_preflop_allin_skips_expensive_runout(self):
+        # A pre-flop all-in (board_len=0 → 5 cards to come) must NOT call the
+        # (5000-board) runout_equity; it keeps only the action-node corrections.
+        class _Boom(_FakeTerminal):
+            def runout_equity(self, *, rng=None):
+                raise AssertionError("runout_equity must not run for a preflop all-in")
+
+        acc = AivatAccumulator(0, _FakeValue({}), np.random.default_rng(0))
+        val = acc.finalize(_Boom({0: 100.0}, decision_free=True, board_len=0))
+        assert math.isclose(val, 100.0)         # no chance term applied
 
 
 # --------------------------------------------------------------------------- #
@@ -159,9 +188,10 @@ class TestBeliefSampling:
 # Statistical acceptance + plumbing (full stub run)
 # --------------------------------------------------------------------------- #
 
-def _run(tmp_path, *, aivat, run_id="A", n=120, seed=13, hole_samples=4):
+def _run(tmp_path, *, aivat, run_id="A", n=120, seed=13, hole_samples=4,
+         starting_stack=400):
     session = _stub_session(run_id=run_id, run_seed=seed, n_players=2,
-                            starting_stack=400)
+                            starting_stack=starting_stack)
     session.config.aivat = aivat
     session.config.aivat_hole_samples = hole_samples
     log = ExperimentLog.open(tmp_path / f"{run_id}.sqlite")
@@ -178,21 +208,31 @@ def _run(tmp_path, *, aivat, run_id="A", n=120, seed=13, hole_samples=4):
 
 class TestAcceptance:
 
-    def test_unbiased_and_reduces_variance(self, tmp_path):
-        rows = _run(tmp_path, aivat=True, n=140)
+    def test_unbiased(self, tmp_path):
+        # Unbiasedness is the robust, regime-independent gate.  Use a short-stack
+        # (all-in-heavy) run so the kept flop/turn runout corrections dominate — the
+        # mean must still match the raw delta.
+        rows = _run(tmp_path, aivat=True, n=160)
         aiv = np.array([r[1] for r in rows], dtype=float)
         dl = np.array([r[2] for r in rows], dtype=float)
         assert not np.isnan(aiv).any()                    # every hand populated
-
-        # Unbiasedness (paired): aivat = delta − Σterms, so d = aivat − delta has
-        # zero expectation.  |mean(d)| must sit inside a 4σ band (non-flaky, and
-        # a mean-shifting bug — a dropped/double-counted term — breaks it).
+        # aivat = delta − Σterms, so d = aivat − delta has zero expectation.
+        # |mean(d)| must sit inside a 4σ band (non-flaky; a mean-shifting bug — a
+        # dropped/double-counted/sign-flipped term — breaks it).
         d = aiv - dl
         se = d.std(ddof=1) / math.sqrt(len(d))
         assert abs(d.mean()) <= 4.0 * se + 1e-9
 
-        # Variance drop (the payoff, and the sign-error trap: a flipped correction
-        # anti-correlates the control variate and *inflates* variance).
+    def test_reduces_variance(self, tmp_path):
+        # The payoff.  The scoped AIVAT (action-node + flop/turn all-in corrections,
+        # no per-street chance MIVAT) reduces variance once the value function is
+        # low-noise enough to be a good control variate — so use deeper stacks (fewer
+        # uncorrected pre-flop shoves) and more hole samples (a smoother v).  A
+        # sign-flipped correction would *inflate* variance and fail this.
+        rows = _run(tmp_path, aivat=True, n=140, seed=13,
+                    starting_stack=6000, hole_samples=12)
+        aiv = np.array([r[1] for r in rows], dtype=float)
+        dl = np.array([r[2] for r in rows], dtype=float)
         assert aiv.var() < dl.var()
 
     def test_column_populated_iff_enabled(self, tmp_path):

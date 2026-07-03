@@ -126,6 +126,116 @@ def test_vector_payout_matches_concrete_settlement(stacks, seed):
     assert checked_lines >= 2  # exercised multiple terminal types
 
 
+def _river_env_with_folded_seat(seed, stacks=(300, 300, 300)):
+    """3-player env driven to the river root with seat 2 folded on the flop.
+
+    Seat 2 calls preflop (contributing chips) and folds to a flop raise, so the
+    heads-up river pot contains **dead money** — the case the settlement's
+    ``dead`` term exists for.
+    """
+    np.random.seed(seed)
+    env = PokerEnv(players=[Player(i, s) for i, s in enumerate(stacks)],
+                   low_card_rank=11, high_card_rank=14)
+    _stub_lut(env)
+    g = 0
+    while env.betting_round < 1 and not env.is_terminal and g < 60:
+        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        g += 1
+    assert env.betting_round == 1 and not env.is_terminal
+    # Flop: a contesting seat raises once; seat 2 folds facing it; others call.
+    raised = False
+    g = 0
+    while env.betting_round == 1 and not env.is_terminal and g < 20:
+        legal = [a for a in env.legal_actions if a]
+        actor = env.player_i
+        if actor == 2 and raised and "fold" in legal:
+            env.step_in_place("fold")
+        elif actor != 2 and not raised:
+            raise_act = next((a for a in legal if a.startswith("raise")), None)
+            assert raise_act is not None
+            env.step_in_place(raise_act)
+            raised = True
+        else:
+            env.step_in_place("call" if "call" in legal else "check")
+        g += 1
+    assert not env.players[2].is_active
+    # Turn: check it down to the river root.
+    g = 0
+    while env.betting_round < 3 and not env.is_terminal and g < 20:
+        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        g += 1
+    assert env.betting_round == 3 and not env.is_terminal
+    return env
+
+
+def _engine_net3(root, line, i, j, k, p, stacks):
+    """Concrete 3-player settlement: net chips to seat ``p`` (0 or 1)."""
+    e = copy.deepcopy(root)
+    holes = [None, None, None]
+    holes[p] = (int(i[0]), int(i[1]))
+    holes[1 - p] = (int(j[0]), int(j[1]))
+    holes[2] = (int(k[0]), int(k[1]))
+    e = e.with_hole_cards(holes)
+    for a in line:
+        if e.is_terminal:
+            break
+        e.step_in_place(a)
+    return e.players[p].n_chips - stacks[p]
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_vector_payout_includes_dead_money(seed):
+    """``vector_payout`` must settle folded seats' chips (dead money) to the winner.
+
+    Regression: the settlement previously used only the two contesting seats'
+    matched stake, silently dropping every folded seat's contribution —
+    mispricing the pot (wrong pot odds) in any hand where a third seat
+    contributed before folding, which in multiway play is nearly all of them.
+    """
+    stacks = (300, 300, 300)
+    root = _river_env_with_folded_seat(seed, stacks)
+    board = set(int(c) for c in root.community_cards)
+    cc = root.combo_cards
+    valid = [m for m in range(cc.shape[0])
+             if int(cc[m, 0]) not in board and int(cc[m, 1]) not in board]
+    rng = np.random.default_rng(seed)
+    acting = valid if len(valid) <= 8 else list(rng.choice(valid, 8, replace=False))
+
+    checked_lines = 0
+    for policy in _LINES.values():
+        line = _drive(root, policy)
+        if line is None:
+            continue
+        term = _walk_line(root, line)
+        if term is None:
+            continue
+        tc = term.terminal_contributions
+        dead = float(sum(tc) - tc[0] - tc[1])
+        assert dead > 0.0, "scenario must contain dead money to exercise the fix"
+        checked_lines += 1
+        opp = np.zeros(root.n_combos)
+        for i_idx in acting:
+            i = cc[i_idx]
+            for j_idx in valid:
+                j = cc[j_idx]
+                used = {int(i[0]), int(i[1]), int(j[0]), int(j[1])}
+                if len(used) < 4:
+                    continue
+                k_idx = next(
+                    m for m in valid
+                    if not ({int(cc[m, 0]), int(cc[m, 1])} & used)
+                )
+                opp[:] = 0.0
+                opp[j_idx] = 1.0
+                vij = term.vector_payout(0, 1, opp, river=None)[i_idx]
+                eng = _engine_net3(root, line, i, j, cc[k_idx], 0, stacks)
+                assert abs(float(vij) - float(eng)) < 1e-9, (
+                    f"combo {i_idx} vs {j_idx} on line {line}: "
+                    f"vector={vij} engine={eng} (dead={dead})"
+                )
+    assert checked_lines >= 2  # exercised multiple terminal types
+
+
 def _turn_fold_env(seed, stacks):
     """Drive a heads-up hand to a **turn-side fold** terminal.
 

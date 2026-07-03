@@ -157,6 +157,18 @@ class BlueprintPolicy(Policy):
         self._tables = tables
         self._bias_multiplier = float(bias_multiplier)
 
+    def reopen_after_fork(self) -> None:
+        """Reopen the backing blueprint LMDB indexes in a forked process.
+
+        The blueprint's :class:`~poker_ai.tables.cfr_tables.CFRTables` holds
+        per-street LMDB indexes that are unsafe to share across a ``fork`` (reader
+        locktable slot reuse → ``MDB_BAD_RSLOT``).  A forked worker that reads this
+        policy — e.g. a parallel-search replica evaluating a depth-limit leaf's
+        continuation value against the blueprint — must call this once before its
+        first query.  Delegates to :meth:`CFRTables.reopen_after_fork`.
+        """
+        self._tables.reopen_after_fork()
+
     def strategy(self, state: PolicyState, bias: BiasClass = "none") -> np.ndarray:
         r = state.betting_round
         regret_row = self._tables.regret[r].get_row_if_exists(state.info_set)

@@ -820,10 +820,13 @@ primitive. What *is* taken:
   hero's played σ (the exact vector logged as `decisions.action_dist`) or the
   opponent's `BlueprintOpponent.action_probs` — both exact known policies (§10.1).
 - **The terminal all-in runout** — the one chance event the engine *can* integrate
-  exactly: at a decision-free all-in terminal the realised single board is replaced
-  by `runout_equity` (`term = u(z) − runout_equity[hero]`), collapsing `aivat_value`
-  to `runout_equity − Σ action_terms`. The highest-variance chance event, removed for
-  free.
+  exactly: at a decision-free all-in terminal with **≤2 board cards to come** (a
+  flop/turn all-in) the realised single board is replaced by `runout_equity`
+  (`term = u(z) − runout_equity[hero]`), collapsing `aivat_value` to
+  `runout_equity − Σ action_terms`. A high-variance chance event, removed for free.
+  A **pre-flop** all-in (5 cards to come) is **skipped** — its exact runout blows
+  past `runout_equity`'s enumeration cap into a thousands-of-boards Monte-Carlo
+  sample per hand — so those hands keep only their action-node corrections.
 
 **The value function `v`** reuses the leaf machinery
 ([leaf.py](../poker_ai/search/leaf.py) `continuation_value`) under a fixed

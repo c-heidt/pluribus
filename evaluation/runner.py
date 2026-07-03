@@ -232,6 +232,7 @@ class HandOutcome:
     decisions: List[DecisionRow]
     range_quality: List[RangeQualityRow]
     aivat_value: Optional[float] = None       # §10.2 estimate; None unless AIVAT on
+    hu_from_street: Optional[int] = None      # HU coverage (opp-modeling doc §11.4)
 
 
 def _to_call(env: PokerEnv) -> int:
@@ -380,10 +381,18 @@ def play_hand(
     recorder = RangeQualityRecorder(hero_seat, opponents.keys())
     seen_board = {int(c) for c in env.community_cards}
     prev_round = env.betting_round
+    # HU coverage (opp-modeling doc §11.4): earliest street at which a betting
+    # round *began* with exactly two active seats, the hero among them — the
+    # earliest point a B-HU (design doc §4.2b) solve could activate.  Tracked
+    # for every condition: it is a property of the play trajectory, not of the
+    # method under test.
+    hu_from_street: Optional[int] = _hu_street(env, hero_seat, prev_round)
 
     while not env.is_terminal:
         r = env.betting_round
         if r != prev_round:
+            if hu_from_street is None:
+                hu_from_street = _hu_street(env, hero_seat, r)
             # Round boundary: the engine has dealt the new street's cards and it is
             # pre-action on the new round.  Announce the belief update + solve
             # before the hero acts (a no-op once the hero has folded).
@@ -425,7 +434,17 @@ def play_hand(
         hero.on_observed_action(env_before, seat, action)
         env.step_in_place(action)
 
-    return _finish_hand(env, hero_seat, decisions, recorder, aivat)
+    return _finish_hand(
+        env, hero_seat, decisions, recorder, aivat, hu_from_street=hu_from_street
+    )
+
+
+def _hu_street(env: PokerEnv, hero_seat: int, street: int) -> Optional[int]:
+    """``street`` if the (pre-action) round is heads-up with the hero, else None."""
+    active = [i for i, p in enumerate(env.players) if p.is_active]
+    if len(active) == 2 and hero_seat in active:
+        return int(street)
+    return None
 
 
 def _finish_hand(
@@ -434,6 +453,8 @@ def _finish_hand(
     decisions: List[DecisionRow],
     recorder: RangeQualityRecorder,
     aivat: Optional[AivatAccumulator] = None,
+    *,
+    hu_from_street: Optional[int] = None,
 ) -> HandOutcome:
     """Read the terminal env into a :class:`HandOutcome` (§6 games outcome cols)."""
     hero_delta = float(env.payout[hero_seat])
@@ -461,6 +482,7 @@ def _finish_hand(
         # AIVAT scalar for the hand (u(z) − Σ corrections), incl. the all-in runout
         # chance correction taken at the terminal (§10.2); None when AIVAT is off.
         aivat_value=aivat.finalize(env) if aivat is not None else None,
+        hu_from_street=hu_from_street,
     )
 
 
@@ -730,6 +752,7 @@ def _play_and_log_one(
                     hero_chips_delta=outcome.hero_chips_delta,
                     went_to_showdown=outcome.went_to_showdown,
                     terminal_street=outcome.terminal_street,
+                    hu_from_street=outcome.hu_from_street,
                     final_pot=outcome.final_pot,
                     hero_hole=outcome.hero_hole,
                     final_board=outcome.final_board,
