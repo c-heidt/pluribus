@@ -1,0 +1,20 @@
+# PEP 518 build configuration.
+#
+# Declares the build-time toolchain for the optional compiled core
+# (poker_ai/_core/*.pyx).  Cython is pinned to the 0.29.x series — 3.x can fight
+# the pinned numpy 1.17.4 C-API on Python 3.7 — and numpy is pinned to the
+# runtime version so the extension is built against the ABI it will import
+# against.  These are *build* requirements only; the compiled .so needs neither
+# Cython nor a compiler at runtime.
+#
+# The extension is optional (see poker_ai/_core/__init__.py): building with
+# `--no-build-isolation` reuses the pinned conda env, and `POKER_AI_NO_EXT=1`
+# skips the native build entirely for pure-Python installs.
+[build-system]
+requires = [
+    "setuptools>=40.8.0",
+    "wheel",
+    "Cython<3",
+    "numpy==1.17.4",
+]
+build-backend = "setuptools.build_meta"
