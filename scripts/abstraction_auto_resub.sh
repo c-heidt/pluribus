@@ -6,13 +6,13 @@
 #SBATCH --job-name=pluribus-abstraction
 #SBATCH --output=logs/abstraction-%j.out
 #SBATCH --error=logs/abstraction-%j_error.out
-#SBATCH --partition=highmem
+#SBATCH --partition=cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=72:00:00
+#SBATCH --time=8:00:00
 #SBATCH --signal=B:USR1@300
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=1000000mb
+#SBATCH --mem=350000mb
 #SBATCH --mail-type=ALL
 
 
@@ -30,8 +30,8 @@ SUBMIT_SCRIPT=${SUBMIT_SCRIPT:-$(readlink -f "${BASH_SOURCE[0]}")}
 
 LOW_CARD_RANK=${LOW_CARD_RANK:-2}
 HIGH_CARD_RANK=${HIGH_CARD_RANK:-14}
-N_RIVER_CLUSTERS=${N_RIVER_CLUSTERS:-200}
-N_TURN_CLUSTERS=${N_TURN_CLUSTERS:-200}
+N_RIVER_CLUSTERS=${N_RIVER_CLUSTERS:-100}
+N_TURN_CLUSTERS=${N_TURN_CLUSTERS:-100}
 N_FLOP_CLUSTERS=${N_FLOP_CLUSTERS:-200}
 N_SIMULATIONS_RIVER=${N_SIMULATIONS_RIVER:-200}
 CHUNK_SIZE=${CHUNK_SIZE:-100000}
