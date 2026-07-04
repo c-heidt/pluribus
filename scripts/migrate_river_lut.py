@@ -57,11 +57,36 @@ import shutil
 import sys
 from pathlib import Path
 
+import numpy as np
+
 # Mirror the on-disk schema from information_abstraction/build/checkpoint.py
 # without importing it (keeps the script runnable standalone on the cluster).
 _STREETS = ("river", "turn", "flop")
 _MERGED_DTYPE_BYTES = 4  # float32, matches ChunkStore.get_or_merge_data default
 _RIVER_ARTIFACTS = ("merged_data.dat", "all_combos.npy")
+
+
+def _npy_len(path: Path) -> int:
+    """Return ``shape[0]`` of a ``.npy`` file by reading only its header.
+
+    ``all_combos.npy`` has one row per river combo — order 1e8-1e9 rows for
+    the 52-card river — so ``np.load``-ing it in full needs tens of GB and
+    OOM-kills the job on a small (e.g. 8 GB) node.  The only thing we need
+    from it is the row count, which the ``.npy`` header records verbatim, so
+    we parse just the header (a few bytes) and never touch the data.  Works
+    even for object/pickled arrays: the header still carries the shape.
+    """
+    with open(path, "rb") as f:
+        version = np.lib.format.read_magic(f)
+        if version == (1, 0):
+            shape, _fortran, _dtype = np.lib.format.read_array_header_1_0(f)
+        elif version == (2, 0):
+            shape, _fortran, _dtype = np.lib.format.read_array_header_2_0(f)
+        else:
+            shape, _fortran, _dtype = np.lib.format._read_array_header(f, version)
+    if not shape:
+        raise ValueError(f"{path} has empty shape {shape!r}; expected >= 1 dim")
+    return int(shape[0])
 
 
 def _empty_street() -> dict:
@@ -151,10 +176,9 @@ def main() -> int:
 
     # Derive total_combos / feature_dim from all_combos.npy + file size if the
     # source checkpoint predates those fields (legacy) or is missing them.
-    import numpy as np  # local import: only needed for validation
-
-    all_combos = np.load(src_river_dir / "all_combos.npy", allow_pickle=True)
-    n_rows = len(all_combos)
+    # Only the row count is needed — read it from the .npy header, never load
+    # the (tens-of-GB) array itself (that OOM-kills a small node).
+    n_rows = _npy_len(src_river_dir / "all_combos.npy")
     if total_combos is None:
         total_combos = n_rows
     elif int(total_combos) != n_rows:

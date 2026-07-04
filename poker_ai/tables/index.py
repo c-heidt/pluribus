@@ -206,6 +206,11 @@ class InfosetIndex:
             map_async=True,
             max_readers=256,
             max_spare_txns=0,
+            # Runtime env is disposable node-local scratch — durability comes
+            # from the checkpoint mirror after an explicit flush(sync=True), so
+            # skip the per-commit meta fsync (commits then run at memory speed).
+            sync=False,
+            metasync=False,
         )
         self._map_size: int = resolved_map_size
 
@@ -312,16 +317,27 @@ class InfosetIndex:
             row = self._cache.probe(low, high)
             if row is not None:
                 return row, False
-            flat_row, is_new = self._lmdb_get_or_create(info_set)
+            # Cache already probed and missed above, so the row almost
+            # certainly does not exist — skip the redundant read-first txn and
+            # go straight to the write txn (which re-checks for the row anyway,
+            # so a concurrent allocator is still handled correctly).
+            flat_row, is_new = self._lmdb_get_or_create(info_set, skip_read=True)
             self._cache.insert(low, high, flat_row)
             return flat_row, is_new
         return self._lmdb_get_or_create(info_set)
 
-    def _lmdb_get_or_create(self, info_set) -> tuple:
-        """LMDB-only get-or-create with the map-full retry loop."""
+    def _lmdb_get_or_create(self, info_set, skip_read: bool = False) -> tuple:
+        """LMDB-only get-or-create with the map-full retry loop.
+
+        ``skip_read`` bypasses the leading concurrent read txn and goes
+        straight to the write txn — set by :meth:`get_or_create` when a shm
+        cache is attached, because the caller has already probed and missed
+        the cache, so the read-first optimisation (avoid the writer lock for
+        already-present rows) cannot pay off here.
+        """
         while True:
             try:
-                return self._get_or_create_once(info_set)
+                return self._get_or_create_once(info_set, skip_read=skip_read)
             except lmdb.MapFullError:
                 self._reopen()
 
@@ -415,6 +431,11 @@ class InfosetIndex:
             map_async=True,
             max_readers=256,
             max_spare_txns=0,
+            # Runtime env is disposable node-local scratch — durability comes
+            # from the checkpoint mirror after an explicit flush(sync=True), so
+            # skip the per-commit meta fsync (commits then run at memory speed).
+            sync=False,
+            metasync=False,
         )
 
     def reopen_after_fork(self) -> None:
@@ -443,6 +464,11 @@ class InfosetIndex:
             map_async=True,
             max_readers=256,
             max_spare_txns=0,
+            # Runtime env is disposable node-local scratch — durability comes
+            # from the checkpoint mirror after an explicit flush(sync=True), so
+            # skip the per-commit meta fsync (commits then run at memory speed).
+            sync=False,
+            metasync=False,
         )
         # Purge any reader slots left behind by the parent — the child's new
         # env starts fresh but the lock table on disk can still carry stale
@@ -535,9 +561,14 @@ class InfosetIndex:
             map_async=True,
             max_readers=256,
             max_spare_txns=0,
+            # Runtime env is disposable node-local scratch — durability comes
+            # from the checkpoint mirror after an explicit flush(sync=True), so
+            # skip the per-commit meta fsync (commits then run at memory speed).
+            sync=False,
+            metasync=False,
         )
 
-    def _get_or_create_once(self, info_set: str) -> tuple:
+    def _get_or_create_once(self, info_set: str, skip_read: bool = False) -> tuple:
         """Single-shot get-or-create, wrapped by the retry loop.
 
         Uses a read-first / double-checked-write pattern: try a
@@ -551,15 +582,21 @@ class InfosetIndex:
         because another writer may have created it between our read
         and our write — LMDB only serialises writers, so a second
         writer must always assume the data may have changed since it
-        saw the read-side snapshot.
+        saw the read-side snapshot.  This re-check is what makes
+        ``skip_read`` safe: when the caller (a cache-backed
+        :meth:`get_or_create`) has already established the row is
+        absent, the leading read txn is pure overhead, so we jump
+        straight to the write txn without weakening correctness.
         """
         key = hash_info_set_bytes(info_set)
 
         # Read path — concurrent across workers, no writer-lock contention.
-        with self._env.begin() as txn:
-            val = txn.get(key)
-        if val is not None:
-            return struct.unpack("<Q", val)[0], False
+        # Skipped when the caller already knows the row is absent (cache miss).
+        if not skip_read:
+            with self._env.begin() as txn:
+                val = txn.get(key)
+            if val is not None:
+                return struct.unpack("<Q", val)[0], False
 
         # Write path — serialised at env level; re-check inside the txn.
         with self._env.begin(write=True) as txn:
@@ -573,8 +610,13 @@ class InfosetIndex:
 
             txn.put(key, struct.pack("<Q", next_row))
             txn.put(_NEXT_ROW_KEY, struct.pack("<Q", next_row + 1))
-            with self._n_allocated_mp.get_lock():
-                self._n_allocated_mp.value = next_row + 1
+            # No lock needed: this runs inside the LMDB write txn, and LMDB
+            # serialises every writer across processes through its single
+            # writer mutex, so no two processes are ever in this block at
+            # once.  The mp.Value is retained purely for lock-free reads
+            # (n_allocated_rows) elsewhere; the increment itself is already
+            # mutually excluded by the surrounding write transaction.
+            self._n_allocated_mp.value = next_row + 1
 
             if self._debug:
                 raw = info_set if isinstance(info_set, bytes) else info_set.encode("utf-8")
