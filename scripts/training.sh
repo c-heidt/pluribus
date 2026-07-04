@@ -235,6 +235,53 @@ _forward_signal() {
 trap '_forward_signal TERM' TERM
 trap '_forward_signal INT' INT
 
+# ---------------------------------------------------------------------------
+# Optional in-run profiler.  Completely inert unless PROFILE is set, so the
+# production submission path above is unchanged.  Attaches py-spy to the LIVE
+# trainer process tree (server + every worker, via --subprocesses) after a
+# warmup, so the samples reflect steady state at real scale rather than the
+# cold-start prewarm + initial allocation burst.  --idle is essential: it keeps
+# OFF-cpu samples (threads blocked on the alloc lock, IPC _recv, or an LMDB txn)
+# so the capture can rank *compute* against *lookup/sync* — the whole point of
+# this measurement.  Output is speedscope JSON under $NICKNAME/profiles, viewable
+# offline at https://speedscope.app (Left-Heavy + Sandwich views).
+#
+# Knobs (env, all optional):
+#   PROFILE_WARMUP    seconds to wait after launch before the first capture (1200)
+#   PROFILE_DURATION  seconds per capture (180)
+#   PROFILE_GAP       seconds between captures (600)
+#   PROFILE_N_SAMPLES number of captures (3)
+#   PROFILE_RATE      samples/sec per thread (50; lower keeps the JSON smaller)
+if [ -n "${PROFILE:-}" ]; then
+  if ! command -v py-spy >/dev/null 2>&1; then
+    echo "[profile] py-spy not found — installing into $CONDA_ENV"
+    pip install --quiet py-spy || echo "[profile] py-spy install FAILED; captures will be skipped"
+  fi
+  PROFILE_DIR="$NICKNAME/profiles"
+  PROFILE_WARMUP=${PROFILE_WARMUP:-1200}
+  PROFILE_DURATION=${PROFILE_DURATION:-180}
+  PROFILE_GAP=${PROFILE_GAP:-600}
+  PROFILE_N_SAMPLES=${PROFILE_N_SAMPLES:-3}
+  PROFILE_RATE=${PROFILE_RATE:-50}
+  mkdir -p "$PROFILE_DIR"
+  (
+    echo "[profile] warmup ${PROFILE_WARMUP}s before first capture (steady-state)"
+    sleep "$PROFILE_WARMUP"
+    for i in $(seq 1 "$PROFILE_N_SAMPLES"); do
+      kill -0 "$TRAINER_PID" 2>/dev/null || { echo "[profile] trainer exited — stopping"; break; }
+      out="$PROFILE_DIR/spy_$(date +%s)_sample${i}.speedscope.json"
+      echo "[profile] capture ${i}/${PROFILE_N_SAMPLES} (${PROFILE_DURATION}s @ ${PROFILE_RATE}Hz, subprocesses+idle) -> $out"
+      py-spy record --pid "$TRAINER_PID" --subprocesses --idle \
+        --rate "$PROFILE_RATE" --duration "$PROFILE_DURATION" \
+        --format speedscope --output "$out" \
+        || echo "[profile] py-spy capture ${i} failed (ptrace/yama? see run notes)"
+      sleep "$PROFILE_GAP"
+    done
+    echo "[profile] profiler finished"
+  ) &
+  echo "[profile] enabled — warmup=${PROFILE_WARMUP}s, ${PROFILE_N_SAMPLES}×${PROFILE_DURATION}s captures to $PROFILE_DIR"
+fi
+
 # `wait` returns when interrupted by a signal (after running the
 # trap), even if the child is still running.  Loop until the child
 # has actually exited so the EXIT trap (which cleans up the local
