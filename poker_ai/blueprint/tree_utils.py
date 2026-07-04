@@ -206,6 +206,53 @@ def sample_action(
     return legal_actions[-1]  # float-rounding guard: threshold ~= 1.0
 
 
+def sample_index(rng, weights: np.ndarray) -> int:
+    """Draw one index in ``[0, len(weights))`` proportional to ``weights``.
+
+    A single inverse-CDF draw: one ``rng.random()`` plus a cumulative walk.
+    Equivalent in distribution to
+    ``rng.choice(len(weights), p=weights / weights.sum())`` but avoids
+    :meth:`numpy.random.Generator.choice`'s per-call re-validation and CDF
+    construction, which dominate when repeatedly drawing a *single* index from a
+    short, per-node strategy vector — the subgame-search MCCFR and leaf-rollout
+    hot loops (:mod:`poker_ai.search.mccfr`, :mod:`poker_ai.search.leaf`).  This
+    is the ``rng``-based counterpart of :func:`sample_action`.
+
+    ``weights`` need not be normalised — the draw threshold is scaled by their
+    sum — so callers can pass a raw (possibly float32) strategy vector directly
+    and drop the float64 copy-and-renormalise the ``choice`` path required.
+    When the total mass is non-positive (a degenerate all-zero strategy) the
+    draw falls back to a uniform index, matching the samplers' uniform fallback.
+
+    Parameters
+    ----------
+    rng : numpy.random.Generator
+        Source of randomness.  Consumes exactly one ``rng.random()`` draw on the
+        positive-mass path (or one ``rng.integers`` on the degenerate fallback).
+    weights : np.ndarray
+        Non-negative weights over the candidate indices (need not sum to 1).
+
+    Returns
+    -------
+    int
+        The sampled index.
+    """
+    w = weights.tolist()
+    n = len(w)
+    total = 0.0
+    for x in w:
+        total += x
+    if total <= 0.0:
+        return int(rng.integers(n))
+    threshold = rng.random() * total
+    cumulative = 0.0
+    for i in range(n):
+        cumulative += w[i]
+        if threshold < cumulative:
+            return i
+    return n - 1  # float-rounding guard: threshold ~= total
+
+
 def accumulate_regrets(
     local_delta: Dict[Tuple[int, str], np.ndarray],
     r: int,

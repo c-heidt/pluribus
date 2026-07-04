@@ -1,16 +1,20 @@
-"""Correctness of the O(1) multicard scalar evaluator (`_six`/`_seven`).
+"""Correctness of the O(1) multicard evaluator — scalar (`_six`/`_seven`) AND
+the vectorised batch path (`evaluate_batch` / `_multicard_vec`).
 
-The rewritten scalar 6-/7-card evaluators return the best-5 rank via precomputed
-tables (`_flush_best`, `_nonflush6`, `_nonflush7`) instead of enumerating all
-C(K,5) subsets.  They MUST be byte-identical to the enumeration.  The oracle is
-`Evaluator.evaluate_batch` — the untouched, independently-tested vectorised
-min-over-C(K,5) path (see ``test_evaluator_batch.py``), which is a genuinely
-different algorithm from the new tables.
+Both return the best-5 rank via precomputed tables (`_flush_best`,
+`_nonflush6`, `_nonflush7`) instead of enumerating all C(K,5) subsets.  They
+MUST be byte-identical to the enumeration.  The oracle is
+`Evaluator._evaluate_batch_oracle` — the original vectorised min-over-C(K,5)
+path (see ``test_evaluator_batch.py``), retained verbatim as an INDEPENDENT
+cross-check: it reduces `_eval5_vec` over every 5-subset using a different
+table family (`_flush_rank` / `_unsuited_*`), so it shares no lookup table
+with the multicard LUT under test.
 
 Guarantees, strongest first:
 * ``TestExhaustiveSevenCardTable`` / ``TestExhaustiveSixCardTable`` (slow):
   EVERY possible 7-card (C(52,7)=133,784,560) and 6-card (C(52,6)=20,358,520)
-  hand, new tables vs ``evaluate_batch``, exact.
+  hand, production ``evaluate_batch`` (the LUT) vs ``_evaluate_batch_oracle``,
+  exact.
 * ``TestScalarWiring``: large random sample through the ACTUAL scalar
   ``_seven``/``_six`` Python methods (catches wiring bugs the vectorised lookup
   would miss — int cast, list/tuple, product dtype, flush-suit routing).
@@ -35,45 +39,6 @@ def _full_deck():
     return make_deck_arr(2, 14).astype(np.int64)
 
 
-def _nonflush_arrays(ev, k):
-    """Sorted (keys, vals) arrays for the k-card non-flush product table."""
-    table = ev._nonflush7 if k == 7 else ev._nonflush6
-    keys = np.array(sorted(table), dtype=np.int64)
-    vals = np.array([table[int(x)] for x in keys], dtype=np.int64)
-    return keys, vals
-
-
-def _new_table_vec(ev, cards, keys, vals):
-    """Vectorised reimplementation of the new scalar table lookup.
-
-    Mirrors ``_seven``/``_six`` exactly (per-suit counts+masks, flush suit ->
-    ``_flush_best[mask]``, else product -> non-flush table) so the exhaustive
-    tests can compare against ``evaluate_batch`` at scale.
-    """
-    suit = (cards >> 12) & 0xF
-    rb = (cards >> 16) & 0x1FFF
-    n = cards.shape[0]
-    out = np.empty(n, dtype=np.int64)
-    is_flush = np.zeros(n, dtype=bool)
-    flush_mask = np.zeros(n, dtype=np.int64)
-    for sv in (1, 2, 4, 8):
-        sel = suit == sv
-        cnt = sel.sum(axis=1)
-        m = np.bitwise_or.reduce(np.where(sel, rb, 0), axis=1)
-        take = cnt >= 5
-        flush_mask[take] = m[take]
-        is_flush |= take
-    out[is_flush] = ev._flush_best[flush_mask[is_flush]]
-    nf = ~is_flush
-    if nf.any():
-        prod = np.prod((cards[nf] & 0xFF).astype(np.int64), axis=1)
-        idx = np.searchsorted(keys, prod)
-        # Perfect hash: every real non-flush product must be present exactly.
-        assert np.array_equal(keys[idx], prod)
-        out[nf] = vals[idx]
-    return out
-
-
 def _ncr(n, r):
     if r < 0 or r > n:
         return 0
@@ -86,8 +51,8 @@ def _ncr(n, r):
 
 
 def _exhaustive_vs_batch(ev, k, shard, nshards, chunk=1 << 18):
-    """Compare new tables vs evaluate_batch over the ``shard`` slice of all
-    C(52,k) hands.
+    """Compare production ``evaluate_batch`` (LUT) vs ``_evaluate_batch_oracle``
+    (21-subset) over the ``shard`` slice of all C(52,k) hands.
 
     Sharded by the index of a combination's FIRST card: every combination has a
     unique first card ``deck[i0]``, so assigning ``i0`` to a shard via
@@ -96,7 +61,6 @@ def _exhaustive_vs_batch(ev, k, shard, nshards, chunk=1 << 18):
     This lets the slow proof run in parallel (e.g. ``pytest -n 8``).
     """
     deck = _full_deck().tolist()
-    keys, vals = _nonflush_arrays(ev, k)
     processed = 0
     expected = 0
     for i0 in range(len(deck)):
@@ -113,8 +77,8 @@ def _exhaustive_vs_batch(ev, k, shard, nshards, chunk=1 << 18):
             hands = np.empty((len(block), k), dtype=np.int64)
             hands[:, 0] = first
             hands[:, 1:] = np.array(block, dtype=np.int64)
-            oracle = ev.evaluate_batch(hands)
-            new = _new_table_vec(ev, hands, keys, vals)
+            oracle = ev._evaluate_batch_oracle(hands)
+            new = ev.evaluate_batch(hands)
             assert np.array_equal(oracle, new), (
                 f"{k}-card mismatch, shard {shard}, first-card idx {i0}"
             )
@@ -152,7 +116,9 @@ class TestScalarWiring:
 
     def test_seven_card_scalar_matches_oracle(self, ev):
         hands = self._sample(7, 300_000, seed=0)
-        oracle = ev.evaluate_batch(hands)
+        # Compare against the independent 21-subset oracle (evaluate_batch now
+        # shares the scalar's tables, so it is not an independent reference).
+        oracle = ev._evaluate_batch_oracle(hands)
         scalar = np.fromiter(
             (ev._seven(list(h)) for h in hands.tolist()),
             dtype=np.int64,
@@ -164,7 +130,7 @@ class TestScalarWiring:
 
     def test_six_card_scalar_matches_oracle(self, ev):
         hands = self._sample(6, 200_000, seed=1)
-        oracle = ev.evaluate_batch(hands)
+        oracle = ev._evaluate_batch_oracle(hands)
         scalar = np.fromiter(
             (ev._six(list(h)) for h in hands.tolist()),
             dtype=np.int64,

@@ -24,6 +24,7 @@ with the same ``--nickname`` continues an interrupted run.  There is
 no separate ``resume`` command.
 """
 import logging
+import os
 from pathlib import Path
 from typing import Dict
 
@@ -35,6 +36,48 @@ from poker_ai.blueprint.singleprocess.train import simple_search
 
 
 log = logging.getLogger("poker_ai.blueprint.runner")
+
+
+def _allow_ptrace_if_requested() -> None:
+    """Let an external profiler (py-spy) attach to this process and its workers.
+
+    Under the common Linux ``yama ptrace_scope=1`` a process may only be traced
+    by an *ancestor*.  The cluster profiler (``PROFILE=1`` in scripts/training.sh)
+    runs py-spy in a background subshell that is a **sibling** of this trainer,
+    not an ancestor, so every ``py-spy record`` is denied and no captures are
+    saved.  When ``PLURIBUS_ALLOW_PTRACE`` is set we call
+    ``prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)`` here in the parent — the
+    setting is inherited across ``fork``, so the workers spawned later authorize
+    the same tracer.  No-op off Linux or when the env var is unset; never fatal.
+    """
+    if not os.environ.get("PLURIBUS_ALLOW_PTRACE"):
+        return
+    try:
+        import ctypes
+        import errno as _errno
+
+        PR_SET_PTRACER = 0x59616D61  # from <sys/prctl.h> (yama)
+        PR_SET_PTRACER_ANY = ctypes.c_ulong(-1).value  # allow any tracer
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        # Set argtypes explicitly: without them ctypes passes the huge
+        # PR_SET_PTRACER_ANY as a C int and truncates/overflows it, so the call
+        # fails on the very (yama-enabled) systems where it is needed.
+        libc.prctl.restype = ctypes.c_int
+        libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+        ctypes.set_errno(0)
+        rc = libc.prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)
+        if rc == 0:
+            log.info("PR_SET_PTRACER_ANY set — py-spy may attach to trainer + workers")
+        elif ctypes.get_errno() == _errno.EINVAL:
+            # yama LSM not present → ptrace is unrestricted anyway; nothing to do.
+            log.info("PR_SET_PTRACER unsupported (no yama LSM) — ptrace unrestricted")
+        else:
+            log.warning(
+                "PR_SET_PTRACER failed (errno=%d); py-spy attach may still be "
+                "blocked by ptrace_scope", ctypes.get_errno(),
+            )
+    except Exception as exc:  # pragma: no cover - best-effort, never fatal
+        log.warning("Could not set PR_SET_PTRACER (%s); profiler attach may fail", exc)
 
 
 def _safe_search(server: Server):
@@ -247,6 +290,9 @@ def start(
     already contains a valid checkpoint the training run continues
     from it; when not, it starts fresh.
     """
+    # Authorize an external profiler to attach BEFORE any worker is forked, so
+    # the setting is inherited by the pool (no-op unless PLURIBUS_ALLOW_PTRACE).
+    _allow_ptrace_if_requested()
     config: Dict[str, int] = {**locals()}
     save_path: Path = Path(nickname)
     save_path.mkdir(parents=True, exist_ok=True)

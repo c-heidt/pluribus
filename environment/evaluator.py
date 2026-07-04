@@ -166,6 +166,19 @@ class Evaluator(object):
         assert min(self._nonflush6.values()) > max_sf
         assert max(self._nonflush6.values()) <= max_high
 
+        # Sorted (product -> rank) arrays mirroring the scalar dicts, so the
+        # vectorised evaluator (:meth:`_multicard_vec`) can resolve the
+        # non-flush branch with one ``searchsorted`` instead of per-row dict
+        # lookups.  Same key space as the dicts (the size asserts above pin it).
+        def sorted_arrays(table: "dict"):
+            k = np.fromiter(table.keys(), dtype=np.int64)
+            v = np.fromiter(table.values(), dtype=np.int16)
+            order = np.argsort(k)
+            return k[order], v[order]
+
+        self._nonflush7_keys, self._nonflush7_ranks = sorted_arrays(self._nonflush7)
+        self._nonflush6_keys, self._nonflush6_ranks = sorted_arrays(self._nonflush6)
+
     def _eval5_vec(self, cards5: np.ndarray) -> np.ndarray:
         """Rank a batch of exactly-5-card hands.
 
@@ -197,13 +210,78 @@ class Evaluator(object):
             out[nf] = self._unsuited_ranks[idx]
         return out
 
+    def _multicard_vec(self, cards: np.ndarray, k: int) -> np.ndarray:
+        """Vectorised O(1)-per-hand rank of a block of exactly-``k``-card hands.
+
+        The batch counterpart of :meth:`_seven` / :meth:`_six`: it uses the same
+        exact lookup tables (:attr:`_flush_best`, :attr:`_nonflush7` /
+        :attr:`_nonflush6`), so it is byte-identical to the 21-subset
+        :meth:`_evaluate_batch_oracle` — proven exhaustively over all C(52,7)
+        and C(52,6) hands in ``test_evaluator_multicard.py``.
+
+        Per row: count cards per suit and OR their rank bits; a suit with >=5
+        cards is a flush (at most one can be, and by the flush-precludes-
+        quads/full-house theorem it decides the hand) resolved via
+        ``_flush_best[mask]``; otherwise the rank-prime product keys the
+        non-flush table via a single ``searchsorted``.  ``k == 5`` has no
+        subsets to reduce, so it is exactly :meth:`_eval5_vec`.
+
+        Parameters
+        ----------
+        cards : numpy.ndarray
+            ``(b, k)`` array of card integers (one block; caller chunks).
+        k : int
+            Card count, one of ``{5, 6, 7}``.
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(b,)`` int64 ranks in [1, 7462] (lower = stronger).
+        """
+        if k == 5:
+            return self._eval5_vec(cards).astype(np.int64)
+
+        suit = (cards >> 12) & 0xF
+        rankbits = (cards >> 16) & 0x1FFF
+        b = cards.shape[0]
+        out = np.empty(b, dtype=np.int64)
+        is_flush = np.zeros(b, dtype=bool)
+        flush_mask = np.zeros(b, dtype=np.int64)
+        # At most one suit can hold >=5 of 6/7 cards, so these branches are
+        # mutually exclusive across rows — no row is written twice.
+        for sv in (1, 2, 4, 8):
+            sel = suit == sv
+            take = sel.sum(axis=1) >= 5
+            if take.any():
+                m = np.bitwise_or.reduce(np.where(sel, rankbits, 0), axis=1)
+                flush_mask[take] = m[take]
+                is_flush |= take
+        if is_flush.any():
+            out[is_flush] = self._flush_best[flush_mask[is_flush]]
+
+        nf = ~is_flush
+        if nf.any():
+            keys = self._nonflush7_keys if k == 7 else self._nonflush6_keys
+            ranks = self._nonflush7_ranks if k == 7 else self._nonflush6_ranks
+            products = np.prod((cards[nf] & 0xFF).astype(np.int64), axis=1)
+            idx = np.searchsorted(keys, products)
+            out[nf] = ranks[idx]
+        return out
+
     def evaluate_batch(self, cards: np.ndarray) -> np.ndarray:
-        """Rank a batch of hands of a fixed card count.
+        """Rank a batch of hands of a fixed card count (fast exact table lookup).
 
         The vectorised counterpart of :meth:`evaluate` — same ranks, evaluated
         for many hands at once.  Use it on hot many-hands paths (range showdown
         ranking, runout completions); use the scalar :meth:`evaluate` for single
         hands.
+
+        Backed by the exact multicard LUT (:meth:`_multicard_vec`), which is the
+        batch form of the scalar :meth:`_seven` / :meth:`_six` and shares their
+        tables — so concrete (scalar) and batch payouts stay aligned by
+        construction.  :meth:`_evaluate_batch_oracle` retains the original
+        21-subset enumeration as the independent cross-check the exhaustive
+        tests validate this path against.
 
         Parameters
         ----------
@@ -226,6 +304,33 @@ class Evaluator(object):
         if cards.ndim != 2:
             raise ValueError(f"evaluate_batch expects a 2-D array, got {cards.ndim}-D")
         n, k = cards.shape
+        if k not in (5, 6, 7):
+            raise ValueError(f"evaluate_batch supports K in {{5, 6, 7}}, got K={k}")
+
+        out = np.empty(n, dtype=np.int64)
+        if n == 0:
+            return out
+        # Chunk over rows so peak memory stays bounded for large callers.
+        chunk = 1 << 15
+        for start in range(0, n, chunk):
+            block = cards[start : start + chunk]
+            out[start : start + block.shape[0]] = self._multicard_vec(block, k)
+        return out
+
+    def _evaluate_batch_oracle(self, cards: np.ndarray) -> np.ndarray:
+        """Reference batch evaluator: min over all C(K,5) five-card subsets.
+
+        The original :meth:`evaluate_batch` implementation, kept verbatim as the
+        **independent oracle**.  It shares no code with the multicard LUT (it
+        enumerates every 5-card subset and reduces via :meth:`_eval5_vec`), so
+        the exhaustive tests validate the fast :meth:`evaluate_batch` /
+        :meth:`_seven` / :meth:`_six` path against a genuinely different
+        algorithm.  Not used on any hot path — tests and diagnostics only.
+        """
+        cards = np.asarray(cards)
+        if cards.ndim != 2:
+            raise ValueError(f"evaluate_batch expects a 2-D array, got {cards.ndim}-D")
+        n, k = cards.shape
         subsets = self._subsets.get(k)
         if subsets is None:
             raise ValueError(f"evaluate_batch supports K in {{5, 6, 7}}, got K={k}")
@@ -234,7 +339,6 @@ class Evaluator(object):
         if n == 0:
             return out
         n_subsets = subsets.shape[0]
-        # Chunk over rows so peak memory stays bounded for large callers.
         chunk = 1 << 15
         for start in range(0, n, chunk):
             block = cards[start : start + chunk]

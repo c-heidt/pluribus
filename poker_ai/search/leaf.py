@@ -27,6 +27,7 @@ from typing import List, Mapping, Tuple
 import numpy as np
 
 from environment.poker_env import PokerEnv
+from poker_ai.blueprint.tree_utils import sample_index
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.policy import BiasClass, Policy
 
@@ -172,12 +173,10 @@ def continuation_value(
                 tuple(int(x) for x in e.current_player.cards), for_blueprint=True
             )
             probs = cfg.policies[c].strategy(state, bias=c)
-            # Policy.strategy returns float32; cast + renormalise so
-            # Generator.choice accepts the vector (float32 sums can drift
-            # beyond its ~1e-8 tolerance).
-            probs = np.asarray(probs, dtype=np.float64)
-            probs /= probs.sum()
-            idx = int(rng.choice(len(state.legal_actions), p=probs))
+            # Single inverse-CDF draw over the (short, per-node) strategy vector;
+            # sums in float64 internally and scales by the total, so the float32
+            # σ needs no copy-and-renormalise (the old Generator.choice path did).
+            idx = sample_index(rng, probs)
             tokens.append(e.step_in_place(state.legal_actions[idx]))
         # Decision-free all-in showdown over an incomplete board: take the
         # exact board-average instead of the single dealt runout (§6.4),

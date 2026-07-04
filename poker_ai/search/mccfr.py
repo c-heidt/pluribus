@@ -24,6 +24,7 @@ from typing import Dict, Tuple
 
 import numpy as np
 
+from poker_ai.blueprint.tree_utils import sample_index
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.leaf import continuation_value
 from poker_ai.search.policy import BiasClass
@@ -33,16 +34,6 @@ logger = logging.getLogger(__name__)
 
 # The four §4 continuation strategies, in the canonical meta-action order.
 _BIAS_CLASSES: Tuple[BiasClass, ...] = ("none", "fold", "call", "raise")
-
-
-def _as_prob(vec: np.ndarray) -> np.ndarray:
-    """Float64 probability vector for ``Generator.choice`` (float32 σ can drift
-    past its ~1e-8 tolerance, so cast and renormalise)."""
-    p = np.asarray(vec, dtype=np.float64)
-    total = p.sum()
-    if total > 0.0:
-        return p / total
-    return np.full(len(p), 1.0 / len(p), dtype=np.float64)
 
 
 class _MCCFRSolver:
@@ -198,7 +189,7 @@ class _MCCFRSolver:
 
         if actor != i:
             # External sampling: one opponent action from its current strategy.
-            a_idx = int(self.rng.choice(len(legal), p=_as_prob(sig)))
+            a_idx = sample_index(self.rng, sig)
             token = env.step_in_place(legal[a_idx])
             value = self._traverse(env, i, holes)
             env.undo(token)
@@ -249,7 +240,7 @@ class _MCCFRSolver:
         sig = self._node_sigma(key, actor, holes)
         if actor == i and not self._is_frozen(key, actor, holes):
             self.state.add_strat(key, sig)
-        a_idx = int(self.rng.choice(len(legal), p=_as_prob(sig)))
+        a_idx = sample_index(self.rng, sig)
         token = env.step_in_place(legal[a_idx])
         self._update_strategy(env, i, holes)
         env.undo(token)
@@ -319,7 +310,7 @@ class _MCCFRSolver:
             if s == i:
                 continue
             _, sig = self._meta_node(env, holes, s, pk_base)
-            b = int(self.rng.choice(len(_BIAS_CLASSES), p=_as_prob(sig)))
+            b = sample_index(self.rng, sig)
             sampled[s] = _BIAS_CLASSES[b]
 
         if i not in active:
