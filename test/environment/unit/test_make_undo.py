@@ -64,9 +64,16 @@ def _generic_state(env: PokerEnv) -> dict:
     ``_mutable_view``'s hand-picked field list, this auto-includes any
     *new* env attribute, so it catches a future mutable field that gets
     added to ``__deepcopy__`` but forgotten in the ``UndoToken``."""
+    # Derived caches are *not* logical state: they are pure functions of the
+    # game state, deliberately not carried in the UndoToken.  ``_state_version``
+    # is a monotonic counter (never restored — that is what keeps its values
+    # globally unique so the ``_public_state_cache`` memo can never serve a
+    # sibling's entry), and ``_public_state_cache`` is that memo.  Their
+    # correctness is guarded directly by ``test_public_state_memo_never_stale``.
+    _DERIVED = {"card_info_lut", "_state_version", "_public_state_cache"}
     out = {}
     for k, v in env.__dict__.items():
-        if k == "card_info_lut":
+        if k in _DERIVED:
             continue
         if k == "players":
             out[k] = [(p.n_chips, p.n_bet_chips, p.is_active, p.is_turn,
@@ -193,6 +200,37 @@ class TestStepUndo:
         )
         env.undo(token)
         assert _generic_state(env) == before
+
+    def test_public_state_memo_never_stale(self):
+        # ``_current_public_state`` is memoised under ``_state_version`` (bumped
+        # on every step/undo).  Walk the action tree with step/undo and assert
+        # the memo always equals a fresh recomputation — at every node, after
+        # every step, and after every undo — so no stale public key can leak
+        # into legal_actions / info-set keys.
+        env = _env(n_players=3, seed=0)
+
+        def fresh(e):
+            return (
+                e._betting_stage,
+                tuple((s, tuple(a)) for s, a in e._history.items()),
+            )
+
+        def walk(depth):
+            assert env._current_public_state() == fresh(env)
+            # A second call at the same version must serve the identical object.
+            assert env._current_public_state() is env._current_public_state()
+            if env.is_terminal or depth > 8:
+                return
+            for a in [a for a in env.legal_actions if a is not None][:3]:
+                v0 = env._state_version
+                tok = env.step_in_place(a)
+                assert env._state_version != v0
+                assert env._current_public_state() == fresh(env)
+                walk(depth + 1)
+                env.undo(tok)
+                assert env._current_public_state() == fresh(env)
+
+        walk(0)
 
 
 class TestCardDealingTransitions:

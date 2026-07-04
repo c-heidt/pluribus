@@ -85,8 +85,15 @@ def merge_local_delta(
         info_set)``.  Values are int64 delta arrays (positive or
         negative) produced by :func:`cfr` / :func:`cfrp`.
     """
+    # Group by betting round (each round has its own regret table), then flush
+    # each round's rows in one batched call.  ``merge_delta_rows`` acquires each
+    # chunk's stripe lock once per flush instead of once per info set — the same
+    # writes, far fewer lock acquisitions under concurrent workers.
+    by_round: Dict[int, list] = {}
     for (r, info_set), delta in local_delta.items():
-        tables.regret[r].merge_delta_row(info_set, delta)
+        by_round.setdefault(r, []).append((info_set, delta))
+    for r, items in by_round.items():
+        tables.regret[r].merge_delta_rows(items)
 
 
 def cfr(

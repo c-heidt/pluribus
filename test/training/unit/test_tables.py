@@ -648,3 +648,49 @@ class TestChunkedTableAllocation:
         np.testing.assert_array_equal(
             table.get_row_if_exists("neg_is"), np.full(n_actions, -5, dtype=np.int32)
         )
+
+    def test_merge_delta_rows_matches_per_row(
+        self, tmp_path, tmp_lmdb, n_actions, table_name
+    ):
+        # Batched merge_delta_rows must be byte-identical to a sequence of
+        # per-row merge_delta_row calls (it exists only to cut lock acquisitions).
+        rng = np.random.default_rng(0)
+        infosets = [f"eq_is_{i}" for i in range(40)]
+        deltas = {
+            s: rng.integers(-1000, 1000, size=n_actions).astype(np.int64)
+            for s in infosets
+        }
+        # Reference table: per-row path.
+        os.makedirs(str(tmp_path / "ref_shm"), exist_ok=True)
+        ref_idx = InfosetIndex(tmp_path / "ref_idx")
+        ref = ChunkedTable(
+            n_actions=n_actions, table_name=table_name + "_ref",
+            index=ref_idx, shm_dir=str(tmp_path / "ref_shm"),
+        )
+        try:
+            for s in infosets:
+                ref.merge_delta_row(s, deltas[s])
+            # Batched table.
+            os.makedirs(str(tmp_path / "bat_shm"), exist_ok=True)
+            bat = ChunkedTable(
+                n_actions=n_actions, table_name=table_name + "_bat",
+                index=tmp_lmdb, shm_dir=str(tmp_path / "bat_shm"),
+            )
+            try:
+                bat.merge_delta_rows([(s, deltas[s]) for s in infosets])
+                for s in infosets:
+                    np.testing.assert_array_equal(
+                        bat.get_row(s), ref.get_row(s)
+                    )
+            finally:
+                bat.close(); bat.unlink_all()
+        finally:
+            ref.close(); ref.unlink_all(); ref_idx.close()
+
+    def test_merge_delta_rows_accumulates_duplicates(self, table, n_actions):
+        # Two entries for the same info set in one batch add twice.
+        delta = np.full(n_actions, 4, dtype=np.int64)
+        table.merge_delta_rows([("dup_is", delta), ("dup_is", delta)])
+        np.testing.assert_array_equal(
+            table.get_row_if_exists("dup_is"), np.full(n_actions, 8, dtype=np.int32)
+        )

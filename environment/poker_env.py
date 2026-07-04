@@ -559,6 +559,14 @@ class PokerEnv:
         # input beyond the public state, so the overlay mutators are the cache's
         # sole invalidation points.
         self._legal_actions_cache: Dict[Tuple, List[Optional[str]]] = {}
+        # Single-value memo for ``_current_public_state`` (rebuilds the full
+        # cross-street history tuple, called many times per node as the
+        # legal-actions cache key, public_key, and overlay lookups).  It is a
+        # pure function of ``_betting_stage`` + ``_history``, both mutated only
+        # by ``_apply_action_in_place`` / ``undo``, which bump ``_state_version``
+        # on exit — so a version mismatch is the sole invalidation signal.
+        self._state_version: int = 0
+        self._public_state_cache: Optional[Tuple[int, Tuple]] = None
         self._reset_betting_round_state()
 
         # Mark the first player to act
@@ -619,6 +627,10 @@ class PokerEnv:
         # ``_extra_legal_actions``): an empty per-env memo can never carry stale
         # entries across a config boundary (e.g. a copy taken to start a new hand).
         object.__setattr__(new, "_legal_actions_cache", {})
+        # Derived public-state memo: start the copy with a fresh, empty cache
+        # (its own version counter) so it can never serve a stale entry.
+        object.__setattr__(new, "_state_version", 0)
+        object.__setattr__(new, "_public_state_cache", None)
         return new
 
     # ------------------------------------------------------------------
@@ -774,6 +786,9 @@ class PokerEnv:
             player.is_turn = False
         self.current_player.is_turn = True
 
+        # State changed (history/stage/players); invalidate the public-state memo.
+        self._state_version += 1
+
     def step_in_place(
         self, action_str: Optional[str], *, settle_winners: bool = True
     ) -> "UndoToken":
@@ -828,6 +843,9 @@ class PokerEnv:
         self._history.clear()
         for stage, actions in token.history.items():
             self._history[stage] = list(actions)
+
+        # State restored (history/stage/players); invalidate the public-state memo.
+        self._state_version += 1
 
     def _capture_undo_token(self) -> "UndoToken":
         """Snapshot the mutable per-hand state before an in-place step.
@@ -1296,13 +1314,18 @@ class PokerEnv:
         ``_history`` until its first action) is still distinguished from
         the end of the previous one.
         """
-        return (
+        cache = self._public_state_cache
+        if cache is not None and cache[0] == self._state_version:
+            return cache[1]
+        result = (
             self._betting_stage,
             tuple(
                 (stage, tuple(actions))
                 for stage, actions in self._history.items()
             ),
         )
+        self._public_state_cache = (self._state_version, result)
+        return result
 
     def inject_action(self, action: str) -> bool:
         """Inject `action` into the legal set at the current public state.
