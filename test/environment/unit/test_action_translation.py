@@ -169,17 +169,19 @@ class TestCanonicalizeHistory:
 
     def test_raise_index_advances_to_subsequent_grid(self):
         # 1.5 is in flop first_raise but NOT in subsequent_raise
-        # ([0.5, 1.0]); so the 2nd raise's 1.5 is off-tree and snaps
+        # ([1.0]); so the 2nd raise's 1.5 is off-tree and snaps
         # (above-grid -> 1.0), proving the index advanced.
         env = _env()
         out = env._canonicalize_history({"flop": ["raise:1.5", "raise:1.5"]})
         assert out == [("flop", ["raise:1.5", "raise:1.0"])]
 
     def test_all_in_advances_raise_index(self):
-        # subsequent_raise on flop is [0.5, 1.0]; 0.33 is below-grid -> 0.5.
+        # subsequent_raise on flop is [1.0]; first_raise is [0.5, 1.0, 1.5].
+        # 0.33 snaps to 0.5 on the first grid but to 1.0 on the subsequent
+        # grid, so the result 1.0 proves all_in advanced the raise index.
         env = _env()
         out = env._canonicalize_history({"flop": ["all_in", "raise:0.33"]})
-        assert out == [("flop", ["all_in", "raise:0.5"])]
+        assert out == [("flop", ["all_in", "raise:1.0"])]
 
     def test_fold_call_skip_pass_through(self):
         env = _env()

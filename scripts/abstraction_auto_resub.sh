@@ -6,13 +6,13 @@
 #SBATCH --job-name=pluribus-abstraction
 #SBATCH --output=logs/abstraction-%j.out
 #SBATCH --error=logs/abstraction-%j_error.out
-#SBATCH --partition=cpu
+#SBATCH --partition=highmem
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=8:00:00
 #SBATCH --signal=B:USR1@300
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=350000mb
+#SBATCH --mem=1000000mb
 #SBATCH --mail-type=ALL
 
 

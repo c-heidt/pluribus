@@ -177,12 +177,12 @@ class _NumpyJSONEncoder(json.JSONEncoder):
 # axis to give up.
 RAISE_SIZES_BY_STAGE: Dict[str, Dict[str, List[float]]] = {
     "pre_flop": {
-        "first_raise":      [1.0, 1.5, 2.0, 3.0],
-        "subsequent_raise": [1.0, 1.5],
+        "first_raise":      [1.0, 2.0, 3.0],
+        "subsequent_raise": [1.0],
     },
     "flop": {
         "first_raise":      [0.5, 1.0, 1.5],
-        "subsequent_raise": [0.5, 1.0],
+        "subsequent_raise": [1.0],
     },
     "turn": {
         "first_raise":      [0.5, 1.0],
