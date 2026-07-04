@@ -119,7 +119,7 @@ def _play_to_flop_with(env, flop_action):
 
 class TestCanonicalizationEquivalence:
     def test_off_tree_blueprint_key_equals_on_tree(self):
-        # flop grid first_raise=[0.5,0.75,1.0,1.5]; 0.6 snaps to 0.5.
+        # flop grid first_raise=[0.5,1.0,1.5]; 0.6 snaps to 0.5.
         off = _stub_lut(_env(seed=3))
         _play_to_flop_with(off, "raise:0.6")
         on = _stub_lut(_env(seed=3))
@@ -132,7 +132,7 @@ class TestCanonicalizationEquivalence:
 
     def test_on_tree_blueprint_is_noop(self):
         env = _stub_lut(_env(seed=1))
-        _play_to_flop_with(env, "raise:0.75")  # on-tree
+        _play_to_flop_with(env, "raise:1.0")  # on-tree
         combo = (int(env.combo_cards[0, 0]), int(env.combo_cards[0, 1]))
         assert env._blueprint_info_set(combo) == env._compute_info_set(combo)
 

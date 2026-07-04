@@ -150,31 +150,30 @@ class TestCanonicalizeHistory:
     def test_no_op_on_on_tree_history(self):
         env = _env()
         hist = {
-            "pre_flop": ["call", "raise:0.5", "call"],
-            "flop": ["raise:0.75", "call"],
+            "pre_flop": ["call", "raise:1.0", "call"],
+            "flop": ["raise:1.0", "call"],
         }
         out = env._canonicalize_history(hist)
         assert out == [
-            ("pre_flop", ["call", "raise:0.5", "call"]),
-            ("flop", ["raise:0.75", "call"]),
+            ("pre_flop", ["call", "raise:1.0", "call"]),
+            ("flop", ["raise:1.0", "call"]),
         ]
 
     def test_off_tree_raise_snaps_deterministically(self):
-        # flop first_raise grid [0.5,0.75,1.0,1.5]; 0.6 in (0.5, 0.75):
-        # P_A = ((0.75-0.6)(1+0.5)) / ((0.75-0.5)(1+0.6)) ≈ 0.5625 >= 0.5
+        # flop first_raise grid [0.5,1.0,1.5]; 0.6 in (0.5, 1.0):
+        # P_A = ((1.0-0.6)(1+0.5)) / ((1.0-0.5)(1+0.6)) = 0.6/0.8 = 0.75 >= 0.5
         # -> A = 0.5.
         env = _env()
         out = env._canonicalize_history({"flop": ["raise:0.6"]})
         assert out == [("flop", ["raise:0.5"])]
 
     def test_raise_index_advances_to_subsequent_grid(self):
-        # 0.75 is in flop first_raise but NOT in subsequent_raise
-        # ([0.5, 1.0]); so the 2nd raise's 0.75 is off-tree and snaps
-        # (0.75 in (0.5,1.0): P_A≈0.429 < 0.5 -> 1.0), proving the index
-        # advanced.
+        # 1.5 is in flop first_raise but NOT in subsequent_raise
+        # ([0.5, 1.0]); so the 2nd raise's 1.5 is off-tree and snaps
+        # (above-grid -> 1.0), proving the index advanced.
         env = _env()
-        out = env._canonicalize_history({"flop": ["raise:0.75", "raise:0.75"]})
-        assert out == [("flop", ["raise:0.75", "raise:1.0"])]
+        out = env._canonicalize_history({"flop": ["raise:1.5", "raise:1.5"]})
+        assert out == [("flop", ["raise:1.5", "raise:1.0"])]
 
     def test_all_in_advances_raise_index(self):
         # subsequent_raise on flop is [0.5, 1.0]; 0.33 is below-grid -> 0.5.
@@ -210,7 +209,7 @@ class TestBlueprintInfoSet:
     def test_no_op_equals_compute_info_set_on_tree(self):
         env = _env()
         _stub_lut(env)
-        _play_to_flop_with(env, "raise:0.75")  # on-tree
+        _play_to_flop_with(env, "raise:1.0")  # on-tree
         combo = (int(env.combo_cards[0, 0]), int(env.combo_cards[0, 1]))
         assert env._blueprint_info_set(combo) == env._compute_info_set(combo)
 
@@ -247,7 +246,7 @@ class TestCanonicalPublicKey:
     subgame the solver built."""
 
     def test_no_op_on_tree(self):
-        env = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.75")
+        env = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:1.0")
         assert env.canonical_public_key == env.public_key
 
     def test_off_tree_snaps_to_canonical_neighbour(self):
