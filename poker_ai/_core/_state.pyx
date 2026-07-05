@@ -303,6 +303,18 @@ cdef class FastState:
     def is_terminal(self):
         return self.betting_stage == ST_SHOWDOWN or self.betting_stage == ST_TERMINAL
 
+    cpdef bint is_seat_active(self, int seat):
+        """True iff *seat* is still active (has not folded).
+
+        The Phase-3 in-core traverse needs this to reproduce the Python
+        ``is_terminal(state, i)`` short-circuit (``not players[i].is_active``)
+        exactly — that early return decides how many opponent nodes are
+        visited below a folded traversing player, and therefore how many
+        replay/sample draws the traversal consumes.  ``cpdef`` so the pure-C
+        traverse and Python differential tests share one implementation.
+        """
+        return self.is_active[seat] != 0
+
     @property
     def betting_round(self):
         return self.betting_stage
@@ -490,6 +502,21 @@ cdef class FastState:
     def info_set(self):
         cdef int seat = self._cur_seat()
         cdef int rnd = self.betting_stage
+        # Match PokerEnv._compute_info_set's LOUD contract: a decision-stage
+        # cluster missing from card_info_lut raises ValueError there (only
+        # terminal/show_down falls back to a default).  info_set() is only called
+        # at decision nodes (rnd 0..3), so a missing cluster here means a genuinely
+        # incomplete LUT — without this guard the precompute's swallow (see
+        # from_poker_env) would leave clusters[seat][rnd]==0 and the core would
+        # SILENTLY train on a wrong (cluster-0) info-set while every PokerEnv path
+        # crashes.  No-op on a complete LUT (has_cluster==1 at every used node).
+        if rnd < N_DECISION_STAGES and self.has_cluster[seat][rnd] == 0:
+            raise ValueError(
+                "FastState.info_set: no cluster for seat %d at decision stage %d "
+                "— cards missing from card_info_lut (load it correctly). Mirrors "
+                "PokerEnv._compute_info_set; the compiled core must never silently "
+                "fall back to cluster 0." % (seat, rnd)
+            )
         cdef int cluster = self.clusters[seat][rnd]
         # Size bound (never under-allocate → no silent heap overflow): a uLEB128
         # varint is at most 10 bytes for a full uint64, so allow 10 for the

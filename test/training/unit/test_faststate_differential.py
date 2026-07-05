@@ -361,3 +361,27 @@ def test_invalid_action_raises_and_leaves_state_unchanged():
 
 def test_configure_is_installed():
     assert _cystate.is_configured()
+
+
+def test_info_set_raises_on_missing_cluster():
+    """A decision-stage cluster missing from the LUT must FAIL LOUD, matching
+    ``PokerEnv._compute_info_set`` (raises ValueError) — never a silent
+    cluster-0 fallback (``from_poker_env`` swallows the precompute miss, so the
+    guard has to live in ``info_set``).  Without it the compiled core would
+    silently train on wrong info sets on an incomplete LUT."""
+    class _EmptyStage:
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+    class _MissingLUT(dict):
+        def __missing__(self, stage):
+            return _EmptyStage()
+
+    env = PokerEnv(players=[Player(i, 10000) for i in range(2)])
+    env.card_info_lut = _MissingLUT()
+    # PokerEnv's own loud contract at a decision stage (the behaviour we mirror).
+    with pytest.raises(ValueError):
+        _ = env.info_set
+    cs = _cystate.FastState.from_poker_env(env)
+    with pytest.raises(ValueError):
+        cs.info_set()
