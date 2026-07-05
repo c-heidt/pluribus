@@ -31,15 +31,15 @@ fi
 
 # Training parameters (cycle-based options are counted in sync cycles = N * sync_interval iterations)
 N_PLAYERS=${N_PLAYERS:-6}
-MAX_RUNTIME_HOURS=${MAX_RUNTIME_HOURS:-71.5} 
-SYNC_INTERVAL=${SYNC_INTERVAL:-500}
-DISCOUNT_INTERVAL=${DISCOUNT_INTERVAL:-50}
+MAX_RUNTIME_HOURS=${MAX_RUNTIME_HOURS:-71.5}
+SYNC_INTERVAL=${SYNC_INTERVAL:-750}
+DISCOUNT_INTERVAL=${DISCOUNT_INTERVAL:-100}
 DISCOUNT_DURATION_CYCLES=${DISCOUNT_DURATION_CYCLES:-2000}
 UPDATE_THRESHOLD=${UPDATE_THRESHOLD:-200}
-STRATEGY_INTERVAL=${STRATEGY_INTERVAL:-5}
-CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-200}
+STRATEGY_INTERVAL=${STRATEGY_INTERVAL:-1}
+CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-2000}
 PRUNE_THRESHOLD=${PRUNE_THRESHOLD:-500000}
-C=${C:--300000000}
+C=${C:--3000000}
 PICKLE_DIR=${PICKLE_DIR:-false}
 N_PROCESSES=${N_PROCESSES:-}
 LUT_PATH=${LUT_PATH:-"$WORKSPACE/exact"}
@@ -77,6 +77,12 @@ export PLURIBUS_CHUNK_SIZE=${PLURIBUS_CHUNK_SIZE:-4000000}
 # accordingly (chunk tables need the rest of RAM).
 export PLURIBUS_INDEX_CACHE=${PLURIBUS_INDEX_CACHE:-1}
 export PLURIBUS_INDEX_CAPACITY=${PLURIBUS_INDEX_CAPACITY:-"67108864,268435456,268435456,268435456"}
+# Compiled Cython core for the CFR hot loop.  1 = every worker drives its
+# traversals through poker_ai._core (byte-verified, fallback-retaining); set 0
+# to force the pure-Python path (e.g. the A/B baseline arm).  REQUIRES the shm
+# index cache above (pure-shm reads, no LMDB fallback) — already default-on —
+# and the extension to be BUILT on this node (preflight check below).
+export PLURIBUS_CFR_CORE=${PLURIBUS_CFR_CORE:-1}
 
 mkdir -p "$PROJECT_DIR/logs"
 mkdir -p "$(dirname "$NICKNAME")"
@@ -87,6 +93,21 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate $CONDA_ENV
 
 cd "$PROJECT_DIR"
+
+# Preflight: when the compiled core is requested it MUST be built on this node.
+# CoreDriver imports the extension in each worker; a missing/stale .so would
+# otherwise surface as a worker crash mid-run. Fail here with the build command
+# instead. (Build once before submitting; do not build inside the job if
+# PROJECT_DIR is shared across concurrent jobs — the .so write would race.)
+if [ "$PLURIBUS_CFR_CORE" = "1" ]; then
+  if ! python -c "import poker_ai._core._state, poker_ai._core._traverse" 2>/dev/null; then
+    echo "ERROR: PLURIBUS_CFR_CORE=1 but the compiled core is not importable." >&2
+    echo "       Build it on this node first:  python setup.py build_ext --inplace" >&2
+    echo "       (or set PLURIBUS_CFR_CORE=0 to run the pure-Python path)." >&2
+    exit 1
+  fi
+  echo "Compiled CFR core present and importable."
+fi
 
 # Ensure LUT path exists
 if [ ! -d "$LUT_PATH" ]; then
@@ -177,6 +198,7 @@ echo "  - Warm start:                  ${WARM_START:-(none)}"
 echo "  - CPUs:                        $SLURM_CPUS_PER_TASK"
 echo "  - PLURIBUS_CFR_BATCH_SIZE:     $PLURIBUS_CFR_BATCH_SIZE"
 echo "  - PLURIBUS_STRATEGY_BATCH_SIZE:$PLURIBUS_STRATEGY_BATCH_SIZE"
+echo "  - PLURIBUS_CFR_CORE:           $PLURIBUS_CFR_CORE"
 echo "  - PLURIBUS_INDEX_CACHE:        $PLURIBUS_INDEX_CACHE"
 echo "  - PLURIBUS_INDEX_CAPACITY:     $PLURIBUS_INDEX_CAPACITY"
 echo "  - PLURIBUS_CHUNK_SIZE:         $PLURIBUS_CHUNK_SIZE"
