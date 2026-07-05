@@ -497,6 +497,17 @@ class PokerEnv:
         self._low_card_rank: int = low_card_rank
         self._high_card_rank: int = high_card_rank
         self._initial_n_chips: int = players[0].n_chips
+        # Per-seat starting stack, so ``payout`` nets each seat against its OWN
+        # start rather than seat 0's.  Identical to ``_initial_n_chips`` for the
+        # equal-stack hands every current caller deals (``new_game``), but the
+        # only correct source once stacks can differ (unequal effective stacks in
+        # a search subgame rebuilt from remaining chips, tournament/session
+        # carryover): netting everyone against seat 0's stack yields a non
+        # zero-sum ``payout`` — see ``payout``.  Player.n_chips is mutated during
+        # the hand, so the per-seat initial must be captured here at construction.
+        self._initial_chips_by_seat: Tuple[int, ...] = tuple(
+            p.n_chips for p in players
+        )
         self.small_blind: int = small_blind
         self.big_blind: int = big_blind
         self._betting_stage_to_round: Dict[str, int] = {
@@ -654,7 +665,7 @@ class PokerEnv:
         # check; `card_info_lut` is read-only and large, so it is shared too.
         for attr in (
             "small_blind", "big_blind", "_low_card_rank", "_high_card_rank",
-            "_initial_n_chips",
+            "_initial_n_chips", "_initial_chips_by_seat",
             "_betting_stage_to_round", "_player_i_lut",
             "_extra_legal_actions", "_overlay_version",
             "card_info_lut",
@@ -2019,16 +2030,23 @@ class PokerEnv:
 
     @property
     def payout(self) -> Dict[int, int]:
-        """Chip delta per player index relative to their starting stack.
+        """Chip delta per player index relative to *that seat's* starting stack.
+
+        Nets each seat's current chips against its **own** starting stack
+        (``_initial_chips_by_seat``), so the mapping is always zero-sum — equal
+        to ``won[i] - contributed[i]`` at a terminal.  For the equal-stack hands
+        every current caller deals (``new_game``) this is identical to netting
+        against seat 0's stack; it differs (and only this is correct) once seats
+        start a hand with unequal stacks.
 
         Returns
         -------
         dict[int, int]
             Mapping of player index → chips gained (positive) or lost
-            (negative) compared to ``initial_chips``.
+            (negative) compared to that seat's starting stack.
         """
         return {
-            i: player.n_chips - self._initial_n_chips
+            i: player.n_chips - self._initial_chips_by_seat[i]
             for i, player in enumerate(self.players)
         }
 

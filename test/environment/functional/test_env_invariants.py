@@ -15,7 +15,8 @@ fast-path, so ALL terminal states have exactly 5 community cards.
 
 import pytest
 
-from environment.poker_env import new_game
+from environment.player import Player
+from environment.poker_env import PokerEnv, new_game
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +259,24 @@ class TestPayoutIntegrityInvariant:
     def test_payout_zero_sum_three_players(self):
         env = new_game(n_players=3, card_info_lut={})
         env = _play_all_calls(env)
+        assert sum(env.payout.values()) == 0
+
+    def test_payout_nets_per_seat_with_unequal_stacks(self):
+        # Regression for the per-seat-initial payout fix: with UNEQUAL starting
+        # stacks, ``payout`` must net each seat against its OWN start (zero-sum),
+        # not against seat 0's stack.  The old code netted everyone against
+        # ``players[0].n_chips``, giving a non-zero-sum result off equal stacks.
+        starting = [150, 400, 900]
+        env = PokerEnv(
+            players=[Player(i, starting[i]) for i in range(3)],
+            small_blind=25,
+            big_blind=50,
+        )
+        env.card_info_lut = {}
+        env = _play_all_calls(env)
+        assert env.is_terminal
+        for i, player in enumerate(env.players):
+            assert env.payout[i] == player.n_chips - starting[i]
         assert sum(env.payout.values()) == 0
 
 

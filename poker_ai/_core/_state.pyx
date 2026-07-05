@@ -1,0 +1,779 @@
+# cython: language_level=3
+"""Compiled betting-state engine (Phase 2) — Cython port of
+``poker_ai._core._state_ref.FastStateRef`` (which is itself the audited reduction
+of ``environment.poker_env.PokerEnv``'s blueprint-training betting engine).
+
+``FastState`` is a ``cdef class`` holding the whole betting state in **flat C
+arrays** (no ``Player`` / ``Pot`` / ``Deck`` / history-dict Python objects on the
+hot path) with make/undo driven by an explicit **C POD stack** (``memcpy`` of a
+fixed struct, not a dataclass).  It is byte-for-byte equivalent to ``PokerEnv`` /
+``FastStateRef`` on the blueprint contract — ``player_i`` / ``legal_actions`` /
+``is_terminal`` / ``info_set`` bytes / ``payout`` at **every** node — which the
+Phase-2 differential fuzz proves against both oracles.
+
+Design notes (why this is Phase-3 ready, not throwaway):
+
+* **History is stored as resolved action *byte-codes*** in flat C arrays
+  (``hist[stage][k]`` + ``hist_n[stage]``), not Python strings.  The code for an
+  action is resolved **once, at step time**, against the dumped ``_ACTION_BYTE``
+  alphabet (one dict lookup per *step* — cheap), so :meth:`info_set` is a pure-C
+  ``memcpy`` walk with **no per-token dict lookup per node** (the old
+  ``encode_info_set`` did an ``O(history)`` re-encode *per node*).  This is the
+  exact byte stream ``encode_info_set`` produces, so the key is identical.
+* **The alphabet / raise grid are DUMPED from ``poker_env`` via :func:`configure`,
+  never hard-coded** — the same anti-drift discipline as the Phase-1 kernels (a
+  hard-coded copy would silently diverge when ``RAISE_SIZES_BY_STAGE`` changes →
+  keys that hash differently from what the tables were written under).
+* **make/undo restores counts, not history data.**  Within one ``_apply`` only the
+  *entry* stage's history grows (by ``skip_counter + 1`` entries); the POD frame
+  snapshots ``hist_n`` (append cursor) — the stale data past the cursor is simply
+  overwritten by the next append, so no data copy is needed.
+* Settlement (:meth:`payout`) is a **separate value layer** (Python evaluator +
+  ``Pot.compute_utility``, identical to ``FastStateRef.payout``); it is only
+  touched at terminal leaves and is already covered by the Phase-1d/1e kernels, so
+  Phase 2 leaves it in Python and Phase 3 may swap in the kernels if it profiles.
+"""
+
+from libc.stdlib cimport malloc, realloc, free
+from libc.string cimport memcpy
+from libc.math cimport ceil
+from cpython.bytes cimport PyBytes_FromStringAndSize
+
+
+# ---------------------------------------------------------------------------
+# Compile-time bounds (loud RuntimeError on overflow — never silent truncation)
+# ---------------------------------------------------------------------------
+DEF MAX_PLAYERS = 32
+DEF MAX_STAGE_ACTIONS = 2048   # history entries per betting round (skips + actions)
+DEF MAX_FRACS = 8              # raise fractions per stage in the grid
+DEF N_DECISION_STAGES = 4      # pre_flop, flop, turn, river (rounds 0..3)
+
+# Internal stage enumeration (canonical play order), mirroring the PokerEnv
+# ``_betting_stage`` strings.  0..3 are decision rounds; 4/5 are terminal.
+DEF ST_PRE = 0
+DEF ST_FLOP = 1
+DEF ST_TURN = 2
+DEF ST_RIVER = 3
+DEF ST_SHOWDOWN = 4
+DEF ST_TERMINAL = 5
+
+# Community cards visible at each stage (board is external / precomputed).
+cdef int _BOARD_LEN[6]
+_BOARD_LEN[:] = [0, 3, 4, 5, 5, 5]
+
+
+# ---------------------------------------------------------------------------
+# Process-wide config dumped from poker_env (see configure()).  The alphabet and
+# raise grid are constant per process, so they live at module scope shared by all
+# FastState instances — never hard-coded here.
+# ---------------------------------------------------------------------------
+cdef bint _configured = False
+cdef int _MAX_RAISES = 0
+cdef int _STAGE_BYTE[N_DECISION_STAGES]      # internal stage idx -> _STAGE_ID byte
+cdef object _ACTION_CODE = None              # list[4] of {token_str: int code}
+cdef int _FIRST_N[N_DECISION_STAGES]
+cdef int _SUB_N[N_DECISION_STAGES]
+cdef double _FIRST_FRAC[N_DECISION_STAGES][MAX_FRACS]
+cdef double _SUB_FRAC[N_DECISION_STAGES][MAX_FRACS]
+cdef object _FIRST_STR = None                # list[4] of list[str] "raise:<f>"
+cdef object _SUB_STR = None
+
+_STAGE_NAMES = ("pre_flop", "flop", "turn", "river")
+
+
+def configure(stage_id, action_byte, raise_sizes_by_stage, max_raises):
+    """Install the encoding alphabet + raise grid dumped from ``poker_env``.
+
+    Call once at wire time with the live ``_STAGE_ID`` / ``_ACTION_BYTE`` /
+    ``RAISE_SIZES_BY_STAGE`` / ``MAX_RAISES_PER_ROUND`` — never a hard-coded copy
+    (they derive from the raise grid and would silently drift otherwise).
+    """
+    global _configured, _MAX_RAISES, _ACTION_CODE, _FIRST_STR, _SUB_STR
+    cdef int si, k
+    cdef double f
+    _MAX_RAISES = int(max_raises)
+    _ACTION_CODE = [dict(action_byte[name]) for name in _STAGE_NAMES]
+    _FIRST_STR = [[] for _ in range(N_DECISION_STAGES)]
+    _SUB_STR = [[] for _ in range(N_DECISION_STAGES)]
+    for si in range(N_DECISION_STAGES):
+        name = _STAGE_NAMES[si]
+        _STAGE_BYTE[si] = int(stage_id[name])
+        cfg = raise_sizes_by_stage.get(name, {})
+        first = list(cfg.get("first_raise", [1.0]))
+        sub = list(cfg.get("subsequent_raise", [1.0]))
+        if len(first) > MAX_FRACS or len(sub) > MAX_FRACS:
+            raise RuntimeError("raise grid exceeds MAX_FRACS — raise the bound")
+        _FIRST_N[si] = len(first)
+        _SUB_N[si] = len(sub)
+        for k in range(len(first)):
+            f = float(first[k])
+            _FIRST_FRAC[si][k] = f
+            # f"raise:{f}" — the identical formatting poker_env / FastStateRef use.
+            (<list>_FIRST_STR[si]).append("raise:{}".format(f))
+        for k in range(len(sub)):
+            f = float(sub[k])
+            _SUB_FRAC[si][k] = f
+            (<list>_SUB_STR[si]).append("raise:{}".format(f))
+    _configured = True
+
+
+def is_configured():
+    return _configured
+
+
+# ---------------------------------------------------------------------------
+# make/undo POD frame — the full mutable betting state (fixed struct, memcpy'd).
+# hist DATA is NOT snapshotted (append-only; restored via the hist_n cursor).
+# ---------------------------------------------------------------------------
+ctypedef struct FrameT:
+    int betting_stage
+    int player_i_index
+    int n_raises
+    int n_actions
+    int skip_counter
+    long last_raise_amount
+    int n_players_started_round
+    long n_chips[MAX_PLAYERS]
+    long n_bet_chips[MAX_PLAYERS]
+    int is_active[MAX_PLAYERS]
+    long pot_chips[MAX_PLAYERS]
+    int hist_n[N_DECISION_STAGES]
+
+
+cdef class FastState:
+    """Flat-array betting engine equivalent to ``FastStateRef`` / ``PokerEnv``.
+
+    Construct via :meth:`from_poker_env` (Phase-2 differential harness) — the deal
+    and per-(seat, round) cluster precompute stay in Python; this engine owns only
+    the betting transitions.
+    """
+
+    # config (immutable after construction)
+    cdef int n_players
+    cdef long small_blind
+    cdef long big_blind
+    cdef int player_i_lut[6][MAX_PLAYERS]
+    cdef int hole[MAX_PLAYERS][2]
+    cdef int board[5]
+    cdef int order[MAX_PLAYERS]
+    cdef int clusters[MAX_PLAYERS][N_DECISION_STAGES]
+    cdef int has_cluster[MAX_PLAYERS][N_DECISION_STAGES]
+
+    # mutable betting state
+    cdef long n_chips[MAX_PLAYERS]
+    cdef long n_bet_chips[MAX_PLAYERS]
+    cdef int is_active[MAX_PLAYERS]
+    cdef long pot_chips[MAX_PLAYERS]
+    cdef int betting_stage
+    cdef int player_i_index
+    cdef int n_raises
+    cdef int n_actions
+    cdef int skip_counter
+    cdef long last_raise_amount
+    cdef int n_players_started_round
+
+    # history: resolved action byte-codes, per decision round (append-only cursor)
+    cdef unsigned char hist[N_DECISION_STAGES][MAX_STAGE_ACTIONS]
+    cdef int hist_n[N_DECISION_STAGES]
+
+    # make/undo POD stack
+    cdef FrameT* _stack
+    cdef int _stack_top
+    cdef int _stack_cap
+
+    def __cinit__(self):
+        if not _configured:
+            raise RuntimeError(
+                "poker_ai._core._state.FastState used before configure() — the "
+                "action alphabet + raise grid must be dumped from poker_env first."
+            )
+        # Start small so the realloc growth path is exercised by ordinary play
+        # (a root-to-leaf line is tens of steps deep) rather than being dead code
+        # only a pathological >64-deep 6-max line would ever reach.  The stack
+        # reaches its steady-state depth after a few doublings, one-time cost.
+        self._stack_cap = 8
+        self._stack = <FrameT*>malloc(self._stack_cap * sizeof(FrameT))
+        if self._stack == NULL:
+            raise MemoryError()
+        self._stack_top = 0
+
+    def __dealloc__(self):
+        if self._stack != NULL:
+            free(self._stack)
+
+    # ------------------------------------------------------------------
+    # Construction from a live PokerEnv (Python owns the deal + clusters)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def from_poker_env(env):
+        """Snapshot a live ``PokerEnv`` into an equivalent flat ``FastState``.
+
+        Mirrors ``FastStateRef.from_poker_env`` exactly: board is the
+        line-independent ``deck[2n:2n+5]``; clusters are precomputed per
+        (seat, round) from ``env.card_info_lut``.
+        """
+        cdef FastState s = FastState()
+        cdef int n = env.n_players
+        if n > MAX_PLAYERS:
+            raise RuntimeError("n_players exceeds MAX_PLAYERS")
+        s.n_players = n
+        s.small_blind = int(env.small_blind)
+        s.big_blind = int(env.big_blind)
+
+        cdef int seat, k, si
+        # Per-stage seat permutation (mirrors PokerEnv._player_i_lut / FastStateRef).
+        base = list(range(n))
+        postflop = base[::-1] if n == 2 else base
+        preflop = base[2:] + base[:2]
+        lut_by_stage = [preflop, postflop, postflop, postflop, postflop, postflop]
+        for si in range(6):
+            perm = lut_by_stage[si]
+            for k in range(n):
+                s.player_i_lut[si][k] = <int>perm[k]
+
+        # Hole cards + board (deck[2n:2n+5], line-independent).
+        board = [int(c) for c in env.deck._cards[2 * n: 2 * n + 5]]
+        for k in range(5):
+            s.board[k] = <int>board[k]
+        holes = [[int(c) for c in p._cards] for p in env.players]
+        for seat in range(n):
+            s.hole[seat][0] = <int>holes[seat][0]
+            s.hole[seat][1] = <int>holes[seat][1]
+            s.order[seat] = <int>env.players[seat].order
+
+        # Clusters per (seat, round) — same key PokerEnv._compute_info_set uses.
+        for seat in range(n):
+            for si in range(N_DECISION_STAGES):
+                s.clusters[seat][si] = 0
+                s.has_cluster[seat][si] = 0
+        for si in range(N_DECISION_STAGES):
+            name = _STAGE_NAMES[si]
+            blen = _BOARD_LEN[si]
+            try:
+                stage_lut = env.card_info_lut[name]
+            except (KeyError, TypeError):
+                continue
+            for seat in range(n):
+                key = tuple(sorted(holes[seat]) + sorted(board[:blen]))
+                try:
+                    s.clusters[seat][si] = <int>stage_lut[key]
+                    s.has_cluster[seat][si] = 1
+                except (KeyError, IndexError):
+                    pass
+
+        # Mutable betting state.
+        for seat in range(n):
+            s.n_chips[seat] = <long>env.players[seat].n_chips
+            s.n_bet_chips[seat] = <long>env.players[seat].n_bet_chips
+            s.is_active[seat] = 1 if env.players[seat].is_active else 0
+            s.pot_chips[seat] = <long>env.pot._chips[seat]
+        stage_name = env._betting_stage
+        s.betting_stage = _STAGE_NAMES.index(stage_name) if stage_name in _STAGE_NAMES else (
+            ST_SHOWDOWN if stage_name == "show_down" else ST_TERMINAL)
+        s.player_i_index = <int>env._player_i_index
+        s.n_raises = <int>env._n_raises
+        s.n_actions = <int>env._n_actions
+        s.skip_counter = <int>env._skip_counter
+        s.last_raise_amount = <long>env._last_raise_amount
+        s.n_players_started_round = <int>env._n_players_started_round
+
+        # History: resolve each existing token to its byte-code (rounds 0..3).
+        for si in range(N_DECISION_STAGES):
+            s.hist_n[si] = 0
+        for name, actions in env._history.items():
+            if name not in _STAGE_NAMES:
+                continue
+            si = _STAGE_NAMES.index(name)
+            table = <dict>_ACTION_CODE[si]
+            for token in actions:
+                s._push_hist_code(si, s._resolve_code(table, token))
+        return s
+
+    # ------------------------------------------------------------------
+    # Derived read-only contract (mirrors FastStateRef / PokerEnv)
+    # ------------------------------------------------------------------
+    cdef inline int _cur_seat(self):
+        return self.player_i_lut[self.betting_stage][self.player_i_index]
+
+    @property
+    def player_i(self):
+        return self._cur_seat()
+
+    @property
+    def is_terminal(self):
+        return self.betting_stage == ST_SHOWDOWN or self.betting_stage == ST_TERMINAL
+
+    @property
+    def betting_round(self):
+        return self.betting_stage
+
+    @property
+    def pot_size(self):
+        return self._pot_size()
+
+    cdef inline long _pot_size(self):
+        cdef long tot = 0
+        cdef int s
+        for s in range(self.n_players):
+            tot += self.pot_chips[s]
+        return tot
+
+    cdef inline long _biggest_bet(self):
+        cdef long mx = self.n_bet_chips[0]
+        cdef int s
+        for s in range(1, self.n_players):
+            if self.n_bet_chips[s] > mx:
+                mx = self.n_bet_chips[s]
+        return mx
+
+    cdef inline bint _is_all_in(self, int seat):
+        return self.is_active[seat] != 0 and self.n_chips[seat] == 0
+
+    cdef int _n_players_with_moves(self):
+        cdef int c = 0
+        cdef int s
+        for s in range(self.n_players):
+            if self.is_active[s] != 0 and self.n_chips[s] != 0:
+                c += 1
+        return c
+
+    def n_players_with_moves(self):
+        return self._n_players_with_moves()
+
+    cdef int _n_active_players(self):
+        cdef int c = 0
+        cdef int s
+        for s in range(self.n_players):
+            if self.is_active[s] != 0:
+                c += 1
+        return c
+
+    cdef bint _more_betting_needed(self):
+        # True iff some live (active, non-all-in) player has not matched the
+        # largest bet among ALL active players (all-in included) — mirrors
+        # dynamics.more_betting_needed / FastStateRef.more_betting_needed.
+        cdef long max_bet = 0
+        cdef bint any_live = False
+        cdef int s
+        for s in range(self.n_players):
+            if self.is_active[s] != 0:
+                if self.n_bet_chips[s] > max_bet:
+                    max_bet = self.n_bet_chips[s]
+                if self.n_chips[s] != 0:
+                    any_live = True
+        if not any_live:
+            return False
+        for s in range(self.n_players):
+            if self.is_active[s] != 0 and self.n_chips[s] != 0:
+                if self.n_bet_chips[s] < max_bet:
+                    return True
+        return False
+
+    cdef inline bint _all_players_have_actioned(self):
+        return self.n_actions >= self.n_players_started_round
+
+    cdef bint _hand_over(self):
+        # Terminal when <=1 active, or all remaining active are all-in, or the
+        # sole live player has matched the largest bet.  A lone live player who
+        # still owes a call is NOT terminal.  Mirrors FastStateRef._hand_over.
+        cdef int n_active = 0
+        cdef int n_live = 0
+        cdef int live_seat = -1
+        cdef long max_bet = 0
+        cdef int s
+        for s in range(self.n_players):
+            if self.is_active[s] != 0:
+                n_active += 1
+                if self.n_bet_chips[s] > max_bet:
+                    max_bet = self.n_bet_chips[s]
+                if self.n_chips[s] != 0:
+                    n_live += 1
+                    live_seat = s
+        if n_active <= 1:
+            return True
+        if n_live == 0:
+            return True
+        if n_live == 1:
+            return self.n_bet_chips[live_seat] >= max_bet
+        return False
+
+    # ------------------------------------------------------------------
+    # legal_actions (canonical, no overlay) — returns Python action strings
+    # ------------------------------------------------------------------
+    def legal_actions(self):
+        cdef int seat = self._cur_seat()
+        if self.is_active[seat] == 0:
+            return [None]
+        cdef long biggest_bet = self._biggest_bet()
+        cdef long n_chips_to_call = biggest_bet - self.n_bet_chips[seat]
+        cdef long chips_available = self.n_chips[seat]
+        actions = ["fold"]
+        if n_chips_to_call >= chips_available:
+            if chips_available > 0:
+                actions.append("all_in")
+        else:
+            actions.append("call")
+            if self.n_raises < _MAX_RAISES and self._n_players_with_moves() >= 2:
+                actions += self._get_available_raise_sizes()
+        return actions
+
+    cdef long _compute_raise_chip_amount(self, double pot_fraction, bint enforce_minimum):
+        cdef int seat = self._cur_seat()
+        cdef long biggest_bet = self._biggest_bet()
+        cdef long n_chips_to_call = biggest_bet - self.n_bet_chips[seat]
+        cdef long n_chips_to_add = <long>ceil(<double>self._pot_size() * pot_fraction)
+        cdef long floor_amt
+        if enforce_minimum:
+            floor_amt = n_chips_to_call + self.last_raise_amount
+            if floor_amt > n_chips_to_add:
+                n_chips_to_add = floor_amt
+        return n_chips_to_add
+
+    def _get_available_raise_sizes(self):
+        cdef int st = self.betting_stage
+        if st >= ST_SHOWDOWN:
+            return []
+        cdef int seat = self._cur_seat()
+        cdef long biggest_bet = self._biggest_bet()
+        cdef long n_chips_to_call = biggest_bet - self.n_bet_chips[seat]
+        cdef long chips_available = self.n_chips[seat]
+        cdef int n
+        cdef int k
+        cdef double frac
+        cdef long chips_raw, actual_raise, chips
+        cdef long added[MAX_FRACS]
+        cdef int n_added = 0
+        cdef int j
+        cdef bint dup
+        raise_actions = []
+        if self.n_raises == 0:
+            n = _FIRST_N[st]
+            frac_strs = <list>_FIRST_STR[st]
+        else:
+            n = _SUB_N[st]
+            frac_strs = <list>_SUB_STR[st]
+        for k in range(n):
+            if self.n_raises == 0:
+                frac = _FIRST_FRAC[st][k]
+            else:
+                frac = _SUB_FRAC[st][k]
+            chips_raw = self._compute_raise_chip_amount(frac, False)
+            actual_raise = chips_raw - n_chips_to_call
+            if actual_raise < self.last_raise_amount:
+                continue
+            chips = self._compute_raise_chip_amount(frac, True)
+            if chips > chips_available or chips >= chips_available - 1:
+                continue
+            dup = False
+            for j in range(n_added):
+                if added[j] == chips:
+                    dup = True
+                    break
+            if dup:
+                continue
+            added[n_added] = chips
+            n_added += 1
+            raise_actions.append(frac_strs[k])
+        if chips_available > 0 and chips_available >= n_chips_to_call:
+            dup = False
+            for j in range(n_added):
+                if added[j] == chips_available:
+                    dup = True
+                    break
+            if not dup:
+                raise_actions.append("all_in")
+        return raise_actions
+
+    # ------------------------------------------------------------------
+    # info_set — pure-C encode over resolved history byte-codes
+    # ------------------------------------------------------------------
+    def info_set(self):
+        cdef int seat = self._cur_seat()
+        cdef int rnd = self.betting_stage
+        cdef int cluster = self.clusters[seat][rnd]
+        # Size bound (never under-allocate → no silent heap overflow): a uLEB128
+        # varint is at most 10 bytes for a full uint64, so allow 10 for the
+        # cluster and, per stage, 1 stage byte + 10 for varint(count) + the codes.
+        cdef Py_ssize_t need = 10
+        cdef int si
+        for si in range(N_DECISION_STAGES):
+            if self.hist_n[si] > 0:
+                need += 11 + self.hist_n[si]
+        cdef unsigned char* buf = <unsigned char*>malloc(need)
+        if buf == NULL:
+            raise MemoryError()
+        cdef Py_ssize_t pos = 0
+        cdef int k
+        try:
+            _put_uvarint(buf, &pos, <unsigned long long>cluster)
+            for si in range(N_DECISION_STAGES):
+                if self.hist_n[si] > 0:
+                    buf[pos] = <unsigned char>_STAGE_BYTE[si]
+                    pos += 1
+                    _put_uvarint(buf, &pos, <unsigned long long>self.hist_n[si])
+                    for k in range(self.hist_n[si]):
+                        buf[pos] = self.hist[si][k]
+                        pos += 1
+            return PyBytes_FromStringAndSize(<char*>buf, pos)
+        finally:
+            free(buf)
+
+    # ------------------------------------------------------------------
+    # step / undo (C POD stack)
+    # ------------------------------------------------------------------
+    cdef void _push_frame(self) except *:
+        # ``except *`` is REQUIRED: a bare ``cdef void`` swallows any raise at the
+        # C call boundary (Cython prints "Exception ignored" and continues with
+        # corrupted state).  This method can raise MemoryError on realloc failure.
+        cdef FrameT* f
+        cdef int s
+        if self._stack_top >= self._stack_cap:
+            self._stack_cap *= 2
+            self._stack = <FrameT*>realloc(self._stack, self._stack_cap * sizeof(FrameT))
+            if self._stack == NULL:
+                raise MemoryError()
+        f = &self._stack[self._stack_top]
+        f.betting_stage = self.betting_stage
+        f.player_i_index = self.player_i_index
+        f.n_raises = self.n_raises
+        f.n_actions = self.n_actions
+        f.skip_counter = self.skip_counter
+        f.last_raise_amount = self.last_raise_amount
+        f.n_players_started_round = self.n_players_started_round
+        for s in range(self.n_players):
+            f.n_chips[s] = self.n_chips[s]
+            f.n_bet_chips[s] = self.n_bet_chips[s]
+            f.is_active[s] = self.is_active[s]
+            f.pot_chips[s] = self.pot_chips[s]
+        for s in range(N_DECISION_STAGES):
+            f.hist_n[s] = self.hist_n[s]
+        self._stack_top += 1
+
+    cdef void _restore_frame(self, int idx):
+        cdef FrameT* f = &self._stack[idx]
+        cdef int s
+        self.betting_stage = f.betting_stage
+        self.player_i_index = f.player_i_index
+        self.n_raises = f.n_raises
+        self.n_actions = f.n_actions
+        self.skip_counter = f.skip_counter
+        self.last_raise_amount = f.last_raise_amount
+        self.n_players_started_round = f.n_players_started_round
+        for s in range(self.n_players):
+            self.n_chips[s] = f.n_chips[s]
+            self.n_bet_chips[s] = f.n_bet_chips[s]
+            self.is_active[s] = f.is_active[s]
+            self.pot_chips[s] = f.pot_chips[s]
+        for s in range(N_DECISION_STAGES):
+            self.hist_n[s] = f.hist_n[s]
+
+    def step_in_place(self, action_str):
+        """Apply ``action_str`` in place; return an int undo token (stack index)."""
+        cdef int token = self._stack_top
+        self._push_frame()
+        self._apply(action_str)
+        return token
+
+    def undo(self, token):
+        """Restore the state pushed by the matching :meth:`step_in_place` (LIFO)."""
+        cdef int idx = <int>token
+        if idx != self._stack_top - 1:
+            raise RuntimeError(
+                "FastState.undo out of LIFO order (expected top=%d, got %d)"
+                % (self._stack_top - 1, idx)
+            )
+        self._restore_frame(idx)
+        self._stack_top -= 1
+
+    # ------------------------------------------------------------------
+    # Internal transitions (mirror FastStateRef._apply / PokerEnv)
+    # ------------------------------------------------------------------
+    cdef inline int _resolve_code(self, dict table, token) except -1:
+        code = table.get(token)
+        if code is None:
+            raise RuntimeError(
+                "FastState: token %r has no alphabet code in this stage — off-tree "
+                "raw-token path is not represented in the compiled history."
+                % (token,)
+            )
+        return <int>code
+
+    cdef void _push_hist_code(self, int stage, int code) except *:
+        # ``except *`` REQUIRED (see _push_frame): the overflow guard below raises.
+        if self.hist_n[stage] >= MAX_STAGE_ACTIONS:
+            raise RuntimeError("FastState history overflow — raise MAX_STAGE_ACTIONS")
+        self.hist[stage][self.hist_n[stage]] = <unsigned char>code
+        self.hist_n[stage] += 1
+
+    cdef void _add_to_pot(self, int seat, long n_chips):
+        cdef long actual = n_chips
+        if self.n_chips[seat] < actual:
+            actual = self.n_chips[seat]
+        self.pot_chips[seat] += actual
+        self.n_chips[seat] -= actual
+        self.n_bet_chips[seat] += actual
+
+    cdef void _move_to_next_player(self):
+        self.player_i_index += 1
+        if self.player_i_index >= self.n_players:
+            self.player_i_index = 0
+
+    cdef void _reset_betting_round_state(self):
+        self.n_actions = 0
+        self.n_raises = 0
+        self.last_raise_amount = self.big_blind
+        self.player_i_index = 0
+        # Count only players who can still act (active AND not all-in).
+        self.n_players_started_round = self._n_players_with_moves()
+        while self.is_active[self._cur_seat()] == 0:
+            self.skip_counter += 1
+            self.player_i_index += 1
+
+    cdef void _increment_stage(self):
+        cdef int st = self.betting_stage
+        cdef int s
+        if st == ST_PRE:
+            self.betting_stage = ST_FLOP
+        elif st == ST_FLOP:
+            self.betting_stage = ST_TURN
+        elif st == ST_TURN:
+            self.betting_stage = ST_RIVER
+        elif st == ST_RIVER:
+            self.betting_stage = ST_SHOWDOWN
+        # show_down / terminal: no change
+        for s in range(self.n_players):
+            self.n_bet_chips[s] = 0
+
+    cdef void _apply(self, action_str) except *:
+        # ``except *`` REQUIRED (see _push_frame): this raises ValueError on an
+        # unrecognised action and propagates RuntimeError from _resolve_code /
+        # _push_hist_code.  Without it those raises are silently swallowed and the
+        # state is left half-mutated — the invalid action appears to "succeed".
+        cdef int seat = self._cur_seat()
+        cdef int entry_stage = self.betting_stage
+        cdef long biggest_bet, n_chips_to_call, n_chips_to_add, actual_raise_amount
+        cdef double pot_fraction
+        cdef int cur, k
+
+        if action_str is None:
+            if self.is_active[seat] != 0:
+                raise AssertionError("Active player cannot do nothing!")
+        elif action_str == "call":
+            if not self._is_all_in(seat):
+                biggest_bet = self._biggest_bet()
+                self._add_to_pot(seat, biggest_bet - self.n_bet_chips[seat])
+        elif action_str == "fold":
+            self.is_active[seat] = 0
+        elif action_str == "all_in":
+            n_chips_to_add = self.n_chips[seat]
+            biggest_bet = self._biggest_bet()
+            n_chips_to_call = biggest_bet - self.n_bet_chips[seat]
+            actual_raise_amount = n_chips_to_add - n_chips_to_call
+            if actual_raise_amount >= self.last_raise_amount:
+                self.last_raise_amount = actual_raise_amount
+                self.n_raises += 1
+            self._add_to_pot(seat, n_chips_to_add)
+        elif isinstance(action_str, str) and (<str>action_str).startswith("raise:"):
+            pot_fraction = float((<str>action_str).split(":")[1])
+            n_chips_to_add = self._compute_raise_chip_amount(pot_fraction, True)
+            biggest_bet = self._biggest_bet()
+            n_chips_to_call = biggest_bet - self.n_bet_chips[seat]
+            actual_raise_amount = n_chips_to_add - n_chips_to_call
+            if actual_raise_amount >= self.last_raise_amount:
+                self.last_raise_amount = actual_raise_amount
+            self._add_to_pot(seat, n_chips_to_add)
+            self.n_raises += 1
+        else:
+            raise ValueError("Unrecognised action '%r'." % (action_str,))
+
+        # Append skip padding + the action token, as resolved byte-codes.
+        cdef dict table = <dict>_ACTION_CODE[entry_stage]
+        for k in range(self.skip_counter):
+            self._push_hist_code(entry_stage, 0)  # "skip" == 0 in every stage
+        self._push_hist_code(entry_stage, self._resolve_code(table, action_str))
+        self.n_actions += 1
+        self.skip_counter = 0
+
+        # Advance loop (mirrors the corrected PokerEnv._apply_action_in_place):
+        # detect terminal / advance the stage only — never deal or settle.
+        while True:
+            self._move_to_next_player()
+            if self._hand_over():
+                if self.betting_stage < ST_SHOWDOWN:
+                    self.betting_stage = ST_TERMINAL
+                break
+            if not self._more_betting_needed() and self._all_players_have_actioned():
+                self._increment_stage()
+                self._reset_betting_round_state()
+                if self.betting_stage == ST_SHOWDOWN:
+                    break
+            cur = self._cur_seat()
+            if self.is_active[cur] == 0:
+                self.skip_counter += 1
+                continue
+            if self._is_all_in(cur):
+                self.skip_counter += 1
+                continue
+            break
+
+    # ------------------------------------------------------------------
+    # Value layer (separate; Python evaluator + Pot — identical to FastStateRef)
+    # ------------------------------------------------------------------
+    def payout(self):
+        """Net chip delta per seat at a terminal: ``won[i] - contrib[i]``."""
+        from environment.evaluator import default_evaluator
+        from environment.pot import Pot
+        from environment.player import Player
+
+        cdef int seat
+        board = [self.board[k] for k in range(5)]
+        grouped = {}
+        for seat in range(self.n_players):
+            if self.is_active[seat] != 0:
+                rank = default_evaluator.evaluate(
+                    [self.hole[seat][0], self.hole[seat][1]], board
+                )
+                grouped.setdefault(rank, []).append(seat)
+        stub = [Player(s) for s in range(self.n_players)]
+        for seat in range(self.n_players):
+            stub[seat].order = self.order[seat]
+        ranked = [[stub[s] for s in grouped[r]] for r in sorted(grouped)]
+        pot = Pot(self.n_players)
+        pot._chips = [self.pot_chips[s] for s in range(self.n_players)]
+        won = pot.compute_utility(stub, ranked)
+        return {s: won[s] - self.pot_chips[s] for s in range(self.n_players)}
+
+    # ------------------------------------------------------------------
+    # Debug / differential-test accessors (not on the hot path)
+    # ------------------------------------------------------------------
+    def snapshot(self):
+        """Full mutable-state tuple for differential comparison against the ref."""
+        cdef int s, k
+        return (
+            self.betting_stage, self.player_i_index, self.n_raises,
+            self.n_actions, self.skip_counter, self.last_raise_amount,
+            self.n_players_started_round,
+            tuple(self.n_chips[s] for s in range(self.n_players)),
+            tuple(self.n_bet_chips[s] for s in range(self.n_players)),
+            tuple(self.is_active[s] for s in range(self.n_players)),
+            tuple(self.pot_chips[s] for s in range(self.n_players)),
+            tuple(
+                tuple(self.hist[si][k] for k in range(self.hist_n[si]))
+                for si in range(N_DECISION_STAGES)
+            ),
+        )
+
+
+cdef inline void _put_uvarint(unsigned char* buf, Py_ssize_t* pos, unsigned long long value):
+    # Unsigned LEB128 — identical to poker_env._put_uvarint / _infoset.put_varint.
+    cdef unsigned int byte
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            buf[pos[0]] = <unsigned char>(byte | 0x80)
+            pos[0] += 1
+        else:
+            buf[pos[0]] = <unsigned char>byte
+            pos[0] += 1
+            return
