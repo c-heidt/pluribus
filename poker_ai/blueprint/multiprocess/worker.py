@@ -49,6 +49,7 @@ import numpy as np
 
 from poker_ai.blueprint.bias import BiasClass
 from poker_ai.blueprint.cfr import merge_local_delta
+from poker_ai.blueprint.core_runner import CoreDriver, core_enabled
 from poker_ai.tables.cfr_tables import CFRTables
 from poker_ai.blueprint.training import (
     cfr_step,
@@ -184,6 +185,13 @@ class Worker(mp.Process):
         if not hasattr(self, "_info_set_lut"):
             self._info_set_lut = load_info_set_lut(self._lut_path, self._pickle_dir)
         self._set_seed()
+        # Build the compiled-core driver (PLURIBUS_CFR_CORE=1) *after* the fork
+        # + LMDB reopen so its CoreTables holds this process's own shm cache
+        # arrays and regret chunk mmaps.  The parent prewarmed the caches
+        # before forking, so the pure-shm read path already sees a complete
+        # mirror; the driver's own guardrail re-checks that per street.  Stays
+        # None (Python path) when unset or biased.
+        self._core = CoreDriver(self._tables) if core_enabled(self._bias) else None
 
         while True:
             name, kwargs = self._job_queue.get(block=True)
@@ -214,6 +222,7 @@ class Worker(mp.Process):
                             self._local_delta,
                             bias=self._bias,
                             bias_magnitude=self._bias_magnitude,
+                            core=self._core,
                         )
                 elif name == "sync":
                     self._flush_delta()

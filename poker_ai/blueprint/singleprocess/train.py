@@ -25,6 +25,7 @@ import numpy as np
 from environment.action_space import MAX_ACTIONS_PER_STREET
 from poker_ai.blueprint.bias import BiasClass
 from poker_ai.blueprint.cfr import merge_local_delta
+from poker_ai.blueprint.core_runner import CoreDriver, core_enabled
 from poker_ai.tables.cfr_tables import CFRTables
 from poker_ai.tables.warm_start import (
     apply_warm_start_to_tables,
@@ -189,6 +190,13 @@ def simple_search(
     # Prewarm the shm index caches from LMDB now that any warm-start /
     # resume mapping is in place (single process → no fork to precede).
     tables.prewarm_caches()
+    # Optional compiled-core CFR (PLURIBUS_CFR_CORE=1).  Built after the
+    # caches are warm so the pure-shm read path sees a complete mirror;
+    # falls back to the Python path (core stays None) when unset or biased.
+    core = None
+    if core_enabled(bias):
+        core = CoreDriver(tables)
+        log.info("PLURIBUS_CFR_CORE=1 — driving CFR through the compiled core")
     discount_state = DiscountState(
         duration_cycles=discount_duration_cycles,
         discount_interval=discount_interval,
@@ -205,7 +213,7 @@ def simple_search(
             local_delta: Dict[Tuple[int, str], np.ndarray] = {}
             cfr_step(
                 tables, state, i, t, prune_threshold, c, local_delta,
-                bias=bias, bias_magnitude=bias_magnitude,
+                bias=bias, bias_magnitude=bias_magnitude, core=core,
             )
             merge_local_delta(tables, local_delta)
 

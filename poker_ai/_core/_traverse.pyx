@@ -424,14 +424,22 @@ def traverse_replay(CoreTables ct, fast_state, int i, int t, choices,
     return local_delta
 
 
-def traverse_rng(CoreTables ct, fast_state, int i, int t, rng, prune=None):
+def traverse_rng(CoreTables ct, fast_state, int i, int t, rng, prune=None,
+                 local_delta=None):
     """Run one in-core traversal sampling opponents from ``rng`` (production path).
 
-    ``rng`` is a ``numpy.random.RandomState``.  Returns the ``local_delta`` dict
-    for ``merge_local_delta``.  RNG byte-parity with the Python path is not
-    pursued; correctness is certified RNG-free (``traverse_replay``) and
-    distributionally.
+    ``rng`` is a ``numpy.random.RandomState`` (or the ``numpy.random`` module —
+    anything exposing ``random_sample()``).  Returns the ``local_delta`` dict for
+    ``merge_local_delta``.  RNG byte-parity with the Python path is not pursued;
+    correctness is certified RNG-free (``traverse_replay``) and distributionally.
+
+    ``local_delta`` — when a caller-owned dict is passed, the traversal
+    accumulates into it **in place** (adding into any existing ``(round,
+    info_set)`` row), exactly as the Python ``_traverse`` accumulates into a
+    worker's persistent buffer across a batch; when ``None`` a fresh dict is
+    allocated per call (single-process / test use).  Byte-identical either way —
+    the accumulation is `av[k] += ...` on whichever array the key already holds.
     """
-    cdef dict local_delta = {}
-    _traverse(ct, fast_state, i, local_delta, None, rng, prune)
-    return local_delta
+    cdef dict ld = {} if local_delta is None else <dict>local_delta
+    _traverse(ct, fast_state, i, ld, None, rng, prune)
+    return ld

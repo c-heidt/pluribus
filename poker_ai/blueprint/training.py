@@ -83,6 +83,7 @@ def cfr_step(
     local_delta: Dict[Tuple[int, str], np.ndarray],
     bias: BiasClass = "none",
     bias_magnitude: float = 0.0,
+    core=None,
 ) -> None:
     """Execute one CFR traversal for player *i* with stochastic pruning.
 
@@ -92,6 +93,11 @@ def cfr_step(
     sampling CFR.  The 5% unpruned fallback is what keeps pruned
     actions from being permanently stuck — their regrets still get
     updated on those traversals.
+
+    The pruning coin is drawn identically whether the traversal runs
+    on the Python path or the compiled core, so the cfr/cfrp mix (and
+    the global RNG stream advance) is the same either way; only the
+    recursion body differs.
 
     Regret updates are written into the caller-owned ``local_delta``
     buffer; the caller decides when to flush via
@@ -122,9 +128,20 @@ def cfr_step(
     bias_magnitude : float, optional
         Per-occurrence terminal-payoff bonus applied when
         ``bias != "none"``.
+    core : poker_ai.blueprint.core_runner.CoreDriver, optional
+        When supplied (``PLURIBUS_CFR_CORE=1``), the traversal runs
+        through the compiled Cython core instead of the Python
+        :func:`cfr` / :func:`cfrp` recursion.  The core accumulates
+        into the same ``local_delta`` in place, so the caller's flush
+        path is unchanged.  ``None`` (default) keeps the Python path,
+        which stays the live oracle.
     """
     use_pruning = np.random.uniform() < PRUNE_PROBABILITY
-    if use_pruning and t > prune_threshold:
+    prune_on = use_pruning and t > prune_threshold
+    if core is not None:
+        core.run_cfr(state, i, t, c, prune_on, local_delta)
+        return
+    if prune_on:
         cfrp(tables, state, i, t, c, local_delta,
              bias=bias, bias_magnitude=bias_magnitude)
     else:
