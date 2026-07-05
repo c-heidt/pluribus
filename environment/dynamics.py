@@ -73,32 +73,6 @@ def rotate_blinds(env: PokerEnv) -> None:
     env.players.append(env.players.pop(0))
 
 
-def advance_stage(env: PokerEnv) -> None:
-    """Deal community cards for the next betting stage.
-
-    Called at the end of a betting round to transition the board
-    state. Also resets ``n_bet_chips`` on every player so
-    bet-equality checks start fresh for the new round.
-
-    Parameters
-    ----------
-    env : PokerEnv
-        The game environment. ``env._betting_stage`` determines how
-        many cards to deal (3 for pre_flop→flop, 1 for subsequent
-        transitions).
-    """
-    stage = env._betting_stage
-    if stage == "pre_flop":
-        env.community_cards += env.deck.deal_community(3)
-    elif stage == "flop":
-        env.community_cards += env.deck.deal_community(1)
-    elif stage == "turn":
-        env.community_cards += env.deck.deal_community(1)
-    # "river" → "show_down" needs no deal
-    for player in env.players:
-        player.n_bet_chips = 0
-
-
 def rank_players_by_best_hand(env: PokerEnv) -> list:
     """Rank active players by hand strength.
 

@@ -430,3 +430,34 @@ class TestInjectActionMalformedInput:
         with pytest.raises(ValueError):
             env.inject_action("raise:abc")
         assert not env.has_overlay_at_current_node
+
+
+class TestOverlayCacheLineageConsistency:
+    """The overlay is shared by reference across a deepcopy lineage, so its
+    legal-actions cache must be invalidated lineage-wide — an inject/reset on
+    one env must be visible to every sibling/parent that already cached the node.
+    """
+
+    def test_sibling_injection_visible_to_env_that_already_cached(self):
+        a = _env()
+        _ = a.legal_actions                      # a caches the root node
+        b = copy.deepcopy(a)                      # shares the overlay + version box
+        assert b.inject_action("raise:1.5") is True
+        # The overlay is shared, so BOTH envs must offer the injected action.
+        assert "raise:1.5" in b.legal_actions
+        assert "raise:1.5" in a.legal_actions
+
+    def test_reset_on_sibling_purges_cached_injection(self):
+        c = _env()
+        c.inject_action("raise:1.5")
+        _ = c.legal_actions                      # c caches the node WITH the injection
+        d = copy.deepcopy(c)
+        d.reset_overlay()                         # clears the shared overlay
+        # The shared overlay is now empty, so c must no longer offer the action.
+        assert "raise:1.5" not in c.legal_actions
+        assert not c.has_overlay_at_current_node
+
+    def test_overlay_version_shared_by_reference(self):
+        a = _env()
+        b = copy.deepcopy(a)
+        assert a._overlay_version is b._overlay_version

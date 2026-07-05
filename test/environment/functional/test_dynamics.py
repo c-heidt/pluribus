@@ -101,55 +101,6 @@ class TestRotateBlinds:
 
 
 # ---------------------------------------------------------------------------
-# advance_stage
-# ---------------------------------------------------------------------------
-
-class TestAdvanceStage:
-    def test_pre_flop_deals_three_community(self):
-        env = _env(2)
-        initial_community = len(env.community_cards)
-        env._betting_stage = "pre_flop"
-        dynamics.advance_stage(env)
-        assert len(env.community_cards) == initial_community + 3
-
-    def test_flop_deals_one_community(self):
-        env = _env(2)
-        env._betting_stage = "pre_flop"
-        dynamics.advance_stage(env)
-        env._betting_stage = "flop"
-        dynamics.advance_stage(env)
-        assert len(env.community_cards) == 4
-
-    def test_turn_deals_one_community(self):
-        env = _env(2)
-        env._betting_stage = "pre_flop"
-        dynamics.advance_stage(env)
-        env._betting_stage = "flop"
-        dynamics.advance_stage(env)
-        env._betting_stage = "turn"
-        dynamics.advance_stage(env)
-        assert len(env.community_cards) == 5
-
-    def test_river_deals_no_community(self):
-        env = _env(2)
-        env._betting_stage = "pre_flop"
-        dynamics.advance_stage(env)  # 3 cards
-        community_before = len(env.community_cards)
-        env._betting_stage = "river"
-        dynamics.advance_stage(env)
-        assert len(env.community_cards) == community_before
-
-    def test_advance_resets_n_bet_chips(self):
-        env = _env(3)
-        for p in env.players:
-            p.n_bet_chips = 200
-        env._betting_stage = "pre_flop"
-        dynamics.advance_stage(env)
-        for p in env.players:
-            assert p.n_bet_chips == 0
-
-
-# ---------------------------------------------------------------------------
 # n_active_players
 # ---------------------------------------------------------------------------
 
@@ -369,53 +320,6 @@ class TestComputeWinners:
         # Both gain equal amounts (500 each)
         assert env.players[0].n_chips == chips_0_before + 500
         assert env.players[1].n_chips == chips_1_before + 500
-
-
-# ---------------------------------------------------------------------------
-# Bet reset at each stage (Bug 3 regression at dynamics level)
-# ---------------------------------------------------------------------------
-
-class TestBetChipsResetInAdvanceStage:
-    def _env_with_bets(self, stage):
-        """Build a fresh env, set stage directly, and give players non-zero bets."""
-        env = _env(2)
-        env._betting_stage = stage
-        for p in env.players:
-            p.n_bet_chips = 200
-        return env
-
-    def test_advance_from_preflop_resets_n_bet_chips(self):
-        env = self._env_with_bets("pre_flop")
-        dynamics.advance_stage(env)
-        for p in env.players:
-            assert p.n_bet_chips == 0
-
-    def test_advance_from_flop_resets_n_bet_chips(self):
-        env = self._env_with_bets("flop")
-        dynamics.advance_stage(env)
-        for p in env.players:
-            assert p.n_bet_chips == 0
-
-    def test_advance_from_turn_resets_n_bet_chips(self):
-        env = self._env_with_bets("turn")
-        dynamics.advance_stage(env)
-        for p in env.players:
-            assert p.n_bet_chips == 0
-
-    def test_advance_from_river_resets_n_bet_chips(self):
-        env = self._env_with_bets("river")
-        dynamics.advance_stage(env)
-        for p in env.players:
-            assert p.n_bet_chips == 0
-
-    def test_more_betting_needed_false_after_advance(self):
-        env = _env(2)
-        env._betting_stage = "pre_flop"
-        env.players[0].n_bet_chips = 100
-        env.players[1].n_bet_chips = 200
-        assert dynamics.more_betting_needed(env) is True
-        dynamics.advance_stage(env)
-        assert dynamics.more_betting_needed(env) is False
 
 
 # ---------------------------------------------------------------------------

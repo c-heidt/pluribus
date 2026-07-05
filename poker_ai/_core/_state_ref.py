@@ -69,8 +69,8 @@ class FastStateRef:
         # mutable betting state
         "n_chips", "n_bet_chips", "is_active", "pot_chips",
         "betting_stage", "player_i_index", "n_raises", "n_actions",
-        "skip_counter", "last_raise_amount", "all_players_have_made_action",
-        "first_move_of_current_round", "n_players_started_round", "history",
+        "skip_counter", "last_raise_amount",
+        "n_players_started_round", "history",
     )
 
     # ------------------------------------------------------------------
@@ -97,8 +97,6 @@ class FastStateRef:
         n_actions: int,
         skip_counter: int,
         last_raise_amount: int,
-        all_players_have_made_action: bool,
-        first_move_of_current_round: bool,
         n_players_started_round: int,
         history: Dict[str, List[str]],
         order: Sequence[int],
@@ -136,8 +134,6 @@ class FastStateRef:
         self.n_actions = n_actions
         self.skip_counter = skip_counter
         self.last_raise_amount = last_raise_amount
-        self.all_players_have_made_action = all_players_have_made_action
-        self.first_move_of_current_round = first_move_of_current_round
         self.n_players_started_round = n_players_started_round
         self.history = {k: list(v) for k, v in history.items()}
 
@@ -187,8 +183,6 @@ class FastStateRef:
             n_actions=env._n_actions,
             skip_counter=env._skip_counter,
             last_raise_amount=env._last_raise_amount,
-            all_players_have_made_action=env._all_players_have_made_action,
-            first_move_of_current_round=env._first_move_of_current_round,
             n_players_started_round=env._n_players_started_round,
             history={k: list(v) for k, v in env._history.items()},
             order=[p.order for p in env.players],
@@ -335,7 +329,6 @@ class FastStateRef:
         return (
             self.betting_stage, self.player_i_index, self.n_raises,
             self.n_actions, self.skip_counter, self.last_raise_amount,
-            self.all_players_have_made_action, self.first_move_of_current_round,
             self.n_players_started_round,
             list(self.n_chips), list(self.n_bet_chips), list(self.is_active),
             list(self.pot_chips),
@@ -350,7 +343,6 @@ class FastStateRef:
     def undo(self, token: UndoToken) -> None:
         (self.betting_stage, self.player_i_index, self.n_raises,
          self.n_actions, self.skip_counter, self.last_raise_amount,
-         self.all_players_have_made_action, self.first_move_of_current_round,
          self.n_players_started_round,
          n_chips, n_bet_chips, is_active, pot_chips, history) = token
         self.n_chips = list(n_chips)
@@ -369,7 +361,6 @@ class FastStateRef:
             self.player_i_index = 0
 
     def _reset_betting_round_state(self) -> None:
-        self.all_players_have_made_action = False
         self.n_actions = 0
         self.n_raises = 0
         self.last_raise_amount = self.big_blind
@@ -402,7 +393,6 @@ class FastStateRef:
 
     def _apply(self, action_str: Optional[str]) -> None:
         seat = self.player_i
-        self.first_move_of_current_round = False
 
         if action_str is None:
             assert not self.is_active[seat], "Active player cannot do nothing!"
@@ -458,7 +448,6 @@ class FastStateRef:
             if finished_betting and self.all_players_have_actioned:
                 self._increment_stage()
                 self._reset_betting_round_state()
-                self.first_move_of_current_round = True
                 if self.betting_stage == "show_down":
                     break
             cur = self.player_i

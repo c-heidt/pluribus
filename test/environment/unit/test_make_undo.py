@@ -33,9 +33,7 @@ def _mutable_view(env: PokerEnv) -> dict:
     return {
         "betting_stage": env._betting_stage,
         "skip_counter": env._skip_counter,
-        "first_move": env._first_move_of_current_round,
         "last_raise_amount": env._last_raise_amount,
-        "all_acted": env._all_players_have_made_action,
         "n_actions": env._n_actions,
         "n_raises": env._n_raises,
         "player_i_index": env._player_i_index,

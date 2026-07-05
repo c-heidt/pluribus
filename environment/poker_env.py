@@ -114,9 +114,7 @@ class UndoToken:
 
     betting_stage: str
     skip_counter: int
-    first_move_of_current_round: bool
     last_raise_amount: int
-    all_players_have_made_action: bool
     n_actions: int
     n_raises: int
     player_i_index: int
@@ -517,6 +515,15 @@ class PokerEnv:
         self._extra_legal_actions: Dict[
             Tuple[str, Tuple[str, ...]], FrozenSet[str]
         ] = {}
+        # Monotone version of the overlay above, held in a 1-element list so the
+        # whole deepcopy lineage shares ONE counter by reference (exactly like
+        # ``_extra_legal_actions`` itself).  ``inject_action`` / ``reset_overlay``
+        # bump it; the per-env ``_legal_actions_cache`` stamps each entry with the
+        # version it was built at and treats a mismatch as a miss.  This is what
+        # makes an inject/reset on ANY env in the lineage invalidate every
+        # lineage env's cache — the overlay is shared, so its invalidation must be
+        # too (a bare per-env ``pop``/``clear`` left sibling caches stale).
+        self._overlay_version: List[int] = [0]
 
         # Live game state (deep-copied by __deepcopy__)
         self.players: List[Player] = players
@@ -589,14 +596,16 @@ class PokerEnv:
 
         # Betting round counters
         self._skip_counter: int = 0
-        self._first_move_of_current_round: bool = True
         self._last_raise_amount: int = self.big_blind
         # Memo of ``legal_actions`` keyed by public state (lazily filled — see
-        # :attr:`legal_actions`).  A sibling of ``_extra_legal_actions``: both are
-        # public-state-keyed and the overlay is ``legal_actions``' only mutable
-        # input beyond the public state, so the overlay mutators are the cache's
-        # sole invalidation points.
-        self._legal_actions_cache: Dict[Tuple, List[Optional[str]]] = {}
+        # :attr:`legal_actions`).  Each entry is ``(overlay_version, actions)``;
+        # an entry whose stamped version differs from the current shared
+        # ``_overlay_version`` is stale (an inject/reset happened somewhere in the
+        # lineage) and is recomputed.  The public state is the rest of the key, so
+        # ``step_in_place`` / ``undo`` still need no cache bookkeeping.
+        self._legal_actions_cache: Dict[
+            Tuple, Tuple[int, List[Optional[str]]]
+        ] = {}
         # Single-value memo for ``_current_public_state`` (rebuilds the full
         # cross-street history tuple, called many times per node as the
         # legal-actions cache key, public_key, and overlay lookups).  It is a
@@ -640,12 +649,14 @@ class PokerEnv:
         # Immutable / read-only shared state — share references, no copy.
         # `_extra_legal_actions` is mutated in place by inject_action, so
         # every env in a deepcopy lineage sees the same augmented game tree;
-        # `card_info_lut` is read-only and large, so it is shared too.
+        # `_overlay_version` rides alongside it (shared by reference too) so a
+        # bump on any env is visible to every lineage env's cache-staleness
+        # check; `card_info_lut` is read-only and large, so it is shared too.
         for attr in (
             "small_blind", "big_blind", "_low_card_rank", "_high_card_rank",
             "_initial_n_chips",
             "_betting_stage_to_round", "_player_i_lut",
-            "_extra_legal_actions",
+            "_extra_legal_actions", "_overlay_version",
             "card_info_lut",
         ):
             object.__setattr__(new, attr, getattr(self, attr))
@@ -653,17 +664,18 @@ class PokerEnv:
         for attr in (
             "players", "pot", "deck", "community_cards",
             "_history", "_betting_stage",
-            "_skip_counter", "_first_move_of_current_round",
-            "_last_raise_amount", "_all_players_have_made_action",
+            "_skip_counter",
+            "_last_raise_amount",
             "_n_actions", "_n_raises", "_player_i_index",
             "_n_players_started_round", "_runout_info",
             "_terminal_contributions", "_terminal_board_len",
         ):
             object.__setattr__(new, attr, copy.deepcopy(getattr(self, attr), memo))
         # The legal-action memo is a pure derived cache; start the copy empty and
-        # let it refill lazily.  Deliberately *not* shared by reference (unlike
-        # ``_extra_legal_actions``): an empty per-env memo can never carry stale
-        # entries across a config boundary (e.g. a copy taken to start a new hand).
+        # let it refill lazily.  Kept per-env (not shared): entries are stamped
+        # with the shared ``_overlay_version``, so an overlay change on any
+        # lineage env is caught by the version check rather than by sharing the
+        # dict — and an empty copy can never carry stale entries anyway.
         object.__setattr__(new, "_legal_actions_cache", {})
         # Derived public-state memo: start the copy with a fresh, empty cache
         # (its own version counter) so it can never serve a stale entry.
@@ -701,8 +713,6 @@ class PokerEnv:
             )
             action_str = self._map_to_closest_legal_action(action_str)
             logger.info("Mapped '%s' -> '%s'", original_action, action_str)
-
-        self._first_move_of_current_round = False
 
         if action_str is None:
             assert (
@@ -784,7 +794,6 @@ class PokerEnv:
             if finished_betting and self.all_players_have_actioned:
                 self._increment_stage()
                 self._reset_betting_round_state()
-                self._first_move_of_current_round = True
                 if self._betting_stage == "show_down":
                     # Final (river) betting round completed with >=2 players still
                     # in — a normal showdown over the already-complete board.
@@ -842,9 +851,7 @@ class PokerEnv:
         """
         self._betting_stage = token.betting_stage
         self._skip_counter = token.skip_counter
-        self._first_move_of_current_round = token.first_move_of_current_round
         self._last_raise_amount = token.last_raise_amount
-        self._all_players_have_made_action = token.all_players_have_made_action
         self._n_actions = token.n_actions
         self._n_raises = token.n_raises
         self._player_i_index = token.player_i_index
@@ -879,9 +886,7 @@ class PokerEnv:
         return UndoToken(
             betting_stage=self._betting_stage,
             skip_counter=self._skip_counter,
-            first_move_of_current_round=self._first_move_of_current_round,
             last_raise_amount=self._last_raise_amount,
-            all_players_have_made_action=self._all_players_have_made_action,
             n_actions=self._n_actions,
             n_raises=self._n_raises,
             player_i_index=self._player_i_index,
@@ -908,7 +913,6 @@ class PokerEnv:
 
     def _reset_betting_round_state(self) -> None:
         """Reset per-round counters and advance to the first active player."""
-        self._all_players_have_made_action = False
         self._n_actions = 0
         self._n_raises = 0
         self._last_raise_amount = self.big_blind
@@ -1467,10 +1471,11 @@ class PokerEnv:
         existing = self._extra_legal_actions.get(key, frozenset())
         if action not in existing:
             self._extra_legal_actions[key] = existing | {action}
-            # The overlay just widened the legal set at this public state, so drop
-            # its memo entry (computed before the injection); other states are
-            # unaffected.
-            self._legal_actions_cache.pop(key, None)
+            # The shared overlay just widened the legal set at this public state.
+            # Bump the lineage-shared version so every env's cache (this one and
+            # any sibling/parent that already memoised this node) re-derives
+            # against the new overlay on its next read.
+            self._overlay_version[0] += 1
         return True
 
     def _raise_fraction_is_playable(self, fraction: float) -> bool:
@@ -1509,9 +1514,12 @@ class PokerEnv:
         tree at matching public states.
         """
         self._extra_legal_actions.clear()
-        # Clearing the overlay can narrow the legal set at any injected state, so
-        # drop the whole memo (overlay-bearing entries are now stale).
-        self._legal_actions_cache.clear()
+        # Clearing the shared overlay can narrow the legal set at any injected
+        # state.  Bump the lineage-shared version so every env's memo (this one
+        # and every sibling/parent) re-derives against the now-empty overlay —
+        # a bare ``self._legal_actions_cache.clear()`` would leave sibling caches
+        # still offering the purged actions.
+        self._overlay_version[0] += 1
 
     @property
     def has_overlay_at_current_node(self) -> bool:
@@ -1655,17 +1663,23 @@ class PokerEnv:
         ``_legal_actions_cache`` keyed by :meth:`_current_public_state`.  The key
         *is* the validation: a lookup returns the value for exactly the current
         state, so ``step_in_place`` / ``undo`` need no cache bookkeeping (the
-        public state they restore re-selects the right entry), and the overlay
-        mutators (:meth:`inject_action` / :meth:`reset_overlay`) are the only
-        invalidation points.  A defensive copy is returned so callers keep the
-        historical "fresh list each call" contract and can never corrupt the memo.
+        public state they restore re-selects the right entry).  The overlay
+        mutators (:meth:`inject_action` / :meth:`reset_overlay`) bump the
+        lineage-shared :attr:`_overlay_version`; each entry is stamped with the
+        version it was built at, and a mismatch is treated as a miss — so an
+        inject/reset on **any** env in the deepcopy lineage invalidates this
+        (and every sibling's) memo, matching the overlay's shared-by-reference
+        semantics.  A defensive copy is returned so callers keep the historical
+        "fresh list each call" contract and can never corrupt the memo.
         """
         key = self._current_public_state()
+        version = self._overlay_version[0]
         cached = self._legal_actions_cache.get(key)
-        if cached is None:
-            cached = self._compute_legal_actions(key)
-            self._legal_actions_cache[key] = cached
-        return list(cached)
+        if cached is None or cached[0] != version:
+            actions = self._compute_legal_actions(key)
+            self._legal_actions_cache[key] = (version, actions)
+            return list(actions)
+        return list(cached[1])
 
     def _compute_legal_actions(self, public_state: Tuple) -> List[Optional[str]]:
         """Derive the legal-action list for ``public_state`` (the current state)."""
