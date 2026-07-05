@@ -36,6 +36,17 @@ def _to_flop(env: PokerEnv) -> None:
         env.step_in_place("call" if "call" in env.legal_actions else "check")
 
 
+def _shove_to_runout(env: PokerEnv) -> PokerEnv:
+    """Reference all-in runout under the corrected all-in contract: one player
+    shoves and the opponent then calls all-in (a shove is no longer terminal on
+    its own).  Mirrors the both-all-in line the AllInPolicy rollouts take, so the
+    reference ``runout_equity`` matches the leaf value."""
+    env.step_in_place("all_in")
+    if not env.is_terminal:
+        env.step_in_place("all_in" if "all_in" in env.legal_actions else "call")
+    return env
+
+
 class UniformPolicy(Policy):
     """Uniform over ``state.legal_actions``; records every call."""
 
@@ -162,7 +173,7 @@ class TestTerminal:
         env = _full_deck_env(); _stub_lut(env); _to_flop(env)
         ctx_on = _ctx(env, n_rollouts=3, use_equity=True)
         ctx_off = _ctx(env, n_rollouts=3, use_equity=False)
-        env.step_in_place("all_in")  # force-resolve → decision-free terminal
+        _shove_to_runout(env)  # shove + opponent calls all-in → decision-free terminal
         assert env.is_terminal and env.is_decision_free
         eq = env.runout_equity()
         out_on = continuation_value(env, _profile(env), ctx_on)
@@ -317,7 +328,7 @@ class TestDecisionFreeEquityFlag:
         env = self._flop_allin_frontier(7)
         # Reference: step the all-in directly and read exact equity.
         ref_env = copy.deepcopy(env)
-        ref_env.step_in_place("all_in")
+        _shove_to_runout(ref_env)
         assert ref_env.is_decision_free
         ref = ref_env.runout_equity()
         out = continuation_value(
@@ -346,7 +357,7 @@ class TestDecisionFreeEquityFlag:
         assert calls["n"] == 1
         # The cached value still equals the exact runout equity.
         ref_env = copy.deepcopy(env)
-        ref_env.step_in_place("all_in")
+        _shove_to_runout(ref_env)
         ref = ref_env.runout_equity()
         for i in range(env.n_players):
             assert abs(out[i] - ref[i]) < 1e-9
@@ -370,7 +381,7 @@ class TestDecisionFreeEquityFlag:
         # Flag-off uses the env's single sampled runout → varies with the
         # board-deal RNG, and differs from the exact flag-on value.
         base = self._fixed_frontier()
-        ref_env = copy.deepcopy(base); ref_env.step_in_place("all_in")
+        ref_env = copy.deepcopy(base); _shove_to_runout(ref_env)
         exact = ref_env.runout_equity()
         sampled = []
         for s in range(8):
@@ -464,7 +475,7 @@ class TestSharedRunoutCache:
         # Same (holes, snapshot) over 40 rollouts across two calls → ONE integration.
         assert calls["n"] == 1
         assert len(shared) == 1
-        ref_env = copy.deepcopy(env); ref_env.step_in_place("all_in")
+        ref_env = copy.deepcopy(env); _shove_to_runout(ref_env)
         ref = ref_env.runout_equity()
         for out in (out_a, out_b):
             for i in range(env.n_players):

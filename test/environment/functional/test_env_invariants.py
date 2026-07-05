@@ -190,6 +190,12 @@ class TestBoardCompletionInvariant:
                     env.step_in_place("call")
             if not env.is_terminal and "all_in" in env.legal_actions:
                 env.step_in_place("all_in")
+                # Corrected contract: the shove is not terminal until the
+                # opponent responds — call the all-in to reach the showdown.
+                if not env.is_terminal:
+                    env.step_in_place(
+                        "all_in" if "all_in" in env.legal_actions else "call"
+                    )
                 assert env.is_terminal
                 assert len(env.community_cards) == 5, (
                     f"all-in at {target_stage}: expected 5 cards, "

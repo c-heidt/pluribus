@@ -194,7 +194,17 @@ def n_players_with_moves(env: PokerEnv) -> int:
 
 
 def more_betting_needed(env: PokerEnv) -> bool:
-    """Return True if active non-all-in players have unequal bets.
+    """Return True if any live player has not yet matched the largest bet.
+
+    "Live" means active (not folded) and not all-in — a player who still has a
+    betting decision.  The comparison is against the maximum bet among **all**
+    active players, *including all-in players*: an all-in raise over the top of
+    the current bet leaves the live players owing a call/fold decision, so more
+    betting is still needed even though the live players' bets are equal *to
+    each other*.  Comparing live bets only to each other (the previous
+    behaviour) silently treated an unmatched over-the-top all-in as "betting
+    complete" and advanced the street without giving the opponents a chance to
+    respond — the round-advance twin of the ``_hand_over`` all-in contract.
 
     Parameters
     ----------
@@ -204,12 +214,14 @@ def more_betting_needed(env: PokerEnv) -> bool:
     Returns
     -------
     bool
-        ``True`` if at least two active non-all-in players have
-        contributed different amounts this round; ``False`` otherwise.
+        ``True`` if at least one active non-all-in player has bet less than the
+        largest amount committed by any active player this round; ``False``
+        otherwise (every live player has matched the top bet, or no live player
+        remains).
     """
-    active_bets = [
-        p.n_bet_chips for p in env.players if p.is_active and not p.is_all_in
-    ]
-    if len(active_bets) <= 1:
+    active = [p for p in env.players if p.is_active]
+    live = [p for p in active if not p.is_all_in]
+    if not live:
         return False
-    return not all(b == active_bets[0] for b in active_bets)
+    max_bet = max(p.n_bet_chips for p in active)
+    return any(p.n_bet_chips < max_bet for p in live)

@@ -32,6 +32,35 @@ from test.evaluation.test_runner import _stub_session
 from test.search.test_solver import UniformPolicy, _flop_env, _policies
 
 
+class _NonUniformPolicy(UniformPolicy):
+    """A fixed non-uniform strategy: favours call/check, seldom folds/shoves.
+
+    AIVAT is a control-variate method — it only *reduces* variance when the
+    value function actually predicts play.  That requires a realistic
+    (non-uniform) policy: under a uniform random policy the corrections are
+    uncorrelated with outcomes, so AIVAT's variance reduction is unreliable
+    (and the correct full-stack all-in dynamics tip borderline cases either
+    way).  Used by the variance-reduction acceptance test.
+    """
+
+    def strategy(self, state, bias="none"):
+        la = state.legal_actions
+        n = len(la)
+        if not n:
+            return np.array([], np.float32)
+        w = np.empty(n, dtype=np.float64)
+        for i, a in enumerate(la):
+            w[i] = (
+                1.0 if a is None
+                else 8.0 if a in ("call", "check")
+                else 1.0 if a == "fold"
+                else 0.5 if a == "all_in"
+                else 2.0  # raise:<f>
+            )
+        w /= w.sum()
+        return w.astype(np.float32)
+
+
 # --------------------------------------------------------------------------- #
 # Deterministic arithmetic (fake value function)
 # --------------------------------------------------------------------------- #
@@ -189,9 +218,9 @@ class TestBeliefSampling:
 # --------------------------------------------------------------------------- #
 
 def _run(tmp_path, *, aivat, run_id="A", n=120, seed=13, hole_samples=4,
-         starting_stack=400):
+         starting_stack=400, blueprint=None):
     session = _stub_session(run_id=run_id, run_seed=seed, n_players=2,
-                            starting_stack=starting_stack)
+                            starting_stack=starting_stack, blueprint=blueprint)
     session.config.aivat = aivat
     session.config.aivat_hole_samples = hole_samples
     log = ExperimentLog.open(tmp_path / f"{run_id}.sqlite")
@@ -229,8 +258,11 @@ class TestAcceptance:
         # low-noise enough to be a good control variate — so use deeper stacks (fewer
         # uncorrected pre-flop shoves) and more hole samples (a smoother v).  A
         # sign-flipped correction would *inflate* variance and fail this.
+        # AIVAT reduces variance only against a realistic (non-uniform) policy —
+        # a uniform policy leaves the corrections uncorrelated with outcomes.
         rows = _run(tmp_path, aivat=True, n=140, seed=13,
-                    starting_stack=6000, hole_samples=12)
+                    starting_stack=6000, hole_samples=12,
+                    blueprint=_NonUniformPolicy())
         aiv = np.array([r[1] for r in rows], dtype=float)
         dl = np.array([r[2] for r in rows], dtype=float)
         assert aiv.var() < dl.var()

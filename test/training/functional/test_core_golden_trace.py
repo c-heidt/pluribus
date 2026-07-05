@@ -45,7 +45,16 @@ _LUT_PATH = "data/20cards_exact"
 
 # Frozen fingerprint of the merged regret + strategy tables after the run above.
 # See the module docstring for when and how to regenerate this.
-GOLDEN_DIGEST = "e23d93b6b08842048d37b58ee0c166e3c9260fd803712ead082d8efe5f221251"
+# Re-baselined 2026-07-05 after the follow-on betting-contract fixes that
+# complete the heads-up all-in work: (1) an over-the-top all-in now lets the
+# opponent call/fold instead of the street silently advancing with the shove
+# uncalled (``more_betting_needed`` compares live bets against the top bet,
+# all-in included), and (2) heads-up post-flop action order corrected so the big
+# blind leads and the button acts last.  Both reshape the N_PLAYERS=2 tree.
+# Previous digests:
+#   4ca50490d570bd4a8318b03112dd40f0466796d89c4fd8ee5a9ddb350b4f99c9  (after _hand_over all-in fix)
+#   e23d93b6b08842048d37b58ee0c166e3c9260fd803712ead082d8efe5f221251  (pre all-in fixes)
+GOLDEN_DIGEST = "7fef05fc8c7c421e8c667bd049530aeb3121c16aeb41ecbeb7f33bdd83243022"
 
 
 def train_and_digest(save_path: Path, *, n_iterations: int = N_ITERATIONS):

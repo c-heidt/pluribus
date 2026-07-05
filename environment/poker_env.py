@@ -568,13 +568,23 @@ class PokerEnv:
             self.players[0].is_dealer = True
         else:
             self.players[-1].is_dealer = True
+        # Post-flop, action opens with the first seat left of the button.  For
+        # 3+ players that is the small blind (seat 0), so the natural seat order
+        # is correct.  Heads-up is the exception: the button *is* the small
+        # blind (seat 0) and acts LAST post-flop, so the big blind (seat 1)
+        # leads — the post-flop order is the seat order reversed.  (Pre-flop the
+        # button/SB still acts first, which the ``[2:]+[:2]`` rotation already
+        # yields as ``[0, 1]`` for two players.)
+        postflop_order = (
+            player_i_order[::-1] if n_players == 2 else player_i_order
+        )
         self._player_i_lut: Dict[str, List[int]] = {
             "pre_flop": player_i_order[2:] + player_i_order[:2],
-            "flop":     player_i_order,
-            "turn":     player_i_order,
-            "river":    player_i_order,
-            "show_down": player_i_order,
-            "terminal": player_i_order,
+            "flop":     postflop_order,
+            "turn":     postflop_order,
+            "river":    postflop_order,
+            "show_down": postflop_order,
+            "terminal": postflop_order,
         }
 
         # Betting round counters
@@ -759,56 +769,38 @@ class PokerEnv:
 
         while True:
             self._move_to_next_player()
+            # Hand-ending check FIRST, before any round-closing stage advance, so
+            # the runout snapshot (§6.4) sees the board betting actually ended on.
+            # A player facing an unmatched all-in they can still act on is NOT
+            # terminal here — :meth:`_hand_over` returns ``False`` until they call
+            # or fold (the fix: the old ``n_players_with_moves() == 1`` shortcut
+            # ended the hand before the opponent could respond to an all-in).
+            if self._hand_over():
+                if self._betting_stage not in {"show_down", "terminal"}:
+                    self._betting_stage = "terminal"
+                self._settle_terminal(board_len_at_action, settle_winners)
+                break
             finished_betting = not dynamics.more_betting_needed(self)
             if finished_betting and self.all_players_have_actioned:
                 self._increment_stage()
                 self._reset_betting_round_state()
                 self._first_move_of_current_round = True
+                if self._betting_stage == "show_down":
+                    # Final (river) betting round completed with >=2 players still
+                    # in — a normal showdown over the already-complete board.
+                    self._settle_terminal(board_len_at_action, settle_winners)
+                    break
             if not self.current_player.is_active:
                 self._skip_counter += 1
-            elif self.current_player.is_active:
-                if dynamics.n_players_with_moves(self) == 1:
-                    self._betting_stage = "terminal"
-                    # Board the hand-ending action actually saw — before the
-                    # force-deal below (and before any round-closing stage
-                    # advance) completes it to five.  A fold/all-in that ends the
-                    # hand early never "saw" the dealt-out cards.
-                    self._terminal_board_len = board_len_at_action
-                    cards_needed = 5 - len(self.community_cards)
-                    if cards_needed > 0:
-                        # All-in showdown over an incomplete board: the rest of
-                        # the hand is pure chance.  Record the pre-runout state
-                        # (board prefix, pot contributions, active mask) *before*
-                        # the board is dealt and ``compute_winners`` resets the
-                        # pot, so :meth:`runout_equity` can integrate the value
-                        # over every board completion (§6.4).  Only meaningful
-                        # with >=2 players still active (an actual showdown).
-                        if dynamics.n_active_players(self) >= 2:
-                            self._runout_info = (
-                                tuple(self.community_cards),
-                                tuple(self.pot.capture()),
-                                tuple(p.is_active for p in self.players),
-                            )
-                        self.community_cards += self.deck.deal_community(cards_needed)
-                if self._betting_stage in {"terminal", "show_down"}:
-                    # Normal river show-down (reached via ``_increment_stage``,
-                    # not the force-deal above): the board the final action saw is
-                    # already complete (five cards).
-                    if self._terminal_board_len is None:
-                        self._terminal_board_len = board_len_at_action
-                    if settle_winners:
-                        dynamics.compute_winners(self)
-                    else:
-                        # Lightweight terminal settlement for range-valued callers
-                        # (vector regime): capture the matched-stake contributions
-                        # that ``vector_payout`` reads, but skip the concrete
-                        # hand ranking + chip distribution it never uses.  Mirrors
-                        # the snapshot inside ``compute_winners`` (before its
-                        # ``pot.reset``), so ``_terminal_contributions`` is set
-                        # identically; the pot/stacks are simply left untouched
-                        # (the caller make/undo-traverses and never reads them).
-                        self._terminal_contributions = tuple(self.pot.capture())
-                break
+                continue
+            if self.current_player.is_all_in:
+                # An all-in player has no betting decision; advance past them
+                # (they stay in the hand for the showdown).  Reached only with
+                # >=2 live players still to act — otherwise :meth:`_hand_over`
+                # above already ended the hand.
+                self._skip_counter += 1
+                continue
+            break
 
         for player in self.players:
             player.is_turn = False
@@ -921,7 +913,14 @@ class PokerEnv:
         self._n_raises = 0
         self._last_raise_amount = self.big_blind
         self._player_i_index = 0
-        self._n_players_started_round = dynamics.n_active_players(self)
+        # Count only players who can still act this round (active AND not
+        # all-in).  A player already all-in from an earlier street never acts
+        # here yet stays ``is_active``; counting them (``n_active_players``)
+        # made ``all_players_have_actioned`` unreachable after one lap, so the
+        # live players were polled a second time.  Players who go all-in or
+        # fold *during* the round were counted at its start (they had moves)
+        # and do bump ``_n_actions``, so the ``>=`` gate stays correct for them.
+        self._n_players_started_round = dynamics.n_players_with_moves(self)
         while not self.current_player.is_active:
             self._skip_counter += 1
             self._player_i_index += 1
@@ -952,6 +951,57 @@ class PokerEnv:
             raise ValueError(f"Unknown betting_stage: {self._betting_stage}")
         for player in self.players:
             player.n_bet_chips = 0
+
+    def _hand_over(self) -> bool:
+        """True when no active player has any further betting decision.
+
+        The hand ends when every player but one has folded, or every remaining
+        active player is all-in, or the single active player who still has chips
+        has already matched the largest bet (nothing left to call).
+
+        Crucially — and unlike the old ``n_players_with_moves() == 1`` shortcut
+        this replaces — a lone live player who still owes an outstanding call
+        (the classic case: facing an all-in they have not yet called) is **not**
+        treated as terminal.  They must first get to call or fold; only then does
+        the hand resolve.  This is the fix for the mis-written contract where an
+        all-in ended the hand before the opponent could respond.
+        """
+        active = [p for p in self.players if p.is_active]
+        if len(active) <= 1:
+            return True
+        live = [p for p in active if not p.is_all_in]
+        if not live:
+            return True
+        if len(live) == 1:
+            max_bet = max(p.n_bet_chips for p in active)
+            return live[0].n_bet_chips >= max_bet
+        return False
+
+    def _settle_terminal(self, board_len_at_action: int, settle_winners: bool) -> None:
+        """Deal out any remaining board and settle a terminal node.
+
+        When the board is incomplete and >=2 players still contest it, snapshots
+        the pre-runout state (board prefix, contributions, active mask) for the
+        decision-free runout-equity integration (§6.4) *before* dealing and
+        settling.  Then deals the board to five and either runs the concrete
+        winner settlement (``settle_winners=True``) or — for range-valued (vector
+        regime) callers — only snapshots ``_terminal_contributions``.
+        """
+        if self._terminal_board_len is None:
+            self._terminal_board_len = board_len_at_action
+        cards_needed = 5 - len(self.community_cards)
+        if cards_needed > 0:
+            if dynamics.n_active_players(self) >= 2:
+                self._runout_info = (
+                    tuple(self.community_cards),
+                    tuple(self.pot.capture()),
+                    tuple(p.is_active for p in self.players),
+                )
+            self.community_cards += self.deck.deal_community(cards_needed)
+        if settle_winners:
+            dynamics.compute_winners(self)
+        else:
+            self._terminal_contributions = tuple(self.pot.capture())
 
     def _map_to_closest_legal_action(self, invalid_action: str) -> str:
         """Map an out-of-range action to the closest legal one.
@@ -1630,7 +1680,14 @@ class PokerEnv:
                 actions.append("all_in")
         else:
             actions.append("call")
-            if self._n_raises < MAX_RAISES_PER_ROUND:
+            # Raises (and shove-as-raise) are only meaningful when at least one
+            # *other* live player could call them.  Facing a lone all-in — the
+            # current player is the only one with chips — the sole legal
+            # responses are call or fold (a raise/over-shove would just be
+            # returned uncalled).  ``n_players_with_moves`` counts the current
+            # live player, so ``>= 2`` means another live player remains.
+            if (self._n_raises < MAX_RAISES_PER_ROUND
+                    and dynamics.n_players_with_moves(self) >= 2):
                 actions += self._get_available_raise_sizes()
         overlay = self._extra_legal_actions.get(public_state)
         if overlay:

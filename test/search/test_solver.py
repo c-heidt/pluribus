@@ -339,18 +339,23 @@ class TestPassSeparation:
     def test_regret_pass_does_not_touch_strategy(self):
         solver, env, holes = self._solver()
         hl = [holes[s] for s in range(2)]
-        solver._traverse(env.with_hole_cards(hl), 0, holes)
+        # Traverse as the seat that actually acts at the flop root — heads-up
+        # that is the big blind (seat 1), who leads post-flop — so the traverser
+        # is guaranteed a decision node in the sampled line.
+        root_actor = env.player_i
+        solver._traverse(env.with_hole_cards(hl), root_actor, holes)
         assert solver.state.regret, "regret pass should populate regret"
         assert not solver.state.strat_sum, "regret pass must NOT populate strat_sum"
 
     def test_strategy_pass_accumulates_strategy(self):
         solver, env, holes = self._solver()
         hl = [holes[s] for s in range(2)]
-        solver._update_strategy(env.with_hole_cards(hl), 0, holes)
+        root_actor = env.player_i
+        solver._update_strategy(env.with_hole_cards(hl), root_actor, holes)
         assert solver.state.strat_sum, "strategy pass should populate strat_sum"
-        # only the traverser's (seat 0) rows are accumulated in its own pass
+        # only the traverser's own rows are accumulated in its own pass
         for (pk, _hr) in solver.state.strat_sum:
-            assert solver.state.actor_at[pk] == 0
+            assert solver.state.actor_at[pk] == root_actor
 
 
 # --------------------------------------------------------------------------- #

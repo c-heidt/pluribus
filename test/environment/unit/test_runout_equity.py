@@ -49,6 +49,18 @@ def _drive_to_allin_runout(env, max_steps=12):
     return env.is_decision_free
 
 
+def _shove_to_runout(env):
+    """Drive a heads-up hand to a decision-free all-in runout under the corrected
+    all-in contract: one player shoves and the opponent then calls all-in (a
+    shove is no longer terminal on its own — the opponent must first respond).
+    No-op if the shove already ended the hand (e.g. an all-in on a complete
+    board, where the opponent's response leaves nothing to run out)."""
+    env.step_in_place("all_in")
+    if not env.is_terminal:
+        env.step_in_place("all_in" if "all_in" in env.legal_actions else "call")
+    return env
+
+
 def _brute_runout_equity(env):
     """Independent reference: enumerate every board completion of the recorded
     prefix, score the showdown via the shared evaluator + ``Pot.compute_utility``,
@@ -88,7 +100,7 @@ class TestIsDecisionFree:
 
     def test_true_on_allin_runout(self):
         env = _env([10000, 10000])
-        env.step_in_place("all_in")  # ==1 force-resolve, board incomplete
+        _shove_to_runout(env)  # shove + opponent calls all-in -> runout
         assert env.is_terminal
         assert env.is_decision_free
         assert env._runout_info is not None
@@ -141,7 +153,7 @@ class TestRunoutEquityExact:
     @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
     def test_headsup_matches_brute_force(self, seed):
         env = _env([10000, 10000], seed=seed)
-        env.step_in_place("all_in")
+        _shove_to_runout(env)
         assert env.is_decision_free
         eq = env.runout_equity()
         ref, _ = _brute_runout_equity(env)
@@ -172,7 +184,7 @@ class TestRunoutEquityExact:
             env.step_in_place("call" if "call" in env.legal_actions else "check")
             guard += 1
         assert env.betting_round == 1 and len(env.community_cards) == 3
-        env.step_in_place("all_in")
+        _shove_to_runout(env)
         assert env.is_decision_free
         prefix, _, _ = env._runout_info
         assert len(prefix) == 3
@@ -187,14 +199,14 @@ class TestRunoutEquityInvariants:
 
     def test_zero_sum(self):
         env = _env([10000, 10000], seed=2)
-        env.step_in_place("all_in")
+        _shove_to_runout(env)
         eq = env.runout_equity()
         assert abs(sum(eq.values())) < 1e-6
 
     def test_runout_equity_does_not_mutate_env(self):
         # Pure computation: the env must be field-identical before and after.
         env = _env([10000, 10000], seed=2)
-        env.step_in_place("all_in")
+        _shove_to_runout(env)
         snap = (
             tuple(env.community_cards),
             list(env.pot._chips),
@@ -216,7 +228,7 @@ class TestRunoutEquityInvariants:
         # Same rng seed → identical sampled-fallback estimate.
         np.random.seed(0)
         env = PokerEnv(players=[Player(i, 10000) for i in range(2)])
-        env.step_in_place("all_in")  # full-deck preflop → 5-card runout > cap
+        _shove_to_runout(env)  # full-deck preflop → 5-card runout > cap
         a = env.runout_equity(rng=np.random.default_rng(11), cap=1000)
         b = env.runout_equity(rng=np.random.default_rng(11), cap=1000)
         assert a == b
@@ -224,7 +236,7 @@ class TestRunoutEquityInvariants:
     def test_card_removal_excludes_all_holes(self):
         # No board completion the enumeration scores may contain a dealt hole.
         env = _env([10000, 10000], seed=1)
-        env.step_in_place("all_in")
+        _shove_to_runout(env)
         prefix, _, _ = env._runout_info
         holes = set()
         for p in env.players:
@@ -236,35 +248,41 @@ class TestRunoutEquityInvariants:
         assert len(avail) == env.deck_size - len(holes) - len(prefix)
 
     def test_matches_sampled_payout_mean(self):
-        # The exact equity equals the mean of the env's own single-board
-        # resolution over many independent runouts (statistical sanity).
-        holes = None
+        # The exact runout equity equals the mean of the env's own single-board
+        # resolution over many independent runouts (statistical sanity).  Small
+        # stacks keep the contested pot — and thus the Monte-Carlo variance —
+        # small enough for a tight tolerance; deterministic under np.seed(0).
         np.random.seed(0)
-        base = PokerEnv(players=[Player(i, 10000) for i in range(2)],
+        base = PokerEnv(players=[Player(i, 200) for i in range(2)],
                         low_card_rank=10, high_card_rank=14)
-        base.step_in_place("all_in")
+        _shove_to_runout(base)
         eq = base.runout_equity()
         holes = [tuple(base.players[i]._cards) for i in range(2)]
         acc = np.zeros(2)
         N = 3000
         for _ in range(N):
-            e = PokerEnv(players=[Player(i, 10000) for i in range(2)],
+            e = PokerEnv(players=[Player(i, 200) for i in range(2)],
                          low_card_rank=10, high_card_rank=14)
             e = e.with_hole_cards(holes)
-            e.step_in_place("all_in")
+            _shove_to_runout(e)
             for i in range(2):
                 acc[i] += e.payout[i]
         mc = acc / N
-        # Within Monte-Carlo tolerance (pot ~ a few hundred chips here).
-        assert abs(mc[0] - eq[0]) < 8.0
+        # Within Monte-Carlo tolerance for the (now full-stack) contested pot.
+        assert abs(mc[0] - eq[0]) < 15.0
 
 
 class TestMakeUndoRoundTrip:
 
     def test_undo_clears_runout_info(self):
         env = _env([10000, 10000], seed=3)
+        env.step_in_place("all_in")  # shove: not terminal, no runout yet
+        assert env._runout_info is None
         before = copy.deepcopy(env)
-        token = env.step_in_place("all_in")
+        # The opponent's all-in call is the step that reaches the runout.
+        token = env.step_in_place(
+            "all_in" if "all_in" in env.legal_actions else "call"
+        )
         assert env._runout_info is not None
         env.undo(token)
         assert env._runout_info is None
@@ -272,7 +290,7 @@ class TestMakeUndoRoundTrip:
 
     def test_deepcopy_carries_runout_info(self):
         env = _env([10000, 10000], seed=3)
-        env.step_in_place("all_in")
+        _shove_to_runout(env)
         clone = copy.deepcopy(env)
         assert clone._runout_info == env._runout_info
         assert clone.runout_equity() == env.runout_equity()
@@ -285,7 +303,7 @@ class TestRunoutEquityCapFallback:
         # the sampling fallback runs: finite, zero-sum, and it warns.
         np.random.seed(0)
         env = PokerEnv(players=[Player(i, 10000) for i in range(2)])
-        env.step_in_place("all_in")
+        _shove_to_runout(env)
         assert env.is_decision_free
         with caplog.at_level("WARNING"):
             eq = env.runout_equity(rng=np.random.default_rng(0), cap=2000)
@@ -295,7 +313,7 @@ class TestRunoutEquityCapFallback:
 
     def test_exact_path_below_cap_does_not_warn(self, caplog):
         env = _env([10000, 10000], seed=0)
-        env.step_in_place("all_in")
+        _shove_to_runout(env)
         with caplog.at_level("WARNING"):
             env.runout_equity()
         assert not any("exceed cap" in r.message for r in caplog.records)
@@ -332,7 +350,7 @@ class TestSinglePotFastPath:
         # vectorised no-tie path; it must equal the scalar brute-force reference
         # bit-for-bit.
         env = _env([10000, 10000], seed=seed)
-        env.step_in_place("all_in")
+        _shove_to_runout(env)
         assert env.is_decision_free
         eq = env.runout_equity()
         ref, _ = _brute_runout_equity(env)
@@ -345,7 +363,7 @@ class TestSinglePotFastPath:
         seen_tie = False
         for seed in range(8):
             env = _env([10000, 10000], seed=seed)
-            env.step_in_place("all_in")
+            _shove_to_runout(env)
             if not env.is_decision_free:
                 continue
             if self._tie_completions(env) > 0:

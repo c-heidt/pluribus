@@ -221,8 +221,21 @@ class TestMoreBettingNeeded:
         env.players[0].n_bet_chips = 50
         env.players[1].n_bet_chips = 100
         env.players[2].fold()
-        # Only player 1 can act, so no more betting needed
+        # Only player 1 can act, and has already out-bet the all-in, so there
+        # is nothing left to call — no more betting needed.
         assert dynamics.more_betting_needed(env) is False
+
+    def test_true_when_live_player_owes_over_the_top_all_in(self):
+        # An all-in player has bet MORE than the lone live player, who still
+        # owes a call-or-fold.  More betting IS needed even though the live
+        # bets are "equal to each other" (there is only one live player) —
+        # the comparison must be against the top bet, all-in included.
+        env = _env(3)
+        env.players[0].n_chips = 0
+        env.players[0].n_bet_chips = 200   # all-in, over the top
+        env.players[1].n_bet_chips = 100   # live, has not matched the shove
+        env.players[2].fold()
+        assert dynamics.more_betting_needed(env) is True
 
 
 # ---------------------------------------------------------------------------
