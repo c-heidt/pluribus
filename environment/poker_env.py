@@ -314,6 +314,34 @@ def encode_info_set(cluster: int, history_items) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Optional compiled-core encoder (Phase 1b)
+# ---------------------------------------------------------------------------
+# Keep the pure-Python encoder as the byte-exact oracle, then swap the public
+# ``encode_info_set`` for the Cython kernel when it is built AND enabled
+# (``PLURIBUS_CORE_KERNELS`` includes ``info_set``).  ``configure()`` dumps the
+# LIVE ``_STAGE_ID`` / ``_ACTION_BYTE`` (derived here from
+# ``RAISE_SIZES_BY_STAGE``) into the kernel so its alphabet can never drift from
+# the grid the tables were written under.  ``_compute_info_set`` /
+# ``_blueprint_info_set`` look this name up as a module global at call time, so
+# the swap is transparent; tests monkeypatch it directly.
+_encode_info_set_py = encode_info_set
+
+try:
+    from poker_ai._core import CORE_AVAILABLE as _CORE_AVAILABLE
+    from poker_ai._core.flags import kernel_enabled as _kernel_enabled
+
+    if _CORE_AVAILABLE and _kernel_enabled("info_set"):
+        from poker_ai._core._infoset import (
+            configure as _core_infoset_configure,
+            encode_info_set as _core_encode_info_set,
+        )
+        _core_infoset_configure(_STAGE_ID, _ACTION_BYTE, _RAW_TOKEN_MARK)
+        encode_info_set = _core_encode_info_set
+except ImportError:
+    pass  # extension / flags unavailable -> keep the pure-Python reference
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 

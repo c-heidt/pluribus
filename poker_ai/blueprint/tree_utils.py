@@ -378,3 +378,26 @@ def calculate_strategy_from_row(
         for i in range(n):
             result[i] = p
     return np.array(result, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Optional compiled-core kernel (Phase 1a: regret matching)
+# ---------------------------------------------------------------------------
+# Keep a stable handle on the pure-Python implementation as the byte-exact
+# oracle, then swap the public ``calculate_strategy_from_row`` for the Cython
+# kernel when the extension is built AND enabled (``PLURIBUS_CORE_KERNELS``
+# includes ``regret_match``).  ``get_node_strategy`` looks the name up as a
+# module global at call time, so the swap is transparent to every caller.  The
+# decision is made once at import (no per-call env read on the hot path):
+# production sets the flag before launch; tests that must exercise the core path
+# monkeypatch this module's ``calculate_strategy_from_row`` directly.
+_calculate_strategy_from_row_py = calculate_strategy_from_row
+
+try:
+    from poker_ai._core import CORE_AVAILABLE as _CORE_AVAILABLE
+    from poker_ai._core.flags import kernel_enabled as _kernel_enabled
+
+    if _CORE_AVAILABLE and _kernel_enabled("regret_match"):
+        from poker_ai._core._regret import calculate_strategy_from_row
+except ImportError:
+    pass  # extension / flags unavailable -> keep the pure-Python reference

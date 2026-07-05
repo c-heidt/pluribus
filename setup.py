@@ -52,6 +52,13 @@ def get_ext_modules() -> list:
         return []
     import numpy as np
 
+    # The core package dir carries vendored headers (``xxhash.h`` +
+    # ``_xxh3.h``) that a kernel includes with quotes; add it to the include
+    # path so the include resolves regardless of the build's working directory
+    # (quote-include-relative-to-source already covers the in-tree build, this
+    # makes it robust for out-of-tree / isolated builds too).
+    core_dir = os.path.join("poker_ai", "_core")
+
     extensions = []
     for path in sorted(glob.glob("poker_ai/_core/*.pyx")):
         module = path[: -len(".pyx")].replace(os.sep, ".")
@@ -59,7 +66,7 @@ def get_ext_modules() -> list:
             setuptools.Extension(
                 name=module,
                 sources=[path],
-                include_dirs=[np.get_include()],
+                include_dirs=[np.get_include(), core_dir],
             )
         )
     if not extensions:

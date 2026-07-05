@@ -632,3 +632,48 @@ class Evaluator(object):
 # the concrete and vectorised payouts *aligned by construction*: identical tables,
 # identical ranks.
 default_evaluator: Evaluator = Evaluator()
+
+
+# ---------------------------------------------------------------------------
+# Optional compiled-core evaluator (Phase 1d: _five/_six/_seven)
+# ---------------------------------------------------------------------------
+# When the extension is built AND enabled (``PLURIBUS_CORE_KERNELS`` includes
+# ``evaluator``), route the shared ``default_evaluator``'s scalar dispatch
+# through the Cython kernel.  It is a byte-identical drop-in — it indexes the
+# evaluator's own dumped tables (``_flush_best`` / ``_flush_rank`` and the sorted
+# ``_unsuited`` / ``_nonflush{6,7}`` key/rank arrays) — so every consumer of
+# ``default_evaluator`` (terminal settlement, range showdown, batch ranking)
+# sees identical ranks.  ``evaluate`` looks the dispatch up in ``hand_size_map``
+# at call time, so swapping the map is transparent; the scalar ``_five`` /
+# ``_six`` / ``_seven`` methods stay untouched as the byte-exact oracle, and the
+# numpy ``evaluate_batch`` path (not the scalar kernel's target) is left as
+# Python.
+try:
+    from poker_ai._core import CORE_AVAILABLE as _CORE_AVAILABLE
+    from poker_ai._core.flags import kernel_enabled as _kernel_enabled
+
+    if _CORE_AVAILABLE and _kernel_enabled("evaluator"):
+        from poker_ai._core._eval import (
+            configure as _core_eval_configure,
+            five as _core_five,
+            six as _core_six,
+            seven as _core_seven,
+        )
+
+        _core_eval_configure(
+            default_evaluator._flush_best,
+            default_evaluator._flush_rank,
+            default_evaluator._unsuited_keys,
+            default_evaluator._unsuited_ranks,
+            default_evaluator._nonflush6_keys,
+            default_evaluator._nonflush6_ranks,
+            default_evaluator._nonflush7_keys,
+            default_evaluator._nonflush7_ranks,
+        )
+        default_evaluator.hand_size_map = {
+            5: _core_five,
+            6: _core_six,
+            7: _core_seven,
+        }
+except ImportError:
+    pass

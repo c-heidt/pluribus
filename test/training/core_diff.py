@@ -100,6 +100,39 @@ class ReplaySampler:
         return self._i == len(self._choices)
 
 
+def build_trained_tables(save_path, card_info_lut, *, n_players: int = 2,
+                         n_iterations: int = 40, seed: int = 123):
+    """Build a fresh ``CFRTables`` lightly pre-trained for non-uniform regrets.
+
+    A degenerate all-uniform fresh table would not exercise regret matching, so
+    a short seeded run populates realistic regrets; the seed makes the resulting
+    snapshot identical every run (kept read-only afterward via explicit
+    ``local_delta`` in the record/replay runs).  The caller owns closing the
+    returned tables.  Shared by the harness self-tests and the Phase-1 kernel
+    end-to-end tests so both train against the same distribution.
+    """
+    from pathlib import Path
+
+    from environment.action_space import MAX_ACTIONS_PER_STREET
+    from environment.poker_env import new_game
+    from poker_ai.tables.cfr_tables import CFRTables
+    from poker_ai.tables.index import lmdb_map_size_for_players
+
+    shm_dir = Path(save_path) / "shm"
+    shm_dir.mkdir(parents=True, exist_ok=True)
+    tables = CFRTables(
+        index_path=Path(save_path) / "lmdb_index",
+        shm_dir=str(shm_dir),
+        actions_per_street=MAX_ACTIONS_PER_STREET,
+        lmdb_map_size=lmdb_map_size_for_players(n_players),
+    )
+    np.random.seed(seed)
+    for t in range(1, n_iterations + 1):
+        for i in range(n_players):
+            cfr_mod.cfr(tables, new_game(n_players, card_info_lut), i, t)
+    return tables
+
+
 def run_recording(tables, state, i: int, t: int, *, seed: int = 0):
     """Run one Python traversal with a :class:`RecordingSampler`.
 

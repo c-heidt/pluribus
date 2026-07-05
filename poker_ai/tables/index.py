@@ -90,6 +90,29 @@ def hash_info_set_bytes(info_set: Union[bytes, str]) -> bytes:
     return struct.pack("<QQ", high, low)
 
 
+# ---------------------------------------------------------------------------
+# Optional compiled-core hash (Phase 1c: xxh3_128)
+# ---------------------------------------------------------------------------
+# Keep the pure-Python hash as the byte-exact oracle, then swap the public
+# ``hash_info_set_128`` for the Cython kernel when the extension is built AND
+# enabled (``PLURIBUS_CORE_KERNELS`` includes ``index_hash``).  The kernel hashes
+# with a vendored ``xxhash.h`` pinned to the same upstream 0.8.2 the pip
+# ``xxhash`` package bundles, and asserts a known-answer digest at its own import
+# — so a version/ABI drift fails loud rather than silently rewriting every LMDB
+# key.  ``hash_info_set_bytes`` and ``InfosetIndex`` look this name up as a module
+# global at call time, so the swap reaches every caller; tests monkeypatch it.
+_hash_info_set_128_py = hash_info_set_128
+
+try:
+    from poker_ai._core import CORE_AVAILABLE as _CORE_AVAILABLE
+    from poker_ai._core.flags import kernel_enabled as _kernel_enabled
+
+    if _CORE_AVAILABLE and _kernel_enabled("index_hash"):
+        from poker_ai._core._index import hash_info_set_128
+except ImportError:
+    pass
+
+
 def lmdb_map_size_for_players(n_players: int) -> int:
     """Return a sensible LMDB ``map_size`` for the given player count.
 
