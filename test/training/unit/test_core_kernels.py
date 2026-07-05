@@ -544,3 +544,57 @@ class TestSettlementKernel:
             assert core_settle_payout(contrib, groups, order) == [
                 won[i] - contrib[i] for i in range(n)
             ]
+
+
+class TestKernelExceptionsPropagate:
+    """Regression: a ``cdef`` helper's raise must PROPAGATE, never be swallowed at
+    the C call boundary.
+
+    A ``cdef`` function returning ``void`` / a C scalar *without* an exception
+    spec (``except *`` / ``except? -1``) silently drops any Python exception —
+    Cython prints "Exception ignored in: ..." and the call returns garbage, a
+    silent-wrong-result class a happy-path fuzz never catches (it bit
+    ``_state.FastState._apply`` in Phase 2).  Every Phase-1 raising helper avoids
+    it by returning ``object`` (NULL-propagates) or declaring a spec; these tests
+    trip each raise path and assert it actually raises.
+    """
+
+    def test_settle_over_max_players_raises(self):
+        # cdef object _settle_won -> ValueError for n > MAX_PLAYERS (object return
+        # NULL-propagates); a swallow would return a garbage list.
+        with pytest.raises(ValueError):
+            core_settle_won([10] * 33, [[0]], list(range(33)))
+
+    def test_index_hash_non_bytes_raises(self):
+        with pytest.raises(TypeError):
+            core_hash_info_set_128(123)
+
+    def test_index_lookup_non_bytes_raises(self):
+        keys = np.zeros((4, 2), np.uint64)
+        rows = np.zeros(4, np.uint64)
+        with pytest.raises(TypeError):
+            core_lookup(keys, rows, 3, 123)
+
+    def test_eval_lookup_product_miss_raises(self):
+        # cdef short _lookup(...) except? -1 -> KeyError on a product absent from
+        # the table.  Force a miss by ranking the 7-card table with 6 mixed-suit
+        # cards (their 6-card product is not a 7-card key); a swallow would return
+        # a garbage rank (and print "Exception ignored").
+        from environment.utils import new_card
+
+        ev = _py_evaluator
+        _core_eval_configure(
+            ev._flush_best, ev._flush_rank,
+            ev._unsuited_keys, ev._unsuited_ranks,
+            ev._nonflush6_keys, ev._nonflush6_ranks,
+            ev._nonflush7_keys, ev._nonflush7_ranks,
+        )
+        six_mixed = [new_card(s) for s in ("2c", "3d", "4h", "5s", "6c", "7d")]
+        with pytest.raises(KeyError):
+            core_seven(six_mixed)
+
+    def test_regret_bad_input_propagates(self):
+        # Fallback path does regret_row.tolist(); a bad object raises (propagated
+        # through the object-returning cdef helpers), never swallowed.
+        with pytest.raises(Exception):
+            core_csfr(object())
