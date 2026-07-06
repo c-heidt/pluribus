@@ -18,6 +18,12 @@ class _FakeTables:
     def __init__(self):
         self.snapshot_calls = 0
         self.flush_index_calls = 0
+        self.persist_index_calls = 0
+
+    def persist_indexes(self):
+        # Deferred-allocation bulk flush; a no-op on the synchronous path.
+        self.persist_index_calls += 1
+        return 0
 
     def snapshot_dirty_chunks(self):
         # Returning [] keeps the (now-stopped) writer's work trivial if

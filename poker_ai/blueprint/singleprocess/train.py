@@ -244,3 +244,8 @@ def simple_search(
                     f"({iters_per_sec:.1f} iter/s)"
                 )
                 _last_log_time = now
+
+    # In deferred-allocation mode the shm cache is the live row authority and
+    # LMDB lags; make the on-disk index current so a reopen / warm-start (and the
+    # golden-trace regression) sees every allocated row.  No-op otherwise.
+    tables.persist_indexes()

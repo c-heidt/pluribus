@@ -191,6 +191,7 @@ class InfosetIndex:
         path: Union[str, Path],
         debug: bool = False,
         map_size: Optional[int] = None,
+        deferred: bool = False,
     ) -> None:
         """Open or create an LMDB-backed index at *path*.
 
@@ -244,6 +245,15 @@ class InfosetIndex:
         # path (standalone indexes, tests, cache disabled).
         self._cache = None
 
+        # Deferred-durability allocation (PLURIBUS_DEFERRED_ALLOC): when True AND
+        # a cache is attached, row numbers are assigned by the shm cache under
+        # its lightweight lock instead of an LMDB write txn; LMDB is written in
+        # bulk only at checkpoints (:meth:`bulk_persist`).  ``_persist_watermark``
+        # tracks how many rows are already durable in LMDB — nothing below it
+        # needs re-writing on the next flush.
+        self._deferred: bool = deferred
+        self._persist_watermark: int = 0
+
         # Shared counter mirroring __next_row__ in LMDB.  Initialised here
         # (pre-fork, safe to read LMDB) so any process can query the row
         # count without an LMDB transaction (which triggers MDB_BAD_RSLOT
@@ -267,7 +277,14 @@ class InfosetIndex:
 
     @property
     def n_allocated_rows(self) -> int:
-        """Total number of rows allocated so far, lock-free safe to read."""
+        """Total number of rows allocated so far, lock-free safe to read.
+
+        In deferred-allocation mode the shm cache is the live authority (LMDB
+        lags until the next :meth:`bulk_persist`), so the count comes from cache
+        occupancy; otherwise from the LMDB-mirrored counter.
+        """
+        if self._deferred and self._cache is not None:
+            return self._cache.occupancy()
         return self._n_allocated_mp.value
 
     def set_cache(self, cache) -> None:
@@ -283,7 +300,12 @@ class InfosetIndex:
         """Load the attached cache from this index's LMDB (no-op if none)."""
         if self._cache is None:
             return 0
-        return self._cache.prewarm_from_cursor(self._env)
+        loaded = self._cache.prewarm_from_cursor(self._env)
+        # Everything prewarmed is already durable in LMDB, so the next deferred
+        # flush only needs to persist rows allocated after this point.
+        if self._deferred:
+            self._persist_watermark = self._cache.occupancy()
+        return loaded
 
     def get(self, info_set) -> Optional[int]:
         """Look up *info_set* and return its flat row number.
@@ -337,6 +359,10 @@ class InfosetIndex:
         """
         if self._cache is not None:
             low, high = hash_info_set_128(info_set)
+            if self._deferred:
+                # Deferred durability: the cache allocates the row under its own
+                # lightweight lock; LMDB is written in bulk at checkpoints.
+                return self._cache.get_or_claim(low, high)
             row = self._cache.probe(low, high)
             if row is not None:
                 return row, False
@@ -348,6 +374,179 @@ class InfosetIndex:
             self._cache.insert(low, high, flat_row)
             return flat_row, is_new
         return self._lmdb_get_or_create(info_set)
+
+    def get_or_create_many(self, info_sets) -> list:
+        """Batched :meth:`get_or_create`: resolve/allocate many in **one** txn.
+
+        Semantically identical to calling :meth:`get_or_create` for each
+        ``info_set`` in order — returns a list of ``(flat_row, is_new)`` in the
+        same order — but collapses every allocation into a **single** LMDB write
+        transaction, so the per-street env writer mutex is acquired once for the
+        whole batch instead of once per new info set.  This is the CFR flush hot
+        path's dominant cost under many workers (each new info set is otherwise
+        its own writer-lock/commit/fsync cycle), and the whole reason this method
+        exists.
+
+        Byte-identical to N sequential :meth:`get_or_create` calls: cache hits
+        resolve with no LMDB access; misses are assigned dense consecutive rows
+        ``next_row, next_row+1, …`` in input order inside the write txn (the same
+        mapping serial allocation produces), each re-checked against LMDB first
+        so a row a concurrent writer already committed is reused rather than
+        re-allocated (the double-checked-lock guarantee, unchanged).  The
+        ``__next_row__`` watermark and the ``n_allocated`` mirror end at the same
+        final value; cache inserts happen after commit, exactly as the single-row
+        path does.
+
+        Without a cache attached this falls back to per-item allocation (the
+        no-cache path is not the production hot path and keeps the read-first
+        optimisation); production always attaches the shm cache.
+
+        Parameters
+        ----------
+        info_sets : Sequence
+            Info sets to resolve/allocate, in order.
+
+        Returns
+        -------
+        list[tuple[int, bool]]
+            ``(flat_row, is_new)`` per input, in input order.
+        """
+        if not info_sets:
+            return []
+        if self._cache is None:
+            return [self._lmdb_get_or_create(info_set) for info_set in info_sets]
+
+        if self._deferred:
+            # Deferred durability: the cache allocates every row under a SINGLE
+            # lock acquisition for the whole batch's misses (no LMDB on the hot
+            # path at all).
+            digests = [hash_info_set_128(info_set) for info_set in info_sets]
+            return self._cache.get_or_claim_many(digests)
+
+        # Probe the shm cache for each; hits resolve now, misses go to one txn.
+        # ``low, high = hash_info_set_128(...)`` follows the (inverted) word
+        # convention the whole cache path uses — ``low`` holds the high word;
+        # ``probe``/``insert`` are called ``(low, high)`` to match.
+        results: list = [None] * len(info_sets)
+        misses = []  # (idx, info_set, low, high)
+        for idx, info_set in enumerate(info_sets):
+            low, high = hash_info_set_128(info_set)
+            row = self._cache.probe(low, high)
+            if row is not None:
+                results[idx] = (row, False)
+            else:
+                misses.append((idx, info_set, low, high))
+
+        if misses:
+            # One write txn for every miss, with the same map-full retry as the
+            # single-row path (a MapFullError aborts the whole txn → the batch
+            # is safe to retry from the freshly-read watermark).
+            while True:
+                try:
+                    assigned = self._allocate_many_once(misses)
+                    break
+                except lmdb.MapFullError:
+                    self._reopen()
+            for idx, row, is_new in assigned:
+                results[idx] = (row, is_new)
+            # Insert every miss into the cache after commit (idempotent; matches
+            # the single-row path, which inserts on every cache miss regardless
+            # of whether this call or a concurrent one did the allocation).
+            for idx, info_set, low, high in misses:
+                self._cache.insert(low, high, results[idx][0])
+        return results
+
+    def _allocate_many_once(self, misses) -> list:
+        """Assign rows for every miss inside one write txn; ``[(idx,row,is_new)]``.
+
+        Mirrors the write-txn body of :meth:`_get_or_create_once` exactly, once
+        per miss: re-check the key inside the txn (``txn.get`` sees both other
+        workers' committed rows and this txn's own earlier puts, so duplicate
+        keys within the batch collapse to one row), assign the next dense row on
+        a genuine miss, and write the watermark + ``n_allocated`` mirror **once**
+        at the end.  The debug-shadow collision check is replicated per new key.
+        """
+        assigned = []
+        with self._env.begin(write=True) as txn:
+            meta = txn.get(_NEXT_ROW_KEY)
+            next_row: int = struct.unpack("<Q", meta)[0] if meta else 0
+            for idx, info_set, low, high in misses:
+                # Key bytes == hash_info_set_bytes(info_set): both pack the
+                # hash_info_set_128 return in order, so reuse the probe words
+                # instead of hashing again under the writer lock.
+                key = struct.pack("<QQ", low, high)
+                val = txn.get(key)
+                if val is not None:
+                    assigned.append((idx, struct.unpack("<Q", val)[0], False))
+                    continue
+                row = next_row
+                txn.put(key, struct.pack("<Q", row))
+                next_row += 1
+                if self._debug:
+                    raw = info_set if isinstance(info_set, bytes) else info_set.encode("utf-8")
+                    shadow_key = _STR_PREFIX + key
+                    existing_str = txn.get(shadow_key)
+                    if existing_str is not None and existing_str != raw:
+                        raise AssertionError(
+                            f"128-bit hash collision detected!\n"
+                            f"  info_set A (existing): {existing_str!r}\n"
+                            f"  info_set B (new):      {info_set!r}\n"
+                            f"  hash key: {key.hex()}"
+                        )
+                    txn.put(shadow_key, raw)
+                assigned.append((idx, row, True))
+            txn.put(_NEXT_ROW_KEY, struct.pack("<Q", next_row))
+            self._n_allocated_mp.value = next_row
+        return assigned
+
+    def bulk_persist(self) -> int:
+        """Deferred mode: flush cache rows allocated since the last flush to LMDB.
+
+        The one place deferred allocation touches LMDB.  Exports every cache
+        entry with ``row >= _persist_watermark`` (the dense rows allocated since
+        the previous flush) and writes them — plus the updated ``__next_row__``
+        watermark — in a **single** write transaction, then advances the
+        persisted watermark.  Called at checkpoints (under the sync barrier, no
+        worker allocating) and at single-process run-end, so a resume rebuilds
+        an exact ``[0, occupancy)`` from LMDB via ``prewarm_from_cursor``.
+
+        No-op (returns 0) when there is no cache, deferred mode is off, or no new
+        rows have been allocated since the last flush.
+
+        Returns
+        -------
+        int
+            Number of digest→row entries written this flush.
+        """
+        if self._cache is None or not self._deferred:
+            return 0
+        occ = self._cache.occupancy()
+        if occ == self._persist_watermark:
+            return 0
+        keys, rows = self._cache.export_since(self._persist_watermark)
+        while True:
+            try:
+                with self._env.begin(write=True) as txn:
+                    cursor = txn.cursor()
+                    # Deferred mode carries no raw info_set to the flush, so the
+                    # debug shadow-key collision check is not available here; the
+                    # cache's full 128-bit digest compare already makes a wrong
+                    # row impossible short of a genuine 128-bit collision (the
+                    # same residual risk LMDB itself carries).
+                    items = [
+                        (struct.pack("<QQ", int(keys[i, 0]), int(keys[i, 1])),
+                         struct.pack("<Q", int(rows[i])))
+                        for i in range(len(rows))
+                    ]
+                    if items:
+                        cursor.putmulti(items)
+                    txn.put(_NEXT_ROW_KEY, struct.pack("<Q", occ))
+                break
+            except lmdb.MapFullError:
+                self._reopen()
+        self._n_allocated_mp.value = occ
+        self._persist_watermark = occ
+        return len(rows)
 
     def _lmdb_get_or_create(self, info_set, skip_read: bool = False) -> tuple:
         """LMDB-only get-or-create with the map-full retry loop.

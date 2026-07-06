@@ -204,6 +204,94 @@ class ShmIndexCache:
         rows[slot] = np.uint64(row)
         self._occupancy.value += 1
 
+    def get_or_claim(self, digest_low: int, digest_high: int) -> tuple:
+        """Atomically resolve-or-**allocate** ``digest`` → ``(row, is_new)``.
+
+        The deferred-durability allocator: the cache — not LMDB — assigns the
+        row.  A lock-free :meth:`probe` handles the common case (already-seen
+        info set) with no lock.  On a miss the allocation lock is taken and the
+        digest re-probed (another worker may have claimed it in the gap); if
+        still absent, the next dense row (``_occupancy.value`` — the occupancy
+        counter already equals the dense row count) is claimed and published via
+        :meth:`_insert_locked`, which bumps the counter.
+
+        This replaces the LMDB write transaction (B-tree traversal + meta-page
+        commit, ~µs) with a re-probe + three ``uint64`` stores (~tens of ns) —
+        the whole point of deferred durability.  Row agreement across workers is
+        preserved exactly as before: the in-lock re-probe is the same
+        double-checked-lock guarantee the LMDB writer mutex used to give, on a
+        far cheaper lock.  Raises :class:`IndexError` on overflow (via
+        ``_insert_locked``), the same loud failure as :meth:`insert`.
+
+        Returns
+        -------
+        tuple[int, bool]
+            ``(flat_row, is_new)`` — ``is_new`` is ``True`` iff this call
+            allocated the row.
+        """
+        row = self.probe(digest_low, digest_high)
+        if row is not None:
+            return row, False
+        with self._lock:
+            # Re-probe under the lock — a concurrent claimer may have won.
+            row = self.probe(digest_low, digest_high)
+            if row is not None:
+                return row, False
+            new_row = int(self._occupancy.value)
+            self._insert_locked(digest_low, digest_high, new_row)
+            return new_row, True
+
+    def get_or_claim_many(self, digests) -> list:
+        """Batched :meth:`get_or_claim`: one lock acquisition for all misses.
+
+        Probes every ``(low, high)`` lock-free; if any miss, takes the
+        allocation lock **once** and claims them all (re-probing each under the
+        lock, so duplicate digests within the batch collapse to one row). Order-
+        preserving; returns ``[(row, is_new), ...]``.
+        """
+        results: list = [None] * len(digests)
+        misses = []
+        for i, (low, high) in enumerate(digests):
+            row = self.probe(low, high)
+            if row is not None:
+                results[i] = (row, False)
+            else:
+                misses.append(i)
+        if misses:
+            with self._lock:
+                for i in misses:
+                    low, high = digests[i]
+                    row = self.probe(low, high)  # re-probe (dedups within batch)
+                    if row is not None:
+                        results[i] = (row, False)
+                    else:
+                        new_row = int(self._occupancy.value)
+                        self._insert_locked(low, high, new_row)
+                        results[i] = (new_row, True)
+        return results
+
+    def export_since(self, watermark: int) -> tuple:
+        """Return ``(keys, rows)`` for every entry with ``row >= watermark``.
+
+        The set of rows allocated since the last durability flush — vectorised
+        scan of the ``rows`` array (``!= EMPTY`` and ``>= watermark``, which are
+        exactly the dense rows ``[watermark, occupancy)``).  Consumed by
+        :meth:`InfosetIndex.bulk_persist` to write those digests into LMDB in one
+        transaction.  O(capacity) numpy, run once per checkpoint off the hot
+        path — never per allocation.
+
+        Returns
+        -------
+        tuple[numpy.ndarray, numpy.ndarray]
+            ``keys`` shape ``(m, 2)`` uint64 (``[:, 0]`` = low, ``[:, 1]`` =
+            high) and ``rows`` shape ``(m,)`` uint64, for the ``m`` entries at or
+            above ``watermark``.
+        """
+        rows = self._rows
+        mask = (rows != _EMPTY) & (rows >= np.uint64(watermark))
+        idx = np.nonzero(mask)[0]
+        return self._keys[idx], rows[idx]
+
     # ------------------------------------------------------------------
     # Prewarm / audit (LMDB-backed)
     # ------------------------------------------------------------------

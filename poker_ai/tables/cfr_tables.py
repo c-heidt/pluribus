@@ -175,9 +175,22 @@ class CFRTables:
         if actions_per_street is None:
             raise ValueError("actions_per_street is required")
 
+        # Deferred-durability allocation (PLURIBUS_DEFERRED_ALLOC): the shm cache
+        # assigns rows under its lightweight lock and LMDB is written in bulk at
+        # checkpoints (:meth:`persist_indexes`), taking the LMDB writer mutex off
+        # the allocation hot path.  Requires the cache — a no-op otherwise.
+        self._deferred_alloc: bool = (
+            enable_index_cache
+            and os.environ.get("PLURIBUS_DEFERRED_ALLOC", "0") == "1"
+        )
+
         base = Path(index_path)
         self._indexes: Dict[int, InfosetIndex] = {
-            r: InfosetIndex(base / f"street_{r}", map_size=lmdb_map_size)
+            r: InfosetIndex(
+                base / f"street_{r}",
+                map_size=lmdb_map_size,
+                deferred=self._deferred_alloc,
+            )
             for r in range(4)
         }
 
@@ -600,6 +613,19 @@ class CFRTables:
         """
         for idx in self._indexes.values():
             idx.reopen_after_fork()
+
+    def persist_indexes(self) -> int:
+        """Bulk-flush deferred-allocation rows into LMDB (no-op if not deferred).
+
+        In deferred-allocation mode the shm cache is the live row authority and
+        LMDB lags; this writes every row allocated since the last flush into LMDB
+        in one transaction per street so the on-disk index is consistent with the
+        chunk snapshot taken at the same checkpoint (both cover ``[0,
+        occupancy)``).  Must run under the sync barrier (no worker allocating),
+        before :meth:`flush_indexes` and ``snapshot_dirty_chunks``.  Returns the
+        total number of rows persisted across all streets.
+        """
+        return sum(idx.bulk_persist() for idx in self._indexes.values())
 
     def flush_indexes(self) -> None:
         """Flush every LMDB index to disk.

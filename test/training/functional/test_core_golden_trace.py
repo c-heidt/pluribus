@@ -128,6 +128,24 @@ class TestGoldenTrace:
             "regression in the traversal or regret maths."
         )
 
+    def test_matches_frozen_digest_deferred_alloc(self, tmp_path, monkeypatch):
+        """Deferred-durability allocation is byte-identical to the LMDB path.
+
+        With ``PLURIBUS_DEFERRED_ALLOC=1`` the shm cache assigns row numbers and
+        LMDB is bulk-flushed at run-end instead of one txn per new info set.
+        Single-process allocation is sequential, so the info-set→row mapping (and
+        therefore every chunk row the digest reads) is unchanged — the golden
+        digest must still hold.  This is the byte-exact gate for the allocator
+        rework.
+        """
+        monkeypatch.setenv("PLURIBUS_DEFERRED_ALLOC", "1")
+        monkeypatch.setenv("PLURIBUS_INDEX_CACHE", "1")
+        digest, _ = train_and_digest(tmp_path)
+        assert digest == GOLDEN_DIGEST, (
+            "deferred-allocation trainer output drifted from the golden trace — "
+            "the shm-cache allocator is not byte-identical to the LMDB allocator."
+        )
+
     def test_deterministic_across_runs(self, tmp_path):
         """Two independent runs produce the identical digest (nondeterminism guard).
 

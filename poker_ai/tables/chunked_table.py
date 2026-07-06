@@ -336,8 +336,8 @@ class ChunkedTable:
             to int32 before the add), exactly as in :meth:`merge_delta_row`.
         """
         by_chunk = {}
-        for info_set, delta in items:
-            chunk_id, local_row = self._locate_row(info_set)
+        locations = self._locate_rows([info_set for info_set, _ in items])
+        for (info_set, delta), (chunk_id, local_row) in zip(items, locations):
             by_chunk.setdefault(chunk_id, []).append((local_row, delta))
         for chunk_id, rows in by_chunk.items():
             lock = self.get_stripe_lock(chunk_id)
@@ -453,3 +453,28 @@ class ChunkedTable:
         chunk_id, local_row = divmod(flat_row, CHUNK_SIZE)
         self._store.ensure_open(chunk_id)
         return chunk_id, local_row
+
+    def _locate_rows(self, info_sets) -> list:
+        """Batched :meth:`_locate_row`: ``(chunk_id, local_row)`` per info set.
+
+        Resolves/allocates every flat row through the index in **one** batched
+        call (:meth:`InfosetIndex.get_or_create_many` — one LMDB write txn for
+        the whole batch instead of one per new info set), then applies the same
+        per-row bookkeeping :meth:`_locate_row` does: bump the per-table
+        allocation counter once by the number of freshly-allocated rows, and
+        ``ensure_open`` each row's chunk (idempotent; opens any chunks a batch of
+        allocations crossed into).  Order-preserving.
+        """
+        results = self._index.get_or_create_many(info_sets)
+        n_new = 0
+        locations = []
+        for flat_row, is_new in results:
+            if is_new:
+                n_new += 1
+            chunk_id, local_row = divmod(flat_row, CHUNK_SIZE)
+            self._store.ensure_open(chunk_id)
+            locations.append((chunk_id, local_row))
+        if n_new:
+            with self._n_allocated.get_lock():
+                self._n_allocated.value += n_new
+        return locations

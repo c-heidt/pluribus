@@ -296,6 +296,11 @@ class CheckpointManager:
             self._server.flush_all_workers()
 
         # Phase 1 — snapshot under the barrier.  Cheap: memcpy + LMDB sync.
+        # In deferred-allocation mode, first bulk-write the rows the shm cache
+        # has allocated since the last checkpoint into LMDB, so the on-disk index
+        # matches the chunk snapshot taken immediately after (both cover
+        # [0, occupancy)).  No-op when deferred allocation is off.
+        self._server._tables.persist_indexes()
         buffers = self._server._tables.snapshot_dirty_chunks()
         self._server._tables.flush_indexes()
         state_dict = self._server.to_dict(t=t)

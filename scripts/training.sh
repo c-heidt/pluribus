@@ -83,6 +83,15 @@ export PLURIBUS_INDEX_CAPACITY=${PLURIBUS_INDEX_CAPACITY:-"67108864,268435456,26
 # index cache above (pure-shm reads, no LMDB fallback) — already default-on —
 # and the extension to be BUILT on this node (preflight check below).
 export PLURIBUS_CFR_CORE=${PLURIBUS_CFR_CORE:-1}
+# Deferred-durability allocation.  1 = the shm index cache assigns info-set row
+# numbers under its own lightweight lock and LMDB is written in bulk only at
+# checkpoints — taking the LMDB single-writer mutex off the allocation hot path
+# (the measured 48-worker bottleneck once the compiled core is on).  Byte-
+# identical single-process (golden-trace gated), fallback-retaining.  REQUIRES
+# the shm index cache above (it IS the allocator); enforced by the guard below.
+# Pure-Python — needs no build.  Set 0 to force the legacy per-infoset LMDB
+# write-txn allocator (e.g. the A/B baseline arm).
+export PLURIBUS_DEFERRED_ALLOC=${PLURIBUS_DEFERRED_ALLOC:-1}
 
 mkdir -p "$PROJECT_DIR/logs"
 mkdir -p "$(dirname "$NICKNAME")"
@@ -107,6 +116,16 @@ if [ "$PLURIBUS_CFR_CORE" = "1" ]; then
     exit 1
   fi
   echo "Compiled CFR core present and importable."
+fi
+
+# Deferred allocation IS the shm cache (it allocates rows there), so it is
+# meaningless without it.  CFRTables silently disables deferred when the cache
+# is off; catch the inconsistent request loudly instead of silently reverting to
+# the slow LMDB-writer-mutex allocator.  No build check — deferred is pure Python.
+if [ "$PLURIBUS_DEFERRED_ALLOC" = "1" ] && [ "$PLURIBUS_INDEX_CACHE" != "1" ]; then
+  echo "ERROR: PLURIBUS_DEFERRED_ALLOC=1 requires PLURIBUS_INDEX_CACHE=1 (the shm" >&2
+  echo "       cache is the allocator). Enable the cache or set DEFERRED_ALLOC=0." >&2
+  exit 1
 fi
 
 # Ensure LUT path exists
@@ -199,6 +218,7 @@ echo "  - CPUs:                        $SLURM_CPUS_PER_TASK"
 echo "  - PLURIBUS_CFR_BATCH_SIZE:     $PLURIBUS_CFR_BATCH_SIZE"
 echo "  - PLURIBUS_STRATEGY_BATCH_SIZE:$PLURIBUS_STRATEGY_BATCH_SIZE"
 echo "  - PLURIBUS_CFR_CORE:           $PLURIBUS_CFR_CORE"
+echo "  - PLURIBUS_DEFERRED_ALLOC:     $PLURIBUS_DEFERRED_ALLOC"
 echo "  - PLURIBUS_INDEX_CACHE:        $PLURIBUS_INDEX_CACHE"
 echo "  - PLURIBUS_INDEX_CAPACITY:     $PLURIBUS_INDEX_CAPACITY"
 echo "  - PLURIBUS_CHUNK_SIZE:         $PLURIBUS_CHUNK_SIZE"
