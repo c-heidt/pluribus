@@ -29,16 +29,27 @@ if [ -z "${WORKSPACE:-}" ]; then
   exit 1
 fi
 
-# Training parameters (cycle-based options are counted in sync cycles = N * sync_interval iterations)
+# Training parameters (cycle-based options are counted in sync cycles = N * sync_interval iterations).
+#
+# The cycle/iteration cadence below is fitted to the cluster's current throughput
+# of ~7M traversals-per-player per hour (the ``t`` in the progress logs), which at
+# SYNC_INTERVAL=1000 is 7,000 sync cycles/hour.  Re-derive if throughput changes:
+#   cycles/hour = 7e6 / SYNC_INTERVAL ;  raw traversals-per-player/hour = 7e6.
 N_PLAYERS=${N_PLAYERS:-6}
 MAX_RUNTIME_HOURS=${MAX_RUNTIME_HOURS:-71.5}
-SYNC_INTERVAL=${SYNC_INTERVAL:-750}
-DISCOUNT_INTERVAL=${DISCOUNT_INTERVAL:-100}
-DISCOUNT_DURATION_CYCLES=${DISCOUNT_DURATION_CYCLES:-2000}
+SYNC_INTERVAL=${SYNC_INTERVAL:-1000}
+# LCFR discount stretched over the first 4h (was ~13 min at this throughput),
+# keeping the same 19 discount steps: one every 1400 cycles (12 min), window
+# 28000 cycles (4.0h = 20 * DISCOUNT_INTERVAL).
+DISCOUNT_INTERVAL=${DISCOUNT_INTERVAL:-1400}
+DISCOUNT_DURATION_CYCLES=${DISCOUNT_DURATION_CYCLES:-28000}
+# Strategy warm-up before the average-strategy pass begins (~1.7 min at 7,000 cycles/h).
 UPDATE_THRESHOLD=${UPDATE_THRESHOLD:-200}
 STRATEGY_INTERVAL=${STRATEGY_INTERVAL:-1}
-CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-2000}
-PRUNE_THRESHOLD=${PRUNE_THRESHOLD:-500000}
+# Checkpoint once per hour (7000 cycles = 1.0h at 7,000 cycles/h).
+CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-7000}
+# CFR-P pruning begins at 2.5h.  Raw iterations (traversals-per-player): 2.5h * 7e6/h = 17.5M.
+PRUNE_THRESHOLD=${PRUNE_THRESHOLD:-17500000}
 C=${C:--3000000}
 PICKLE_DIR=${PICKLE_DIR:-false}
 N_PROCESSES=${N_PROCESSES:-}
@@ -59,19 +70,21 @@ fi
 # Efficiency knobs honoured by the trainer (env-driven so they can be
 # overridden per submission without editing code).
 export PLURIBUS_CFR_BATCH_SIZE=${PLURIBUS_CFR_BATCH_SIZE:-5}
-# Sampled playthroughs per update_strategy queue item.  Used to size the
-# default PLURIBUS_STRATEGY_PER_JOB below (the average-strategy pass no longer
-# runs as its own barriered queue job — see PLURIBUS_STRATEGY_PER_JOB).
+# Sizes the auto-default for PLURIBUS_STRATEGY_PER_JOB (workers_per_player * this
+# playthroughs per player per sync cycle).  Inert while PLURIBUS_STRATEGY_PER_JOB
+# is pinned below; kept for the unset / off-core fallback path.
 export PLURIBUS_STRATEGY_BATCH_SIZE=${PLURIBUS_STRATEGY_BATCH_SIZE:-128}
 # Average-strategy playthroughs folded into EACH cfr job (per player, after
 # warm-up).  The strategy pass is now interleaved with CFR and flushed with the
 # regret delta at the sync barrier instead of running as its own barrier — so
-# with PLURIBUS_CFR_CORE=1 it is core-accelerated AND overlapped, and its
-# frequency is decoupled from the sync interval.  Leave UNSET to auto-size to
-# the same per-cycle strategy mass the old barriered pass produced
-# (workers_per_player * PLURIBUS_STRATEGY_BATCH_SIZE per player per sync cycle);
-# RAISE it for faster average-strategy convergence at core speed.
-export PLURIBUS_STRATEGY_PER_JOB=${PLURIBUS_STRATEGY_PER_JOB:-}
+# with PLURIBUS_CFR_CORE=1 it is core-accelerated AND overlapped.  Pinned to 10
+# (= 2 strategy playthroughs per CFR traversal at PLURIBUS_CFR_BATCH_SIZE=5) —
+# a little above the auto default, and INDEPENDENT of SYNC_INTERVAL (unlike the
+# auto-size, whose formula has sync_interval in the denominator, so bumping the
+# sync interval would otherwise silently cut strategy throughput).  RAISE for
+# faster average-strategy convergence; UNSET to return to the SYNC_INTERVAL-coupled
+# auto-size from PLURIBUS_STRATEGY_BATCH_SIZE.
+export PLURIBUS_STRATEGY_PER_JOB=${PLURIBUS_STRATEGY_PER_JOB:-10}
 export PLURIBUS_CHUNK_SIZE=${PLURIBUS_CHUNK_SIZE:-4000000}
 # Shared-memory index cache: serves the per-node info-set lookup from shm
 # instead of an LMDB read txn (the dominant inner-loop cost).  Capacities are
@@ -224,6 +237,7 @@ echo "  - Warm start:                  ${WARM_START:-(none)}"
 echo "  - CPUs:                        $SLURM_CPUS_PER_TASK"
 echo "  - PLURIBUS_CFR_BATCH_SIZE:     $PLURIBUS_CFR_BATCH_SIZE"
 echo "  - PLURIBUS_STRATEGY_BATCH_SIZE:$PLURIBUS_STRATEGY_BATCH_SIZE"
+echo "  - PLURIBUS_STRATEGY_PER_JOB:   ${PLURIBUS_STRATEGY_PER_JOB:-(auto)}"
 echo "  - PLURIBUS_CFR_CORE:           $PLURIBUS_CFR_CORE"
 echo "  - PLURIBUS_DEFERRED_ALLOC:     $PLURIBUS_DEFERRED_ALLOC"
 echo "  - PLURIBUS_INDEX_CACHE:        $PLURIBUS_INDEX_CACHE"

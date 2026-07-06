@@ -30,3 +30,23 @@ def kernel_enabled(name: str) -> bool:
     if value == "all":
         return True
     return name in {token.strip() for token in value.split(",")}
+
+
+def search_core_enabled() -> bool:
+    """Return ``True`` iff the compiled real-time *search* walk is enabled.
+
+    Top-level dispatch flag ``PLURIBUS_SEARCH_CORE`` for the subgame solver's
+    compiled core — the search-side analogue of ``PLURIBUS_CFR_CORE`` (blueprint
+    training).  It gates the recursive *walk* ports (the vector ``_walk`` and the
+    MCCFR ``_traverse``/leaf rollout, plan Phases 3-4), which additionally require
+    the extension to be built (``poker_ai._core.CORE_AVAILABLE``); the callers own
+    that ``and`` so an extension-less install always falls back to Python.
+
+    The per-node *leaf kernels* (``showdown`` / ``regret_match_matrix`` / ``runout``,
+    Phases 1-2) gate independently through :func:`kernel_enabled` — they are pure
+    byte-identical swaps and can be A/B'd one at a time without turning on the walk.
+
+    Read fresh from the environment on every call so tests can toggle it with
+    ``monkeypatch.setenv`` without re-importing.
+    """
+    return os.environ.get("PLURIBUS_SEARCH_CORE", "") == "1"
