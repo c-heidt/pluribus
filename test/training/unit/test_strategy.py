@@ -183,4 +183,20 @@ class TestStrategyStep:
         monkeypatch.setattr(training, "update_strategy", mock)
         tables, state = MagicMock(), MagicMock()
         strategy_step(tables, state, i=2)
-        mock.assert_called_once_with(tables, state, 2)
+        # Default (no core, no accumulator) → the legacy direct-write path.
+        mock.assert_called_once_with(tables, state, 2, local_delta=None)
+
+    def test_accumulates_into_local_delta_when_supplied(self, monkeypatch):
+        """With a local_delta, strategy_step forwards it (no direct-write)."""
+        mock = MagicMock()
+        monkeypatch.setattr(training, "update_strategy", mock)
+        tables, state, ld = MagicMock(), MagicMock(), {}
+        strategy_step(tables, state, i=1, local_delta=ld)
+        mock.assert_called_once_with(tables, state, 1, local_delta=ld)
+
+    def test_dispatches_to_core_when_supplied(self):
+        """With a core driver, strategy_step routes to core.run_strategy."""
+        tables, state, ld = MagicMock(), MagicMock(), {}
+        core = MagicMock()
+        strategy_step(tables, state, i=3, local_delta=ld, core=core)
+        core.run_strategy.assert_called_once_with(state, 3, ld)

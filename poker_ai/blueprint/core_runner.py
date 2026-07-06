@@ -120,6 +120,7 @@ class CoreDriver:
 
         self._FastState = _cy_state.FastState
         self._traverse_rng = _cy_traverse.traverse_rng
+        self._strategy_rng = _cy_traverse.strategy_rng
         self._core_tables = _cy_traverse.CoreTables(
             tables, CANONICAL_ACTIONS, ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
         )
@@ -186,4 +187,32 @@ class CoreDriver:
         self._traverse_rng(
             self._core_tables, fast_state, i, t, self._rng,
             prune=prune, local_delta=local_delta,
+        )
+
+    def run_strategy(self, state, i, local_strategy_delta) -> None:
+        """Run one in-core strategy-sampling playthrough for player ``i``.
+
+        Byte-for-byte replacement for the ``update_strategy`` call inside
+        :func:`poker_ai.blueprint.training.strategy_step`: a single sampled line
+        that accumulates player ``i``'s average-strategy visit counts **in place**
+        into the caller-owned ``local_strategy_delta`` (mirror of the regret
+        ``local_delta``), so the worker's persistent strategy buffer keeps working
+        exactly as the regret buffer does across a batch.  Opponent sampling is
+        drawn from the same per-process ``numpy.random`` stream as
+        :meth:`run_cfr`.
+
+        Parameters
+        ----------
+        state : environment.poker_env.PokerEnv
+            The freshly dealt root state for this playthrough.
+        i : int
+            Player whose average strategy is being updated.
+        local_strategy_delta : dict[tuple[int, bytes], numpy.ndarray]
+            Caller-owned visit-count accumulator, mutated in place.  Flushed by
+            :func:`poker_ai.blueprint.cfr.merge_local_strategy_delta`.
+        """
+        fast_state = self._FastState.from_poker_env(state)
+        self._strategy_rng(
+            self._core_tables, fast_state, i, self._rng,
+            local_strategy_delta=local_strategy_delta,
         )

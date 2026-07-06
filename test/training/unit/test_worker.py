@@ -115,6 +115,26 @@ class TestWorkerDeltaFlush:
         debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
         assert len(debug_records) > 0
 
+    def test_flushes_strategy_delta_into_strategy_tables(self, tmp_path):
+        """The folded strategy accumulator flushes into tables.strategy at sync."""
+        w, tables = _make_worker(tmp_path)
+        w._local_strategy_delta = {(0, "hand_S"): _make_delta(0, call=3)}
+        w._flush_delta()
+        row = tables.strategy[0].get_row_if_exists("hand_S")
+        assert row is not None
+        assert row[ACTION_TO_IDX[0]["call"]] == 3
+        # Cleared after the flush, symmetric with the regret delta.
+        assert w._local_strategy_delta == {}
+
+    def test_flushes_both_deltas_to_the_right_tables(self, tmp_path):
+        """One sync flush lands regret and strategy deltas in their own tables."""
+        w, tables = _make_worker(tmp_path)
+        w._local_delta = {(0, "hand_R"): _make_delta(0, fold=2)}
+        w._local_strategy_delta = {(0, "hand_R"): _make_delta(0, fold=7)}
+        w._flush_delta()
+        assert tables.regret[0].get_row_if_exists("hand_R")[ACTION_TO_IDX[0]["fold"]] == 2
+        assert tables.strategy[0].get_row_if_exists("hand_R")[ACTION_TO_IDX[0]["fold"]] == 7
+
 
 # ---------------------------------------------------------------------------
 # Local delta lifecycle
@@ -125,6 +145,10 @@ class TestLocalDeltaState:
     def test_initial_delta_is_empty(self, tmp_path):
         w, _ = _make_worker(tmp_path)
         assert w._local_delta == {}
+
+    def test_initial_strategy_delta_is_empty(self, tmp_path):
+        w, _ = _make_worker(tmp_path)
+        assert w._local_strategy_delta == {}
 
     def test_delta_empty_after_repeated_syncs(self, tmp_path):
         w, _ = _make_worker(tmp_path)

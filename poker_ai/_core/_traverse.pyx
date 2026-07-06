@@ -443,3 +443,116 @@ def traverse_rng(CoreTables ct, fast_state, int i, int t, rng, prune=None,
     cdef dict ld = {} if local_delta is None else <dict>local_delta
     _traverse(ct, fast_state, i, ld, None, rng, prune)
     return ld
+
+
+# ---------------------------------------------------------------------------
+# Strategy-sampling walk (average-strategy accumulation)
+# ---------------------------------------------------------------------------
+
+cdef void _walk_strategy(CoreTables ct, s, int i, dict lsd,
+                         _Replay replay, rng) except *:
+    """One strategy-sampling playthrough; accumulates player ``i``'s visit counts.
+
+    Byte-identical to ``poker_ai.blueprint.strategy.update_strategy`` driven with a
+    ``local_delta`` accumulator: a single sampled line (no branching), one action
+    drawn per node from the regret-matching σ, and at each **player-``i``** node the
+    sampled action's count is ``+1``'d into ``lsd[(r, info_set)]`` (an ``int64``
+    row, lazily zero-allocated — the same key/shape ``update_strategy`` writes).
+    Opponent nodes sample and descend but write nothing.  ``replay`` xor ``rng``
+    supplies the action (the same pluggable sampler as ``_traverse``); on the
+    replay path σ is not needed (the recorded action stands), so the regret read
+    is skipped exactly as ``_traverse`` skips it at replayed opponent nodes.
+
+    ``except *`` REQUIRED — ``info_set`` / ``step_in_place`` / the memoryview
+    coercion can raise, and a bare ``cdef void`` would swallow it (the Phase-2
+    lesson).
+    """
+    if s.is_terminal or not s.is_seat_active(i):
+        return
+
+    cdef list legal = [a for a in s.legal_actions() if a is not None]
+    if len(legal) == 0:
+        return
+
+    cdef int r = s.betting_round
+    cdef int n = ct._nact[r]
+    cdef bint mine = (s.player_i == i)
+
+    cdef int k, col, tok
+    cdef bint has_row
+    cdef bint mask[MAX_ACTIONS]
+    cdef float sigma[MAX_ACTIONS]
+    cdef long[::1] sav
+
+    a2i = ct._a2i[r]
+    # info_set is resolved lazily and reused: the rng path needs it for the regret
+    # read, the my-node write needs it for the accumulator key.  A replayed
+    # opponent node needs neither, so it is never resolved there.
+    iset = None
+
+    if replay is not None:
+        action = replay.take(legal)
+    else:
+        iset = s.info_set()
+        row_mv = ct._regret_row(r, iset)
+        has_row = row_mv is not None
+        canonical = ct._canonical[r]
+        legal_set = set(legal)
+        for k in range(n):
+            mask[k] = 1 if (canonical[k] in legal_set) else 0
+        ct._sigma(row_mv, has_row, mask, n, sigma)
+        action = _rng_sample(rng, legal, sigma, a2i)
+
+    if mine:
+        if iset is None:
+            iset = s.info_set()
+        col = <int>a2i[action]
+        key = (r, iset)
+        arr = lsd.get(key)
+        if arr is None:
+            arr = np.zeros(n, dtype=np.int64)
+            lsd[key] = arr
+        sav = arr
+        sav[col] += 1
+
+    tok = s.step_in_place(action)
+    _walk_strategy(ct, s, i, lsd, replay, rng)
+    s.undo(tok)
+
+
+def strategy_replay(CoreTables ct, fast_state, int i, choices):
+    """Run one in-core strategy walk driven by a recorded action sequence.
+
+    Returns the visit-count ``local_delta`` dict (``(round, info_set_bytes) ->
+    int64 ndarray``).  The byte-exact gate: record a strategy playthrough's
+    sampled actions with the Python ``update_strategy`` (every node samples, so
+    the recording spans player *and* opponent nodes, unlike the cfr replay which
+    records opponent nodes only), replay the same sequence into this and the
+    Python reference, and assert the two dicts are identical.  Asserts the replay
+    is fully consumed (the walk visited exactly the recorded nodes).
+    """
+    cdef _Replay replay = _Replay(choices)
+    cdef dict lsd = {}
+    _walk_strategy(ct, fast_state, i, lsd, replay, None)
+    if not replay.exhausted():
+        raise AssertionError(
+            "replay under-consumed: the driven core strategy walk visited fewer "
+            "nodes than were recorded — the two walks diverged"
+        )
+    return lsd
+
+
+def strategy_rng(CoreTables ct, fast_state, int i, rng, local_strategy_delta=None):
+    """Run one in-core strategy walk sampling from ``rng`` (production path).
+
+    ``rng`` is a ``numpy.random.RandomState`` (or the ``numpy.random`` module).
+    Returns the visit-count ``local_delta`` for ``merge_local_strategy_delta``.
+    Like ``traverse_rng``: when a caller-owned ``local_strategy_delta`` dict is
+    passed the walk accumulates into it **in place** (a worker's persistent
+    strategy buffer across a batch), else a fresh dict is allocated per call.
+    RNG byte-parity with the Python path is not pursued; correctness is certified
+    RNG-free (``strategy_replay``) and distributionally (the shared ``_rng_sample``).
+    """
+    cdef dict lsd = {} if local_strategy_delta is None else <dict>local_strategy_delta
+    _walk_strategy(ct, fast_state, i, lsd, None, rng)
+    return lsd

@@ -151,6 +151,7 @@ class Server:
         n_processes: Optional[int] = None,
         batch_size: Optional[int] = None,
         strategy_batch_size: Optional[int] = None,
+        strategy_per_job: Optional[int] = None,
         bias: BiasClass = "none",
         bias_magnitude: float = 0.0,
         warm_start: Optional[Union[str, Path]] = None,
@@ -220,20 +221,25 @@ class Server:
             Defaults to the ``PLURIBUS_CFR_BATCH_SIZE`` environment
             variable if set, else ``5``.
         strategy_batch_size : int, optional
-            Number of strategy-sampling traversals executed per
-            ``update_strategy`` queue item.  Each strategy-update
-            firing dispatches ``workers_per_player`` such items per
-            player, so the average-strategy table receives
-            ``workers_per_player * strategy_batch_size`` sampled
-            playthroughs per player per firing instead of one.  A
-            single playthrough is orders of magnitude cheaper than a
-            CFR traversal (one sampled line, no branching), so a large
-            batch here is close to free relative to the CFR work
-            between firings — and without it the average-strategy
-            table accumulates only a few visit counts per firing,
-            which can never populate a full-size blueprint.  Defaults
-            to the ``PLURIBUS_STRATEGY_BATCH_SIZE`` environment
-            variable if set, else ``128``.
+            Target average-strategy sample mass, in sampled playthroughs
+            per player per sync cycle: ``workers_per_player *
+            strategy_batch_size``.  The strategy pass is no longer a
+            separate barriered dispatch — it is folded into the cfr jobs
+            (see ``strategy_per_job``) — so this value is used only to
+            size the ``strategy_per_job`` default so the folded pass
+            reproduces the same per-cycle mass the old barriered pass
+            produced.  A playthrough is orders of magnitude cheaper than
+            a CFR traversal (one sampled line, no branching), so ample
+            mass here is close to free; too little starves the
+            average-strategy table.  Defaults to the
+            ``PLURIBUS_STRATEGY_BATCH_SIZE`` environment variable if set,
+            else ``128``.
+        strategy_per_job : int, optional
+            Average-strategy playthroughs folded into each ``cfr`` job
+            (per player, after warm-up).  ``None`` (default) auto-sizes
+            to the ``strategy_batch_size`` per-cycle mass above; the
+            ``PLURIBUS_STRATEGY_PER_JOB`` environment variable overrides.
+            ``0`` disables the strategy pass entirely.
         """
         # Install a minimal SIGTERM/SIGINT handler immediately so a
         # signal that arrives during the slow startup phases (LUT
@@ -295,6 +301,39 @@ class Server:
             f"{self._workers_per_player * n_players} queue items per loop, "
             f"{traversals_per_loop} traversals per loop, "
             f"{self._workers_per_player * self._batch_size} per player"
+        )
+
+        # Number of average-strategy playthroughs folded into each ``cfr`` job
+        # (per player, after warm-up).  The strategy pass no longer runs as its
+        # own sync barrier — each worker interleaves it with CFR and flushes the
+        # accumulated visit counts alongside the regret delta at the next sync —
+        # so its frequency is decoupled from the sync interval and is now a free
+        # knob (raise it for faster average-strategy convergence at core speed).
+        if strategy_per_job is None:
+            # Falsy (unset OR the empty string a ``${VAR:-}`` export produces)
+            # → fall through to the auto-sized default below.
+            env_spj = os.environ.get("PLURIBUS_STRATEGY_PER_JOB")
+            strategy_per_job = int(env_spj) if env_spj else None
+        if strategy_per_job is None:
+            # Default targets the SAME per-cycle strategy sample mass the old
+            # barriered pass produced — ``workers_per_player * strategy_batch_size``
+            # playthroughs per player per sync cycle — but spread across that
+            # cycle's cfr jobs so it overlaps CFR.  jobs/player/cycle =
+            # sync_interval/batch_size, hence per-job =
+            # wpp * strategy_batch_size * batch_size / sync_interval (floored at 1
+            # so strategy never fully stops).
+            strategy_per_job = max(1, round(
+                self._workers_per_player * self._strategy_batch_size
+                * self._batch_size / sync_interval
+            ))
+        if strategy_per_job < 0:
+            raise ValueError(
+                f"strategy_per_job must be >= 0, got {strategy_per_job}"
+            )
+        self._strategy_per_job = strategy_per_job
+        log.info(
+            f"strategy_per_job={self._strategy_per_job} "
+            f"(folded into each cfr job after warm-up; no separate barrier)"
         )
 
         self._bias: BiasClass = bias
@@ -422,17 +461,17 @@ class Server:
         Each iteration:
 
         1. Dispatches one ``cfr`` job per player into the worker pool.
+           After warm-up each ``cfr`` job also folds in
+           ``strategy_per_job`` average-strategy playthroughs for the
+           same player, accumulated into the worker's persistent
+           strategy delta.
         2. At sync barriers, drains the queue, broadcasts a ``sync``
-           job so workers flush their accumulated deltas, then
-           re-drains the queue.
-        3. At sync barriers that satisfy the strategy-interval
-           schedule, dispatches ``workers_per_player`` batched
-           ``update_strategy`` jobs per player (each running
-           ``strategy_batch_size`` sampled playthroughs) and waits
-           for them all to complete.
-        4. At sync barriers that satisfy the discount schedule,
+           job so workers flush their accumulated regret *and* strategy
+           deltas, then re-drains the queue.  The strategy pass is thus
+           overlapped with CFR and needs no barrier of its own.
+        3. At sync barriers that satisfy the discount schedule,
            applies an LCFR discount to the shared tables.
-        5. At sync barriers that satisfy the checkpoint schedule,
+        4. At sync barriers that satisfy the checkpoint schedule,
            writes a checkpoint via the checkpoint manager.
 
         The loop exits when :attr:`max_runtime_hours` is reached or
@@ -464,10 +503,25 @@ class Server:
                 if sigterm.is_set():
                     break
 
+                # Average-strategy playthroughs are folded into the cfr jobs
+                # (``strat_batch`` per job, per player) so they overlap CFR and
+                # flush with the regret delta at the next sync — no separate
+                # strategy barrier.  Gated to 0 during warm-up by the same
+                # ``should_update_strategy`` predicate the old barriered pass used.
+                strat_batch = (
+                    self._strategy_per_job
+                    if should_update_strategy(
+                        t // self._sync_interval,
+                        self._strategy_interval,
+                        self._update_threshold,
+                    )
+                    else 0
+                )
                 for i in range(self._n_players):
                     for _ in range(self._workers_per_player):
                         self._send_job(
-                            "cfr", t=t, i=i, batch=self._batch_size
+                            "cfr", t=t, i=i, batch=self._batch_size,
+                            strat_batch=strat_batch,
                         )
                 t += step
                 self._current_t = t
@@ -483,24 +537,10 @@ class Server:
 
                     sync_step = t // self._sync_interval
 
-                    if should_update_strategy(
-                        sync_step, self._strategy_interval, self._update_threshold
-                    ):
-                        # Saturate the pool exactly like the cfr dispatch:
-                        # workers_per_player batched jobs per player.  One
-                        # sampled playthrough per player per firing (the
-                        # old behaviour) starves the average-strategy
-                        # table — see ``strategy_batch_size`` in __init__.
-                        for i in range(self._n_players):
-                            for _ in range(self._workers_per_player):
-                                self._send_job(
-                                    "update_strategy",
-                                    i=i,
-                                    batch=self._strategy_batch_size,
-                                )
-                        self._join_queue()
-                        if sigterm.is_set():
-                            break
+                    # Strategy updates are no longer a barrier here — they are
+                    # folded into the cfr jobs above (``strat_batch``) and flushed
+                    # with the regret delta by the ``sync`` broadcast, so the pool
+                    # never stalls on a strategy-only phase.
 
                     if should_discount(sync_step, self._discount_interval):
                         self._discount_state.apply(self._tables, sync_step)

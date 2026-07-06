@@ -153,23 +153,40 @@ def strategy_step(
     tables: CFRTables,
     state: PokerState,
     i: int,
+    local_delta: Dict[Tuple[int, str], np.ndarray] = None,
+    core=None,
 ) -> None:
     """Execute one strategy-update traversal for player *i*.
 
-    Thin wrapper around :func:`poker_ai.blueprint.strategy.update_strategy`
-    that keeps the single- and multi-process loops structurally
-    symmetric with :func:`cfr_step`.
+    Wrapper around :func:`poker_ai.blueprint.strategy.update_strategy` that keeps
+    the single- and multi-process loops structurally symmetric with
+    :func:`cfr_step` — same ``core`` / ``local_delta`` dispatch shape.
 
     Parameters
     ----------
     tables : CFRTables
-        Shared tables (only ``tables.strategy`` is written).
+        Shared tables (only ``tables.strategy`` is written, and only when
+        ``local_delta is None``).
     state : PokerState
         Root game state for this traversal.
     i : int
         Traversing player whose average strategy is being updated.
+    local_delta : dict, optional
+        Caller-owned visit-count accumulator keyed by ``(betting_round,
+        info_set)``.  When supplied, the sampled visit counts are written here
+        (to be flushed later via
+        :func:`poker_ai.blueprint.cfr.merge_local_strategy_delta`) instead of
+        directly into the shared ``tables.strategy``.  ``None`` (default) keeps
+        the legacy direct-write behaviour used by the single-process loop.
+    core : poker_ai.blueprint.core_runner.CoreDriver, optional
+        When supplied (``PLURIBUS_CFR_CORE=1``), the playthrough runs through the
+        compiled core, accumulating into ``local_delta`` in place.  ``None``
+        (default) keeps the Python path, which stays the live oracle.
     """
-    update_strategy(tables, state, i)
+    if core is not None:
+        core.run_strategy(state, i, local_delta)
+        return
+    update_strategy(tables, state, i, local_delta=local_delta)
 
 
 # ---------------------------------------------------------------------------

@@ -96,6 +96,41 @@ def merge_local_delta(
         tables.regret[r].merge_delta_rows(items)
 
 
+def merge_local_strategy_delta(
+    tables: CFRTables,
+    local_strategy_delta: Dict[Tuple[int, str], np.ndarray],
+) -> None:
+    """Flush a local average-strategy accumulator into the shared strategy tables.
+
+    The strategy-table counterpart of :func:`merge_local_delta`: walks the
+    per-infoset visit-count deltas accumulated by one or more strategy-sampling
+    playthroughs (:func:`poker_ai.blueprint.strategy.update_strategy` with a
+    ``local_delta``, or the compiled core's ``strategy_rng``) and adds each into
+    the corresponding row of ``tables.strategy[betting_round]``.  Batched +Δ into
+    ``tables.strategy[r]`` is arithmetically identical to the sequence of
+    per-node ``update_row(info_set, action, 1)`` calls the barriered strategy pass
+    used to make — the same final counts — but folds all of a worker's
+    accumulated increments into one stripe-locked ``merge_delta_rows`` per chunk
+    at the sync barrier instead of taking a stripe lock per visit.
+
+    After this call the caller is expected to clear or discard
+    ``local_strategy_delta``; this function does not do so itself.
+
+    Parameters
+    ----------
+    tables : CFRTables
+        Shared regret and strategy tables.
+    local_strategy_delta : dict[tuple[int, str], np.ndarray]
+        Per-infoset visit-count increments keyed by ``(betting_round,
+        info_set)``.  Values are non-negative int64 delta arrays.
+    """
+    by_round: Dict[int, list] = {}
+    for (r, info_set), delta in local_strategy_delta.items():
+        by_round.setdefault(r, []).append((info_set, delta))
+    for r, items in by_round.items():
+        tables.strategy[r].merge_delta_rows(items)
+
+
 def cfr(
     tables: CFRTables,
     state: PokerState,

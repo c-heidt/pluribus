@@ -59,12 +59,19 @@ fi
 # Efficiency knobs honoured by the trainer (env-driven so they can be
 # overridden per submission without editing code).
 export PLURIBUS_CFR_BATCH_SIZE=${PLURIBUS_CFR_BATCH_SIZE:-5}
-# Sampled playthroughs per update_strategy queue item.  Each strategy
-# firing runs workers_per_player * this many playthroughs per player;
-# playthroughs are single sampled lines, so this is cheap relative to
-# the CFR work between firings but is what actually populates the
-# average-strategy table.
+# Sampled playthroughs per update_strategy queue item.  Used to size the
+# default PLURIBUS_STRATEGY_PER_JOB below (the average-strategy pass no longer
+# runs as its own barriered queue job — see PLURIBUS_STRATEGY_PER_JOB).
 export PLURIBUS_STRATEGY_BATCH_SIZE=${PLURIBUS_STRATEGY_BATCH_SIZE:-128}
+# Average-strategy playthroughs folded into EACH cfr job (per player, after
+# warm-up).  The strategy pass is now interleaved with CFR and flushed with the
+# regret delta at the sync barrier instead of running as its own barrier — so
+# with PLURIBUS_CFR_CORE=1 it is core-accelerated AND overlapped, and its
+# frequency is decoupled from the sync interval.  Leave UNSET to auto-size to
+# the same per-cycle strategy mass the old barriered pass produced
+# (workers_per_player * PLURIBUS_STRATEGY_BATCH_SIZE per player per sync cycle);
+# RAISE it for faster average-strategy convergence at core speed.
+export PLURIBUS_STRATEGY_PER_JOB=${PLURIBUS_STRATEGY_PER_JOB:-}
 export PLURIBUS_CHUNK_SIZE=${PLURIBUS_CHUNK_SIZE:-4000000}
 # Shared-memory index cache: serves the per-node info-set lookup from shm
 # instead of an LMDB read txn (the dominant inner-loop cost).  Capacities are
@@ -245,12 +252,6 @@ if [ -n "$WARM_START" ]; then
   EXTRA_ARGS+=(--warm_start "$WARM_START")
 fi
 
-# When profiling, let the trainer authorize py-spy to attach.  The profiler
-# runs in a sibling subshell (below), so under ptrace_scope=1 the trainer must
-# opt in via prctl(PR_SET_PTRACER_ANY) — see runner.py _allow_ptrace_if_requested.
-# Must be exported BEFORE the trainer launches so it (and its forked workers) see it.
-[ -n "${PROFILE:-}" ] && export PLURIBUS_ALLOW_PTRACE=1
-
 # Run the trainer in the background so this shell can forward
 # slurm's grace-period SIGTERM to the python process.  When SLURM
 # signals a batch job, the signal goes to the bash wrapper — not to
@@ -282,92 +283,6 @@ _forward_signal() {
 }
 trap '_forward_signal TERM' TERM
 trap '_forward_signal INT' INT
-
-# ---------------------------------------------------------------------------
-# Optional in-run profiler.  Completely inert unless PROFILE is set, so the
-# production submission path above is unchanged.  Attaches py-spy to the LIVE
-# trainer process tree (server + every worker, via --subprocesses) after a
-# warmup, so the samples reflect steady state at real scale rather than the
-# cold-start prewarm + initial allocation burst.  --idle is essential: it keeps
-# OFF-cpu samples (threads blocked on the alloc lock, IPC _recv, or an LMDB txn)
-# so the capture can rank *compute* against *lookup/sync* — the whole point of
-# this measurement.  Output is speedscope JSON under $NICKNAME/profiles, viewable
-# offline at https://speedscope.app (Left-Heavy + Sandwich views).
-#
-# Knobs (env, all optional):
-#   PROFILE_WARMUP    seconds to wait after launch before the first capture (1200)
-#   PROFILE_DURATION  seconds per capture (180)
-#   PROFILE_GAP       seconds between captures (600)
-#   PROFILE_N_SAMPLES number of captures (3)
-#   PROFILE_RATE      samples/sec (default 25; py-spy samples every process
-#                     serially per tick, so with ~48 workers it CANNOT sustain a
-#                     high rate — it logs "N s behind in sampling" and the
-#                     profile skews.  Keep this low for many-worker runs.)
-if [ -n "${PROFILE:-}" ]; then
-  if ! command -v py-spy >/dev/null 2>&1; then
-    echo "[profile] py-spy not found — installing into $CONDA_ENV"
-    pip install --quiet py-spy || echo "[profile] py-spy install FAILED; captures will be skipped"
-  fi
-  PROFILE_DIR="$NICKNAME/profiles"
-  PROFILE_WARMUP=${PROFILE_WARMUP:-1200}
-  PROFILE_DURATION=${PROFILE_DURATION:-180}
-  PROFILE_GAP=${PROFILE_GAP:-600}
-  PROFILE_N_SAMPLES=${PROFILE_N_SAMPLES:-3}
-  PROFILE_RATE=${PROFILE_RATE:-25}
-  if ! mkdir -p "$PROFILE_DIR" 2>/dev/null; then
-    echo "[profile] WARNING: cannot create $PROFILE_DIR — captures will have nowhere to go"
-  fi
-  echo "[profile] output dir: $PROFILE_DIR"
-  echo "[profile] ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo '?') (0/1=attach ok, 2/3=blocked)"
-  (
-    echo "[profile] warmup ${PROFILE_WARMUP}s before first capture (steady-state)"
-    sleep "$PROFILE_WARMUP"
-    # Attach self-test BEFORE spending a capture: prove py-spy can ptrace the
-    # trainer.  If this fails, every record below fails too — surface why now
-    # instead of silently producing no files.
-    if py-spy dump --pid "$TRAINER_PID" >/dev/null 2>"$PROFILE_DIR/.spy_selftest.err"; then
-      echo "[profile] attach self-test OK (py-spy can read pid $TRAINER_PID)"
-    else
-      echo "[profile] ATTACH FAILED — py-spy cannot ptrace pid $TRAINER_PID; NO files will be saved."
-      echo "[profile]   py-spy: $(tr '\n' ' ' < "$PROFILE_DIR/.spy_selftest.err")"
-      echo "[profile]   fix: run on a node with ptrace_scope<=1, or grant the job CAP_SYS_PTRACE."
-    fi
-    for i in $(seq 1 "$PROFILE_N_SAMPLES"); do
-      kill -0 "$TRAINER_PID" 2>/dev/null || { echo "[profile] trainer exited — stopping"; break; }
-      ts=$(date +%s)
-      base="spy_${ts}_sample${i}.speedscope.json"
-      # Capture to node-local scratch first — py-spy writing straight to Lustre
-      # is fragile (a client hiccup can lose the file even on exit 0).  Fold
-      # py-spy's own stderr (the "Wrote speedscope file to ... Samples: N
-      # Errors: M" report) into this log so it is visible inline, not stranded
-      # in the separate SLURM _error.out.
-      local_out="$WORK_DIR/$base"
-      out="$PROFILE_DIR/$base"
-      echo "[profile] capture ${i}/${PROFILE_N_SAMPLES} (${PROFILE_DURATION}s @ ${PROFILE_RATE}Hz, subprocesses+idle) -> local $local_out"
-      if py-spy record --pid "$TRAINER_PID" --subprocesses --idle \
-           --rate "$PROFILE_RATE" --duration "$PROFILE_DURATION" \
-           --format speedscope --output "$local_out" 2>&1; then
-        if [ -s "$local_out" ]; then
-          sz=$(stat -c%s "$local_out" 2>/dev/null || echo 0)
-          if cp -f "$local_out" "$out" 2>/dev/null && sync && [ -s "$out" ]; then
-            echo "[profile] SAVED $out (${sz}B local, copied to /pfs OK)"
-          else
-            echo "[profile] captured OK locally (${sz}B) but COPY TO /pfs FAILED: $out — Lustre?  Local copy: $local_out"
-          fi
-        else
-          echo "[profile] py-spy exit 0 but produced NO/empty local file — see its Samples/Errors line above (attach to workers failed?)"
-        fi
-      else
-        rc=$?
-        echo "[profile] py-spy capture ${i} FAILED (exit $rc) — no file (see attach self-test above)"
-      fi
-      sleep "$PROFILE_GAP"
-    done
-    n=$(ls -1 "$PROFILE_DIR"/spy_*.speedscope.json 2>/dev/null | wc -l)
-    echo "[profile] profiler finished — ${n} file(s) in $PROFILE_DIR"
-  ) &
-  echo "[profile] enabled — warmup=${PROFILE_WARMUP}s, ${PROFILE_N_SAMPLES}×${PROFILE_DURATION}s captures to $PROFILE_DIR"
-fi
 
 # `wait` returns when interrupted by a signal (after running the
 # trap), even if the child is still running.  Loop until the child

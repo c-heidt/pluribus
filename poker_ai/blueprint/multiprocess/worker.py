@@ -9,20 +9,21 @@ around those primitives.
 
 Job protocol
 ------------
-The worker understands four job names:
+The worker understands three job names:
 
 - ``"cfr"`` — run ``kwargs["batch"]`` CFR traversals for player
   ``kwargs["i"]`` at iteration ``kwargs["t"]`` (defaults to ``1``
-  for backward compatibility with callers that do not batch).
-  Regret updates are written to the worker's persistent
-  :attr:`_local_delta` buffer across the full batch.
-- ``"sync"`` — flush :attr:`_local_delta` into the shared regret
+  for backward compatibility with callers that do not batch).  Regret
+  updates are written to the worker's persistent :attr:`_local_delta`
+  buffer across the full batch.  The same job then folds in
+  ``kwargs["strat_batch"]`` (default ``0``) average-strategy
+  playthroughs for the same player, accumulating visit counts into
+  :attr:`_local_strategy_delta` — so the strategy pass rides along with
+  CFR instead of running as its own sync barrier.
+- ``"sync"`` — flush both :attr:`_local_delta` (regret) and
+  :attr:`_local_strategy_delta` (average strategy) into the shared
   tables via :meth:`_flush_delta`.
-- ``"update_strategy"`` — run ``kwargs["batch"]`` strategy-update
-  traversals for player ``kwargs["i"]`` (defaults to ``1``).  No
-  accumulator is involved; visit counts are written directly
-  through the stripe-locked table API.
-- ``"terminate"`` — flush any remaining delta, then exit the dispatch
+- ``"terminate"`` — flush any remaining deltas, then exit the dispatch
   loop.  Sent by :meth:`Server.terminate` during shutdown.
 
 Anything the server dispatches that is not one of these names raises
@@ -31,12 +32,12 @@ surfaces as a :class:`WorkerError` on the server side.
 
 Persistent local state
 ----------------------
-The worker keeps a single :attr:`_local_delta` dict for the lifetime
-of the process.  CFR jobs accumulate regret updates into it and
-sync/terminate jobs flush it.  Batching many traversals into one
-merge is the whole point of the sync-barrier architecture —
-per-traversal merges would serialise every worker behind the stripe
-locks of the shared tables.
+The worker keeps two accumulator dicts for the lifetime of the process:
+:attr:`_local_delta` (regret) and :attr:`_local_strategy_delta` (average
+strategy).  CFR jobs accumulate into both and sync/terminate jobs flush
+both.  Batching many traversals into one merge is the whole point of the
+sync-barrier architecture — per-traversal merges would serialise every
+worker behind the stripe locks of the shared tables.
 """
 
 import logging
@@ -48,7 +49,7 @@ from typing import Dict, Optional, Tuple, Union
 import numpy as np
 
 from poker_ai.blueprint.bias import BiasClass
-from poker_ai.blueprint.cfr import merge_local_delta
+from poker_ai.blueprint.cfr import merge_local_delta, merge_local_strategy_delta
 from poker_ai.blueprint.core_runner import CoreDriver, core_enabled
 from poker_ai.tables.cfr_tables import CFRTables
 from poker_ai.blueprint.training import (
@@ -151,6 +152,12 @@ class Worker(mp.Process):
         # info_set).  Batched across many CFR calls and flushed on
         # explicit "sync" jobs dispatched by the server.
         self._local_delta: Dict[Tuple[int, str], np.ndarray] = {}
+        # Persistent average-strategy visit-count accumulator, symmetric with
+        # ``_local_delta``.  CFR jobs fold ``strat_batch`` strategy playthroughs
+        # into it (see the "cfr" branch); it is flushed on the same "sync" jobs,
+        # so the strategy pass overlaps CFR instead of stalling at its own
+        # barrier.
+        self._local_strategy_delta: Dict[Tuple[int, str], np.ndarray] = {}
 
     def run(self):
         """Child-process entry point: set up state, then process jobs.
@@ -208,6 +215,7 @@ class Worker(mp.Process):
                     # game state; regret updates accumulate into the
                     # persistent :attr:`_local_delta` across the batch.
                     batch = kwargs.get("batch", 1)
+                    player_i = kwargs["i"]
                     for _ in range(batch):
                         game_state = state.new_game(
                             self._n_players, self._info_set_lut,
@@ -215,7 +223,7 @@ class Worker(mp.Process):
                         cfr_step(
                             self._tables,
                             game_state,
-                            kwargs["i"],
+                            player_i,
                             kwargs["t"],
                             self._prune_threshold,
                             self._c,
@@ -224,21 +232,27 @@ class Worker(mp.Process):
                             bias_magnitude=self._bias_magnitude,
                             core=self._core,
                         )
-                elif name == "sync":
-                    self._flush_delta()
-                elif name == "update_strategy":
-                    # Like "cfr", one queue item carries ``batch``
-                    # traversals.  Each is a fresh deal walked as a
-                    # single sampled line, so a batch is cheap relative
-                    # to one CFR traversal; the batch is what gives the
-                    # average-strategy table enough visit mass to be a
-                    # usable play-time artifact.
-                    batch = kwargs.get("batch", 1)
-                    for _ in range(batch):
+                    # Fold the average-strategy pass into the same job: run
+                    # ``strat_batch`` strategy playthroughs for the same player,
+                    # accumulating visit counts into the persistent
+                    # :attr:`_local_strategy_delta` (flushed with the regret
+                    # delta at the next sync).  The server gates ``strat_batch``
+                    # (0 during warm-up), so the strategy pass no longer needs a
+                    # separate barrier — it overlaps CFR across the whole pool.
+                    strat_batch = kwargs.get("strat_batch", 0)
+                    for _ in range(strat_batch):
                         game_state = state.new_game(
                             self._n_players, self._info_set_lut,
                         )
-                        strategy_step(self._tables, game_state, kwargs["i"])
+                        strategy_step(
+                            self._tables,
+                            game_state,
+                            player_i,
+                            local_delta=self._local_strategy_delta,
+                            core=self._core,
+                        )
+                elif name == "sync":
+                    self._flush_delta()
                 else:
                     raise ValueError(f"Unrecognised job name: {name}")
             except Exception:
@@ -271,25 +285,30 @@ class Worker(mp.Process):
         seed(random_seed)
 
     def _flush_delta(self) -> None:
-        """Flush :attr:`_local_delta` into the shared regret tables.
+        """Flush the regret and average-strategy accumulators into the tables.
 
-        Iterates the accumulator and routes each
-        ``(betting_round, info_set)`` delta into the corresponding
-        per-street regret table via
-        :func:`poker_ai.blueprint.cfr.merge_local_delta`, which internally
-        acquires the correct stripe lock per chunk.  The accumulator
-        is cleared after a successful flush and a status line is
-        emitted on the server's logging queue.
+        Routes each ``(betting_round, info_set)`` regret delta into the
+        corresponding per-street regret table via
+        :func:`poker_ai.blueprint.cfr.merge_local_delta`, then flushes the
+        folded strategy visit-count accumulator via
+        :func:`poker_ai.blueprint.cfr.merge_local_strategy_delta` into
+        ``tables.strategy`` — both use the same stripe-locked
+        ``merge_delta_rows``, so a single sync barrier durably lands both.  Each
+        accumulator is cleared after its flush.
 
-        No-op when the accumulator is empty — this is the common
-        case for ``terminate`` jobs that arrive right after a sync
-        barrier.  The flush count is emitted at ``DEBUG`` level; at
-        ``INFO`` or above only the server's periodic progress line
-        is visible, keeping HPC cluster logs readable.
+        No-op for whichever accumulator is empty — the common case for
+        ``terminate`` jobs that arrive right after a sync barrier.  The regret
+        flush count is emitted at ``DEBUG`` level; at ``INFO`` or above only the
+        server's periodic progress line is visible, keeping HPC cluster logs
+        readable.
         """
-        if not self._local_delta:
-            return
-        n_infosets = len(self._local_delta)
-        merge_local_delta(self._tables, self._local_delta)
-        self._local_delta.clear()
-        log.debug(f"[worker={self.name}] Flushed {n_infosets:,} infosets to shared tables")
+        if self._local_delta:
+            n_infosets = len(self._local_delta)
+            merge_local_delta(self._tables, self._local_delta)
+            self._local_delta.clear()
+            log.debug(
+                f"[worker={self.name}] Flushed {n_infosets:,} infosets to shared tables"
+            )
+        if self._local_strategy_delta:
+            merge_local_strategy_delta(self._tables, self._local_strategy_delta)
+            self._local_strategy_delta.clear()

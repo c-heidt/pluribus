@@ -32,7 +32,11 @@ their average strategy.
 """
 
 import logging
+from typing import Dict, Optional, Tuple
 
+import numpy as np
+
+from environment.action_space import MAX_ACTIONS_PER_STREET
 from poker_ai.tables.cfr_tables import CFRTables
 from poker_ai.blueprint.tree_utils import (
     get_legal_actions,
@@ -49,32 +53,45 @@ def update_strategy(
     tables: CFRTables,
     state: PokerState,
     i: int,
+    local_delta: Optional[Dict[Tuple[int, bytes], np.ndarray]] = None,
 ) -> None:
     """Sample a play-through from *state* and record player *i*'s actions.
 
     Recursively walks the game tree starting from *state*.  At every
     node the function draws one action from the current regret-matching
     strategy; when the current player is *i* the sampled action's
-    visit count is incremented in ``tables.strategy[r]`` by 1, where
-    ``r`` is the betting round of the current node.  The traversal
-    then descends into the sampled successor.
+    visit count is incremented by 1 for the current betting round ``r``.
+    The traversal then descends into the sampled successor.
 
     Opponent decisions are also sampled — the traversal follows a
     single playthrough rather than branching — but they do not write
     anything to the strategy tables.
 
-    The function returns nothing; all state updates happen in place on
-    ``tables.strategy``.
+    The function returns nothing; the visit-count increments land either
+    directly in the shared ``tables.strategy`` tables or in a
+    caller-owned accumulator, depending on ``local_delta``.
 
     Parameters
     ----------
     tables : CFRTables
-        CFR tables being trained.  Only ``tables.strategy[r]`` is
-        modified; regret tables are read-only in this traversal.
+        CFR tables being trained.  ``tables.regret`` is read to compute
+        the sampling distribution; ``tables.strategy[r]`` is written
+        only when ``local_delta is None``.
     state : PokerState
         Starting game state for this strategy-sampling pass.
     i : int
         Traversing player whose average strategy is being updated.
+    local_delta : dict, optional
+        Caller-owned visit-count accumulator keyed by ``(betting_round,
+        info_set)`` with ``int64`` delta rows — symmetric with the
+        ``local_delta`` :func:`poker_ai.blueprint.cfr.cfr` accumulates into.
+        When supplied, increments are written here (lock-free) instead of
+        into the shared tables and the caller is responsible for flushing
+        via :func:`poker_ai.blueprint.cfr.merge_local_strategy_delta`.
+        When ``None`` (default) the increment is applied directly to
+        ``tables.strategy[r]`` via the stripe-locked ``update_row`` — the
+        legacy single-process / post-barrier behaviour, byte-identical to
+        before.
     """
     if is_terminal(state, i) is not None:
         return
@@ -88,11 +105,19 @@ def update_strategy(
 
     if state.player_i == i:
         log.debug("ACTION SAMPLED: ph %s ACTION: %s", state.player_i, action)
-        tables.strategy[r].update_row(info_set, a_to_i[action], 1)
+        if local_delta is None:
+            tables.strategy[r].update_row(info_set, a_to_i[action], 1)
+        else:
+            key = (r, info_set)
+            row = local_delta.get(key)
+            if row is None:
+                row = np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int64)
+                local_delta[key] = row
+            row[a_to_i[action]] += 1
 
     # Single sampled action: descend in place and restore on the way back,
     # so this function leaves its ``state`` argument unchanged (the same
     # non-mutating contract the old copy-on-write traversal had).
     token = state.step_in_place(action)
-    update_strategy(tables, state, i)
+    update_strategy(tables, state, i, local_delta)
     state.undo(token)

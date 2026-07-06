@@ -173,6 +173,55 @@ def run_replay(tables, state, i: int, t: int, choices: List[str]):
     return local_delta
 
 
+def run_recording_strategy(tables, state, i: int, *, seed: int = 0):
+    """Run one Python ``update_strategy`` walk with a :class:`RecordingSampler`.
+
+    The strategy-walk counterpart of :func:`run_recording`.  Returns
+    ``(local_delta, choices)`` where ``local_delta`` is the visit-count
+    accumulator ``update_strategy`` fills (``(round, info_set_bytes) -> int64``)
+    and ``choices`` is every sampled action in DFS order.  Unlike the cfr
+    recording (opponent nodes only), the strategy walk samples at **every** node,
+    so ``choices`` spans player and opponent nodes alike.  ``state`` is
+    deep-copied so the caller's root is untouched; passing an explicit
+    ``local_delta`` keeps ``tables.strategy`` a read-only snapshot.
+    """
+    import poker_ai.blueprint.strategy as strat_mod
+
+    sampler = RecordingSampler(seed=seed)
+    local_delta: Dict[Tuple[int, bytes], np.ndarray] = {}
+    original = strat_mod.sample_action
+    strat_mod.sample_action = sampler
+    try:
+        strat_mod.update_strategy(tables, deepcopy(state), i, local_delta=local_delta)
+    finally:
+        strat_mod.sample_action = original
+    return local_delta, sampler.choices
+
+
+def run_replay_strategy(tables, state, i: int, choices: List[str]):
+    """Run one Python ``update_strategy`` walk driven by a recorded sequence.
+
+    The strategy-walk counterpart of :func:`run_replay`.  Returns the visit-count
+    ``local_delta``.  Asserts the replay is fully consumed (the driven walk
+    visited exactly the recorded nodes).
+    """
+    import poker_ai.blueprint.strategy as strat_mod
+
+    sampler = ReplaySampler(choices)
+    local_delta: Dict[Tuple[int, bytes], np.ndarray] = {}
+    original = strat_mod.sample_action
+    strat_mod.sample_action = sampler
+    try:
+        strat_mod.update_strategy(tables, deepcopy(state), i, local_delta=local_delta)
+    finally:
+        strat_mod.sample_action = original
+    assert sampler.exhausted(), (
+        "replay under-consumed: the driven strategy walk visited fewer nodes "
+        "than were recorded — the two walks diverged"
+    )
+    return local_delta
+
+
 def assert_local_delta_equal(a: Dict, b: Dict) -> None:
     """Assert two ``local_delta`` dicts are byte-identical.
 
