@@ -71,6 +71,24 @@ def _regret_match_matrix(regret: np.ndarray) -> np.ndarray:
     return np.where(total > 0.0, pos / safe, 1.0 / width)
 
 
+# Compiled-core wiring (Phase 1): when built AND enabled
+# (``PLURIBUS_CORE_KERNELS`` includes ``regret_match_matrix``), swap the batched
+# regret-matcher for its byte-identical Cython kernel.  ``_walk`` calls it as the
+# module global ``_regret_match_matrix``, so the rebind is transparent; the
+# pure-Python reference is kept as ``_regret_match_matrix_py`` (the oracle).
+_regret_match_matrix_py = _regret_match_matrix
+try:
+    from poker_ai._core import CORE_AVAILABLE as _CORE_AVAILABLE
+    from poker_ai._core.flags import kernel_enabled as _kernel_enabled
+
+    if _CORE_AVAILABLE and _kernel_enabled("regret_match_matrix"):
+        from poker_ai._core._regret import (
+            calculate_strategy_matrix as _regret_match_matrix,
+        )
+except ImportError:
+    pass
+
+
 class _VectorSolver:
     """Heads-up turn/river vector-form Linear CFR over a fixed subgame root.
 

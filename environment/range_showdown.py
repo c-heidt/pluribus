@@ -359,3 +359,30 @@ def showdown_values(
         ranks, valid, combo_cards, reach_a, stake, dead=dead, removal=removal
     )
     return cfv_a, cfv_b
+
+
+# --------------------------------------------------------------------------- #
+# Compiled-core wiring (Phase 1).  When the extension is built AND enabled
+# (``PLURIBUS_CORE_KERNELS`` includes ``showdown``), rebind the two vector-regime
+# settlement primitives to their byte-identical Cython kernels.  Every consumer
+# reaches them as ``range_showdown.showdown_cfv`` / ``.reach_after_removal`` (the
+# env's ``vector_payout`` and ``showdown_values`` above use the module globals),
+# so the swap is transparent and the pure-Python references are retained as the
+# ``_*_py`` oracles (tests monkeypatch these module attrs directly).
+# --------------------------------------------------------------------------- #
+showdown_cfv_py = showdown_cfv
+reach_after_removal_py = reach_after_removal
+try:
+    from poker_ai._core import CORE_AVAILABLE as _CORE_AVAILABLE
+    from poker_ai._core.flags import kernel_enabled as _kernel_enabled
+
+    if _CORE_AVAILABLE and _kernel_enabled("showdown"):
+        from poker_ai._core._showdown import (
+            reach_after_removal as _core_reach_after_removal,
+            showdown_cfv as _core_showdown_cfv,
+        )
+
+        showdown_cfv = _core_showdown_cfv
+        reach_after_removal = _core_reach_after_removal
+except ImportError:
+    pass

@@ -21,6 +21,8 @@ vectorising a large loop.
 cimport cython
 import numpy as np
 
+from poker_ai._core._mathutil cimport pairwise_sum
+
 
 def calculate_strategy_from_row(regret_row, valid_mask=None):
     """Positive-regret-proportional strategy with uniform fallback (float32).
@@ -95,6 +97,60 @@ cdef object _from_int32(const int[::1] regrets, object valid_mask):
         p = 1.0 / n
         for i in range(n):
             o[i] = <float>p
+    return out
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def calculate_strategy_matrix(regret):
+    """Batched row-wise regret matching over the **last** axis (float64).
+
+    Byte-identical drop-in for ``poker_ai.search.vector._regret_match_matrix``:
+    each row's strategy is its positive regret normalised by the row's positive
+    total, uniform (``1/width``) when that total is not positive.  Serves both the
+    ``(n_combos, width)`` and ``(n_combos, n_rivers, width)`` vector tensors — the
+    action ``width`` is always the last axis and every leading axis is flattened.
+
+    Bit-identity requirements reproduced exactly:
+
+    - the per-row positive total is numpy's ``pos.sum(axis=-1)`` — a **pairwise**
+      reduction over the (contiguous) last axis, so it folds via
+      :func:`pairwise_sum`, not a naive loop;
+    - the strategy is ``pos / total`` (element-by-scalar **division**, matching
+      numpy's ``pos / safe`` — *not* a reciprocal multiply, which would differ in
+      the last ULP);
+    - the uniform fallback is ``1.0 / width`` (float division of the int width).
+    """
+    a = np.ascontiguousarray(regret, dtype=np.float64)
+    cdef int ndim = a.ndim
+    cdef Py_ssize_t width = a.shape[ndim - 1] if ndim else 0
+    out = np.empty_like(a)
+    if a.size == 0 or width == 0:
+        return out
+
+    cdef Py_ssize_t nrows = a.size // width
+    cdef const double[::1] av = a.reshape(-1)
+    cdef double[::1] ov = out.reshape(-1)
+    # Per-row positive-regret scratch, reused across rows (fed to pairwise_sum).
+    pos_buf = np.empty(width, dtype=np.float64)
+    cdef double[::1] pos = pos_buf
+
+    cdef Py_ssize_t r, j, base
+    cdef double x, total, uv
+    with nogil:
+        for r in range(nrows):
+            base = r * width
+            for j in range(width):
+                x = av[base + j]
+                pos[j] = x if x > 0.0 else 0.0
+            total = pairwise_sum(&pos[0], width)
+            if total > 0.0:
+                for j in range(width):
+                    ov[base + j] = pos[j] / total
+            else:
+                uv = 1.0 / width
+                for j in range(width):
+                    ov[base + j] = uv
     return out
 
 
