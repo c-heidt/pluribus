@@ -50,6 +50,40 @@ class TestCanonicalRaiseFractions:
         env.current_player.n_chips = n_to_call
         assert env.canonical_raise_fractions() == []
 
+    def test_empty_and_agrees_with_legal_actions_facing_lone_all_in(self):
+        """Facing a lone all-in, ``legal_actions`` offers no raise, so neither may
+        ``canonical_raise_fractions`` (it must not diverge from the real tree).
+
+        Two short stacks shove so the big stack acts with ``n_players_with_moves
+        == 1`` — a raise here would only be returned uncalled.
+        """
+        import numpy as np
+
+        import environment.dynamics as dynamics
+
+        for seed in range(40):
+            np.random.seed(seed)
+            env = PokerEnv(
+                players=[Player(0, 1000), Player(1, 40), Player(2, 55)],
+                low_card_rank=11, high_card_rank=14,
+            )
+            steps = 0
+            while not env.is_terminal and steps < 16:
+                pi = env.player_i
+                legal = [a for a in env.legal_actions if a]
+                if pi in (1, 2) and "all_in" in legal:
+                    env.step_in_place("all_in")
+                elif pi == 0 and dynamics.n_players_with_moves(env) == 1:
+                    # The lone-all-in node: assert agreement + emptiness.
+                    la = [a for a in env.legal_actions if a]
+                    assert not any(a.startswith("raise") for a in la), la
+                    assert env.canonical_raise_fractions() == []
+                    return
+                else:
+                    env.step_in_place("call" if "call" in legal else "check")
+                steps += 1
+        pytest.fail("could not construct a lone-all-in node")
+
 
 class TestChipsToAdd:
 

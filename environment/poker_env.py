@@ -1262,9 +1262,10 @@ class PokerEnv:
 
         Mirrors the gating that :meth:`legal_actions` applies before
         delegating to :meth:`_get_available_raise_sizes`: an inactive
-        player, a call amount that meets or exceeds the stack, or having
-        already hit :data:`MAX_RAISES_PER_ROUND` all yield an empty list.
-        Stack-clamping and min-raise enforcement come from
+        player, a call amount that meets or exceeds the stack, having
+        already hit :data:`MAX_RAISES_PER_ROUND`, or **facing a lone
+        all-in** (no other live player could call a raise) all yield an
+        empty list.  Stack-clamping and min-raise enforcement come from
         ``_get_available_raise_sizes`` itself.
         """
         if not self.current_player.is_active:
@@ -1274,6 +1275,12 @@ class PokerEnv:
         if n_chips_to_call >= self.current_player.n_chips:
             return []
         if self._n_raises >= MAX_RAISES_PER_ROUND:
+            return []
+        if dynamics.n_players_with_moves(self) < 2:
+            # Facing a lone all-in — a raise/over-shove would only be returned
+            # uncalled, so ``legal_actions`` offers only call/fold here and this
+            # helper must agree (``_compute_legal_actions`` gates raises on the
+            # same ``n_players_with_moves() >= 2`` condition).
             return []
         return [
             float(s.split(":", 1)[1])
@@ -2185,14 +2192,14 @@ class PokerEnv:
                     for _ in range(cap)
                 )
 
-        scratch = Pot(n)
-        scratch._chips = list(pot_chips)
         prefix_list = list(prefix)
         accum = [0.0] * n
 
         # Materialise the (cap-bounded) completions and rank every
         # (completion x active player) seven-card hand in one vectorised batch,
-        # then keep the per-completion side-pot scoring exactly as before.
+        # then settle every completion's side pots (delegated to the swappable
+        # module-level ``_settle_runout`` so the compiled ``runout`` kernel can
+        # replace only the settlement while the ranking stays identical).
         completions = [
             prefix_list + [int(c) for c in comp] for comp in completions
         ]
@@ -2209,61 +2216,9 @@ class PokerEnv:
             rank_mat = default_evaluator.evaluate_batch(
                 hands.reshape(count * n_active, 7)
             ).reshape(count, n_active)
-
-            def _score_scalar(indices) -> None:
-                for ci in indices:
-                    groups: Dict[int, List[Player]] = collections.defaultdict(list)
-                    for a, p in enumerate(active_players):
-                        groups[int(rank_mat[ci, a])].append(p)
-                    ranked = [groups[r] for r in sorted(groups)]
-                    winnings = scratch.compute_utility(self.players, ranked)
-                    for i in range(n):
-                        accum[i] += winnings[i]
-
-            # Fast path.  The side-pot structure is **board-independent** (it is
-            # fixed by the frozen contributions), and a board changes the payout
-            # only through the active players' relative ranks.  For any completion
-            # whose every pot has a *unique* best eligible active hand, each pot is
-            # won outright by that hand — `compute_utility`'s "best eligible group
-            # takes the pot" rule with singleton groups — so the whole settlement
-            # vectorises (`argmin` per pot + `bincount` over completions).  Only
-            # completions with a tie in some pot need the exact scalar split, and a
-            # pot with no eligible active contributor (degenerate) routes every
-            # completion to the scalar path.  Equivalent to the per-board loop, just
-            # without Python per board.
-            specs = []
-            degenerate = False
-            for sp in scratch.side_pots:
-                cols = np.fromiter(
-                    (a for a, p in enumerate(active_players) if p.player_i in sp),
-                    dtype=np.intp,
-                )
-                if cols.size == 0:
-                    degenerate = True
-                    break
-                glob = np.fromiter(
-                    (active_players[a].player_i for a in cols),
-                    dtype=np.intp,
-                    count=cols.size,
-                )
-                specs.append((cols, float(sum(sp.values())), glob))
-
-            if degenerate:
-                _score_scalar(range(count))
-            else:
-                clean = np.ones(count, dtype=bool)
-                per_pot = []
-                for cols, total, glob in specs:
-                    sub = rank_mat[:, cols]                       # (count, |cols|)
-                    best = sub.min(axis=1)
-                    clean &= (sub == best[:, None]).sum(axis=1) == 1
-                    per_pot.append((glob[sub.argmin(axis=1)], total))
-                if clean.any():
-                    for glob_win, total in per_pot:
-                        wins = np.bincount(glob_win[clean], minlength=n)
-                        for i in range(n):
-                            accum[i] += float(wins[i]) * total
-                _score_scalar(np.flatnonzero(~clean).tolist())
+            accum = _settle_runout(
+                active_players, self.players, pot_chips, rank_mat, count, n
+            )
 
         if count == 0:
             # No feasible completion (degenerate card exhaustion) — fall back to
@@ -2553,3 +2508,100 @@ class PokerEnv:
         legal_set = {a for a in self.legal_actions if a is not None}
         return np.array([a in legal_set for a in canonical], dtype=bool)
 
+
+
+# --------------------------------------------------------------------------- #
+# Runout settlement (Phase 2 seam).  Extracted from ``runout_equity`` so the
+# compiled ``runout`` kernel can replace the per-completion side-pot scoring while
+# the deck/completion/ranking setup stays shared.  ``runout_equity`` calls the
+# module global ``_settle_runout`` at run time, so the rebind below is transparent.
+#
+# Every quantity summed here is INTEGER (chips won per seat, or the fast path's
+# ``count * pot_total``), so ``accum`` is an integer-valued float independent of
+# summation order — the Cython kernel need only reproduce the same per-completion
+# settlement (``Pot.compute_utility``) and the caller does the ``/count`` division.
+# --------------------------------------------------------------------------- #
+def _settle_runout(active_players, all_players, pot_chips, rank_mat, count, n):
+    """Sum ``Pot.compute_utility`` over every board completion → ``accum`` (len n).
+
+    Pure-Python reference (the byte-exact oracle): the vectorised fast path for
+    completions whose every side pot has a unique best eligible hand, plus the
+    scalar tie-split for the rest.  ``accum[i]`` is chips won by seat ``i`` summed
+    over all completions.
+    """
+    scratch = Pot(n)
+    scratch._chips = list(pot_chips)
+    accum = [0.0] * n
+
+    def _score_scalar(indices):
+        for ci in indices:
+            groups = collections.defaultdict(list)
+            for a, p in enumerate(active_players):
+                groups[int(rank_mat[ci, a])].append(p)
+            ranked = [groups[r] for r in sorted(groups)]
+            winnings = scratch.compute_utility(all_players, ranked)
+            for i in range(n):
+                accum[i] += winnings[i]
+
+    specs = []
+    degenerate = False
+    for sp in scratch.side_pots:
+        cols = np.fromiter(
+            (a for a, p in enumerate(active_players) if p.player_i in sp),
+            dtype=np.intp,
+        )
+        if cols.size == 0:
+            degenerate = True
+            break
+        glob = np.fromiter(
+            (active_players[a].player_i for a in cols),
+            dtype=np.intp,
+            count=cols.size,
+        )
+        specs.append((cols, float(sum(sp.values())), glob))
+
+    if degenerate:
+        _score_scalar(range(count))
+    else:
+        clean = np.ones(count, dtype=bool)
+        per_pot = []
+        for cols, total, glob in specs:
+            sub = rank_mat[:, cols]                       # (count, |cols|)
+            best = sub.min(axis=1)
+            clean &= (sub == best[:, None]).sum(axis=1) == 1
+            per_pot.append((glob[sub.argmin(axis=1)], total))
+        if clean.any():
+            for glob_win, total in per_pot:
+                wins = np.bincount(glob_win[clean], minlength=n)
+                for i in range(n):
+                    accum[i] += float(wins[i]) * total
+        _score_scalar(np.flatnonzero(~clean).tolist())
+    return accum
+
+
+_settle_runout_py = _settle_runout
+
+try:
+    from poker_ai._core import CORE_AVAILABLE as _CORE_AVAILABLE
+    from poker_ai._core.flags import kernel_enabled as _kernel_enabled
+
+    if _CORE_AVAILABLE and _kernel_enabled("runout"):
+        from poker_ai._core._runout import settle_runout as _core_settle_runout
+
+        def _settle_runout(active_players, all_players, pot_chips, rank_mat, count, n):
+            """Cython-backed runout settlement (flag ``runout``).
+
+            Marshals the plain integer inputs the kernel wants — per-``player_i``
+            ``order`` and the active columns' global seats — and returns the summed
+            chips-won as floats (integer-valued, matching the Python accumulator).
+            """
+            order = [0] * n
+            for p in all_players:
+                order[p.player_i] = p.order
+            active_glob = [p.player_i for p in active_players]
+            acc = _core_settle_runout(
+                rank_mat, list(pot_chips), order, active_glob, n
+            )
+            return [float(acc[i]) for i in range(n)]
+except ImportError:
+    pass
