@@ -227,6 +227,35 @@ def reach_after_removal(
     return total - on_card[s0] - on_card[s1] + w
 
 
+def fold_cfv(
+    valid: np.ndarray,
+    combo_cards: np.ndarray,
+    opp_reach: np.ndarray,
+    signed_gain: float,
+    removal: Optional[Tuple[np.ndarray, np.ndarray, int]] = None,
+) -> np.ndarray:
+    """Per-combo counterfactual value at a **fold** terminal (rank-independent).
+
+    Factored out of :meth:`environment.poker_env.PokerEnv.vector_payout`'s fold
+    branch so it can be swapped for a fused Cython kernel.  The pot is decided by
+    the fold, but card removal between the two ranges still applies: for the acting
+    combo's signed gain ``signed_gain`` (``+(stake+dead)`` if the acting seat is the
+    still-live winner, ``-stake`` if it folded),
+
+        value_i = signed_gain * (board_compatible_i ? available_opp_reach_i : 0)
+
+    where ``available_opp_reach`` is :func:`reach_after_removal` on the board-masked
+    opponent reach and ``valid`` is :func:`board_valid_mask` for the board the fold
+    actually reached.  Byte-identical to the inline ``sign * gain * np.where(valid,
+    reach_after_removal(np.where(valid, opp_reach, 0), removal), 0)`` it replaces —
+    the associativity (``signed_gain = sign * gain``) and the trailing ``* 0.0``
+    (which yields ``-0.0`` for a negative gain) are preserved deliberately.
+    """
+    opp = np.where(valid, opp_reach, 0.0)
+    avail = reach_after_removal(combo_cards, opp, removal)
+    return signed_gain * np.where(valid, avail, 0.0)
+
+
 def showdown_cfv(
     ranks: np.ndarray,
     valid: np.ndarray,
@@ -372,17 +401,20 @@ def showdown_values(
 # --------------------------------------------------------------------------- #
 showdown_cfv_py = showdown_cfv
 reach_after_removal_py = reach_after_removal
+fold_cfv_py = fold_cfv
 try:
     from poker_ai._core import CORE_AVAILABLE as _CORE_AVAILABLE
     from poker_ai._core.flags import kernel_enabled as _kernel_enabled
 
     if _CORE_AVAILABLE and _kernel_enabled("showdown"):
         from poker_ai._core._showdown import (
+            fold_cfv as _core_fold_cfv,
             reach_after_removal as _core_reach_after_removal,
             showdown_cfv as _core_showdown_cfv,
         )
 
         showdown_cfv = _core_showdown_cfv
         reach_after_removal = _core_reach_after_removal
+        fold_cfv = _core_fold_cfv
 except ImportError:
     pass

@@ -2312,12 +2312,12 @@ class PokerEnv:
         # A fold needs only board-compatibility (no showdown ranking), so use the
         # rank-free mask — cheaper, and it never ranks a partial pre-river board.
         valid = range_showdown.board_valid_mask(low, high, board)
-        opp = np.where(valid, opp_reach, 0.0)
-        avail = range_showdown.reach_after_removal(combo_cards, opp, removal)
         # The fold's winner collects the loser's matched stake plus the dead
         # money; the folder forfeits only its own (matched) contribution.
         gain = stake + dead if winner == seat else stake
-        return sign * gain * np.where(valid, avail, 0.0)
+        return range_showdown.fold_cfv(
+            valid, combo_cards, opp_reach, sign * gain, removal
+        )
 
     @property
     def deck_size(self) -> int:

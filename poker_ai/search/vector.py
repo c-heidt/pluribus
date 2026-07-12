@@ -107,6 +107,23 @@ class _VectorSolver:
         self.cfg = cfg
         self.rng = rng
 
+        # Search Cython core (Phase 3): when ``PLURIBUS_SEARCH_CORE=1`` and the
+        # search has no off-tree injections, drive the walk on the compiled
+        # ``FastState`` betting engine (make/undo collapses out of Python).  The
+        # Python ``_walk`` is unchanged and byte-identical either way; falls back
+        # to the ``PokerEnv`` root when the flag is off, the core is unavailable,
+        # or an off-tree action was injected (see ``fast_env``).
+        self._walk_env = root_env
+        try:
+            from poker_ai._core.flags import search_core_enabled
+            if search_core_enabled():
+                from poker_ai.search.fast_env import build_fast_walk_env
+                fast_env = build_fast_walk_env(root_env)
+                if fast_env is not None:
+                    self._walk_env = fast_env
+        except ImportError:
+            pass
+
         live = sorted(ctx.ranges)
         if len(live) != 2:
             raise ValueError(
@@ -178,8 +195,10 @@ class _VectorSolver:
         s0, s1 = self._seats
         # Alternating updates: one full tree pass per traverser (river_k=None at
         # the root — turn betting / river-subgame nodes sit above the chance node).
-        self._walk(self.root_env, s0, self._reach[s0], self._reach[s1], None)
-        self._walk(self.root_env, s1, self._reach[s1], self._reach[s0], None)
+        # ``_walk_env`` is the compiled FastState adapter under PLURIBUS_SEARCH_CORE
+        # (else the PokerEnv root) — byte-identical, only make/undo speed differs.
+        self._walk(self._walk_env, s0, self._reach[s0], self._reach[s1], None)
+        self._walk(self._walk_env, s1, self._reach[s1], self._reach[s0], None)
 
     # ------------------------------------------------------------------
     # Recursion (always entered on a non-terminal node)

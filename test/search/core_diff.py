@@ -218,6 +218,10 @@ def run_vector_pass(solver, sampled_k):
     """
     solver._sampled_k = sampled_k
     s0, s1 = solver._seats
-    solver._walk(solver.root_env, s0, solver._reach[s0], solver._reach[s1], None)
-    solver._walk(solver.root_env, s1, solver._reach[s1], solver._reach[s0], None)
+    # Walk whatever env the solver was configured with — the ``PokerEnv`` root by
+    # default, or the compiled ``FastEnvAdapter`` under PLURIBUS_SEARCH_CORE
+    # (Phase 3c); the two must produce byte-identical tables.
+    walk_env = getattr(solver, "_walk_env", solver.root_env)
+    solver._walk(walk_env, s0, solver._reach[s0], solver._reach[s1], None)
+    solver._walk(walk_env, s1, solver._reach[s1], solver._reach[s0], None)
     return snapshot(solver.state.vregret), snapshot(solver.state.vstrat)

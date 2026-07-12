@@ -142,6 +142,46 @@ def run_loop(solver, state: SolverState, cfg: SolverConfig) -> Tuple[int, str]:
 _SHARED: dict = {}
 
 
+def _limit_worker_threads(n_threads: int = 1) -> None:
+    """Pin this forked replica's BLAS/OpenMP thread pools to ``n_threads``.
+
+    Parallel search forks ``W`` replicas; numpy's OpenBLAS defaults to one thread
+    per core, so ``W`` replicas on a ``C``-core box spin up ~``W*C`` threads that
+    busy-wait and thrash the scheduler.  Measured impact on this box (22 cores, 8
+    workers): the vector solve ran *slower* than serial and the compiled core's
+    per-iteration win inverted into a net loss (core-on became slower than
+    core-off) purely from the oversubscription.  Each replica is a single
+    fine-grained CFR walk over tiny (n_combos,) arrays that never benefits from
+    intra-op BLAS threads, so **one thread per replica is optimal**.
+
+    Best-effort and never raises (pinning is an optimisation, not correctness):
+    sets the standard env vars (for any pool that re-reads them) AND calls
+    OpenBLAS's runtime setter on numpy's bundled library — the reliable path in a
+    forked child, whose BLAS pool is already initialised so the env var alone may
+    be ignored.
+    """
+    import os as _os
+
+    for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                 "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        _os.environ[_var] = str(n_threads)
+    try:
+        import ctypes
+        import glob
+        import numpy as _np
+
+        libdir = _os.path.join(_os.path.dirname(_np.__file__), ".libs")
+        for _so in glob.glob(_os.path.join(libdir, "libopenblas*.so")):
+            try:
+                _lib = ctypes.CDLL(_so)
+            except OSError:
+                continue
+            if hasattr(_lib, "openblas_set_num_threads"):
+                _lib.openblas_set_num_threads(int(n_threads))
+    except Exception:
+        pass  # best-effort; a missing/renamed BLAS must never break the solve
+
+
 def _build_solver(root_env, state, ctx, cfg, rng, regime):
     if regime == "vector":
         return _VectorSolver(root_env, state, ctx, cfg, rng)
@@ -178,6 +218,9 @@ def _run_replica(payload: Tuple[int, np.random.SeedSequence, int]):
     warm: Optional[SolverState] = _SHARED["warm"]
     regime: str = _SHARED["regime"]
 
+    # Pin this replica to a single BLAS thread — W replicas each spinning a
+    # per-core OpenBLAS pool oversubscribe the box and thrash (see the docstring).
+    _limit_worker_threads(1)
     # Reopen fork-inherited blueprint LMDB envs before any leaf query (MDB_BAD_RSLOT).
     _reopen_forked_lmdb(ctx)
 

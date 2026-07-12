@@ -71,6 +71,7 @@ cdef bint _configured = False
 cdef int _MAX_RAISES = 0
 cdef int _STAGE_BYTE[N_DECISION_STAGES]      # internal stage idx -> _STAGE_ID byte
 cdef object _ACTION_CODE = None              # list[4] of {token_str: int code}
+cdef object _CODE_ACTION = None              # list[4] of {int code: token_str} (public_key)
 cdef int _FIRST_N[N_DECISION_STAGES]
 cdef int _SUB_N[N_DECISION_STAGES]
 cdef double _FIRST_FRAC[N_DECISION_STAGES][MAX_FRACS]
@@ -88,11 +89,17 @@ def configure(stage_id, action_byte, raise_sizes_by_stage, max_raises):
     ``RAISE_SIZES_BY_STAGE`` / ``MAX_RAISES_PER_ROUND`` — never a hard-coded copy
     (they derive from the raise grid and would silently drift otherwise).
     """
-    global _configured, _MAX_RAISES, _ACTION_CODE, _FIRST_STR, _SUB_STR
+    global _configured, _MAX_RAISES, _ACTION_CODE, _CODE_ACTION, _FIRST_STR, _SUB_STR
     cdef int si, k
     cdef double f
     _MAX_RAISES = int(max_raises)
     _ACTION_CODE = [dict(action_byte[name]) for name in _STAGE_NAMES]
+    # Inverse map (code -> token) for public_key reconstruction — the byte-codes
+    # in ``hist`` are the same ones PokerEnv appends to ``_history`` (skip=0), so
+    # inverting the alphabet rebuilds the exact string history public_key needs.
+    _CODE_ACTION = [
+        {code: token for token, code in (<dict>tbl).items()} for tbl in _ACTION_CODE
+    ]
     _FIRST_STR = [[] for _ in range(N_DECISION_STAGES)]
     _SUB_STR = [[] for _ in range(N_DECISION_STAGES)]
     for si in range(N_DECISION_STAGES):
@@ -133,6 +140,7 @@ ctypedef struct FrameT:
     int skip_counter
     long last_raise_amount
     int n_players_started_round
+    int terminal_board_len
     long n_chips[MAX_PLAYERS]
     long n_bet_chips[MAX_PLAYERS]
     int is_active[MAX_PLAYERS]
@@ -149,7 +157,8 @@ cdef class FastState:
     """
 
     # config (immutable after construction)
-    cdef int n_players
+    # ``readonly`` so the search FastEnvAdapter can read the seat count (Phase 3).
+    cdef readonly int n_players
     cdef long small_blind
     cdef long big_blind
     cdef int player_i_lut[6][MAX_PLAYERS]
@@ -170,7 +179,16 @@ cdef class FastState:
     cdef int n_actions
     cdef int skip_counter
     cdef long last_raise_amount
-    cdef int n_players_started_round
+    # ``readonly`` so the search DepthLimit.classify / FastEnvAdapter can read it
+    # as a plain Python attribute (Phase 3); still written at C level internally.
+    cdef readonly int n_players_started_round
+    # Board length (community-card count) when the hand became terminal, before
+    # any force-deal — the search vector_payout fold path masks against it.  -1
+    # (== Python ``None``) until terminal.  Snapshotted in FrameT for undo.
+    cdef int _terminal_board_len
+    # Deck bounds (search vector_payout: removal / ranked_board / board mask).
+    cdef int _low_card_rank
+    cdef int _high_card_rank
 
     # history: resolved action byte-codes, per decision round (append-only cursor)
     cdef unsigned char hist[N_DECISION_STAGES][MAX_STAGE_ACTIONS]
@@ -196,6 +214,9 @@ cdef class FastState:
         if self._stack == NULL:
             raise MemoryError()
         self._stack_top = 0
+        self._terminal_board_len = -1
+        self._low_card_rank = 0
+        self._high_card_rank = 0
 
     def __dealloc__(self):
         if self._stack != NULL:
@@ -219,6 +240,12 @@ cdef class FastState:
         s.n_players = n
         s.small_blind = int(env.small_blind)
         s.big_blind = int(env.big_blind)
+        s._low_card_rank = <int>env._low_card_rank
+        s._high_card_rank = <int>env._high_card_rank
+        # ``None`` at a live decision-node root (the only place a solve constructs
+        # a FastState); mirror PokerEnv's captured value defensively otherwise.
+        tbl = getattr(env, "_terminal_board_len", None)
+        s._terminal_board_len = -1 if tbl is None else <int>tbl
 
         cdef int seat, k, si
         # Per-stage seat permutation (mirrors PokerEnv._player_i_lut / FastStateRef).
@@ -318,6 +345,52 @@ cdef class FastState:
     @property
     def betting_round(self):
         return self.betting_stage
+
+    # ------------------------------------------------------------------
+    # Search public-state surface (Phase 3) — mirrors PokerEnv exactly so the
+    # subgame solver keys SolverState nodes identically off a FastState.
+    # ------------------------------------------------------------------
+    @property
+    def public_key(self):
+        """``(stage_name, ((stage_name, (action_str, ...)), ...))`` — byte-for-byte
+        identical to ``PokerEnv.public_key`` for canonical (on-tree) histories.
+
+        Rebuilt from the resolved ``hist`` byte-codes: iterating ``si=0..3`` where
+        ``hist_n[si] > 0`` reproduces ``_history.items()`` play order (stages are
+        only ever inserted ascending), and inverting the dumped action alphabet
+        (skip=0) recovers the exact token strings PokerEnv appended (including the
+        ``"skip"`` padding).  Off-tree injected raises have no alphabet code and are
+        NOT representable here — the solver falls back to the Python walk when the
+        overlay is non-empty (see FastEnvAdapter), so this only ever runs on
+        canonical histories.
+        """
+        cdef int si, k
+        cdef int st = self.betting_stage
+        if st < N_DECISION_STAGES:
+            stage_name = _STAGE_NAMES[st]
+        elif st == ST_SHOWDOWN:
+            stage_name = "show_down"
+        else:
+            stage_name = "terminal"
+        items = []
+        cdef dict inv
+        for si in range(N_DECISION_STAGES):
+            if self.hist_n[si] > 0:
+                inv = <dict>_CODE_ACTION[si]
+                actions = []
+                for k in range(self.hist_n[si]):
+                    actions.append(inv[self.hist[si][k]])
+                items.append((_STAGE_NAMES[si], tuple(actions)))
+        return (stage_name, tuple(items))
+
+    @property
+    def n_raises_this_round(self):
+        return self.n_raises
+
+    @property
+    def terminal_board_len(self):
+        """Community-card count when betting ended, or ``None`` (PokerEnv parity)."""
+        return None if self._terminal_board_len < 0 else self._terminal_board_len
 
     @property
     def pot_size(self):
@@ -567,6 +640,7 @@ cdef class FastState:
         f.skip_counter = self.skip_counter
         f.last_raise_amount = self.last_raise_amount
         f.n_players_started_round = self.n_players_started_round
+        f.terminal_board_len = self._terminal_board_len
         for s in range(self.n_players):
             f.n_chips[s] = self.n_chips[s]
             f.n_bet_chips[s] = self.n_bet_chips[s]
@@ -586,6 +660,7 @@ cdef class FastState:
         self.skip_counter = f.skip_counter
         self.last_raise_amount = f.last_raise_amount
         self.n_players_started_round = f.n_players_started_round
+        self._terminal_board_len = f.terminal_board_len
         for s in range(self.n_players):
             self.n_chips[s] = f.n_chips[s]
             self.n_bet_chips[s] = f.n_bet_chips[s]
@@ -723,16 +798,25 @@ cdef class FastState:
 
         # Advance loop (mirrors the corrected PokerEnv._apply_action_in_place):
         # detect terminal / advance the stage only — never deal or settle.
+        # Board length on the street the just-applied action was made on — the
+        # value PokerEnv captures as ``board_len_at_action`` BEFORE any
+        # round-closing stage advance, then stores as ``_terminal_board_len`` in
+        # ``_settle_terminal`` (only-if-None).  The search vector_payout fold path
+        # masks against it; ``_BOARD_LEN[entry_stage] == len(community_cards)``.
         while True:
             self._move_to_next_player()
             if self._hand_over():
                 if self.betting_stage < ST_SHOWDOWN:
                     self.betting_stage = ST_TERMINAL
+                if self._terminal_board_len < 0:
+                    self._terminal_board_len = _BOARD_LEN[entry_stage]
                 break
             if not self._more_betting_needed() and self._all_players_have_actioned():
                 self._increment_stage()
                 self._reset_betting_round_state()
                 if self.betting_stage == ST_SHOWDOWN:
+                    if self._terminal_board_len < 0:
+                        self._terminal_board_len = _BOARD_LEN[entry_stage]
                     break
             cur = self._cur_seat()
             if self.is_active[cur] == 0:
@@ -769,6 +853,66 @@ cdef class FastState:
         pot._chips = [self.pot_chips[s] for s in range(self.n_players)]
         won = pot.compute_utility(stub, ranked)
         return {s: won[s] - self.pot_chips[s] for s in range(self.n_players)}
+
+    def vector_payout(self, int seat, int opp_seat, opp_reach, river, combo_cards):
+        """Range-vs-range terminal value to ``seat`` — Phase-3b, byte-identical to
+        ``PokerEnv.vector_payout``.
+
+        The search vector regime's terminal settlement moved in-core: the caller
+        (the compiled/adapter walk) supplies the CFR quantities it owns
+        (``opp_seat``'s reach, the sampled ``river``, the shared ``combo_cards``);
+        everything else reads FastState fields.  ``pot_chips`` are the per-seat
+        contributions PokerEnv captures as ``_terminal_contributions`` (same source
+        ``payout`` uses).  It calls the **module-level** ``range_showdown``
+        functions (``showdown_cfv``/``reach_after_removal`` are core-backed under the
+        ``showdown`` flag), exactly as ``PokerEnv.vector_payout`` does — so the whole
+        method is byte-identical to the env by construction; only the field source
+        differs.  Precondition (as in the env): a terminal with exactly two
+        contesting seats.
+        """
+        from environment import range_showdown
+
+        if not self.is_terminal:
+            raise ValueError("vector_payout is only defined at a terminal node.")
+        cdef int s
+        cdef long tc_seat = self.pot_chips[seat]
+        cdef long tc_opp = self.pot_chips[opp_seat]
+        cdef long tc_sum = 0
+        for s in range(self.n_players):
+            tc_sum += self.pot_chips[s]
+        # Matched stake (winner-takes; larger stack's excess uncalled) + dead money
+        # (every other, folded, seat's contribution) — float, mirroring the env.
+        stake = float(tc_seat if tc_seat < tc_opp else tc_opp)
+        dead = float(tc_sum - tc_seat - tc_opp)
+        low = self._low_card_rank
+        high = self._high_card_rank
+        removal = range_showdown.removal_for(low, high)
+        community = [self.board[s] for s in range(5)]
+
+        if self.is_active[seat] != 0 and self.is_active[opp_seat] != 0:
+            # Showdown: complete the board with the search's sampled river (or the
+            # already-complete board for a river subgame), then settle ranges.
+            board = community[:4] + [int(river)] if river is not None else community
+            ranks, valid = range_showdown.ranked_board(low, high, board)
+            return range_showdown.showdown_cfv(
+                ranks, valid, combo_cards, opp_reach, stake, dead=dead, removal=removal
+            )
+
+        # Fold: the still-active contesting seat wins; value is rank-independent.
+        winner = seat if self.is_active[seat] != 0 else opp_seat
+        sign = 1.0 if winner == seat else -1.0
+        real_len = self._terminal_board_len
+        if real_len < 0:
+            real_len = len(community)
+        if river is not None and real_len == 5:
+            board = community[:4] + [int(river)]
+        else:
+            board = community[:real_len]
+        valid = range_showdown.board_valid_mask(low, high, board)
+        gain = stake + dead if winner == seat else stake
+        return range_showdown.fold_cfv(
+            valid, combo_cards, opp_reach, sign * gain, removal
+        )
 
     # ------------------------------------------------------------------
     # Debug / differential-test accessors (not on the hot path)

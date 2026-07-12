@@ -241,3 +241,65 @@ def reach_after_removal(combo_cards, opp_reach, removal=None):
     for i in range(n):
         o[i] = total - on[s0[i]] - on[s1[i]] + w[i]
     return out
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def fold_cfv(valid, combo_cards, opp_reach, signed_gain, removal=None):
+    """Fused fold-terminal CFV — byte-identical drop-in for
+    ``range_showdown.fold_cfv``.
+
+    Collapses the fold branch's three numpy passes + call
+    (``where(valid, opp_reach, 0)`` → ``reach_after_removal`` →
+    ``signed_gain * where(valid, avail, 0)``) into a single C sweep over the
+    ``(n_combos,)`` buffers.  The ``total`` uses :func:`pairwise_sum` to match
+    numpy's ``w.sum()`` bit-for-bit (as ``reach_after_removal`` does); the trailing
+    ``signed_gain * 0.0`` for a board-incompatible combo is written verbatim (not
+    a literal ``0.0``) so a negative ``signed_gain`` yields ``-0.0`` exactly as the
+    numpy ``signed_gain * np.where(...)`` does — the golden digest depends on it.
+    """
+    if removal is None:
+        removal = _removal_index(combo_cards)
+    s0_arr, s1_arr, deck_size_py = removal
+
+    cdef const long[::1] s0 = np.ascontiguousarray(s0_arr, dtype=np.int64)
+    cdef const long[::1] s1 = np.ascontiguousarray(s1_arr, dtype=np.int64)
+    cdef const unsigned char[::1] vld = np.ascontiguousarray(
+        np.asarray(valid, dtype=bool).view(np.uint8))
+    cdef const double[::1] reach = np.ascontiguousarray(opp_reach, dtype=np.float64)
+    cdef Py_ssize_t n = reach.shape[0]
+    cdef Py_ssize_t ds = deck_size_py
+    cdef double sg = signed_gain
+
+    out = np.empty(n, dtype=np.float64)
+    if n == 0:
+        return out
+    cdef double[::1] o = out
+
+    # w = where(valid, opp_reach, 0.0)  — the board-masked opponent reach.
+    w_arr = np.empty(n, dtype=np.float64)
+    cdef double[::1] w = w_arr
+    cdef Py_ssize_t i
+    for i in range(n):
+        w[i] = reach[i] if vld[i] else 0.0
+
+    cdef double total = pairwise_sum(&w[0], n)
+
+    on_arr = np.zeros(ds, dtype=np.float64)
+    cdef double[::1] on = on_arr
+    for i in range(n):           # numpy bincount over concat([s0, s1]) — s0 first
+        on[s0[i]] += w[i]
+    for i in range(n):
+        on[s1[i]] += w[i]
+
+    cdef double avail
+    for i in range(n):
+        # avail == reach_after_removal on the masked w; then signed_gain *
+        # where(valid, avail, 0.0) — the invalid path keeps the ``sg * 0.0``
+        # (so -0.0 survives for sg < 0, matching numpy).
+        if vld[i]:
+            avail = total - on[s0[i]] - on[s1[i]] + w[i]
+            o[i] = sg * avail
+        else:
+            o[i] = sg * 0.0
+    return out
