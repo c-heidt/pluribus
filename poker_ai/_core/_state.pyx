@@ -316,6 +316,57 @@ cdef class FastState:
                 s._push_hist_code(si, s._resolve_code(table, token))
         return s
 
+    def set_board(self, board):
+        """Overwrite the 5-card board (Phase 4b leaf rollout).
+
+        The betting engine is board-independent, so a rollout builds the FastState
+        once from the frontier and draws a fresh 5-card runout per call — this
+        installs it.  ``board`` is the full 5 cards (prefix + drawn completion);
+        only ``payout`` / ``runout_equity`` ranking read it.  Cluster caches
+        (``clusters``) are NOT recomputed here — a UniformPolicy rollout ignores
+        them; the in-core BlueprintPolicy path (4c) recomputes per drawn board.
+        """
+        cdef int k
+        if len(board) != 5:
+            raise ValueError("set_board expects exactly 5 cards")
+        for k in range(5):
+            self.board[k] = <int>board[k]
+
+    def refresh_clusters(self, card_info_lut):
+        """Recompute per-(seat, street) LUT clusters from the CURRENT board.
+
+        The Phase-4b leaf rollout draws a fresh board per call (``set_board``), so
+        the clusters ``info_set`` embeds must be re-derived for that board — same
+        key ``PokerEnv._compute_info_set`` / ``from_poker_env`` use
+        (``sorted(hole) + sorted(board[:street_len])``).  A missing key leaves the
+        (seat, street) cluster unset (``has_cluster == 0``), exactly as
+        ``from_poker_env`` swallows a precompute miss; ``info_set`` then raises loud
+        at a decision node with no cluster (never a silent cluster-0).
+        """
+        cdef int seat, si, blen
+        board = [self.board[seat] for seat in range(5)]
+        for seat in range(self.n_players):
+            for si in range(N_DECISION_STAGES):
+                self.clusters[seat][si] = 0
+                self.has_cluster[seat][si] = 0
+        for si in range(N_DECISION_STAGES):
+            name = _STAGE_NAMES[si]
+            blen = _BOARD_LEN[si]
+            try:
+                stage_lut = card_info_lut[name]
+            except (KeyError, TypeError):
+                continue
+            for seat in range(self.n_players):
+                key = tuple(
+                    sorted([self.hole[seat][0], self.hole[seat][1]])
+                    + sorted(board[:blen])
+                )
+                try:
+                    self.clusters[seat][si] = <int>stage_lut[key]
+                    self.has_cluster[seat][si] = 1
+                except (KeyError, IndexError):
+                    pass
+
     # ------------------------------------------------------------------
     # Derived read-only contract (mirrors FastStateRef / PokerEnv)
     # ------------------------------------------------------------------
@@ -915,8 +966,128 @@ cdef class FastState:
         )
 
     # ------------------------------------------------------------------
+    # Decision-free all-in runout (Phase 4a) — the shared terminal the MCCFR
+    # walk AND the leaf rollout score exactly, ported off PokerEnv so both can
+    # settle from a FastState.  Byte-identical to PokerEnv (the completion
+    # average is an integer chip sum → order-independent, so the completion
+    # enumeration order need not match the deck's).
+    # ------------------------------------------------------------------
+    @property
+    def is_decision_free(self):
+        """True iff this is a terminal all-in showdown over an incomplete board.
+
+        Mirrors ``PokerEnv.is_decision_free`` (``_runout_info is not None``, set in
+        ``_settle_terminal`` when ``5-len(community) > 0`` and ``n_active >= 2``):
+        terminal, ``0 <= terminal_board_len < 5``, and >=2 seats still active.
+        """
+        if not (self.betting_stage == ST_SHOWDOWN or self.betting_stage == ST_TERMINAL):
+            return False
+        return (0 <= self._terminal_board_len < 5) and self._n_active_players() >= 2
+
+    @property
+    def runout_key(self):
+        """``(board_prefix, pot_contributions, active_mask)`` — ``None`` if not a
+        decision-free runout.  Byte-identical to ``PokerEnv.runout_key``
+        (``_runout_info``) so the search-lifetime ``runout_cache`` shared with the
+        PokerEnv path keys identically."""
+        if not self.is_decision_free:
+            return None
+        cdef int tbl = self._terminal_board_len
+        cdef int s
+        prefix = tuple(self.board[s] for s in range(tbl))
+        pot = tuple(self.pot_chips[s] for s in range(self.n_players))
+        active = tuple(bool(self.is_active[s]) for s in range(self.n_players))
+        return (prefix, pot, active)
+
+    def runout_equity(self, rng=None, cap=5000):
+        """Exact expected per-seat chip delta over every board completion.
+
+        Byte-identical drop-in for ``PokerEnv.runout_equity``: reconstructs the
+        pre-runout snapshot from FastState fields (prefix = ``board[:terminal_board_len]``,
+        contributions = ``pot_chips``, active = ``is_active``), enumerates the
+        completion deck (all deck cards minus every dealt hole and the prefix),
+        batch-ranks each (completion x active seat) 7-card hand with the shared
+        evaluator, and settles via the SAME module-level ``_settle_runout`` PokerEnv
+        uses (core-backed under the ``runout`` flag) over Player stubs carrying
+        ``player_i``/``order``.  The completion average is an integer chip sum, so
+        the result is independent of completion order (the deck order need not match).
+        """
+        import itertools
+        import numpy as np
+        from environment.evaluator import default_evaluator
+        from environment.player import Player
+        from environment.utils import enumerate_combos
+        from environment.poker_env import _settle_runout, _n_choose_k
+
+        if not self.is_decision_free:
+            raise ValueError(
+                "runout_equity requires a decision-free all-in runout state "
+                "(is_decision_free is False); nothing to integrate."
+            )
+        cdef int n = self.n_players
+        cdef int tbl = self._terminal_board_len
+        cdef int s, kk = 5 - tbl
+        prefix = [self.board[s] for s in range(tbl)]
+        used = set(prefix)
+        for s in range(n):
+            used.add(self.hole[s][0])
+            used.add(self.hole[s][1])
+        combo_cards, _ = enumerate_combos(self._low_card_rank, self._high_card_rank)
+        full_deck = [int(c) for c in np.unique(combo_cards)]
+        available = [c for c in full_deck if c not in used]
+
+        if kk <= 0:
+            completions = [()]
+        else:
+            n_combos = _n_choose_k(len(available), kk)
+            if n_combos <= cap:
+                completions = itertools.combinations(available, kk)
+            else:
+                gen = rng if rng is not None else np.random.default_rng()
+                completions = (
+                    tuple(gen.choice(available, size=kk, replace=False))
+                    for _ in range(cap)
+                )
+        prefix_list = list(prefix)
+        completions = [prefix_list + [int(c) for c in comp] for comp in completions]
+        count = len(completions)
+
+        # Player stubs carrying player_i (== seat) + order for the side-pot settle.
+        stub = [Player(s) for s in range(n)]
+        for s in range(n):
+            stub[s].order = self.order[s]
+        active_players = [stub[s] for s in range(n) if self.is_active[s] != 0]
+        pot_chips = [self.pot_chips[s] for s in range(n)]
+
+        accum = [0.0] * n
+        if count and active_players:
+            boards = np.asarray(completions, dtype=np.int64)          # (count, 5)
+            holes = np.asarray(
+                [[self.hole[s][0], self.hole[s][1]]
+                 for s in range(n) if self.is_active[s] != 0],
+                dtype=np.int64,
+            )                                                          # (n_active, 2)
+            n_active = len(active_players)
+            hands = np.empty((count, n_active, 7), dtype=np.int64)
+            hands[:, :, :5] = boards[:, None, :]
+            hands[:, :, 5:] = holes[None, :, :]
+            rank_mat = default_evaluator.evaluate_batch(
+                hands.reshape(count * n_active, 7)
+            ).reshape(count, n_active)
+            accum = _settle_runout(active_players, stub, pot_chips, rank_mat, count, n)
+
+        if count == 0:
+            return {i: float(-pot_chips[i]) for i in range(n)}
+        return {i: accum[i] / count - pot_chips[i] for i in range(n)}
+
+    # ------------------------------------------------------------------
     # Debug / differential-test accessors (not on the hot path)
     # ------------------------------------------------------------------
+    def cluster_at(self, int seat, int si):
+        """``(cluster_id, has_cluster)`` for ``(seat, street)`` — Phase-4b gate for
+        ``refresh_clusters`` (not on the hot path)."""
+        return (self.clusters[seat][si], self.has_cluster[seat][si])
+
     def snapshot(self):
         """Full mutable-state tuple for differential comparison against the ref."""
         cdef int s, k

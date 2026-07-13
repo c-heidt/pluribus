@@ -32,6 +32,21 @@ from poker_ai.search.solver_state import Key, SolverConfig, SolverState, _hand_r
 
 logger = logging.getLogger(__name__)
 
+# Search Cython core (Phase 4b): under ``PLURIBUS_SEARCH_CORE=1`` swap the leaf
+# rollout (the ~74% MCCFR cost) for the FastState-driven rollout, which builds the
+# leaf env once and make/undo-walks it per rollout, settling terminals in-core.
+# ``_leaf_value`` calls the module global ``continuation_value`` so the rebind is
+# transparent; the pure-Python reference is retained (and used as the fallback the
+# fast path delegates to for unrepresentable frontiers).  Equilibrium-gated.
+_continuation_value_py = continuation_value
+try:
+    from poker_ai._core.flags import search_core_enabled as _search_core_enabled
+
+    if _search_core_enabled():
+        from poker_ai.search.leaf_fast import continuation_value_fast as continuation_value
+except ImportError:
+    pass
+
 # The four §4 continuation strategies, in the canonical meta-action order.
 _BIAS_CLASSES: Tuple[BiasClass, ...] = ("none", "fold", "call", "raise")
 
