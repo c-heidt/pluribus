@@ -125,6 +125,44 @@ class TestOpen:
             "SELECT hu_from_street FROM games WHERE run_id = 'new'"
         ).fetchone()[0]
         assert got == 2
+
+    def test_v2_db_migrates_condition(self, tmp_path):
+        """Opening a schema-v2 DB adds ``games.condition`` (v2 → v3 migration, §10.1).
+
+        Same additive-ALTER contract as ``hu_from_street``: a pre-condition file
+        gets the column ALTERed in, old rows read NULL, new rows round-trip it.
+        """
+        path = tmp_path / "old.sqlite"
+        v2_ddl = _SCHEMA_DDL.replace("    condition          TEXT,\n", "")
+        # The v2 file predates the column *and* its index (added together in v3).
+        v2_ddl = "\n".join(
+            ln for ln in v2_ddl.splitlines() if "idx_games_condition" not in ln
+        )
+        assert "    condition " not in v2_ddl           # column def gone
+        assert "idx_games_condition" not in v2_ddl      # its index gone
+        con = sqlite3.connect(str(path))
+        con.executescript(v2_ddl)
+        con.execute(
+            "INSERT INTO games (run_id, hand_index, schema_version, "
+            "config_fingerprint, table_label, table_config, hero_seat, "
+            "button_seat, n_players, big_blind, starting_stack, deck_seed) "
+            "VALUES ('old', 0, 2, 'f', 't', '{}', 0, 1, 3, 100.0, 600.0, 7)"
+        )
+        con.commit()
+        con.close()
+
+        lg = ExperimentLog.open(path)
+        cols = {r[1] for r in lg._con.execute("PRAGMA table_info(games)")}
+        assert "condition" in cols
+        assert lg._con.execute(
+            "SELECT condition FROM games WHERE run_id = 'old'"
+        ).fetchone()[0] is None
+        with lg.game():
+            lg.log_game(_game(run_id="new", condition="A"))
+        got = lg._con.execute(
+            "SELECT condition FROM games WHERE run_id = 'new'"
+        ).fetchone()[0]
+        assert got == "A"
         lg.close()
 
 

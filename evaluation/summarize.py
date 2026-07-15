@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import sqlite3
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -84,6 +85,36 @@ def _mean_ci(values: Sequence[float]) -> Dict[str, float]:
     var = max(var, 0.0)                      # guard tiny negative from rounding
     ci = _CI_Z * math.sqrt(var) / math.sqrt(n) if n > 0 else None
     return {"n": n, "mean": mean, "ci95": ci}
+
+
+def _bootstrap_ci(
+    values: Sequence[float], *, n_resamples: int = 2000, seed: int = 0, alpha: float = 0.05
+) -> Dict[str, Optional[float]]:
+    """Deterministic percentile-bootstrap 95% CI on the mean of ``values``.
+
+    Fixed-seed stdlib ``random`` (the standalone summary path avoids a numpy
+    dependency, see :func:`_percentile`) so the reported interval is reproducible
+    run-to-run.  Returns the ``(alpha/2, 1-alpha/2)`` percentiles of the resample
+    means; ``None`` bounds for fewer than two points.  Used for the cross-condition
+    paired difference (§10.1), where the bootstrap is preferred over the normal
+    approximation because per-hand poker outcomes are heavy-tailed.
+    """
+    n = len(values)
+    if n < 2:
+        return {"lo": None, "hi": None, "n_resamples": 0}
+    rng = random.Random(seed)
+    means: List[float] = []
+    for _ in range(n_resamples):
+        total = 0.0
+        for _ in range(n):
+            total += values[rng.randrange(n)]
+        means.append(total / n)
+    means.sort()
+    return {
+        "lo": _percentile(means, 100.0 * (alpha / 2.0)),
+        "hi": _percentile(means, 100.0 * (1.0 - alpha / 2.0)),
+        "n_resamples": n_resamples,
+    }
 
 
 def _percentile(values: Sequence[float], q: float) -> Optional[float]:
@@ -191,6 +222,96 @@ def _query_strength(con: sqlite3.Connection) -> dict:
         "tables": {t: _mean_ci(vs) for t, vs in sorted(by_table.items())},
         "by_position": {p: _mean_ci(vs) for p, vs in by_pos.items()},
         "overall": _mean_ci(overall),
+    }
+
+
+# Baseline preference for the paired difference: the first arm present becomes the
+# reference the others are differenced against (treatment − baseline).
+_PAIRED_BASELINE_PREFERENCE = ("B0", "vanilla")
+
+
+def _query_paired(con: sqlite3.Connection) -> dict:
+    """Cross-condition CRN paired differences (§10.1) — the multi-arm headline.
+
+    When two or more ``condition`` arms are present, the comparison of interest is
+    not each arm's absolute bb/100 but the **per-hand difference on the matched
+    deal**: join arms on ``deck_seed`` (equal per hand when they share
+    ``run_seed``/``table_policy``/table shape), difference the bb/100, and CI the
+    mean.  The shared card-luck cancels, so the CI is far tighter than differencing
+    two independent arm means.  ``None``/absent when fewer than two arms are logged.
+
+    Prefers ``aivat_value`` when every joined game carries it (stacks with the CRN
+    cancellation), else raw ``hero_chips_delta``.  Defensive against a rare 32-bit
+    ``deck_seed`` collision within an arm: such deck_seeds are dropped from the join
+    (ambiguous) and counted, rather than paired arbitrarily.
+    """
+    n_cond = _scalar(
+        con, "SELECT COUNT(DISTINCT condition) FROM games WHERE condition IS NOT NULL"
+    )
+    n_cond = int(n_cond or 0)
+    if n_cond < 2:
+        return {"available": False, "n_conditions": n_cond}
+
+    games = _rows(
+        con,
+        "SELECT condition, deck_seed, hero_chips_delta, aivat_value, big_blind "
+        "FROM games WHERE condition IS NOT NULL AND deck_seed IS NOT NULL",
+    )
+    used_aivat = bool(games) and all(g["aivat_value"] is not None for g in games)
+
+    def bb100(g) -> Optional[float]:
+        bb = g["big_blind"]
+        val = g["aivat_value"] if used_aivat else g["hero_chips_delta"]
+        if bb is None or bb == 0 or val is None:
+            return None
+        return 100.0 * val / bb
+
+    per_cond: Dict[str, Dict[int, float]] = {}
+    dupes: Dict[str, set] = {}
+    for g in games:
+        c, ds, v = g["condition"], g["deck_seed"], bb100(g)
+        if v is None:
+            continue
+        seen = per_cond.setdefault(c, {})
+        if ds in seen:
+            dupes.setdefault(c, set()).add(ds)
+        else:
+            seen[ds] = v
+    for c, seeds in dupes.items():                       # drop ambiguous deck_seeds
+        for ds in seeds:
+            per_cond[c].pop(ds, None)
+
+    conditions = sorted(per_cond)
+    baseline = next(
+        (b for b in _PAIRED_BASELINE_PREFERENCE if b in per_cond), conditions[0]
+    )
+    base_map = per_cond[baseline]
+    comparisons = []
+    for c in conditions:
+        if c == baseline:
+            continue
+        tmap = per_cond[c]
+        shared = sorted(set(tmap) & set(base_map))
+        deltas = [tmap[ds] - base_map[ds] for ds in shared]
+        stat = _mean_ci(deltas)
+        comparisons.append(
+            {
+                "treatment": c,
+                "baseline": baseline,
+                "n_paired": len(deltas),
+                "mean_delta_bb100": stat["mean"],
+                "ci95_normal": stat["ci95"],
+                "ci95_bootstrap": _bootstrap_ci(deltas),
+            }
+        )
+    return {
+        "available": True,
+        "metric": "bb100",
+        "used_aivat": used_aivat,
+        "baseline": baseline,
+        "conditions": conditions,
+        "dropped_ambiguous_deck_seeds": {c: len(s) for c, s in dupes.items()},
+        "comparisons": comparisons,
     }
 
 
@@ -485,6 +606,22 @@ def _print_human(report: dict) -> str:
         )
         L.append(f"  by position  {pos}  (bb/100)")
 
+    pr = report.get("paired")
+    if pr and pr.get("available"):
+        metric = "aivat" if pr["used_aivat"] else "raw"
+        L.append("")
+        L.append(
+            f"PAIRED Δ vs {pr['baseline']}  (CRN, {metric} bb/100, deck-matched; "
+            "95% bootstrap CI)"
+        )
+        for cmp in pr["comparisons"]:
+            b = cmp["ci95_bootstrap"]
+            L.append(
+                f"  {cmp['treatment']:<14} {_fmt(cmp['mean_delta_bb100'],'+.2f')}  "
+                f"[{_fmt(b['lo'],'+.2f')}, {_fmt(b['hi'],'+.2f')}]   "
+                f"({cmp['n_paired']} paired hands)"
+            )
+
     ov = rq["overall"]
     rf = ov["resolved_frac"]
     L.append("")
@@ -563,6 +700,7 @@ def build_report(con: sqlite3.Connection) -> dict:
     report = {
         "meta": _query_meta(con),
         "strength": _query_strength(con),
+        "paired": _query_paired(con),
         "range_quality": _query_range_health(con),
         "hu_coverage": _query_hu_coverage(con),
         "approach": _query_approach(con),

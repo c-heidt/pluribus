@@ -670,15 +670,20 @@ Ordered so each step yields something usable before the next.
 10. **Cross-condition pairing / CRN (§10.1).** The variance lever that makes the
     ~10k-hand-per-arm vanilla/B0/A comparison
     ([opponent_modeling.md](opponent_modeling.md) §7) detectable. Three parts:
-    (a) a `max_hands` fixed-count run mode (mutually exclusive with `time_budget`)
-    so arms share the `hand_index` range; (b) a `condition` column + an assertion
-    that dealing/seat-assignment are drawn hero-independently, so a shared
-    `run_seed` guarantees equal `deck_seed` per hand across arms; (c) summary
-    tooling (§8) that joins arms on `deck_seed`, differences `aivat_value` per
-    hand, and bootstraps the CI on the **paired difference** — plus the
-    learning-curve binning (bin A's hands by cumulative opponent-count, difference
-    vs the paired B0 hand). Independent of the modeling package, so it can land
-    before or in parallel with it; it gates the headline result either way.
+    (a) a `max_hands` fixed-count run mode (paired mode: disables `time_budget`)
+    so arms share the `hand_index` range; (b) a `condition` column + the
+    hero-independence invariant (dealing/seat-assignment drawn before any agent
+    call), so a shared `run_seed` guarantees equal `deck_seed` per hand across
+    arms; (c) summary tooling (§8) that joins arms on `deck_seed`, differences
+    `aivat_value` per hand, and bootstraps the CI on the **paired difference**.
+    Independent of the modeling package. *done — schema `games.condition` (v3) +
+    `idx_games_deck`; `EvalConfig.condition` + total-based paired `max_hands`
+    (resume-safe, budget-disabling) + the hero-independence invariant comment in
+    `_play_and_log_one`; `summarize._query_paired` + `_bootstrap_ci` in the report
+    and human block. Tests: CRN deal-is-hero-independent gate, v2→v3 migration,
+    paired-mode total count, `_query_paired` deck-seed join.* The learning-curve
+    binning (bin A's hands by cumulative opponent-count, difference vs the paired
+    B0 hand) rides on Part I's online learner and lands with it.
 
 ## 10. Planned Components
 

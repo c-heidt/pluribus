@@ -47,7 +47,8 @@ from typing import Iterable, Iterator, List, Optional
 
 # Bump on any schema change (games.schema_version); lets analysis span runs (§6).
 # v2: + games.hu_from_street (HU coverage for B-HU, opponent-modeling doc §11.4).
-SCHEMA_VERSION = 2
+# v3: + games.condition (experiment arm for cross-condition CRN pairing, §10.1).
+SCHEMA_VERSION = 3
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +59,7 @@ _SCHEMA_DDL = """
 CREATE TABLE IF NOT EXISTS games (
     game_id            INTEGER PRIMARY KEY,
     run_id             TEXT    NOT NULL,
+    condition          TEXT,
     hand_index         INTEGER NOT NULL,
     schema_version     INTEGER NOT NULL,
     config_fingerprint TEXT    NOT NULL,
@@ -159,9 +161,17 @@ CREATE TABLE IF NOT EXISTS hand_failures (
     failed_at    TEXT
 );
 
+"""
+
+# Indexes are created *after* the additive column migrations in :meth:`open`, since
+# an index may reference a column that an older DB lacks until the ALTER runs
+# (e.g. ``idx_games_condition`` on the v3 ``condition`` column).
+_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_games_table     ON games(table_label);
 CREATE INDEX IF NOT EXISTS idx_games_run       ON games(run_id, hand_index);
 CREATE INDEX IF NOT EXISTS idx_games_pairing   ON games(pairing_id);
+CREATE INDEX IF NOT EXISTS idx_games_deck      ON games(deck_seed);      -- cross-condition CRN join (§10.1)
+CREATE INDEX IF NOT EXISTS idx_games_condition ON games(condition);
 CREATE INDEX IF NOT EXISTS idx_seats_agent     ON game_seats(agent_label);
 CREATE INDEX IF NOT EXISTS idx_seats_lookup    ON game_seats(game_id, seat);
 CREATE INDEX IF NOT EXISTS idx_decisions_game  ON decisions(game_id);
@@ -195,6 +205,7 @@ class GameRow:
     starting_stack: float
     deck_seed: int
     # reproducibility / variance reduction / outcome / provenance (nullable) ----
+    condition: Optional[str] = None              # experiment arm for CRN pairing (§10.1)
     agent_seed: Optional[int] = None
     aivat_value: Optional[float] = None          # filled once AIVAT exists (§10.2)
     pairing_id: Optional[int] = None
@@ -349,6 +360,11 @@ class ExperimentLog:
         have = {r[1] for r in con.execute("PRAGMA table_info(games)")}
         if "hu_from_street" not in have:  # v1 → v2
             con.execute("ALTER TABLE games ADD COLUMN hu_from_street INTEGER")
+        if "condition" not in have:       # v2 → v3
+            con.execute("ALTER TABLE games ADD COLUMN condition TEXT")
+        # Indexes last — after the ALTERs, so an index on a freshly-migrated column
+        # (idx_games_condition) has its column to reference.
+        con.executescript(_INDEX_DDL)
         return cls(con)
 
     def close(self) -> None:

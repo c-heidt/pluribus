@@ -103,9 +103,22 @@ class EvalConfig:
 
     run_id: str
     run_seed: int = 0
+    # Experiment arm for cross-condition CRN pairing (§10.1): 'vanilla' | 'B0' |
+    # 'A(p_max,tau)' etc.  Logged verbatim onto every ``games`` row so the summary
+    # can group/pair arms; ``None`` for single-arm runs.  Does NOT affect play —
+    # arms are paired by sharing ``run_seed``/``table_policy``/table shape, which
+    # makes ``deck_seed`` match per hand (verified hero-independent, §10.1).
+    condition: Optional[str] = None
     table_policy: str = "all_blueprint"       # all_blueprint | random | fixed
     fixed_seats: Optional[Dict[int, str]] = None   # required for table_policy='fixed'
     time_budget_hours: float = 1.0            # wall-clock budget; 0 → unbounded
+    # Paired mode (§10.1): a fixed hand count for this run.  When set it is the
+    # sole stop criterion — the wall-clock ``time_budget_hours`` is ignored — so
+    # every arm of a comparison covers the *same* ``hand_index`` range and pairs
+    # cleanly on ``deck_seed``.  Time-budget mode desyncs arms (a search agent
+    # completes far fewer hands than a blueprint-only one at equal wall-clock), so
+    # any vanilla/B0/A comparison must use ``max_hands``.  ``None`` → budget-bound.
+    max_hands: Optional[int] = None
     n_players: int = 6
     big_blind: int = 100
     small_blind: int = 50
@@ -512,6 +525,8 @@ def _validate_config(cfg: EvalConfig) -> None:
     """
     if cfg.n_players < 2:
         raise ValueError(f"n_players must be >= 2, got {cfg.n_players}")
+    if cfg.max_hands is not None and cfg.max_hands <= 0:
+        raise ValueError(f"max_hands must be > 0 when set, got {cfg.max_hands}")
     if cfg.table_policy not in ("all_blueprint", "random", "fixed"):
         raise ValueError(
             f"unknown table_policy {cfg.table_policy!r}; expected "
@@ -605,13 +620,26 @@ def run_evaluation(
         failure there propagates).  ``None`` → no sync-back (the node-local db is
         the only artifact — a local run with no separate permanent path).
     max_hands
-        Optional hard cap on hands this call (tests; ``None`` → budget-bound only).
+        Optional **per-call** hard cap on hands this invocation (tests/back-compat).
+        Takes precedence over ``cfg.max_hands``.  For the paired-mode fixed count
+        (§10.1) prefer ``EvalConfig.max_hands``, which is *total*-based (resume-safe)
+        and disables the wall-clock budget; ``None`` here + ``cfg.max_hands=None`` →
+        budget-bound only.
     """
     cfg = session.config
     _validate_config(cfg)
     fingerprint = config_fingerprint(session.solver_cfg, cfg.fingerprint_table_policy())
     hand_index = log.next_hand_index(cfg.run_id)
-    budget_s = cfg.time_budget_hours * 3600.0
+    # Paired mode (§10.1): a fixed ``cfg.max_hands`` is the sole stop criterion —
+    # the wall-clock budget is disabled so every arm covers the same hand_index
+    # range and pairs on ``deck_seed``.  It is *total*-based (the resume cursor
+    # already counts logged hands), so a preempted-then-resumed arm still stops at
+    # exactly ``max_hands`` total.  The explicit ``max_hands`` param stays a
+    # per-call cap (tests/back-compat) and takes precedence when passed.
+    budget_s = 0.0 if cfg.max_hands is not None else cfg.time_budget_hours * 3600.0
+    call_cap = max_hands
+    if call_cap is None and cfg.max_hands is not None:
+        call_cap = max(0, cfg.max_hands - hand_index)
     start = time.monotonic()
     n_attempted = 0
     n_failed = 0
@@ -624,7 +652,7 @@ def run_evaluation(
             break
         if budget_s > 0 and (time.monotonic() - start) >= budget_s:
             break
-        if max_hands is not None and n_attempted >= max_hands:
+        if call_cap is not None and n_attempted >= call_cap:
             break
         ok = _play_and_log_one(
             session, log, cfg, fingerprint, hand_index, now_fn, git_sha, hostname
@@ -696,6 +724,12 @@ def _play_and_log_one(
     )
     hero_seat = hand_index % cfg.n_players           # position rotation (§10.1)
     try:
+        # CRN invariant (§10.1): the deal and seat assignment are drawn here from
+        # ``(deck_seed, table_ss)`` — both pure functions of ``(run_seed,
+        # hand_index)`` — and completed BEFORE the hero agent is constructed, so
+        # they are hero-independent.  Arms sharing run_seed/table_policy/table shape
+        # therefore see identical cards + seating per hand (paired on ``deck_seed``).
+        # Do not move any agent construction above this block.
         np.random.seed(deck_seed)
         env = session.new_env()
         seat_labels = assign_seats(
@@ -734,6 +768,7 @@ def _play_and_log_one(
             game_id = log.log_game(
                 GameRow(
                     run_id=cfg.run_id,
+                    condition=cfg.condition,
                     hand_index=hand_index,
                     config_fingerprint=fingerprint,
                     table_label=cfg.table_policy,

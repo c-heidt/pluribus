@@ -330,6 +330,81 @@ class TestResumeAndDeterminism:
 
 
 # --------------------------------------------------------------------------- #
+# Cross-condition CRN plumbing (§10.1) — condition label, paired-mode max_hands,
+# and the load-bearing property: the deal is hero-independent.
+# --------------------------------------------------------------------------- #
+
+class TestCRN:
+
+    def test_condition_is_logged_on_every_game(self, tmp_path):
+        session = _stub_session(run_id="C", n_players=3)
+        session.config.condition = "A(p0.8,t50)"
+        log = ExperimentLog.open(tmp_path / "run.sqlite")
+        try:
+            run_evaluation(log=log, session=session, max_hands=3)
+            conds = [r[0] for r in _rows(log._con, "SELECT condition FROM games")]
+        finally:
+            log.close()
+        assert conds == ["A(p0.8,t50)"] * 3
+
+    def test_cfg_max_hands_is_total_based_and_ignores_budget(self, tmp_path):
+        path = tmp_path / "run.sqlite"
+        session = _stub_session(run_id="P", n_players=3)
+        session.config.max_hands = 3
+        session.config.time_budget_hours = 999.0     # would never stop if consulted
+        log = ExperimentLog.open(path)
+        try:
+            n = run_evaluation(log=log, session=session)   # no param → cfg governs
+            idx = [r[0] for r in _rows(log._con,
+                   "SELECT hand_index FROM games ORDER BY hand_index")]
+        finally:
+            log.close()
+        assert n == 3 and idx == [0, 1, 2]           # fixed count, budget ignored
+
+        # Resume: total is already 3, so a re-run plays 0 more (total-based, not
+        # per-call — the paired arms must not over-run on restart).
+        log2 = ExperimentLog.open(path)
+        s2 = _stub_session(run_id="P", n_players=3)
+        s2.config.max_hands = 3
+        try:
+            n2 = run_evaluation(log=log2, session=s2)
+            idx2 = [r[0] for r in _rows(log2._con,
+                    "SELECT hand_index FROM games ORDER BY hand_index")]
+        finally:
+            log2.close()
+        assert n2 == 0 and idx2 == [0, 1, 2]
+
+    def test_deal_is_hero_independent(self, tmp_path, monkeypatch):
+        """Same (run_seed, config) ⇒ identical cards per hand, regardless of what the
+        hero does mid-hand — the load-bearing CRN property (§10.1).  Simulated by a
+        hero that burns extra global-RNG each hand; the deal must not move."""
+        import evaluation.runner as R
+        real = R.play_hand
+
+        def deal(p):
+            log = ExperimentLog.open(p)
+            try:
+                run_evaluation(log=log, session=_stub_session(run_seed=5, n_players=3),
+                               max_hands=5)
+                return _rows(log._con, "SELECT hand_index, deck_seed, hero_hole "
+                             "FROM games ORDER BY hand_index")
+            finally:
+                log.close()
+
+        baseline = deal(tmp_path / "a.sqlite")
+
+        def greedy(*a, **kw):
+            np.random.rand(257)                      # a hero that behaves differently
+            return real(*a, **kw)
+
+        monkeypatch.setattr(R, "play_hand", greedy)
+        varied = deal(tmp_path / "b.sqlite")
+
+        assert len(baseline) == 5
+        assert baseline == varied                    # deck_seed + hole cards unchanged
+
+
+# --------------------------------------------------------------------------- #
 # Config validation + table policies
 # --------------------------------------------------------------------------- #
 
@@ -352,6 +427,16 @@ class TestConfigValidation:
             # Failed before playing anything — no rows, no wasted failure logging.
             assert _rows(log._con, "SELECT COUNT(*) FROM games")[0][0] == 0
             assert _rows(log._con, "SELECT COUNT(*) FROM hand_failures")[0][0] == 0
+        finally:
+            log.close()
+
+    def test_nonpositive_max_hands_fails_fast(self, tmp_path):
+        session = _stub_session(n_players=3)
+        session.config.max_hands = 0
+        log = ExperimentLog.open(tmp_path / "run.sqlite")
+        try:
+            with pytest.raises(ValueError, match="max_hands"):
+                run_evaluation(log=log, session=session)
         finally:
             log.close()
 
