@@ -287,3 +287,6 @@ dmypy.json
 
 # VS Code
 .vscode/**
+
+# Data
+/data/*

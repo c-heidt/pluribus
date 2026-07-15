@@ -180,6 +180,8 @@ and queried with `json_extract` / `->>` when needed).
 CREATE TABLE games (
     game_id            INTEGER PRIMARY KEY,
     run_id             TEXT    NOT NULL,   -- groups games of one experiment batch
+    condition          TEXT,               -- experiment arm: 'vanilla'|'B0'|'A(p_max,tau)' — the
+                                           --   cross-condition GROUP BY; NULL for single-arm runs (§10.1 CRN)
     hand_index         INTEGER NOT NULL,   -- 0-based position within the run; the resume cursor (§10.1)
     schema_version     INTEGER NOT NULL,   -- bump on schema change; lets analysis span runs
     config_fingerprint TEXT    NOT NULL,   -- hash(solver + leaf + table composition)
@@ -192,7 +194,8 @@ CREATE TABLE games (
     big_blind          REAL    NOT NULL,   -- BB in chips; normalises delta to bb/100
     starting_stack     REAL    NOT NULL,   -- effective stack in chips; /big_blind = depth in BB
     -- reproducibility --------------------------------------------------------
-    deck_seed          INTEGER NOT NULL,   -- reproduces the deal
+    deck_seed          INTEGER NOT NULL,   -- reproduces the deal; also the cross-condition CRN
+                                           --   join key (shared run_seed ⇒ equal deck_seed per hand, §10.1)
     agent_seed         INTEGER,            -- reproduces the search sampling (MCCFR/vector RNG)
     -- variance reduction -----------------------------------------------------
     aivat_value        REAL,               -- AIVAT-adjusted hero outcome (§10.2); the low-variance
@@ -482,6 +485,14 @@ loss. Two 6-max-specific breakdowns matter alongside the top line:
   interval, so small edges become detectable. The summary prefers `aivat_value` when
   present and falls back to the raw query above when it is not. (Seat-rotation
   pairing is an optional secondary fallback, §6.)
+- **Cross-condition paired difference (CRN)** — when comparing arms
+  (`condition` = vanilla/B0/A, §10.1), the headline is not each arm's absolute
+  `bb100` but the **per-hand difference** between arms on the matched deal: join on
+  `deck_seed`, compute `Δ = aivat_value(A) − aivat_value(B0)` per hand, and bootstrap
+  the CI on `mean(Δ)`. Because the shared card-luck cancels, this CI is dramatically
+  tighter than differencing the two arms' independent means — it is what makes a
+  small `A − B0` edge significant at ~10k hands. The learning curve is the same Δ,
+  bucketed by A's cumulative opponent-count at each hand.
 
 **Search cost / budget health.** Are searches firing, and do they fit the budget?
 
@@ -656,6 +667,18 @@ Ordered so each step yields something usable before the next.
    than one run to compare. *done — action-node scope; see §10.2. Built:*
    [evaluation/aivat.py](../evaluation/aivat.py), wired into the runner behind the
    opt-in `--aivat` flag.
+10. **Cross-condition pairing / CRN (§10.1).** The variance lever that makes the
+    ~10k-hand-per-arm vanilla/B0/A comparison
+    ([opponent_modeling.md](opponent_modeling.md) §7) detectable. Three parts:
+    (a) a `max_hands` fixed-count run mode (mutually exclusive with `time_budget`)
+    so arms share the `hand_index` range; (b) a `condition` column + an assertion
+    that dealing/seat-assignment are drawn hero-independently, so a shared
+    `run_seed` guarantees equal `deck_seed` per hand across arms; (c) summary
+    tooling (§8) that joins arms on `deck_seed`, differences `aivat_value` per
+    hand, and bootstraps the CI on the **paired difference** — plus the
+    learning-curve binning (bin A's hands by cumulative opponent-count, difference
+    vs the paired B0 hand). Independent of the modeling package, so it can land
+    before or in parallel with it; it gates the headline result either way.
 
 ## 10. Planned Components
 
@@ -729,6 +752,12 @@ final VACUUM INTO; run the §8 summary
 - **Time budget** mirrors blueprint training's `max_runtime_hours`: simulate until
   the budget ends, stopping only at a **hand boundary** (never mid-hand) so every
   `games` row is complete. No fixed hand count — the run fills the budget.
+  **Paired mode (`max_hands` set) overrides this:** the run stops at an exact hand
+  count instead of a wall-clock budget, so conditions being compared cover the
+  *same* `hand_index` range (§10.1 "Cross-condition pairing"). Time-budget mode
+  desyncs conditions — a search agent completes far fewer hands than a
+  blueprint-only agent in equal wall-clock — which breaks pairing; use `max_hands`
+  for any A/B0/vanilla comparison.
 - **Resume / idempotency** via the `(run_id, hand_index)` cursor (§6): a restarted or
   preempted run reads the max completed `hand_index` and continues from the next.
   Deterministic `derive(run_seed, hand_index)` seeding makes the continuation
@@ -738,7 +767,52 @@ final VACUUM INTO; run the §8 summary
 - **Config persisted** as `config.yaml` next to the snapshot (mirrors the blueprint
   runner); `config_fingerprint = hash(solver + leaf + table_policy)`.
 
+**Cross-condition pairing (common random numbers).** The single highest-leverage
+variance lever for comparing approaches (vanilla / B0 / A of
+[opponent_modeling.md](opponent_modeling.md) §7), and it costs **zero extra
+compute** — it is the same hands, seeded identically, not more hands. The
+mechanism is already latent in the deterministic seeding; this locks it:
+
+- **Shared `run_seed` + identical `table_policy` + identical table shape.** Deal
+  and seating are pure functions of `(run_seed, hand_index)` — `deck_seed =
+  derive(run_seed, hand_index)`, `seats = assign(table_policy, hand_index)`,
+  hero/button rotation keyed by `hand_index` — and crucially **none of them depend
+  on the hero agent**. So two runs that share `run_seed` and `table_policy` see, at
+  each `hand_index`, the *same* cards, the *same* opponent seating, and the hero in
+  the *same* seat. Only the hero's own strategy (the treatment) differs.
+  *Verified mechanism:* the deal is **cursor-based over a single
+  construction-time shuffle** — `Deck.__init__` shuffles once off the global RNG
+  (seeded with `deck_seed` immediately before `new_env`), and `deal_private_cards`
+  / `deal_community` only advance a cursor, never re-drawing; the hero's search runs
+  on deepcopies with its own `default_rng`, so nothing it does can perturb the
+  played board (confirmed: interleaving arbitrary global-RNG use between streets
+  leaves holes + board bit-identical). *Precondition, because the board's offset in
+  the permutation depends on how many holes were dealt first:* the arms must also
+  match `n_players` and the deck/stack config (`low/high_card_rank`,
+  `starting_stack`) — a different seat count reshuffles which cards land on the
+  board. The runner should assert hero-independence (dealing/assignment drawn before
+  and separately from any agent call).
+- **`deck_seed` is the cross-run join key.** Pair the conditions on `deck_seed`
+  (equivalently `hand_index` under a shared `run_seed`) and difference per hand:
+  `Δ = aivat_value(A) − aivat_value(B0)` on the matched deal. The enormous
+  shared card-luck cancels in `Δ`, so its CI is far tighter than either arm's —
+  and this **stacks multiplicatively with AIVAT** (§10.2), which further corrects
+  the residual opponent-action variance after the tree diverges. (`pairing_id`
+  remains the *within*-run seat-rotation lever; this is the *across*-run one.)
+- **Fixed `max_hands`, not a time budget** (see the loop note above), so every
+  condition contains the same `hand_index` set to pair against. Each condition is
+  its own `run_id`; a `condition` label column on `games` (e.g. `vanilla|B0|A`,
+  with the `(p_max, τ)` cell for A) makes the paired join self-describing without a
+  run_id→method side table.
+- **What cancels vs. what doesn't.** Card luck cancels fully (shared hole cards +
+  board). Opponent *action* draws share a seed but desync once the hero diverges
+  the tree — that residual is AIVAT's job, not CRN's; sharing the opponent-RNG
+  stream still helps on the pre-divergence (early-street) decisions. Report the CI
+  on the **paired difference** of `aivat_value` (bootstrapped over hands), never on
+  the two arms independently.
+
 **Run config fields:** `run_id`, `run_seed`, `table_policy`, `time_budget`,
+`max_hands` (paired mode; mutually exclusive with `time_budget`), `condition`,
 `big_blind`, `starting_stack`, `n_players = 6`, `sync_interval`, scratch/permanent
 paths.
 

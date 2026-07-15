@@ -22,6 +22,7 @@ from evaluation.blueprint_metrics import (
     _hist_percentile,
     analyze,
     build_report,
+    compute_leaf_coverage,
     compute_regret_metrics,
     compute_street_metrics,
     main,
@@ -225,6 +226,201 @@ class TestRegretMetrics:
 
     def test_no_files_returns_none(self):
         assert compute_regret_metrics([]) is None
+
+
+# --------------------------------------------------------------------------- #
+# Leaf coverage (strategy/regret row-join)
+# --------------------------------------------------------------------------- #
+
+# Row-aligned strategy + regret rows, hand-labelled for min_strategy_mass=10.
+# The join classifies each infoset exactly as BlueprintPolicy would resolve a
+# search leaf: trusted average (strat mass >= threshold), else regret fallback
+# (any positive regret), else uniform.
+LC_STRAT_ROWS = np.array(
+    [
+        [3, 3, 2, 2],      # mass 10 -> avg_trusted (boundary: == threshold)
+        [1, 0, 0, 0],      # mass 1  -> not trusted; regret positive -> fallback
+        [0, 0, 0, 0],      # mass 0; regret all negative              -> uniform
+        [0, 0, 0, 0],      # mass 0; regret all zero                  -> uniform
+        [20, 0, 0, 0],     # mass 20 -> avg_trusted (+ positive regret, no dbl-count)
+    ],
+    dtype=np.int32,
+)
+LC_REGRET_ROWS = np.array(
+    [
+        [-1, -1, -1, -1],  # trusted by mass; regret sign irrelevant
+        [5, -3, 0, 0],     # positive -> regret fallback
+        [-5, -2, -1, 0],   # no positive, mass 0 -> uniform
+        [0, 0, 0, 0],      # no positive, mass 0 -> uniform
+        [7, -2, 0, 0],     # positive but already trusted -> avg_trusted
+    ],
+    dtype=np.int32,
+)
+
+
+def _write_leaf_checkpoint(tmp_path, *, streets=(0,), t=42, n_players=2):
+    """Blueprint dir whose strategy/regret chunks are row-aligned for the join."""
+    bp = tmp_path / "blueprint"
+    cp = bp / f"checkpoint_{t:012d}"
+    cp.mkdir(parents=True)
+    ncs = {r: 0 for r in range(4)}
+    for r in streets:
+        np.save(cp / f"strategy_{r}_chunk_000000.npy", LC_STRAT_ROWS)
+        np.save(cp / f"regret_{r}_chunk_000000.npy", LC_REGRET_ROWS)
+        ncs[r] = 1
+    joblib.dump(
+        {"t": t, "n_players": n_players, "n_chunks_per_street": ncs},
+        cp / "server_state.pkl",
+    )
+    return bp
+
+
+class TestLeafCoverage:
+    def _files(self, tmp_path):
+        cp = tmp_path / "cp"
+        cp.mkdir()
+        np.save(cp / "strategy_0_chunk_000000.npy", LC_STRAT_ROWS)
+        np.save(cp / "regret_0_chunk_000000.npy", LC_REGRET_ROWS)
+        return (
+            sorted(cp.glob("strategy_0_*.npy")),
+            sorted(cp.glob("regret_0_*.npy")),
+        )
+
+    def test_classification_buckets(self, tmp_path):
+        s, r = self._files(tmp_path)
+        lc, warnings = compute_leaf_coverage(s, r, street=0, min_strategy_mass=10)
+        assert warnings == []
+        assert lc["min_strategy_mass"] == 10
+        assert lc["n_scanned"] == 5
+        assert lc["n_infosets_total"] == 5
+        # avg_trusted rows {0, 4}; regret_fallback {1}; uniform {2, 3}.
+        assert lc["counts"] == {
+            "avg_trusted": 2,
+            "regret_fallback": 1,
+            "uniform": 2,
+            "scanned": 5,
+        }
+        assert lc["avg_trusted_frac"] == pytest.approx(2 / 5)
+        assert lc["regret_fallback_frac"] == pytest.approx(1 / 5)
+        assert lc["uniform_frac"] == pytest.approx(2 / 5)
+        # effective = avg_trusted OR positive-regret = rows {0, 1, 4}.
+        assert lc["effective_frac"] == pytest.approx(3 / 5)
+
+    def test_fractions_sum_to_one(self, tmp_path):
+        s, r = self._files(tmp_path)
+        lc, _ = compute_leaf_coverage(s, r, street=0, min_strategy_mass=10)
+        total = (
+            lc["avg_trusted_frac"] + lc["regret_fallback_frac"] + lc["uniform_frac"]
+        )
+        assert total == pytest.approx(1.0)
+        assert lc["effective_frac"] == pytest.approx(
+            lc["avg_trusted_frac"] + lc["regret_fallback_frac"]
+        )
+
+    def test_threshold_shifts_trusted_to_fallback_or_uniform(self, tmp_path):
+        s, r = self._files(tmp_path)
+        # Raise the bar past row 0's mass (10); its all-negative regret can't
+        # rescue it, so it drops from avg_trusted straight to uniform.
+        lc, _ = compute_leaf_coverage(s, r, street=0, min_strategy_mass=11)
+        assert lc["counts"] == {
+            "avg_trusted": 1,       # only row 4 (mass 20)
+            "regret_fallback": 1,   # row 1
+            "uniform": 3,           # rows 0, 2, 3
+            "scanned": 5,
+        }
+        assert lc["effective_frac"] == pytest.approx(2 / 5)
+
+    def test_batching_matches_single_pass(self, tmp_path):
+        s, r = self._files(tmp_path)
+        whole, _ = compute_leaf_coverage(s, r, street=0, min_strategy_mass=10)
+        batched, _ = compute_leaf_coverage(
+            s, r, street=0, min_strategy_mass=10, batch_rows=1
+        )
+        assert whole["counts"] == batched["counts"]
+
+    def test_multiple_chunks_accumulate(self, tmp_path):
+        cp = tmp_path / "cp"
+        cp.mkdir()
+        for i in range(2):
+            np.save(cp / f"strategy_0_chunk_{i:06d}.npy", LC_STRAT_ROWS)
+            np.save(cp / f"regret_0_chunk_{i:06d}.npy", LC_REGRET_ROWS)
+        s = sorted(cp.glob("strategy_0_*.npy"))
+        r = sorted(cp.glob("regret_0_*.npy"))
+        lc, _ = compute_leaf_coverage(s, r, street=0, min_strategy_mass=10)
+        assert lc["n_scanned"] == 10
+        assert lc["counts"]["avg_trusted"] == 4       # 2 per chunk
+        assert lc["counts"]["uniform"] == 4
+
+    def test_chunk_count_mismatch_warns_and_skips(self, tmp_path):
+        cp = tmp_path / "cp"
+        cp.mkdir()
+        np.save(cp / "strategy_0_chunk_000000.npy", LC_STRAT_ROWS)
+        np.save(cp / "strategy_0_chunk_000001.npy", LC_STRAT_ROWS)
+        np.save(cp / "regret_0_chunk_000000.npy", LC_REGRET_ROWS)
+        s = sorted(cp.glob("strategy_0_*.npy"))
+        r = sorted(cp.glob("regret_0_*.npy"))
+        lc, warnings = compute_leaf_coverage(s, r, street=0)
+        assert lc is None
+        assert len(warnings) == 1 and "cannot row-join" in warnings[0]
+
+    def test_row_count_mismatch_within_chunk_warns_and_skips(self, tmp_path):
+        cp = tmp_path / "cp"
+        cp.mkdir()
+        np.save(cp / "strategy_0_chunk_000000.npy", LC_STRAT_ROWS)          # 5 rows
+        np.save(cp / "regret_0_chunk_000000.npy", LC_REGRET_ROWS[:3])       # 3 rows
+        s = sorted(cp.glob("strategy_0_*.npy"))
+        r = sorted(cp.glob("regret_0_*.npy"))
+        lc, warnings = compute_leaf_coverage(s, r, street=0)
+        assert lc is None
+        assert len(warnings) == 1 and "row mismatch" in warnings[0]
+
+    def test_missing_table_returns_none(self, tmp_path):
+        s, r = self._files(tmp_path)
+        assert compute_leaf_coverage([], r, street=0) == (None, [])
+        assert compute_leaf_coverage(s, [], street=0) == (None, [])
+
+    def test_sampling_keeps_tables_aligned(self, tmp_path):
+        cp = tmp_path / "cp"
+        cp.mkdir()
+        for i in range(4):
+            np.save(cp / f"strategy_0_chunk_{i:06d}.npy", LC_STRAT_ROWS)
+            np.save(cp / f"regret_0_chunk_{i:06d}.npy", LC_REGRET_ROWS)
+        s = sorted(cp.glob("strategy_0_*.npy"))
+        r = sorted(cp.glob("regret_0_*.npy"))
+        lc, warnings = compute_leaf_coverage(
+            s, r, street=0, min_strategy_mass=10, sample_chunks=2
+        )
+        assert warnings == []
+        assert lc["sampled"] is True
+        assert lc["n_chunks_read"] == 2
+        assert lc["n_chunks_total"] == 4
+        assert lc["n_infosets_total"] == 20          # exact: 4 chunks * 5 rows
+        assert lc["n_scanned"] == 10                 # 2 sampled chunks * 5 rows
+        # Same per-chunk composition, so fractions are unchanged by sampling.
+        assert lc["avg_trusted_frac"] == pytest.approx(2 / 5)
+
+    def test_build_report_includes_leaf_coverage(self, tmp_path):
+        bp = _write_leaf_checkpoint(tmp_path, streets=(0, 3))
+        report = build_report(bp, include_leaf_coverage=True, min_strategy_mass=10)
+        assert set(report["leaf_coverage"]) == {"preflop", "river"}
+        assert report["meta"]["min_strategy_mass"] == 10
+        assert report["leaf_coverage"]["river"]["effective_frac"] == pytest.approx(3 / 5)
+
+    def test_leaf_coverage_off_by_default(self, tmp_path):
+        bp = _write_leaf_checkpoint(tmp_path)
+        report = build_report(bp)
+        assert report["leaf_coverage"] == {}
+        assert report["meta"]["min_strategy_mass"] is None
+
+    def test_main_cli_leaf_coverage_flag(self, tmp_path):
+        bp = _write_leaf_checkpoint(tmp_path)
+        rc = main(
+            [str(bp), "--out", str(tmp_path / "o"), "--leaf-coverage",
+             "--min-strategy-mass", "10"]
+        )
+        assert rc == 0
+        report = json.load(open(tmp_path / "o" / "blueprint_metrics.json"))
+        assert report["leaf_coverage"]["preflop"]["counts"]["avg_trusted"] == 2
 
 
 # --------------------------------------------------------------------------- #

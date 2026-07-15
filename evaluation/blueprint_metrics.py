@@ -35,6 +35,19 @@ Headline metrics, per street:
 - **Regret health** (opt-in): fraction of regret entries at the
   :data:`~poker_ai.tables.cfr_tables.REGRET_FLOOR`, below the Pluribus prune
   threshold, and with positive regret.
+- **Leaf coverage** (opt-in, ``--leaf-coverage``): the metric that matters when
+  the blueprint is queried as a depth-limited-search *leaf* continuation.
+  :class:`~poker_ai.search.policy.BlueprintPolicy` resolves each infoset to the
+  **average** strategy when its visit mass is trustworthy (``>=
+  min_strategy_mass``), else falls back to regret-matching the (far denser)
+  **regret** row, else to uniform.  This mode row-joins the strategy and regret
+  tables — valid because both share the per-street infoset index, so row *i* is
+  the same infoset in both — and reports, per street, the fraction of infosets a
+  leaf query would resolve to a trusted average (``avg_trusted``), to a regret
+  fallback (``regret_fallback``), or to uniform (``uniform``).  ``effective`` =
+  ``avg_trusted + regret_fallback`` is the fraction that yields a real (non-
+  uniform) blueprint opinion — the true leaf coverage, which the strategy-table
+  ``visited_frac`` alone understates.
 
 Design points:
 
@@ -87,6 +100,12 @@ _MASS_BINS = 120             # log10(row visit mass) histogram over [0, 12]
 _MASS_LOG10_MAX = 12.0
 _DEFAULT_BATCH_ROWS = 1_000_000
 _DEFAULT_SAMPLE_CHUNKS = 4   # chunks/street read by the CLI sanity check
+
+# Minimum strategy-row visit mass for BlueprintPolicy to trust the average
+# strategy at a leaf; below it the policy falls back to regret matching.
+# Mirrors the ``min_strategy_mass`` default in
+# :class:`poker_ai.search.policy.BlueprintPolicy` — keep in sync.
+_DEFAULT_MIN_STRATEGY_MASS = 10
 
 
 # --------------------------------------------------------------------------- #
@@ -141,6 +160,20 @@ def _select_chunks(
         {int(round(i)) for i in np.linspace(0, len(files) - 1, sample_chunks)}
     )
     return [files[i] for i in idx], True
+
+
+def _select_indices(n: int, sample_chunks: Optional[int]) -> Tuple[List[int], bool]:
+    """Chunk indices to read: ``sample_chunks`` evenly-spaced (incl. first+last).
+
+    The index-based twin of :func:`_select_chunks`.  Returning indices (rather
+    than files) lets a caller apply the *same* selection to two parallel file
+    lists — used by :func:`compute_leaf_coverage` to keep the strategy and
+    regret chunk streams row-aligned.
+    """
+    if not sample_chunks or sample_chunks <= 0 or n <= sample_chunks:
+        return list(range(n)), False
+    idx = sorted({int(round(i)) for i in np.linspace(0, n - 1, sample_chunks)})
+    return idx, True
 
 
 def _action_labels(width: int, street: int) -> Tuple[List[str], bool]:
@@ -407,6 +440,114 @@ def compute_regret_metrics(
     }
 
 
+def compute_leaf_coverage(
+    strategy_files: Sequence[Path],
+    regret_files: Sequence[Path],
+    street: int,
+    *,
+    min_strategy_mass: int = _DEFAULT_MIN_STRATEGY_MASS,
+    sample_chunks: Optional[int] = None,
+    batch_rows: int = _DEFAULT_BATCH_ROWS,
+) -> Tuple[Optional[dict], List[str]]:
+    """Row-join strategy + regret chunks into a leaf-coverage dict.
+
+    Classifies every allocated infoset by how
+    :class:`~poker_ai.search.policy.BlueprintPolicy` would resolve it as a
+    depth-limited-search leaf continuation:
+
+    - ``avg_trusted`` — strategy visit mass ``>= min_strategy_mass``; the
+      converged average strategy is used (the best case).
+    - ``regret_fallback`` — not trusted, but the regret row has at least one
+      positive entry, so regret matching yields a non-uniform distribution.
+    - ``uniform`` — neither; the leaf gets no blueprint opinion.
+
+    ``effective`` (``avg_trusted + regret_fallback``) is the fraction of leaf
+    queries that resolve to a real strategy — the true leaf coverage.
+
+    The join is positional: both tables share the per-street infoset index
+    (:class:`poker_ai.tables.cfr_tables.CFRTables`), so row *i* is the same
+    infoset in ``strategy_{street}_chunk_*`` and ``regret_{street}_chunk_*``.
+    Alignment is verified per chunk (matching row counts); a mismatch aborts
+    with a warning rather than silently reporting a bogus join.
+
+    Returns ``(dict_or_None, warnings)``.  ``None`` when the street has no
+    strategy or no regret chunks, or when the two tables cannot be aligned.
+
+    Caveats (documented, mild, and in the safe direction for a diagnostic):
+
+    - The policy masks the strategy row to the node's *legal* actions before the
+      mass check; this pass uses the raw row sum, so ``avg_trusted`` is a slight
+      over-count (a masked row could dip below the threshold at some node).
+    - ``regret_fallback`` tests for any positive regret in the full row, not only
+      among legal actions, for the same reason.
+    """
+    strategy_files = list(strategy_files)
+    regret_files = list(regret_files)
+    warnings: List[str] = []
+    if not strategy_files or not regret_files:
+        return None, warnings
+    if len(strategy_files) != len(regret_files):
+        warnings.append(
+            f"street {street}: {len(strategy_files)} strategy chunks vs "
+            f"{len(regret_files)} regret chunks — cannot row-join; leaf "
+            f"coverage skipped"
+        )
+        return None, warnings
+
+    idx, sampled = _select_indices(len(strategy_files), sample_chunks)
+
+    n_scanned = 0
+    n_avg_trusted = 0      # strat mass >= threshold
+    n_regret_pos = 0       # any positive regret (informative fallback)
+    n_effective = 0        # avg_trusted OR regret_pos (non-uniform leaf)
+    width: Optional[int] = None
+    for i in idx:
+        s_arr = np.load(strategy_files[i], mmap_mode="r")
+        r_arr = np.load(regret_files[i], mmap_mode="r")
+        if s_arr.shape[0] != r_arr.shape[0]:
+            warnings.append(
+                f"street {street}: chunk {i} row mismatch "
+                f"(strategy {s_arr.shape[0]} vs regret {r_arr.shape[0]}) — "
+                f"leaf coverage skipped"
+            )
+            return None, warnings
+        if width is None:
+            width = int(s_arr.shape[1])
+        for start in range(0, s_arr.shape[0], batch_rows):
+            s_batch = np.asarray(s_arr[start : start + batch_rows])
+            r_batch = np.asarray(r_arr[start : start + batch_rows])
+            n_scanned += s_batch.shape[0]
+            avg_trusted = s_batch.sum(axis=1, dtype=np.int64) >= min_strategy_mass
+            regret_pos = (r_batch > 0).any(axis=1)
+            n_avg_trusted += int(avg_trusted.sum())
+            n_regret_pos += int(regret_pos.sum())
+            n_effective += int((avg_trusted | regret_pos).sum())
+
+    if n_scanned == 0:
+        return None, warnings
+
+    n_regret_fallback = n_effective - n_avg_trusted   # regret_pos & ~avg_trusted
+    n_uniform = n_scanned - n_effective
+    return {
+        "min_strategy_mass": int(min_strategy_mass),
+        "n_chunks_total": len(strategy_files),
+        "n_chunks_read": len(idx),
+        "sampled": sampled,
+        "n_infosets_total": _infer_total_rows(strategy_files),
+        "n_scanned": n_scanned,
+        "avg_trusted_frac": n_avg_trusted / n_scanned,
+        "regret_fallback_frac": n_regret_fallback / n_scanned,
+        "effective_frac": n_effective / n_scanned,
+        "uniform_frac": n_uniform / n_scanned,
+        "counts": {
+            "avg_trusted": n_avg_trusted,
+            "regret_fallback": n_regret_fallback,
+            "uniform": n_uniform,
+            "scanned": n_scanned,
+        },
+    }, warnings
+
+
 # --------------------------------------------------------------------------- #
 # Report assembly
 # --------------------------------------------------------------------------- #
@@ -417,6 +558,8 @@ def build_report(
     *,
     checkpoint: Optional[str] = None,
     include_regret: bool = False,
+    include_leaf_coverage: bool = False,
+    min_strategy_mass: int = _DEFAULT_MIN_STRATEGY_MASS,
     sample_chunks: Optional[int] = None,
     batch_rows: int = _DEFAULT_BATCH_ROWS,
 ) -> dict:
@@ -425,6 +568,9 @@ def build_report(
     ``sample_chunks`` bounds how many chunks per street are read (``None`` =
     every chunk = exact frequencies).  ``include_regret`` adds the regret-health
     tables (off by default — it is a training diagnostic and doubles I/O).
+    ``include_leaf_coverage`` adds the strategy/regret row-join that reports how
+    a search leaf would resolve each infoset (average vs. regret fallback vs.
+    uniform); it reads both tables, so it also roughly doubles I/O.
     """
     import joblib
 
@@ -435,6 +581,7 @@ def build_report(
     warnings: List[str] = []
     streets: Dict[str, dict] = {}
     regret: Dict[str, dict] = {}
+    leaf_coverage: Dict[str, dict] = {}
     for r in range(4):
         s_files = _chunk_files(cp_dir, "strategy", r)
         n_expected = int(
@@ -458,6 +605,18 @@ def build_report(
             )
             if rm is not None:
                 regret[_STREET_NAME[r]] = rm
+        if include_leaf_coverage:
+            lc, lc_warnings = compute_leaf_coverage(
+                s_files,
+                _chunk_files(cp_dir, "regret", r),
+                r,
+                min_strategy_mass=min_strategy_mass,
+                sample_chunks=sample_chunks,
+                batch_rows=batch_rows,
+            )
+            warnings.extend(lc_warnings)
+            if lc is not None:
+                leaf_coverage[_STREET_NAME[r]] = lc
 
     any_sampled = any(m["sampled"] for m in streets.values())
     report = {
@@ -469,9 +628,11 @@ def build_report(
             "n_infosets_total": sum(m["n_infosets_total"] for m in streets.values()),
             "sampled": any_sampled,
             "sample_chunks": sample_chunks if any_sampled else None,
+            "min_strategy_mass": min_strategy_mass if include_leaf_coverage else None,
         },
         "streets": streets,
         "regret": regret,
+        "leaf_coverage": leaf_coverage,
         "warnings": warnings,
     }
     return report
@@ -535,6 +696,14 @@ def _print_human(report: dict) -> str:
                 f"  regret health          positive {_fmt(rg['frac_positive'], '.1%')}   "
                 f"prunable {_fmt(rg['frac_prunable'], '.1%')}   "
                 f"at floor {_fmt(rg['frac_at_floor'], '.2%')}"
+            )
+        lc = report.get("leaf_coverage", {}).get(name)
+        if lc:
+            L.append(
+                f"  leaf coverage          effective {_fmt(lc['effective_frac'], '.1%')}   "
+                f"(avg {_fmt(lc['avg_trusted_frac'], '.1%')} + "
+                f"regret {_fmt(lc['regret_fallback_frac'], '.1%')})   "
+                f"uniform {_fmt(lc['uniform_frac'], '.1%')}"
             )
     if report["warnings"]:
         L.append("")
@@ -604,6 +773,16 @@ def render_markdown(report: dict) -> str:
                 f"{_fmt(rg['frac_prunable'], '.1%')} prune-eligible "
                 f"(< {PRUNE_THRESHOLD:,}), {_fmt(rg['frac_at_floor'], '.2%')} at floor"
             )
+        lc = report.get("leaf_coverage", {}).get(name)
+        if lc:
+            L.append(
+                f"- Leaf coverage (as search-leaf continuation, "
+                f"min_strategy_mass={lc['min_strategy_mass']}): "
+                f"**{_fmt(lc['effective_frac'], '.1%')} effective** "
+                f"(non-uniform) = {_fmt(lc['avg_trusted_frac'], '.1%')} trusted "
+                f"average + {_fmt(lc['regret_fallback_frac'], '.1%')} regret "
+                f"fallback; {_fmt(lc['uniform_frac'], '.1%')} resolve to uniform"
+            )
         L.append("")
         L.append("| action | play freq | mean strategy |")
         L.append("|---|---:|---:|")
@@ -637,6 +816,8 @@ def analyze(
     out_dir=None,
     checkpoint: Optional[str] = None,
     include_regret: bool = False,
+    include_leaf_coverage: bool = False,
+    min_strategy_mass: int = _DEFAULT_MIN_STRATEGY_MASS,
     sample_chunks: Optional[int] = None,
     batch_rows: int = _DEFAULT_BATCH_ROWS,
     write_files: bool = True,
@@ -651,6 +832,8 @@ def analyze(
         blueprint_path,
         checkpoint=checkpoint,
         include_regret=include_regret,
+        include_leaf_coverage=include_leaf_coverage,
+        min_strategy_mass=min_strategy_mass,
         sample_chunks=sample_chunks,
         batch_rows=batch_rows,
     )
@@ -711,6 +894,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Also scan the regret tables (training diagnostic; doubles I/O).",
     )
     parser.add_argument(
+        "--leaf-coverage",
+        action="store_true",
+        help="Row-join strategy + regret tables and report how a search leaf "
+        "would resolve each infoset (trusted average / regret fallback / "
+        "uniform). The true leaf coverage for subgame-solving; reads both "
+        "tables, so it roughly doubles I/O.",
+    )
+    parser.add_argument(
+        "--min-strategy-mass",
+        type=int,
+        default=_DEFAULT_MIN_STRATEGY_MASS,
+        help="Visit-mass threshold above which a leaf trusts the average "
+        f"strategy over the regret fallback (default: {_DEFAULT_MIN_STRATEGY_MASS}, "
+        "matching BlueprintPolicy). Only affects --leaf-coverage.",
+    )
+    parser.add_argument(
         "--no-files", action="store_true", help="Print only; do not write artifacts."
     )
     parser.add_argument(
@@ -725,6 +924,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         out_dir=args.out,
         checkpoint=args.checkpoint,
         include_regret=args.regret,
+        include_leaf_coverage=args.leaf_coverage,
+        min_strategy_mass=args.min_strategy_mass,
         sample_chunks=None if args.full else args.sample_chunks,
         batch_rows=args.batch_rows,
         write_files=not args.no_files,

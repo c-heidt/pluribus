@@ -77,14 +77,27 @@ export PLURIBUS_STRATEGY_BATCH_SIZE=${PLURIBUS_STRATEGY_BATCH_SIZE:-128}
 # Average-strategy playthroughs folded into EACH cfr job (per player, after
 # warm-up).  The strategy pass is now interleaved with CFR and flushed with the
 # regret delta at the sync barrier instead of running as its own barrier — so
-# with PLURIBUS_CFR_CORE=1 it is core-accelerated AND overlapped.  Pinned to 10
-# (= 2 strategy playthroughs per CFR traversal at PLURIBUS_CFR_BATCH_SIZE=5) —
-# a little above the auto default, and INDEPENDENT of SYNC_INTERVAL (unlike the
-# auto-size, whose formula has sync_interval in the denominator, so bumping the
-# sync interval would otherwise silently cut strategy throughput).  RAISE for
-# faster average-strategy convergence; UNSET to return to the SYNC_INTERVAL-coupled
-# auto-size from PLURIBUS_STRATEGY_BATCH_SIZE.
-export PLURIBUS_STRATEGY_PER_JOB=${PLURIBUS_STRATEGY_PER_JOB:-10}
+# with PLURIBUS_CFR_CORE=1 it is core-accelerated AND overlapped.  INDEPENDENT of
+# SYNC_INTERVAL (unlike the auto-size, whose formula has sync_interval in the
+# denominator, so bumping the sync interval would otherwise silently cut strategy
+# throughput).  UNSET to return to the SYNC_INTERVAL-coupled auto-size from
+# PLURIBUS_STRATEGY_BATCH_SIZE.
+#
+# Pinned to 30 (was 10).  The average-strategy table is only *trusted* as a
+# search-leaf continuation once a row's visit mass reaches BlueprintPolicy's
+# min_strategy_mass=10; below that the leaf falls back to the noisier last-iterate
+# regret match.  On the 2p/20-card blueprint at 52.5M iters the MEDIAN visited
+# river row held only ~3 visits (mass_log10 p50≈0.49) — ~3x short of the
+# threshold — so only ~9% of river leaves resolved to the converged average and
+# ~90% used the regret fallback (measured via
+# `python -m evaluation.blueprint_metrics --leaf-coverage`).  Strategy mass is
+# linear in playthrough volume, so ~3x the volume (10 -> 30) lifts the median
+# river row across the trust threshold, shrinking the regret-fallback share.
+# Cost: strategy sampling is a single non-branching line (orders of magnitude
+# cheaper than a CFR traversal), so ~10-15% added worker time — cheap for the
+# leaf-quality gain.  RAISE further (40-50) to trust more of the deep-street tail;
+# re-measure --leaf-coverage per checkpoint to confirm the fallback share drops.
+export PLURIBUS_STRATEGY_PER_JOB=${PLURIBUS_STRATEGY_PER_JOB:-30}
 export PLURIBUS_CHUNK_SIZE=${PLURIBUS_CHUNK_SIZE:-4000000}
 # Shared-memory index cache: serves the per-node info-set lookup from shm
 # instead of an LMDB read txn (the dominant inner-loop cost).  Capacities are
