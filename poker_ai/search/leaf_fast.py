@@ -40,14 +40,36 @@ from typing import List, Mapping, Tuple
 
 import numpy as np
 
-from environment.action_space import CANONICAL_ACTIONS
+from environment.action_space import ACTION_TO_IDX, CANONICAL_ACTIONS
 from environment.poker_env import PolicyState
 from poker_ai.blueprint.tree_utils import sample_index
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.leaf import continuation_value
-from poker_ai.search.policy import BiasClass
+from poker_ai.search.policy import BiasClass, BlueprintPolicy
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_core_policy(policies, profile):
+    """The shared ``BlueprintPolicy`` backing every acting seat's bias IF it exposes
+    a built in-core reader — Phase 4c; else ``None`` (→ the Python callback).
+
+    Requires ONE ``BlueprintPolicy`` instance across the biases in ``profile`` so a
+    single ``CoreTables`` (queried per-decision with the seat's bias) serves them all
+    — exactly how ``build_blueprint_session`` wires the fleet.  Any other fleet
+    (``UniformPolicy``, a heterogeneous set, or a blueprint opened without the shm
+    cache) yields ``None`` and the rollout keeps ``_policy_state`` + ``.strategy``.
+    """
+    try:
+        used = {policies[b] for b in profile.values()}
+    except (KeyError, TypeError):
+        return None
+    if len(used) != 1:
+        return None
+    p = next(iter(used))
+    if not isinstance(p, BlueprintPolicy):
+        return None
+    return p if p._ensure_core() is not None else None
 
 
 def _core_state():
@@ -134,6 +156,13 @@ def continuation_value_fast(
     full_deck = [int(c) for c in np.unique(frontier_env.combo_cards)]
     undealt = np.array([c for c in full_deck if c not in used], dtype=np.int64)
 
+    # Phase 4c: serve the blueprint policy read in-core (skip the per-decision
+    # PolicyState build + Python ``strategy``) when the fleet is a cache-backed
+    # BlueprintPolicy; else ``None`` → the Python callback below.  ``legal`` is
+    # canonical-only here (overlay frontiers already fell back above), so the
+    # canonical→legal map is a clean gather.
+    core_policy = _resolve_core_policy(cfg.policies, profile)
+
     cache = runout_cache if runout_cache is not None else {}
     accum = np.zeros(n, dtype=np.float64)
     try:
@@ -153,9 +182,17 @@ def continuation_value_fast(
                         f"{seat}; it must cover every seat that can act."
                     )
                 legal = [a for a in fs.legal_actions() if a is not None]
-                probs = cfg.policies[profile[seat]].strategy(
-                    _policy_state(fs, legal), bias=profile[seat]
-                )
+                bias = profile[seat]
+                if core_policy is not None:
+                    br = fs.betting_round
+                    legal_cols = np.array(
+                        [ACTION_TO_IDX[br][a] for a in legal], dtype=np.int64
+                    )
+                    probs = core_policy.core_sigma(br, fs.info_set(), legal_cols, bias)
+                else:
+                    probs = cfg.policies[bias].strategy(
+                        _policy_state(fs, legal), bias=bias
+                    )
                 idx = sample_index(rng, probs)
                 tokens.append(fs.step_in_place(legal[idx]))
             if use_equity and fs.is_decision_free:

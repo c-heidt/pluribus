@@ -24,6 +24,7 @@ with the same ``--nickname`` continues an interrupted run.  There is
 no separate ``resume`` command.
 """
 import logging
+import os
 from pathlib import Path
 from typing import Dict
 
@@ -83,18 +84,18 @@ def train():
 @train.command()
 @click.option(
     "--n_players",
-    default=6,
+    default=2,
     help="The number of players in the game.",
 )
 @click.option(
     "--max_runtime_hours",
-    default=71.5,
+    default=8.0,
     type=float,
     help="Wall-clock budget for this run in hours. Training stops when elapsed time reaches this limit.",
 )
 @click.option(
     "--sync_interval",
-    default=500,
+    default=1000,
     help=(
         "How many iterations between worker sync barriers.  This is the base "
         "unit for all cycle-based options.  Higher values keep workers busier "
@@ -103,7 +104,7 @@ def train():
 )
 @click.option(
     "--discount_interval",
-    default=5,
+    default=60,
     help=(
         "Apply LCFR discounting every N sync cycles "
         "(= N * sync_interval iterations)."
@@ -111,12 +112,12 @@ def train():
 )
 @click.option(
     "--discount_duration_cycles",
-    default=100,
+    default=1100,
     help="Close the LCFR discount window after this many sync cycles (= N * sync_interval iterations).",
 )
 @click.option(
     "--update_threshold",
-    default=60,
+    default=70,
     help=(
         "Start updating the strategy after this many sync cycles "
         "(= N * sync_interval iterations)."
@@ -124,12 +125,12 @@ def train():
 )
 @click.option(
     "--strategy_interval",
-    default=20,
+    default=1,
     help="Update the current strategy every N sync cycles (= N * sync_interval iterations).",
 )
 @click.option(
     "--checkpoint_interval",
-    default=60,
+    default=2500,
     help=(
         "Write a training checkpoint every N sync cycles "
         "(= N * sync_interval iterations)."
@@ -137,7 +138,7 @@ def train():
 )
 @click.option(
     "--prune_threshold",
-    default=50000,
+    default=700000,
     help=(
         "When a uniform random number is less than 95%, and the iteration > "
         "prune_threshold, use CFR with pruning.  Counted in raw iterations "
@@ -146,7 +147,7 @@ def train():
 )
 @click.option(
     "--c",
-    default=-300000000,
+    default=-300000,
     help=(
         "Pruning threshold for regret, which means when we are using CFR with "
         "pruning and have a state with a regret of less than `c`, then we'll "
@@ -189,6 +190,19 @@ def train():
     help="Either use or don't use multiple processes.",
 )
 @click.option(
+    "--cfr_core/--no_cfr_core",
+    default=True,
+    help=(
+        "Drive CFR traversals through the compiled Cython core (~14x faster "
+        "hot loop). Sets the PLURIBUS_CFR_CORE environment variable, so an "
+        "explicit PLURIBUS_CFR_CORE in the environment (e.g. from a launch "
+        "script) is overridden by this flag. The core requires the shm index "
+        "cache (PLURIBUS_INDEX_CACHE=1, on by default) and the extension to be "
+        "built; pass --no_cfr_core for the pure-Python path (e.g. an A/B "
+        "baseline or an unbuilt checkout)."
+    ),
+)
+@click.option(
     "--bias",
     type=click.Choice(["none", "fold", "call", "raise"]),
     default="none",
@@ -229,6 +243,7 @@ def start(
     lut_path: str,
     pickle_dir: bool,
     single_process: bool,
+    cfr_core: bool,
     sync_interval: int,
     discount_interval: int,
     checkpoint_interval: int,
@@ -247,6 +262,17 @@ def start(
     already contains a valid checkpoint the training run continues
     from it; when not, it starts fresh.
     """
+    # Select the CFR execution path before any table/worker is constructed:
+    # core_runner.core_enabled() and the workers read PLURIBUS_CFR_CORE, and
+    # forked/spawned workers inherit this env, so it must be set here in the
+    # parent. The flag is authoritative over any pre-existing env value.
+    os.environ["PLURIBUS_CFR_CORE"] = "1" if cfr_core else "0"
+    log.info(
+        "CFR execution path: %s (PLURIBUS_CFR_CORE=%s)",
+        "compiled Cython core" if cfr_core else "pure Python",
+        os.environ["PLURIBUS_CFR_CORE"],
+    )
+
     config: Dict[str, int] = {**locals()}
     save_path: Path = Path(nickname)
     save_path.mkdir(parents=True, exist_ok=True)

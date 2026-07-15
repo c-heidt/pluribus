@@ -114,11 +114,16 @@ cdef class CoreTables:
     cdef uint64_t _mask[4]
     cdef list _regret_store    # per-street: regret ChunkStore
     cdef list _chunk_arr       # per-street: list of int32 (CHUNK_SIZE, nact) views
+    cdef list _strategy_store  # per-street: strategy ChunkStore (Phase 4c blueprint read)
+    cdef list _strategy_chunk_arr  # per-street: opened strategy chunk views
     cdef long _chunk_size
     cdef list _canonical       # per-street: list[str] canonical actions
     cdef list _a2i             # per-street: dict action -> column index
     cdef int _nact[4]
     cdef list _caches          # keep ShmIndexCache refs alive (mmaps)
+    # Phase 4c: [street][bias_code][col] == 1 iff col is in that bias class.
+    # bias_code: 0=none, 1=fold, 2=call, 3=raise (matches Policy._bias_mask rules).
+    cdef unsigned char _bias_cols[4][4][MAX_ACTIONS]
 
     def __init__(self, tables, canonical_actions, action_to_idx, max_actions):
         from poker_ai.tables.chunk_store import CHUNK_SIZE
@@ -136,8 +141,11 @@ cdef class CoreTables:
         self._caches = [None] * 4
         self._regret_store = [None] * 4
         self._chunk_arr = [None] * 4
+        self._strategy_store = [None] * 4
+        self._strategy_chunk_arr = [None] * 4
         self._canonical = [None] * 4
         self._a2i = [None] * 4
+        cdef int bc, col
         for r in range(4):
             w = int(max_actions[r])
             if w > MAX_ACTIONS:
@@ -153,8 +161,23 @@ cdef class CoreTables:
             self._mask[r] = <uint64_t>cache._mask
             self._regret_store[r] = tables.regret[r].store
             self._chunk_arr[r] = []
+            self._strategy_store[r] = tables.strategy[r].store
+            self._strategy_chunk_arr[r] = []
             self._canonical[r] = list(canonical_actions[r])
             self._a2i[r] = dict(action_to_idx[r])
+            # Precompute the §4 bias-class column masks (Policy._bias_mask, prefix
+            # rules) so the per-decision in-core read never touches Python strings.
+            for bc in range(4):
+                for col in range(MAX_ACTIONS):
+                    self._bias_cols[r][bc][col] = 0
+            for col in range(w):
+                action = self._canonical[r][col]
+                if action == "fold":
+                    self._bias_cols[r][1][col] = 1
+                elif action == "call" or action == "check":
+                    self._bias_cols[r][2][col] = 1
+                elif action.startswith("raise") or action == "all_in":
+                    self._bias_cols[r][3][col] = 1
 
     def probe_row(self, int r, bytes iset):
         """Test accessor: the ``int32`` shm regret row for ``iset``, or ``None``.
@@ -197,6 +220,137 @@ cdef class CoreTables:
             arrs.append(store.view(len(arrs)))
         cdef int[:, ::1] view = arrs[cid]
         return view[loc]
+
+    cdef object _row_at(self, list arrs, store, long flat):
+        """``flat_row -> int32 row`` over an arbitrary (store, opened-views) pair.
+
+        The store-agnostic tail of ``_regret_row`` (``divmod(flat, CHUNK_SIZE)`` →
+        held chunk view row slice, opening new chunks on demand).  Phase 4c reuses
+        it for the strategy store, which shares the regret store's flat row numbers
+        (regret[r] and strategy[r] share one InfosetIndex per street), so a single
+        ``_probe`` serves both.
+        """
+        cdef long cid = flat // self._chunk_size
+        cdef long loc = flat % self._chunk_size
+        while len(arrs) <= cid:
+            arrs.append(store.view(len(arrs)))
+        cdef int[:, ::1] view = arrs[cid]
+        return view[loc]
+
+    cdef object _strategy_row(self, int r, bytes iset):
+        """The ``int32`` shm average-strategy (visit-count) row, or ``None`` on miss.
+
+        Byte-identical to ``ChunkedTable.get_row_if_exists`` on the strategy table
+        (``tables.strategy[r]``); reuses ``_probe`` (the shared per-street index).
+        """
+        cdef long flat = self._probe(r, iset)
+        if flat < 0:
+            return None
+        return self._row_at(self._strategy_chunk_arr[r], self._strategy_store[r], flat)
+
+    def strategy_probe_row(self, int r, bytes iset):
+        """Test accessor: the ``int32`` shm strategy row for ``iset``, or ``None``.
+
+        The strategy-store analogue of ``probe_row`` — the Phase-4c row-reader
+        differential gate (vs ``ChunkedTable.get_row_if_exists`` on strategy[r]).
+        """
+        return self._strategy_row(r, iset)
+
+    cpdef object blueprint_sigma(self, int r, bytes iset, long[::1] legal_cols,
+                                 int bias_code, double mult, long min_mass):
+        """In-core ``BlueprintPolicy.strategy`` (Phase 4c) — a fresh ``float32``
+        vector aligned to ``legal_cols`` (the canonical column of each legal action,
+        in legal order), tolerance-equivalent (<1e-6) to the Python policy.
+
+        Mirrors ``policy.py:195-229`` exactly: average-strategy read (mass-gated) →
+        else regret-match fallback (the proven ``_sigma``) → §4 bias reweight
+        (renormalised over the FULL canonical width, pre-gather) → canonical→legal
+        gather + renormalise.  ``legal`` is always canonical here (FastState has no
+        overlay; the leaf_fast overlay guard falls back to Python otherwise), so the
+        gather has no off-tree branch.  ``except *`` is implicit for ``cpdef object``
+        (a raise propagates as NULL), so no silent-swallow.
+        """
+        cdef int n = self._nact[r]
+        cdef Py_ssize_t nleg = legal_cols.shape[0]
+        cdef bint valid[MAX_ACTIONS]
+        cdef float full[MAX_ACTIONS]
+        cdef int c
+        cdef Py_ssize_t k
+        cdef long flat
+        cdef object srow_mv
+        cdef int[::1] srow
+        cdef double total, denom
+        cdef bint used_avg = False
+
+        if nleg == 0:                       # no legal actions (Python returns [])
+            return np.empty(0, dtype=np.float32)
+
+        for c in range(n):
+            valid[c] = False
+        for k in range(nleg):
+            c = <int>legal_cols[k]
+            # Guard the raw-C-array (unchecked) indexing below: legal_cols are
+            # canonical columns (< n) by contract, but a malformed value would
+            # silently corrupt ``valid``/``full`` — fail loud instead.
+            if c < 0 or c >= n:
+                raise ValueError(
+                    "blueprint_sigma: legal column %d out of range [0, %d) on "
+                    "street %d" % (c, n, r)
+                )
+            valid[c] = True
+
+        flat = self._probe(r, iset)          # one probe serves both stores
+
+        # --- average-strategy path (mass-gated over the legal columns) ---
+        if flat >= 0:
+            srow_mv = self._row_at(
+                self._strategy_chunk_arr[r], self._strategy_store[r], flat)
+            srow = srow_mv
+            total = 0.0
+            for k in range(nleg):
+                total += <double>srow[<int>legal_cols[k]]
+            if total >= <double>min_mass and total > 0.0:
+                for c in range(n):
+                    full[c] = 0.0
+                for k in range(nleg):
+                    c = <int>legal_cols[k]
+                    full[c] = <float>((<double>srow[c]) / total)
+                used_avg = True
+
+        # --- regret-match fallback (== calculate_strategy_from_row) ---
+        if not used_avg:
+            self._sigma(
+                self._row_at(self._chunk_arr[r], self._regret_store[r], flat)
+                if flat >= 0 else None,
+                flat >= 0, valid, n, full,
+            )
+
+        # --- §4 bias reweight over the full canonical width (pre-gather) ---
+        if bias_code != 0 and mult != 1.0:
+            for c in range(n):
+                if self._bias_cols[r][bias_code][c]:
+                    full[c] = <float>((<double>full[c]) * mult)
+            denom = 0.0
+            for c in range(n):
+                denom += <double>full[c]
+            if denom > 0.0:
+                for c in range(n):
+                    full[c] = <float>((<double>full[c]) / denom)
+
+        # --- canonical -> legal gather + renormalise ---
+        cdef object out_arr = np.empty(nleg, dtype=np.float32)
+        cdef float[::1] out = out_arr
+        total = 0.0
+        for k in range(nleg):
+            out[k] = full[<int>legal_cols[k]]
+            total += <double>out[k]
+        if total > 0.0:
+            for k in range(nleg):
+                out[k] = <float>((<double>out[k]) / total)
+        else:
+            for k in range(nleg):
+                out[k] = <float>(1.0 / nleg)
+        return out_arr
 
     cdef void _sigma(self, object row_mv, bint has_row, bint* mask, int n,
                      float* out) except *:

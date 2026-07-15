@@ -35,7 +35,7 @@ fi
 # of ~7M traversals-per-player per hour (the ``t`` in the progress logs), which at
 # SYNC_INTERVAL=1000 is 7,000 sync cycles/hour.  Re-derive if throughput changes:
 #   cycles/hour = 7e6 / SYNC_INTERVAL ;  raw traversals-per-player/hour = 7e6.
-N_PLAYERS=${N_PLAYERS:-6}
+N_PLAYERS=${N_PLAYERS:-4}
 MAX_RUNTIME_HOURS=${MAX_RUNTIME_HOURS:-71.5}
 SYNC_INTERVAL=${SYNC_INTERVAL:-1000}
 # LCFR discount stretched over the first 4h (was ~13 min at this throughput),

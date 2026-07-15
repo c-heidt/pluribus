@@ -39,6 +39,9 @@ from poker_ai.tables.cfr_tables import CFRTables
 BiasClass = Literal["none", "fold", "call", "raise"]
 """Continuation-strategy bias modes used at depth-limit leaves."""
 
+_BIAS_CODE = {"none": 0, "fold": 1, "call": 2, "raise": 3}
+"""Bias-class → integer code for the in-core reader (matches ``CoreTables._bias_cols``)."""
+
 
 class Policy(ABC):
     """Action-distribution oracle for one state.
@@ -179,6 +182,10 @@ class BlueprintPolicy(Policy):
         self._tables = tables
         self._bias_multiplier = float(bias_multiplier)
         self._min_strategy_mass = int(min_strategy_mass)
+        # Phase 4c: per-process in-core reader over ``tables`` (a compiled
+        # ``CoreTables``), or ``None`` when unavailable.  ``False`` = not-yet-built
+        # (lazy on first use, post-fork); distinct from ``None`` = built-and-absent.
+        self._core_tables = False
 
     def reopen_after_fork(self) -> None:
         """Reopen the backing blueprint LMDB indexes in a forked process.
@@ -190,7 +197,56 @@ class BlueprintPolicy(Policy):
         continuation value against the blueprint — must call this once before its
         first query.  Delegates to :meth:`CFRTables.reopen_after_fork`.
         """
+        # Drop this process's inherited in-core view FIRST so it is rebuilt against
+        # the child's own reopened index/shm arrays on next use (Phase 4c).
+        self._core_tables = False
         self._tables.reopen_after_fork()
+
+    def _ensure_core(self):
+        """Lazily build (once per process) the compiled ``CoreTables`` read view
+        over ``self._tables``, or ``None`` if unavailable — Phase 4c.
+
+        Requires the shm index cache (``enable_index_cache=True`` +
+        ``prewarm_caches()``); ``CoreTables.__init__`` raises without it, so a
+        blueprint opened the legacy way (no cache) transparently yields ``None`` and
+        the caller keeps the pure-Python :meth:`strategy` path.  Best-effort: any
+        construction failure → ``None`` (never breaks a search).
+        """
+        if self._core_tables is not False:
+            return self._core_tables
+        self._core_tables = None
+        try:
+            from poker_ai._core import CORE_AVAILABLE
+            if not CORE_AVAILABLE:
+                return None
+            if getattr(self._tables, "_index_caches", None) is None:
+                return None
+            from poker_ai._core import _traverse as _cyt
+            self._core_tables = _cyt.CoreTables(
+                self._tables, CANONICAL_ACTIONS, ACTION_TO_IDX, MAX_ACTIONS_PER_STREET
+            )
+        except Exception:
+            self._core_tables = None
+        return self._core_tables
+
+    def core_sigma(
+        self, r: int, info_set: bytes, legal_cols: np.ndarray, bias: BiasClass
+    ) -> np.ndarray:
+        """In-core equivalent of :meth:`strategy` for a canonical-only legal set —
+        Phase 4c.  ``legal_cols`` is the canonical column of each legal action (in
+        legal order); returns the ``float32`` distribution over it, tolerance-equal
+        (<1e-6) to ``strategy``.
+
+        Routes through :meth:`_ensure_core` (an O(1) memo check) so it transparently
+        rebuilds after a fork's ``reopen_after_fork`` nulled the reader; the caller is
+        expected to have confirmed a non-``None`` reader (a ``None`` here — no shm
+        cache — is a contract violation and raises loudly rather than silently
+        returning a wrong distribution).
+        """
+        return self._ensure_core().blueprint_sigma(
+            r, info_set, legal_cols, _BIAS_CODE[bias],
+            self._bias_multiplier, self._min_strategy_mass,
+        )
 
     def strategy(self, state: PolicyState, bias: BiasClass = "none") -> np.ndarray:
         r = state.betting_round

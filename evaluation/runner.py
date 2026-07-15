@@ -812,6 +812,28 @@ def _play_and_log_one(
 _BIAS_CLASSES = ("none", "fold", "call", "raise")
 
 
+def _assert_index_caches_complete(tables) -> None:
+    """Hard-assert each street's shm index cache mirrors the whole index (Phase 4c).
+
+    The in-core policy read path (``CoreTables``) trusts the shm cache to hold every
+    allocated row — a miss is read as an unseen infoset → uniform.  That holds only
+    if ``prewarm_caches()`` ran and never overflowed.  Mirrors the training core's
+    ``CoreDriver._verify_caches``; fail loud here rather than silently serve uniform.
+    """
+    caches = getattr(tables, "_index_caches", None)
+    if caches is None:
+        return
+    for r in range(4):
+        occ = caches[r].occupancy()
+        alloc = tables._indexes[r].n_allocated_rows
+        if occ != alloc:
+            raise RuntimeError(
+                "Phase 4c: shm index cache for street %d is not a complete mirror "
+                "of the index (occupancy=%d, allocated=%d) — prewarm_caches() must "
+                "run and never overflow before the in-core policy reads." % (r, occ, alloc)
+            )
+
+
 def build_blueprint_session(
     cfg: EvalConfig,
     *,
@@ -835,16 +857,31 @@ def build_blueprint_session(
     """
     from environment.action_space import MAX_ACTIONS_PER_STREET
     from information_abstraction.lookup import load_info_set_lut
+    from poker_ai._core.flags import search_core_enabled
     from poker_ai.search.leaf import LeafConfig
     from poker_ai.search.policy import BlueprintPolicy
     from poker_ai.tables.cfr_tables import CFRTables
     from poker_ai.tables.warm_start import apply_warm_start_to_tables
 
     lut = load_info_set_lut(lut_path, pickle_dir=pickle_dir)
+    # Phase 4c: when the compiled search core is enabled, attach the shm index
+    # cache so the leaf rollout can read the blueprint policy in-core (the ~16%
+    # Python callback).  Gated on the flag so a non-core run pays no shm cost.
+    use_cache = search_core_enabled()
     tables = CFRTables(
-        index_path=blueprint_path, actions_per_street=MAX_ACTIONS_PER_STREET
+        index_path=blueprint_path,
+        actions_per_street=MAX_ACTIONS_PER_STREET,
+        enable_index_cache=use_cache,
     )
     apply_warm_start_to_tables(tables, blueprint_path, cfg.n_players)
+    if use_cache:
+        # Mirror the whole index into the shm cache ONCE in the parent, after the
+        # warm-start restore and before ``run_parallel`` forks — children inherit
+        # the fork-shared mmaps and CoreTables reads pure-shm (no LMDB on the hot
+        # path).  Fail loud if the mirror is incomplete: the in-core reader has no
+        # LMDB fallback, so a short cache would silently serve uniform strategies.
+        tables.prewarm_caches()
+        _assert_index_caches_complete(tables)
     blueprint = BlueprintPolicy(tables, bias_multiplier=bias_multiplier)
 
     leaf = LeafConfig(
