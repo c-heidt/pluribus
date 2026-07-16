@@ -28,7 +28,7 @@ from poker_ai.search.mccfr import _BIAS_CLASSES
 from poker_ai.search.policy import Policy
 from poker_ai.search.parallel import (
     WorkerPlan,
-    _reopen_forked_lmdb,
+    _reopen_leaf_fleet_lmdb,
     plan_workers,
     resolve_workers,
 )
@@ -68,7 +68,7 @@ class _RecordingPolicy(Policy):
 
 
 class TestReopenForkedLmdb:
-    """`_reopen_forked_lmdb` reopens each unique LMDB policy once, skips the rest."""
+    """`_reopen_leaf_fleet_lmdb` reopens each unique LMDB policy once, skips the rest."""
 
     def _ctx(self, policies):
         from types import SimpleNamespace
@@ -77,22 +77,22 @@ class TestReopenForkedLmdb:
     def test_shared_blueprint_reopened_once(self):
         # The four §4 bias variants share ONE blueprint object → reopen exactly once.
         bp = _RecordingPolicy()
-        _reopen_forked_lmdb(self._ctx({c: bp for c in _BIAS_CLASSES}))
+        _reopen_leaf_fleet_lmdb(self._ctx({c: bp for c in _BIAS_CLASSES}))
         assert bp.reopens == 1
 
     def test_distinct_policies_each_reopened(self):
         a, b = _RecordingPolicy(), _RecordingPolicy()
-        _reopen_forked_lmdb(self._ctx({"none": a, "fold": b}))
+        _reopen_leaf_fleet_lmdb(self._ctx({"none": a, "fold": b}))
         assert a.reopens == 1 and b.reopens == 1
 
     def test_policies_without_reopen_are_skipped(self):
         # A mix: the in-memory UniformPolicy has no reopen hook → skipped, no error.
         bp = _RecordingPolicy()
-        _reopen_forked_lmdb(self._ctx({"none": UniformPolicy(), "fold": bp}))
+        _reopen_leaf_fleet_lmdb(self._ctx({"none": UniformPolicy(), "fold": bp}))
         assert bp.reopens == 1
 
     def test_no_reopenable_policies_is_a_noop(self):
-        _reopen_forked_lmdb(self._ctx(_policies()))   # all UniformPolicy → no crash
+        _reopen_leaf_fleet_lmdb(self._ctx(_policies()))   # all UniformPolicy → no crash
 
 
 def _stub_lut(env: PokerEnv) -> None:
@@ -333,6 +333,26 @@ class TestParallelSolve:
         # iterations_run is the sum across replicas (~W× the per-replica cap).
         res = self._run(workers=3, iters=30)
         assert res.iterations_run == 3 * 30
+
+    def test_parallel_repairs_parent_lmdb_slots(self, monkeypatch):
+        # Regression: the fork pool clobbers the PARENT's slot in LMDB's shared
+        # reader table, so run_parallel must repair the parent env after the pool
+        # joins or the parent's next blueprint read trips MDB_BAD_RSLOT (this bit the
+        # eval — opponent lookups on the shared blueprint failed post-search).  The
+        # spy counter lives in parent memory; forked children increment their own
+        # copy, so the parent sees exactly one repair per parallel solve, none serial.
+        import poker_ai.search.parallel as par
+
+        calls = []
+        real = par._reopen_leaf_fleet_lmdb
+        monkeypatch.setattr(
+            par, "_reopen_leaf_fleet_lmdb",
+            lambda ctx: (calls.append(1), real(ctx))[1],
+        )
+        self._run(workers=1)
+        assert calls == []                    # serial never forks → no parent repair
+        self._run(workers=3)
+        assert len(calls) == 1                 # exactly one PARENT repair after the pool
 
     def test_parallel_policy_is_valid(self):
         res = self._run(workers=3)

@@ -188,18 +188,26 @@ def _build_solver(root_env, state, ctx, cfg, rng, regime):
     return _MCCFRSolver(root_env, state, ctx, cfg, rng)
 
 
-def _reopen_forked_lmdb(ctx: SubgameContext) -> None:
-    """Reopen any LMDB-backed leaf policy in this forked worker (§6.7).
+def _reopen_leaf_fleet_lmdb(ctx: SubgameContext) -> None:
+    """Reopen the leaf fleet's LMDB-backed blueprint envs after a ``fork`` (§6.7).
 
-    The pool is forked (copy-on-write) with the leaf fleet's blueprint tables
-    inherited from the parent.  Those tables are per-street LMDB indexes whose
-    reader-lock slots are **not** fork-safe: the first read in a child that reused
-    the parent's slot trips ``mdb_txn_renew: MDB_BAD_RSLOT``.  A depth-limit leaf
-    evaluates the continuation value by querying these policies, so every replica
-    must reopen them before iterating.  Policies without an LMDB backend (the
-    in-memory ``UniformPolicy`` in tests, a ``SearchPolicy``) expose no
-    ``reopen_after_fork`` and are skipped; the four §4 bias variants share one
-    blueprint object, so it is reopened once (deduped by identity).
+    LMDB's reader-lock table is a **process-shared mmap** (``lock.mdb``), so a
+    ``fork`` is not reader-safe: a child that touches the inherited env clobbers the
+    reader slot that belongs to the *parent's* thread, and the next read on that slot
+    — in *either* process — trips ``mdb_txn_renew: MDB_BAD_RSLOT``.  Reopening gets a
+    fresh env handle bound to a clean slot.
+
+    Called in **two** places, because both sides need repair:
+
+    - each forked **replica**, before its first leaf query (:func:`_run_replica`);
+    - the **parent**, right after the pool joins (:func:`run_parallel`), so its own
+      post-search reads — the eval's opponent/hero blueprint + belief lookups all go
+      through this same shared blueprint — don't hit ``MDB_BAD_RSLOT``.  This was the
+      long-standing bug: the child repair existed, the parent repair did not.
+
+    Policies without an LMDB backend (the in-memory ``UniformPolicy`` in tests, a
+    ``SearchPolicy``) expose no ``reopen_after_fork`` and are skipped; the four §4
+    bias variants share one blueprint object, so it is reopened once (deduped by id).
     """
     seen: set = set()
     for policy in ctx.leaf.policies.values():
@@ -222,7 +230,7 @@ def _run_replica(payload: Tuple[int, np.random.SeedSequence, int]):
     # per-core OpenBLAS pool oversubscribe the box and thrash (see the docstring).
     _limit_worker_threads(1)
     # Reopen fork-inherited blueprint LMDB envs before any leaf query (MDB_BAD_RSLOT).
-    _reopen_forked_lmdb(ctx)
+    _reopen_leaf_fleet_lmdb(ctx)
 
     rng = np.random.default_rng(seed_seq)
     wctx = dataclasses.replace(ctx, rng=rng)
@@ -283,6 +291,13 @@ def run_parallel(
             )
     finally:
         _SHARED = {}
+        # Parent-side reader-slot repair: the forked pool clobbered this process's
+        # slot in the shared LMDB reader table, so the parent's own subsequent reads
+        # (the eval opponents / hero blueprint / belief lookups, all on this same
+        # shared blueprint) would trip MDB_BAD_RSLOT.  Reopen unconditionally — it is
+        # idempotent and cheap (read-only mmap remap), and must run even if a replica
+        # raised so a failed search never leaves the parent env poisoned.
+        _reopen_leaf_fleet_lmdb(ctx)
     wall = time.perf_counter() - start
 
     states = [st for st, _, _ in results]

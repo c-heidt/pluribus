@@ -251,7 +251,7 @@ def test_reopen_after_fork_rebuilds_core_and_reads_match(tmp_path):
     ``reopen_after_fork`` nulls the inherited CoreTables so the child rebuilds it
     against its own reopened index / fork-shared shm arrays; the ShmIndexCache mmaps
     are MAP_SHARED so the digest→row probe and the chunk reads resolve the same bytes
-    the parent sees.  This is the real ``run_parallel`` → ``_reopen_forked_lmdb``
+    the parent sees.  This is the real ``run_parallel`` → ``_reopen_leaf_fleet_lmdb``
     path in miniature.
     """
     import os
