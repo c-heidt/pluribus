@@ -36,7 +36,7 @@ fi
 # SYNC_INTERVAL=1000 is 7,000 sync cycles/hour.  Re-derive if throughput changes:
 #   cycles/hour = 7e6 / SYNC_INTERVAL ;  raw traversals-per-player/hour = 7e6.
 N_PLAYERS=${N_PLAYERS:-4}
-MAX_RUNTIME_HOURS=${MAX_RUNTIME_HOURS:-71.5}
+MAX_RUNTIME_HOURS=${MAX_RUNTIME_HOURS:-96}
 SYNC_INTERVAL=${SYNC_INTERVAL:-1000}
 # LCFR discount stretched over the first 4h (was ~13 min at this throughput),
 # keeping the same 19 discount steps: one every 1400 cycles (12 min), window
@@ -46,8 +46,20 @@ DISCOUNT_DURATION_CYCLES=${DISCOUNT_DURATION_CYCLES:-28000}
 # Strategy warm-up before the average-strategy pass begins (~1.7 min at 7,000 cycles/h).
 UPDATE_THRESHOLD=${UPDATE_THRESHOLD:-200}
 STRATEGY_INTERVAL=${STRATEGY_INTERVAL:-1}
-# Checkpoint once per hour (7000 cycles = 1.0h at 7,000 cycles/h).
-CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-7000}
+# Checkpoint every 3 hours (21000 cycles = 3.0h at 7,000 cycles/h).  Every
+# checkpoint is now RETAINED (previous generations are no longer deleted) and
+# doubles as a post-flop average-strategy snapshot for the offline
+# `poker_ai train average` tool, so this interval is also the snapshot cadence.
+# 3h over the 96h run yields ~30 retained snapshots for the average.
+CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-21000}
+# Start checkpointing/snapshotting after the first 6 hours — the
+# average-strategy warm-up.  42000 cycles = 6.0h at 7,000 cycles/h (past the
+# 28000-cycle / 4h LCFR discount window), so the retained snapshots exclude the
+# near-random early era that pollutes the average.  With the interval above the
+# first snapshot lands exactly at 6h (gate is ``sync_step >= start``), then one
+# every 3h.  An end-of-run / SIGTERM checkpoint is always written regardless of
+# this gate.
+CHECKPOINT_START_CYCLES=${CHECKPOINT_START_CYCLES:-42000}
 # CFR-P pruning begins at 2.5h.  Raw iterations (traversals-per-player): 2.5h * 7e6/h = 17.5M.
 PRUNE_THRESHOLD=${PRUNE_THRESHOLD:-17500000}
 C=${C:--3000000}
@@ -236,6 +248,7 @@ echo "  - Discount duration (cycles):  $DISCOUNT_DURATION_CYCLES"
 echo "  - Update threshold (cycles):   $UPDATE_THRESHOLD"
 echo "  - Strategy interval (cycles):  $STRATEGY_INTERVAL"
 echo "  - Checkpoint interval (cycles):$CHECKPOINT_INTERVAL"
+echo "  - Checkpoint start (cycles):   $CHECKPOINT_START_CYCLES"
 echo "  - Prune threshold (iters):     $PRUNE_THRESHOLD"
 echo "  - C (pruning regret):          $C"
 echo "  - Pickle dir:                  $PICKLE_DIR"
@@ -296,6 +309,7 @@ poker_ai train start \
   --update_threshold "$UPDATE_THRESHOLD" \
   --strategy_interval "$STRATEGY_INTERVAL" \
   --checkpoint_interval "$CHECKPOINT_INTERVAL" \
+  --checkpoint_start_cycles "$CHECKPOINT_START_CYCLES" \
   --prune_threshold "$PRUNE_THRESHOLD" \
   --c "$C" \
   --lut_path "$LUT_PATH" \

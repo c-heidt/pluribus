@@ -139,10 +139,32 @@ def train():
 )
 @click.option(
     "--checkpoint_interval",
-    default=2500,
+    default=1650,
     help=(
         "Write a training checkpoint every N sync cycles "
-        "(= N * sync_interval iterations)."
+        "(= N * sync_interval iterations).  Every checkpoint is RETAINED "
+        "(previous generations are no longer deleted) so the offline "
+        "average-strategy tool can treat them as post-flop snapshots — this "
+        "interval therefore also sets the snapshot cadence.  Defaults are "
+        "PROPORTIONAL to the 4p production schedule (scripts/training.sh: 3h "
+        "of a 96h run = 3.125%): 1650 = 3.125% of an 8h/20-card 2p run "
+        "(~52,500 cycles at the throughput measured from the 8h checkpoint, "
+        "t=52.5M, sync_interval=1000), giving ~30 snapshots like production."
+    ),
+)
+@click.option(
+    "--checkpoint_start_cycles",
+    default=3300,
+    help=(
+        "Only start writing (and retaining) checkpoints once sync_step reaches "
+        "this many cycles; the first checkpoint fires at the first "
+        "checkpoint_interval multiple >= this value.  0 checkpoints from the "
+        "beginning (no gate).  Default 3300 = 6.25% of an 8h/20-card 2p run "
+        "(~52,500 cycles) — PROPORTIONAL to the 4p production warm-up (6h of a "
+        "96h run = 6.25%), not a hard hour barrier — so the retained snapshots "
+        "skip the near-random early era (and the LCFR discount window) exactly "
+        "as production does.  An end-of-run / SIGTERM checkpoint is always "
+        "written regardless of this gate so an orderly stop stays resumable."
     ),
 )
 @click.option(
@@ -286,6 +308,7 @@ def start(
     sync_interval: int,
     discount_interval: int,
     checkpoint_interval: int,
+    checkpoint_start_cycles: int,
     n_processes,
     nickname: str,
     strategy_per_job,
@@ -384,6 +407,7 @@ def start(
             sync_interval=sync_interval,
             discount_interval=discount_interval,
             checkpoint_interval=checkpoint_interval,
+            checkpoint_start_cycles=checkpoint_start_cycles,
             n_processes=n_processes,
             bias=bias,  # type: ignore[arg-type]
             bias_magnitude=bias_magnitude,

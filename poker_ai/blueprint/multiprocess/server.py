@@ -147,6 +147,7 @@ class Server:
         sync_interval: int = 10,
         discount_interval: int = 1,
         checkpoint_interval: int = 1,
+        checkpoint_start_cycles: int = 0,
         start_timestep: int = 0,
         n_processes: Optional[int] = None,
         batch_size: Optional[int] = None,
@@ -199,7 +200,18 @@ class Server:
         discount_interval : int, optional
             Period (in sync cycles) between LCFR discount applications.
         checkpoint_interval : int, optional
-            Period (in sync cycles) between checkpoint writes.
+            Period (in sync cycles) between checkpoint writes.  Every
+            checkpoint is retained (never deleted) and serves as a post-flop
+            average-strategy snapshot, so this also sets the snapshot cadence.
+        checkpoint_start_cycles : int, optional
+            Suppress scheduled checkpoints until ``sync_step`` reaches this
+            many cycles (``0`` = checkpoint from the beginning, identical to
+            having no gate).  The first checkpoint fires at the first
+            ``checkpoint_interval`` multiple ``>=`` this value, so setting it
+            equal to a multiple of the interval fires exactly there.  Used as
+            the average-strategy warm-up so the retained snapshots skip the
+            near-random early era.  The end-of-run / SIGTERM checkpoint
+            ignores this gate so an orderly stop is always resumable.
         start_timestep : int, optional
             Initial traversals-per-player counter (``0`` on fresh
             runs).  Overridden on resume by the checkpoint manager.
@@ -350,11 +362,22 @@ class Server:
         self._sync_interval = sync_interval
         self._discount_interval = discount_interval
         self._checkpoint_interval = checkpoint_interval
+        self._checkpoint_start_cycles = checkpoint_start_cycles
         self._start_t = start_timestep
         self._discount_state = DiscountState(
             duration_cycles=discount_duration_cycles,
             discount_interval=discount_interval,
         )
+        if 0 < checkpoint_start_cycles < discount_duration_cycles:
+            log.warning(
+                "checkpoint_start_cycles=%d is inside the LCFR discount window "
+                "(%d cycles); retained snapshots will include still-discounting "
+                "iterates. Pluribus starts snapshotting after the discount "
+                "window closes — consider raising it above "
+                "discount_duration_cycles.",
+                checkpoint_start_cycles,
+                discount_duration_cycles,
+            )
 
         # Load the LUT once in the parent; workers inherit the
         # deserialised object via fork copy-on-write, avoiding one
@@ -545,7 +568,10 @@ class Server:
                     if should_discount(sync_step, self._discount_interval):
                         self._discount_state.apply(self._tables, sync_step)
 
-                    if should_checkpoint(sync_step, self._checkpoint_interval):
+                    if (
+                        sync_step >= self._checkpoint_start_cycles
+                        and should_checkpoint(sync_step, self._checkpoint_interval)
+                    ):
                         self._checkpoint_manager.checkpoint(t=t)
 
                     now = time.monotonic()
@@ -770,6 +796,8 @@ class Server:
             sync_interval=self._sync_interval,
             discount_interval=self._discount_interval,
             checkpoint_interval=self._checkpoint_interval,
+            # Not structural — snapshot-cadence gate, safe to change on resume.
+            checkpoint_start_cycles=self._checkpoint_start_cycles,
             start_timestep=self._start_t,
             n_chunks_per_street=self._tables.n_chunks_per_street(),
             chunk_size=_CHUNK_SIZE,
