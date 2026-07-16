@@ -133,8 +133,15 @@ def average_street(
     prefix = f"regret_{r}"
     written = 0
     for chunk_id in _chunk_ids(final_dir, prefix):
-        final_chunk = np.load(final_dir / f"{prefix}_chunk_{chunk_id:06d}.npy")
-        n_rows, n_actions = final_chunk.shape
+        # Shape only: mmap the header so we never pull the ~80 MB final chunk
+        # into RAM here (it is read again, once, inside the snapshot loop).
+        n_rows, n_actions = np.load(
+            final_dir / f"{prefix}_chunk_{chunk_id:06d}.npy", mmap_mode="r"
+        ).shape
+        # One float64 accumulator + one int64 presence counter per chunk, plus
+        # one snapshot chunk in flight at a time → peak RAM is ~a few hundred MB
+        # per chunk regardless of how many snapshots or how large the run's total
+        # on-disk footprint is (streaming, not load-everything).
         acc = np.zeros((n_rows, n_actions), dtype=np.float64)
         count = np.zeros(n_rows, dtype=np.int64)
 
@@ -147,6 +154,7 @@ def average_street(
             k = min(arr.shape[0], n_rows)  # earlier snapshots may hold fewer rows
             acc[:k] += sigma_from_regret_chunk(arr[:k])
             count[:k] += 1
+            del arr  # release the ~80 MB snapshot chunk before the next load
 
         out = np.zeros((n_rows, n_actions), dtype=np.int32)
         present = count > 0
@@ -171,6 +179,47 @@ def _link_or_copy(src: Path, dst: Path) -> None:
         os.link(src, dst)
     except OSError:
         shutil.copy2(src, dst)
+
+
+def _copy_lmdb_index(src_index: Path, dst_index: Path, n_players: int) -> None:
+    """Copy the per-street LMDB index compactly (used pages only).
+
+    ``shutil.copytree`` would copy each street's ``data.mdb`` byte-for-byte
+    INCLUDING the sparse ``map_size`` reservation (tens of GiB of zero-holes,
+    and larger at production scale), densifying it on the destination.  LMDB's
+    own ``env.copy`` instead writes only the pages actually in use — the same
+    mechanism the checkpoint mirror uses (:meth:`InfosetIndex.copy_to`) — so the
+    copied index is sized to the real key count, not the reservation.  The
+    logical infoset→row mapping is byte-identical (only physical page layout is
+    repacked), so the averaged chunks stay row-aligned with it.
+    """
+    import lmdb
+    from poker_ai.tables.index import lmdb_map_size_for_players
+
+    # Read-only opens only need a map_size >= the source's used extent; the
+    # canonical per-player reservation is what created it, so it always fits.
+    map_size = lmdb_map_size_for_players(int(n_players))
+    dst_index.mkdir(parents=True, exist_ok=True)
+    for r in range(4):
+        src_street = src_index / f"street_{r}"
+        if not src_street.exists():
+            raise FileNotFoundError(
+                f"LMDB street index missing: {src_street} — is {src_index} a "
+                f"training run's index directory?"
+            )
+        dst_street = dst_index / f"street_{r}"
+        dst_street.mkdir(parents=True, exist_ok=True)
+        env = lmdb.open(
+            str(src_street), map_size=map_size, subdir=True,
+            readonly=True, lock=False,
+        )
+        try:
+            # compact=True repacks the B-tree omitting free pages → smallest
+            # long-lived blueprint index; cost is a one-shot tree walk, tiny
+            # next to reading the run's regret snapshots.
+            env.copy(str(dst_street), compact=True)
+        finally:
+            env.close()
 
 
 def build_final_blueprint(
@@ -262,7 +311,9 @@ def build_final_blueprint(
             f"{out_index} already exists — refusing to overwrite an existing "
             f"blueprint. Choose a fresh --output_dir."
         )
-    shutil.copytree(train_dir / "lmdb_index", out_index)
+    _copy_lmdb_index(
+        train_dir / "lmdb_index", out_index, int(final_state["n_players"])
+    )
 
     out_cp = out_dir / f"checkpoint_{final_state['t']}"
     out_cp.mkdir(parents=True, exist_ok=True)
