@@ -416,5 +416,62 @@ def start(
         _safe_search(server)
 
 
+@train.command(name="average")
+@click.option(
+    "--train_dir",
+    required=True,
+    type=click.Path(exists=True, file_okay=False),
+    help=(
+        "Training directory holding lmdb_index/ and the retained "
+        "checkpoint_<t>/ generations to average."
+    ),
+)
+@click.option(
+    "--output_dir",
+    required=True,
+    type=click.Path(file_okay=False),
+    help="Destination directory for the final averaged blueprint.",
+)
+@click.option(
+    "--scale",
+    type=int,
+    default=None,
+    help=(
+        "Integer scale for the stored post-flop strategy pseudo-counts "
+        "(default 1,000,000). Larger just uses more of the int32 range; the "
+        "readout normalises it away."
+    ),
+)
+@click.option(
+    "--min_t",
+    type=int,
+    default=None,
+    help=(
+        "Exclude snapshots below this iteration t from the post-flop average. "
+        "Defaults to the warm-up (checkpoint_start_cycles * sync_interval) "
+        "recorded in the latest checkpoint. Pass 0 to average every retained "
+        "checkpoint."
+    ),
+)
+def average_snapshots(train_dir, output_dir, scale, min_t):
+    """Build a final blueprint by averaging a run's retained snapshots.
+
+    Reconstructs the post-flop average strategy offline from the retained
+    checkpoints (Pluribus-style snapshot averaging) and writes a blueprint
+    directory loadable by the evaluation / search stack unchanged.
+    """
+    from poker_ai.blueprint.offline_average import (
+        SIGMA_SCALE_DEFAULT,
+        build_final_blueprint,
+    )
+
+    build_final_blueprint(
+        Path(train_dir),
+        Path(output_dir),
+        scale=SIGMA_SCALE_DEFAULT if scale is None else scale,
+        min_t=min_t,
+    )
+
+
 if __name__ == "__main__":
     train()
