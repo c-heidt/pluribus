@@ -437,14 +437,17 @@ class CFRTables:
         Returns
         -------
         bool
-            ``True`` iff every expected ``regret_{r}_chunk_*.npy`` and
-            ``strategy_{r}_chunk_*.npy`` file is present.
+            ``True`` iff every expected ``regret_{r}_chunk_*.npy`` file is
+            present.  Strategy chunks are intentionally NOT required: the
+            average strategy is tracked pre-flop only, so streets 1-3 never
+            write strategy chunks during training and street 0 has none before
+            the warm-up.  :meth:`restore_chunks` zero-fills any missing strategy
+            chunk, so a regret-complete checkpoint is a valid resume point.
         """
         for r in range(4):
             for chunk_id in range(n_chunks.get(r, 0)):
-                for prefix in (f"regret_{r}", f"strategy_{r}"):
-                    if not (dir_path / f"{prefix}_chunk_{chunk_id:06d}.npy").exists():
-                        return False
+                if not (dir_path / f"regret_{r}_chunk_{chunk_id:06d}.npy").exists():
+                    return False
         return True
 
     def restore_chunks(self, dir_path: Path, n_chunks: Dict[int, int]) -> None:
@@ -477,8 +480,12 @@ class CFRTables:
                         chunk_id, np.load(strategy_path)
                     )
                 else:
-                    log.warning(
-                        "Strategy chunk missing: %s — zero-initialised",
+                    # Expected under pre-flop-only average-strategy tracking:
+                    # streets 1-3 never write strategy chunks and street 0 has
+                    # none before the warm-up.  Zero-init and move on (debug,
+                    # not warning — this is the normal steady state).
+                    log.debug(
+                        "Strategy chunk absent: %s — zero-initialised",
                         strategy_path,
                     )
 
@@ -500,7 +507,10 @@ class CFRTables:
         multiplication to prevent int32 underflow and to keep pruned
         actions recoverable.  Strategy entries are non-negative visit
         counts, so no floor is applied to them — clamping them would
-        bias the distribution.
+        bias the distribution.  Only street 0 (pre-flop) strategy is
+        discounted: the average strategy is tracked pre-flop only, so the
+        streets 1-3 strategy tables are always zero and discounting them
+        would be pure waste.
 
         The method reads the shared mmaps directly, which is safe
         **only when every worker is idle** (i.e. immediately after a
@@ -539,15 +549,18 @@ class CFRTables:
                 rview[:] = rresult
                 self.regret[r].store.mark_dirty(chunk_id)
 
-                # Strategy: discount only (non-negative visit counts).
-                # Truncation here zeroed any count of 1 on every discount
-                # application, erasing the strategy mass accumulated inside
-                # the discount window; rounding keeps small counts alive
-                # under the mild late-window factors while still applying
-                # the intended linear down-weighting.
-                sview = self.strategy[r].store.view(chunk_id)[:valid_rows]
-                sview[:] = np.rint(sview.astype(np.float32) * factor32).astype(np.int32)
-                self.strategy[r].store.mark_dirty(chunk_id)
+                # Strategy: pre-flop (street 0) only — post-flop strategy is
+                # never accumulated online, so those tables stay zero and
+                # discounting them is wasted work.  Discount only (non-negative
+                # visit counts); rint (not truncation) keeps a count of 1 alive
+                # under the mild late-window factors instead of zeroing the
+                # strategy mass accumulated inside the discount window.
+                if r == 0:
+                    sview = self.strategy[r].store.view(chunk_id)[:valid_rows]
+                    sview[:] = np.rint(
+                        sview.astype(np.float32) * factor32
+                    ).astype(np.int32)
+                    self.strategy[r].store.mark_dirty(chunk_id)
 
     # ------------------------------------------------------------------
     # Lifecycle

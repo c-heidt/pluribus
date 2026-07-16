@@ -39,12 +39,14 @@ log = logging.getLogger("poker_ai.blueprint.runner")
 
 # Default average-strategy sampling knobs for a bare CLI run, chosen so
 # ``poker_ai train start`` behaves identically to a cluster submission out of
-# the box.  KEEP IN SYNC with the exports in scripts/training.sh
-# (PLURIBUS_STRATEGY_PER_JOB / PLURIBUS_STRATEGY_BATCH_SIZE).  These are applied
-# only when neither the corresponding --flag nor a pre-existing env var is set,
-# so an explicit flag or export still wins (see :func:`start`).
-_DEFAULT_STRATEGY_PER_JOB = 30
-_DEFAULT_STRATEGY_BATCH_SIZE = 128
+# the box.  KEEP IN SYNC with the export in scripts/training.sh
+# (PLURIBUS_STRATEGY_PER_JOB).  Applied only when neither the --flag nor a
+# pre-existing env var is set, so an explicit flag or export still wins (see
+# :func:`start`).  The average strategy is now pre-flop only with full opponent
+# branching, so one pass per deal already covers the whole pre-flop opponent
+# tree — a single playthrough per job is plenty (the old high count and its
+# auto-sizing existed to feed the abandoned post-flop average).
+_DEFAULT_STRATEGY_PER_JOB = 1
 
 
 def _safe_search(server: Server):
@@ -126,10 +128,13 @@ def train():
 )
 @click.option(
     "--update_threshold",
-    default=70,
+    default=3300,
     help=(
-        "Start updating the strategy after this many sync cycles "
-        "(= N * sync_interval iterations)."
+        "Start accumulating the pre-flop average strategy after this many sync "
+        "cycles (= N * sync_interval iterations) — the average-strategy warm-up "
+        "that keeps the near-random early era out of the running mean.  Default "
+        "3300 matches --checkpoint_start_cycles (~6.25%% of an 8h/20-card 2p "
+        "run), so pre-flop φ and the post-flop snapshots share one warm-up."
     ),
 )
 @click.option(
@@ -238,29 +243,15 @@ def train():
     type=int,
     default=None,
     help=(
-        "Average-strategy sample playthroughs folded into each CFR job, per "
-        "player, after warm-up.  Sets the PLURIBUS_STRATEGY_PER_JOB environment "
-        "variable so forked/spawned workers inherit it (the knob is env-only "
-        f"otherwise).  Precedence: this flag > a pre-existing env var > the "
-        f"cluster-matching default ({_DEFAULT_STRATEGY_PER_JOB}, in sync with "
-        "scripts/training.sh).  Raise it to convert more search-leaf lookups from "
-        "the last-iterate regret fallback to the converged average strategy "
-        "(measure with `python -m evaluation.blueprint_metrics --leaf-coverage`)."
-        "  Not a structural checkpoint key, so it may be changed on resume."
-    ),
-)
-@click.option(
-    "--strategy_batch_size",
-    type=int,
-    default=None,
-    help=(
-        "Average-strategy sample mass per player per sync cycle (single-process: "
-        "playthroughs per strategy firing).  Sets the PLURIBUS_STRATEGY_BATCH_SIZE "
-        "environment variable.  On the multi-process path it is inert while "
-        "--strategy_per_job (or its env var) is set, since that pins the per-job "
-        "count directly; otherwise it sizes the auto-default.  Precedence: this "
-        f"flag > a pre-existing env var > the cluster-matching default "
-        f"({_DEFAULT_STRATEGY_BATCH_SIZE}, in sync with scripts/training.sh)."
+        "Pre-flop UPDATE-STRATEGY playthroughs per player folded into each CFR "
+        "job (multi-process) / per strategy firing (single-process), after "
+        "warm-up.  Sets the PLURIBUS_STRATEGY_PER_JOB environment variable so "
+        "forked/spawned workers inherit it (the knob is env-only otherwise).  "
+        f"Precedence: this flag > a pre-existing env var > the default "
+        f"({_DEFAULT_STRATEGY_PER_JOB}).  One pass covers the whole pre-flop "
+        "opponent tree per deal (full branching), so 1-2 is plenty; more just "
+        "samples more deals.  Not a structural checkpoint key, so it may be "
+        "changed on resume."
     ),
 )
 @click.option(
@@ -312,7 +303,6 @@ def start(
     n_processes,
     nickname: str,
     strategy_per_job,
-    strategy_batch_size,
     bias: str,
     bias_magnitude: float,
     warm_start: str,
@@ -337,27 +327,18 @@ def start(
         os.environ["PLURIBUS_CFR_CORE"],
     )
 
-    # Average-strategy sampling knobs. Same rationale as PLURIBUS_CFR_CORE: the
-    # server and forked/spawned workers read these from the environment, so the
+    # Average-strategy sampling knob. Same rationale as PLURIBUS_CFR_CORE: the
+    # server and forked/spawned workers read it from the environment, so the
     # resolved value must be exported here in the parent before any worker is
-    # constructed. Precedence per knob: an explicit --flag wins; else a
-    # pre-existing env var (e.g. an export from scripts/training.sh) is kept;
-    # else the cluster-matching CLI default is applied so a bare `train start`
-    # behaves like a cluster submission rather than falling to the low
-    # sync-coupled auto-size.
+    # constructed. Precedence: an explicit --flag wins; else a pre-existing env
+    # var (e.g. an export from scripts/training.sh) is kept; else the CLI default.
     if strategy_per_job is not None:
         os.environ["PLURIBUS_STRATEGY_PER_JOB"] = str(strategy_per_job)
     elif "PLURIBUS_STRATEGY_PER_JOB" not in os.environ:
         os.environ["PLURIBUS_STRATEGY_PER_JOB"] = str(_DEFAULT_STRATEGY_PER_JOB)
-    if strategy_batch_size is not None:
-        os.environ["PLURIBUS_STRATEGY_BATCH_SIZE"] = str(strategy_batch_size)
-    elif "PLURIBUS_STRATEGY_BATCH_SIZE" not in os.environ:
-        os.environ["PLURIBUS_STRATEGY_BATCH_SIZE"] = str(_DEFAULT_STRATEGY_BATCH_SIZE)
     log.info(
-        "Average-strategy knobs: PLURIBUS_STRATEGY_PER_JOB=%s "
-        "PLURIBUS_STRATEGY_BATCH_SIZE=%s",
+        "Average-strategy knob: PLURIBUS_STRATEGY_PER_JOB=%s",
         os.environ["PLURIBUS_STRATEGY_PER_JOB"],
-        os.environ["PLURIBUS_STRATEGY_BATCH_SIZE"],
     )
 
     config: Dict[str, int] = {**locals()}

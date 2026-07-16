@@ -151,7 +151,6 @@ class Server:
         start_timestep: int = 0,
         n_processes: Optional[int] = None,
         batch_size: Optional[int] = None,
-        strategy_batch_size: Optional[int] = None,
         strategy_per_job: Optional[int] = None,
         bias: BiasClass = "none",
         bias_magnitude: float = 0.0,
@@ -232,26 +231,12 @@ class Server:
             pressure at the cost of longer per-job wall time.
             Defaults to the ``PLURIBUS_CFR_BATCH_SIZE`` environment
             variable if set, else ``5``.
-        strategy_batch_size : int, optional
-            Target average-strategy sample mass, in sampled playthroughs
-            per player per sync cycle: ``workers_per_player *
-            strategy_batch_size``.  The strategy pass is no longer a
-            separate barriered dispatch — it is folded into the cfr jobs
-            (see ``strategy_per_job``) — so this value is used only to
-            size the ``strategy_per_job`` default so the folded pass
-            reproduces the same per-cycle mass the old barriered pass
-            produced.  A playthrough is orders of magnitude cheaper than
-            a CFR traversal (one sampled line, no branching), so ample
-            mass here is close to free; too little starves the
-            average-strategy table.  Defaults to the
-            ``PLURIBUS_STRATEGY_BATCH_SIZE`` environment variable if set,
-            else ``128``.
         strategy_per_job : int, optional
-            Average-strategy playthroughs folded into each ``cfr`` job
-            (per player, after warm-up).  ``None`` (default) auto-sizes
-            to the ``strategy_batch_size`` per-cycle mass above; the
-            ``PLURIBUS_STRATEGY_PER_JOB`` environment variable overrides.
-            ``0`` disables the strategy pass entirely.
+            Pre-flop UPDATE-STRATEGY playthroughs folded into each ``cfr``
+            job (per player, after warm-up).  ``None`` (default) reads the
+            ``PLURIBUS_STRATEGY_PER_JOB`` environment variable, falling back
+            to ``1`` — one pass covers the whole pre-flop opponent tree per
+            deal (full branching).  ``0`` disables the strategy pass entirely.
         """
         # Install a minimal SIGTERM/SIGINT handler immediately so a
         # signal that arrives during the slow startup phases (LUT
@@ -284,16 +269,6 @@ class Server:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         self._batch_size = batch_size
 
-        if strategy_batch_size is None:
-            strategy_batch_size = int(
-                os.environ.get("PLURIBUS_STRATEGY_BATCH_SIZE", 128)
-            )
-        if strategy_batch_size < 1:
-            raise ValueError(
-                f"strategy_batch_size must be >= 1, got {strategy_batch_size}"
-            )
-        self._strategy_batch_size = strategy_batch_size
-
         # workers_per_player saturates the worker pool: every worker
         # processes one queue item at a time regardless of batch_size,
         # so the number of outstanding items needed is independent of
@@ -315,29 +290,17 @@ class Server:
             f"{self._workers_per_player * self._batch_size} per player"
         )
 
-        # Number of average-strategy playthroughs folded into each ``cfr`` job
-        # (per player, after warm-up).  The strategy pass no longer runs as its
-        # own sync barrier — each worker interleaves it with CFR and flushes the
-        # accumulated visit counts alongside the regret delta at the next sync —
-        # so its frequency is decoupled from the sync interval and is now a free
-        # knob (raise it for faster average-strategy convergence at core speed).
+        # Number of pre-flop UPDATE-STRATEGY playthroughs folded into each
+        # ``cfr`` job (per player, after warm-up).  The strategy pass is
+        # interleaved with CFR and flushed alongside the regret delta at the
+        # next sync — no separate barrier.  One pass covers the whole pre-flop
+        # opponent tree per deal (full branching), so the default is 1; the old
+        # auto-sizing existed to feed the abandoned post-flop average.
         if strategy_per_job is None:
             # Falsy (unset OR the empty string a ``${VAR:-}`` export produces)
-            # → fall through to the auto-sized default below.
+            # → fall through to the default.
             env_spj = os.environ.get("PLURIBUS_STRATEGY_PER_JOB")
-            strategy_per_job = int(env_spj) if env_spj else None
-        if strategy_per_job is None:
-            # Default targets the SAME per-cycle strategy sample mass the old
-            # barriered pass produced — ``workers_per_player * strategy_batch_size``
-            # playthroughs per player per sync cycle — but spread across that
-            # cycle's cfr jobs so it overlaps CFR.  jobs/player/cycle =
-            # sync_interval/batch_size, hence per-job =
-            # wpp * strategy_batch_size * batch_size / sync_interval (floored at 1
-            # so strategy never fully stops).
-            strategy_per_job = max(1, round(
-                self._workers_per_player * self._strategy_batch_size
-                * self._batch_size / sync_interval
-            ))
+            strategy_per_job = int(env_spj) if env_spj else 1
         if strategy_per_job < 0:
             raise ValueError(
                 f"strategy_per_job must be >= 0, got {strategy_per_job}"
@@ -345,7 +308,7 @@ class Server:
         self._strategy_per_job = strategy_per_job
         log.info(
             f"strategy_per_job={self._strategy_per_job} "
-            f"(folded into each cfr job after warm-up; no separate barrier)"
+            f"(pre-flop UPDATE-STRATEGY, folded into each cfr job after warm-up)"
         )
 
         self._bias: BiasClass = bias

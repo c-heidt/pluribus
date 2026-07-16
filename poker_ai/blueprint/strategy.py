@@ -55,17 +55,26 @@ def update_strategy(
     i: int,
     local_delta: Optional[Dict[Tuple[int, bytes], np.ndarray]] = None,
 ) -> None:
-    """Sample a play-through from *state* and record player *i*'s actions.
+    """Accumulate player *i*'s average strategy on the **first betting round**.
 
-    Recursively walks the game tree starting from *state*.  At every
-    node the function draws one action from the current regret-matching
-    strategy; when the current player is *i* the sampled action's
-    visit count is incremented by 1 for the current betting round ``r``.
-    The traversal then descends into the sampled successor.
+    Implements Pluribus's UPDATE-STRATEGY pass (Science supplement,
+    Algorithm 1, line 2): the average strategy is tracked *only* on the
+    pre-flop betting round, and within it every opponent action is
+    traversed (full branching) rather than sampled, so a single pass
+    covers the whole pre-flop opponent sub-tree.  At each **player-*i***
+    node one action is drawn from the current regret-matching strategy
+    and its visit count is incremented by 1; the traversal then descends
+    the sampled action.  The walk returns as soon as the hand leaves the
+    pre-flop round (``betting_round != 0``) — the post-flop average is
+    reconstructed offline from checkpoint snapshots
+    (:mod:`poker_ai.blueprint.offline_average`), not tracked online.
 
-    Opponent decisions are also sampled — the traversal follows a
-    single playthrough rather than branching — but they do not write
-    anything to the strategy tables.
+    This replaces the earlier all-streets *sampled* walk: measured A/B
+    showed that online average read worse than the last iterate (its
+    post-flop rows were starved and its early iterations polluted the
+    running mean).  Restricting to the pre-flop round with full opponent
+    branching gives a dense, correctly-averaged pre-flop table cheaply,
+    and drops the per-iteration cost of the post-flop strategy walk.
 
     The function returns nothing; the visit-count increments land either
     directly in the shared ``tables.strategy`` tables or in a
@@ -75,7 +84,7 @@ def update_strategy(
     ----------
     tables : CFRTables
         CFR tables being trained.  ``tables.regret`` is read to compute
-        the sampling distribution; ``tables.strategy[r]`` is written
+        the sampling distribution; ``tables.strategy[0]`` is written
         only when ``local_delta is None``.
     state : PokerState
         Starting game state for this strategy-sampling pass.
@@ -85,25 +94,32 @@ def update_strategy(
         Caller-owned visit-count accumulator keyed by ``(betting_round,
         info_set)`` with ``int64`` delta rows — symmetric with the
         ``local_delta`` :func:`poker_ai.blueprint.cfr.cfr` accumulates into.
-        When supplied, increments are written here (lock-free) instead of
-        into the shared tables and the caller is responsible for flushing
-        via :func:`poker_ai.blueprint.cfr.merge_local_strategy_delta`.
-        When ``None`` (default) the increment is applied directly to
-        ``tables.strategy[r]`` via the stripe-locked ``update_row`` — the
-        legacy single-process / post-barrier behaviour, byte-identical to
-        before.
+        Every key produced here has ``betting_round == 0``.  When supplied,
+        increments are written here (lock-free) instead of into the shared
+        tables and the caller flushes via
+        :func:`poker_ai.blueprint.cfr.merge_local_strategy_delta`.  When
+        ``None`` (default) the increment is applied directly to
+        ``tables.strategy[0]`` via the stripe-locked ``update_row``.
     """
+    # Terminal check first: it also fires when player ``i`` has folded, and it
+    # must precede the betting-round read because ``betting_round`` raises for a
+    # terminal state (there is no active betting round there).
     if is_terminal(state, i) is not None:
+        return
+    # Stop as soon as the hand leaves the pre-flop round — the average strategy
+    # is tracked pre-flop only.
+    if state.betting_round != 0:
         return
 
     legal_actions = get_legal_actions(state)
     if not legal_actions:
         return
 
-    sigma, r, a_to_i, _, info_set = get_node_strategy(tables, state)
-    action = sample_action(legal_actions, sigma, a_to_i)
-
     if state.player_i == i:
+        # Traverser node: sample one action from the regret-matching strategy,
+        # record it, and descend that action only.
+        sigma, r, a_to_i, _, info_set = get_node_strategy(tables, state)
+        action = sample_action(legal_actions, sigma, a_to_i)
         log.debug("ACTION SAMPLED: ph %s ACTION: %s", state.player_i, action)
         if local_delta is None:
             tables.strategy[r].update_row(info_set, a_to_i[action], 1)
@@ -115,9 +131,16 @@ def update_strategy(
                 local_delta[key] = row
             row[a_to_i[action]] += 1
 
-    # Single sampled action: descend in place and restore on the way back,
-    # so this function leaves its ``state`` argument unchanged (the same
-    # non-mutating contract the old copy-on-write traversal had).
-    token = state.step_in_place(action)
-    update_strategy(tables, state, i, local_delta)
-    state.undo(token)
+        # Descend in place and restore on the way back so the caller's ``state``
+        # is left unchanged (the same non-mutating contract as before).
+        token = state.step_in_place(action)
+        update_strategy(tables, state, i, local_delta)
+        state.undo(token)
+    else:
+        # Opponent node: traverse EVERY legal action (Pluribus full pre-flop
+        # branching).  No regret read or info-set resolution here — opponent
+        # nodes write nothing, which is the per-iteration cost saving.
+        for action in legal_actions:
+            token = state.step_in_place(action)
+            update_strategy(tables, state, i, local_delta)
+            state.undo(token)

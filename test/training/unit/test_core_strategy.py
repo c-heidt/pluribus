@@ -8,12 +8,13 @@ core-accelerated and decoupled from the sync barrier.  These gates certify the
 port the same way the cfr traversal is certified:
 
 * **byte-exact replay differential** (the strongest gate) — record a Python
-  ``update_strategy`` playthrough's sampled actions, replay the *same* sequence
+  ``update_strategy`` pre-flop pass's sampled actions, replay the *same* sequence
   into both the Python reference and the core, and assert the two visit-count
-  ``local_delta`` dicts are identical.  Unlike the cfr walk (which branches at the
-  traverser and samples only opponents), the strategy walk is a single sampled
-  line that draws at **every** node, so the recorded sequence spans player and
-  opponent nodes alike.
+  ``local_delta`` dicts are identical.  The strategy walk now samples at
+  **traverser** nodes only and branches over every legal action at opponent nodes
+  (the mirror of the cfr walk), so the recorded sequence spans player nodes only —
+  and if the core's opponent branching diverged, its accumulated counts would
+  differ from the branching Python reference and this gate would fail.
 * **truncation non-vacuity** — a short replay must raise, proving the gate is not
   trivially satisfied.
 * **rng path structure** + in-place accumulation — the production sampler is not
@@ -116,7 +117,7 @@ class TestCoreStrategyByteIdentical:
                     total_counts += sum(int(v.sum()) for v in delta_core.values())
                     compared += 1
             assert compared > 0
-            # The strategy walk samples at every node...
+            # Traverser nodes sampled (choices recorded)...
             assert total_choices > 0
             # ...and player-i nodes actually recorded visit counts.
             assert total_counts > 0

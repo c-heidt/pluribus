@@ -43,8 +43,11 @@ SYNC_INTERVAL=${SYNC_INTERVAL:-1000}
 # 28000 cycles (4.0h = 20 * DISCOUNT_INTERVAL).
 DISCOUNT_INTERVAL=${DISCOUNT_INTERVAL:-1400}
 DISCOUNT_DURATION_CYCLES=${DISCOUNT_DURATION_CYCLES:-28000}
-# Strategy warm-up before the average-strategy pass begins (~1.7 min at 7,000 cycles/h).
-UPDATE_THRESHOLD=${UPDATE_THRESHOLD:-200}
+# Pre-flop average-strategy warm-up: start accumulating φ after the first 6h
+# (42000 cycles = 6.0h at 7,000 cycles/h), matching CHECKPOINT_START_CYCLES so
+# the pre-flop average and the post-flop snapshots share one warm-up and both
+# skip the near-random early era (past the 28000-cycle LCFR discount window).
+UPDATE_THRESHOLD=${UPDATE_THRESHOLD:-42000}
 STRATEGY_INTERVAL=${STRATEGY_INTERVAL:-1}
 # Checkpoint every 3 hours (21000 cycles = 3.0h at 7,000 cycles/h).  Every
 # checkpoint is now RETAINED (previous generations are no longer deleted) and
@@ -82,34 +85,14 @@ fi
 # Efficiency knobs honoured by the trainer (env-driven so they can be
 # overridden per submission without editing code).
 export PLURIBUS_CFR_BATCH_SIZE=${PLURIBUS_CFR_BATCH_SIZE:-5}
-# Sizes the auto-default for PLURIBUS_STRATEGY_PER_JOB (workers_per_player * this
-# playthroughs per player per sync cycle).  Inert while PLURIBUS_STRATEGY_PER_JOB
-# is pinned below; kept for the unset / off-core fallback path.
-export PLURIBUS_STRATEGY_BATCH_SIZE=${PLURIBUS_STRATEGY_BATCH_SIZE:-128}
-# Average-strategy playthroughs folded into EACH cfr job (per player, after
-# warm-up).  The strategy pass is now interleaved with CFR and flushed with the
-# regret delta at the sync barrier instead of running as its own barrier — so
-# with PLURIBUS_CFR_CORE=1 it is core-accelerated AND overlapped.  INDEPENDENT of
-# SYNC_INTERVAL (unlike the auto-size, whose formula has sync_interval in the
-# denominator, so bumping the sync interval would otherwise silently cut strategy
-# throughput).  UNSET to return to the SYNC_INTERVAL-coupled auto-size from
-# PLURIBUS_STRATEGY_BATCH_SIZE.
-#
-# Pinned to 30 (was 10).  The average-strategy table is only *trusted* as a
-# search-leaf continuation once a row's visit mass reaches BlueprintPolicy's
-# min_strategy_mass=10; below that the leaf falls back to the noisier last-iterate
-# regret match.  On the 2p/20-card blueprint at 52.5M iters the MEDIAN visited
-# river row held only ~3 visits (mass_log10 p50≈0.49) — ~3x short of the
-# threshold — so only ~9% of river leaves resolved to the converged average and
-# ~90% used the regret fallback (measured via
-# `python -m evaluation.blueprint_metrics --leaf-coverage`).  Strategy mass is
-# linear in playthrough volume, so ~3x the volume (10 -> 30) lifts the median
-# river row across the trust threshold, shrinking the regret-fallback share.
-# Cost: strategy sampling is a single non-branching line (orders of magnitude
-# cheaper than a CFR traversal), so ~10-15% added worker time — cheap for the
-# leaf-quality gain.  RAISE further (40-50) to trust more of the deep-street tail;
-# re-measure --leaf-coverage per checkpoint to confirm the fallback share drops.
-export PLURIBUS_STRATEGY_PER_JOB=${PLURIBUS_STRATEGY_PER_JOB:-30}
+# Pre-flop UPDATE-STRATEGY playthroughs folded into EACH cfr job (per player,
+# after warm-up), interleaved with CFR and flushed with the regret delta at the
+# sync barrier.  The average strategy is now pre-flop only with full opponent
+# branching, so a single pass already covers the whole pre-flop opponent tree
+# per deal — 1 is plenty (the old 30 and its auto-sizing fed the abandoned
+# post-flop average).  The post-flop blueprint comes from offline snapshot
+# averaging (`poker_ai train average`), not this pass.
+export PLURIBUS_STRATEGY_PER_JOB=${PLURIBUS_STRATEGY_PER_JOB:-1}
 export PLURIBUS_CHUNK_SIZE=${PLURIBUS_CHUNK_SIZE:-4000000}
 # Shared-memory index cache: serves the per-node info-set lookup from shm
 # instead of an LMDB read txn (the dominant inner-loop cost).  Capacities are
@@ -262,8 +245,7 @@ fi
 echo "  - Warm start:                  ${WARM_START:-(none)}"
 echo "  - CPUs:                        $SLURM_CPUS_PER_TASK"
 echo "  - PLURIBUS_CFR_BATCH_SIZE:     $PLURIBUS_CFR_BATCH_SIZE"
-echo "  - PLURIBUS_STRATEGY_BATCH_SIZE:$PLURIBUS_STRATEGY_BATCH_SIZE"
-echo "  - PLURIBUS_STRATEGY_PER_JOB:   ${PLURIBUS_STRATEGY_PER_JOB:-(auto)}"
+echo "  - PLURIBUS_STRATEGY_PER_JOB:   ${PLURIBUS_STRATEGY_PER_JOB:-1}"
 echo "  - PLURIBUS_CFR_CORE:           $PLURIBUS_CFR_CORE"
 echo "  - PLURIBUS_DEFERRED_ALLOC:     $PLURIBUS_DEFERRED_ALLOC"
 echo "  - PLURIBUS_INDEX_CACHE:        $PLURIBUS_INDEX_CACHE"

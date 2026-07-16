@@ -178,12 +178,13 @@ def run_recording_strategy(tables, state, i: int, *, seed: int = 0):
 
     The strategy-walk counterpart of :func:`run_recording`.  Returns
     ``(local_delta, choices)`` where ``local_delta`` is the visit-count
-    accumulator ``update_strategy`` fills (``(round, info_set_bytes) -> int64``)
-    and ``choices`` is every sampled action in DFS order.  Unlike the cfr
-    recording (opponent nodes only), the strategy walk samples at **every** node,
-    so ``choices`` spans player and opponent nodes alike.  ``state`` is
-    deep-copied so the caller's root is untouched; passing an explicit
-    ``local_delta`` keeps ``tables.strategy`` a read-only snapshot.
+    accumulator ``update_strategy`` fills (``(0, info_set_bytes) -> int64``)
+    and ``choices`` is every sampled action in DFS order.  The pre-flop
+    UPDATE-STRATEGY pass samples at **traverser** nodes only (opponent nodes
+    branch deterministically over every legal action), so ``choices`` spans
+    player nodes only — the mirror of the cfr recording (opponent nodes only).
+    ``state`` is deep-copied so the caller's root is untouched; passing an
+    explicit ``local_delta`` keeps ``tables.strategy`` a read-only snapshot.
     """
     import poker_ai.blueprint.strategy as strat_mod
 

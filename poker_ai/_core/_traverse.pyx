@@ -605,17 +605,17 @@ def traverse_rng(CoreTables ct, fast_state, int i, int t, rng, prune=None,
 
 cdef void _walk_strategy(CoreTables ct, s, int i, dict lsd,
                          _Replay replay, rng) except *:
-    """One strategy-sampling playthrough; accumulates player ``i``'s visit counts.
+    """One pre-flop UPDATE-STRATEGY pass; accumulates player ``i``'s visit counts.
 
     Byte-identical to ``poker_ai.blueprint.strategy.update_strategy`` driven with a
-    ``local_delta`` accumulator: a single sampled line (no branching), one action
-    drawn per node from the regret-matching σ, and at each **player-``i``** node the
-    sampled action's count is ``+1``'d into ``lsd[(r, info_set)]`` (an ``int64``
-    row, lazily zero-allocated — the same key/shape ``update_strategy`` writes).
-    Opponent nodes sample and descend but write nothing.  ``replay`` xor ``rng``
-    supplies the action (the same pluggable sampler as ``_traverse``); on the
-    replay path σ is not needed (the recorded action stands), so the regret read
-    is skipped exactly as ``_traverse`` skips it at replayed opponent nodes.
+    ``local_delta`` accumulator: the walk returns once the hand leaves the pre-flop
+    round (``betting_round != 0``); at each **player-``i``** node one action is drawn
+    from the regret-matching σ and its count is ``+1``'d into ``lsd[(0, info_set)]``
+    (an ``int64`` row, lazily zero-allocated); **opponent nodes traverse EVERY legal
+    action** (full pre-flop branching) and write nothing — no σ or info-set is
+    resolved there, which is the per-iteration cost saving.  ``replay`` xor ``rng``
+    supplies the traverser action (the same pluggable sampler as ``_traverse``); on
+    the replay path σ is not needed, so the regret read is skipped.
 
     ``except *`` REQUIRED — ``info_set`` / ``step_in_place`` / the memoryview
     coercion can raise, and a bare ``cdef void`` would swallow it (the Phase-2
@@ -623,12 +623,15 @@ cdef void _walk_strategy(CoreTables ct, s, int i, dict lsd,
     """
     if s.is_terminal or not s.is_seat_active(i):
         return
+    # Average strategy is tracked pre-flop only — stop once betting moves on.
+    if s.betting_round != 0:
+        return
 
     cdef list legal = [a for a in s.legal_actions() if a is not None]
     if len(legal) == 0:
         return
 
-    cdef int r = s.betting_round
+    cdef int r = s.betting_round  # == 0 past the guard above
     cdef int n = ct._nact[r]
     cdef bint mine = (s.player_i == i)
 
@@ -638,28 +641,23 @@ cdef void _walk_strategy(CoreTables ct, s, int i, dict lsd,
     cdef float sigma[MAX_ACTIONS]
     cdef long[::1] sav
 
-    a2i = ct._a2i[r]
-    # info_set is resolved lazily and reused: the rng path needs it for the regret
-    # read, the my-node write needs it for the accumulator key.  A replayed
-    # opponent node needs neither, so it is never resolved there.
-    iset = None
-
-    if replay is not None:
-        action = replay.take(legal)
-    else:
-        iset = s.info_set()
-        row_mv = ct._regret_row(r, iset)
-        has_row = row_mv is not None
-        canonical = ct._canonical[r]
-        legal_set = set(legal)
-        for k in range(n):
-            mask[k] = 1 if (canonical[k] in legal_set) else 0
-        ct._sigma(row_mv, has_row, mask, n, sigma)
-        action = _rng_sample(rng, legal, sigma, a2i)
-
     if mine:
-        if iset is None:
-            iset = s.info_set()
+        # Traverser node: resolve σ (rng path only), sample one action, record
+        # it, and descend that action.
+        a2i = ct._a2i[r]
+        iset = s.info_set()
+        if replay is not None:
+            action = replay.take(legal)
+        else:
+            row_mv = ct._regret_row(r, iset)
+            has_row = row_mv is not None
+            canonical = ct._canonical[r]
+            legal_set = set(legal)
+            for k in range(n):
+                mask[k] = 1 if (canonical[k] in legal_set) else 0
+            ct._sigma(row_mv, has_row, mask, n, sigma)
+            action = _rng_sample(rng, legal, sigma, a2i)
+
         col = <int>a2i[action]
         key = (r, iset)
         arr = lsd.get(key)
@@ -669,21 +667,28 @@ cdef void _walk_strategy(CoreTables ct, s, int i, dict lsd,
         sav = arr
         sav[col] += 1
 
-    tok = s.step_in_place(action)
-    _walk_strategy(ct, s, i, lsd, replay, rng)
-    s.undo(tok)
+        tok = s.step_in_place(action)
+        _walk_strategy(ct, s, i, lsd, replay, rng)
+        s.undo(tok)
+    else:
+        # Opponent node: traverse every legal action (no σ / info-set here).
+        for action in legal:
+            tok = s.step_in_place(action)
+            _walk_strategy(ct, s, i, lsd, replay, rng)
+            s.undo(tok)
 
 
 def strategy_replay(CoreTables ct, fast_state, int i, choices):
     """Run one in-core strategy walk driven by a recorded action sequence.
 
-    Returns the visit-count ``local_delta`` dict (``(round, info_set_bytes) ->
-    int64 ndarray``).  The byte-exact gate: record a strategy playthrough's
-    sampled actions with the Python ``update_strategy`` (every node samples, so
-    the recording spans player *and* opponent nodes, unlike the cfr replay which
-    records opponent nodes only), replay the same sequence into this and the
-    Python reference, and assert the two dicts are identical.  Asserts the replay
-    is fully consumed (the walk visited exactly the recorded nodes).
+    Returns the visit-count ``local_delta`` dict (``(0, info_set_bytes) ->
+    int64 ndarray``).  The byte-exact gate: record a pre-flop UPDATE-STRATEGY
+    pass's sampled actions with the Python ``update_strategy`` (only **traverser**
+    nodes sample now — opponent nodes branch deterministically — so the recording
+    spans player nodes only, in DFS order), replay the same sequence into this and
+    the Python reference, and assert the two dicts are identical.  Asserts the
+    replay is fully consumed (the walk visited exactly the recorded traverser
+    nodes).
     """
     cdef _Replay replay = _Replay(choices)
     cdef dict lsd = {}

@@ -424,18 +424,26 @@ class TestChunkedTableDiscount:
 
 
 class TestCFRTablesDiscount:
-    def test_scales_both_table_types(self, cfr_tables):
-        """After apply_discount, both regret and strategy tables are scaled."""
-        n = cfr_tables.regret[0].n_actions
+    def test_scales_regret_all_streets_strategy_preflop_only(self, cfr_tables):
+        """Regret is discounted on every street; strategy only on pre-flop.
+
+        The average strategy is tracked pre-flop only, so streets 1-3 strategy
+        tables stay zero during training and discounting them is pure waste —
+        ``apply_discount`` leaves them untouched.
+        """
         for street in range(4):
             cfr_tables.regret[street].get_row("both_test")[:] = 1000
             cfr_tables.strategy[street].get_row("both_test")[:] = 1000
         cfr_tables.apply_discount(0.5)
+        # Regret scaled on every street.
         for street in range(4):
-            r_row = cfr_tables.regret[street].get_row("both_test")
-            s_row = cfr_tables.strategy[street].get_row("both_test")
-            assert np.all(r_row <= 500)
-            assert np.all(s_row <= 500)
+            assert np.all(cfr_tables.regret[street].get_row("both_test") <= 500)
+        # Strategy scaled pre-flop, left unchanged post-flop.
+        assert np.all(cfr_tables.strategy[0].get_row("both_test") <= 500)
+        for street in (1, 2, 3):
+            assert np.all(
+                cfr_tables.strategy[street].get_row("both_test") == 1000
+            )
 
     def test_regret_floor_not_breached(self, cfr_tables):
         """After discounting a value at REGRET_FLOOR, it stays >= REGRET_FLOOR."""
