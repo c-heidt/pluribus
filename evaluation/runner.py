@@ -890,6 +890,8 @@ def build_blueprint_session(
     :class:`BlueprintPolicy` over the restored tables backs both the opponents (via
     the bias transform) and the hero's leaf fleet / blueprint queries.
     """
+    from pathlib import Path
+
     from environment.action_space import MAX_ACTIONS_PER_STREET
     from information_abstraction.lookup import load_info_set_lut
     from poker_ai._core.flags import search_core_enabled
@@ -903,12 +905,27 @@ def build_blueprint_session(
     # cache so the leaf rollout can read the blueprint policy in-core (the ~16%
     # Python callback).  Gated on the flag so a non-core run pays no shm cost.
     use_cache = search_core_enabled()
+    # The trained index lives under ``<blueprint>/lmdb_index/street_{r}`` (the
+    # server constructs CFRTables with ``save_path / "lmdb_index"``).  Passing
+    # the blueprint root here would silently CREATE empty ``street_*`` indexes
+    # next to it — every blueprint lookup would miss and the whole eval would
+    # run on a uniform blueprint (chunks restore fine; only the key->row index
+    # would be empty).  Accept either the blueprint root or the lmdb dir itself.
+    bp_root = Path(blueprint_path)
+    index_root = bp_root / "lmdb_index" if (bp_root / "lmdb_index").exists() else bp_root
     tables = CFRTables(
-        index_path=blueprint_path,
+        index_path=index_root,
         actions_per_street=MAX_ACTIONS_PER_STREET,
         enable_index_cache=use_cache,
     )
     apply_warm_start_to_tables(tables, blueprint_path, cfg.n_players)
+    n_indexed = sum(tables._indexes[r].n_allocated_rows for r in range(4))
+    if n_indexed == 0:
+        raise RuntimeError(
+            f"Blueprint index at {index_root} is empty (0 rows across all "
+            f"streets) — the restored chunks are unreachable and every policy "
+            f"query would silently return uniform. Check --blueprint-path."
+        )
     if use_cache:
         # Mirror the whole index into the shm cache ONCE in the parent, after the
         # warm-start restore and before ``run_parallel`` forks — children inherit

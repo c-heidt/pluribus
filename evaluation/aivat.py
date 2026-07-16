@@ -134,13 +134,16 @@ class LeafValue:
     under a fixed all-blueprint continuation profile.  It reads the belief from the
     live ``hero.tracker`` at call time (the tracker is stable within a betting round
     — updated only at round boundaries — so a correction taken mid-round sees the
-    belief as of that round's start, a valid observer information set).
+    belief as of that round's start, a valid observer information set).  A hero with
+    ``tracker is None`` (a blueprint-only / non-search agent) is supported: opponent
+    holes are then drawn belief-free (uniform over available combos), still unbiased.
 
     Parameters
     ----------
     hero
-        The :class:`~poker_ai.search.agent.SearchAgent`; ``hero.tracker`` supplies
-        the belief, ``hero.my_seat`` / ``hero.my_hole`` the known hero hole.
+        Any agent exposing ``my_seat`` / ``my_hole`` (the known hero hole) and a
+        ``tracker`` — a :class:`~poker_ai.search.ranges.RangeTracker` supplying the
+        opponent belief, or ``None`` for a blueprint-only agent (belief-free draws).
     leaf_cfg
         The continuation leaf config — reuse the session's ``solver_cfg.leaf`` for
         its **fleet** (``policies``).  Its ``n_rollouts`` is *overridden* to
@@ -238,6 +241,13 @@ class LeafValue:
         removal keeps the draw card-disjoint — a mild approximation to the exact
         conditioned joint that is harmless here (``v`` may be *any* consistent
         function; unbiasedness does not depend on the sampling being exact).
+
+        A hero **without** a belief tracker (``hero.tracker is None`` — e.g. a
+        blueprint-only / non-search agent under test) has no per-seat range, so the
+        non-hero seats fall back to belief-free sampling: uniform over the
+        board-compatible, still-available combos (``_masked_weights(None, ...)``).
+        Still unbiased — ``v`` need only be consistent — it just integrates over a
+        wider (uninformative) opponent range.
         """
         tracker = self._hero.tracker
         hero_seat = int(self._hero.my_seat)
@@ -245,8 +255,8 @@ class LeafValue:
         cc = env.combo_cards
         board_ok = _board_compatible(env)
 
-        live = tracker.snapshot()               # {seat: range} incl. hero
-        folded = tracker.folded_snapshot()       # {seat: fold-time range}
+        live = tracker.snapshot() if tracker is not None else {}   # {seat: range}
+        folded = tracker.folded_snapshot() if tracker is not None else {}
 
         holes: List[Tuple[int, int]] = [(-1, -1)] * env.n_players
         holes[hero_seat] = my_hole

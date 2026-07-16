@@ -18,6 +18,7 @@ All fast: small deck, heads-up, tiny solver budget — no ``slow`` / ``requires_
 """
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -209,6 +210,32 @@ class TestBeliefSampling:
         legal = [a for a in env.legal_actions if a is not None]
         vf = LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1), n_hole_samples=3)
         vals = vf.child_values(env, legal)
+        assert set(vals) == set(legal)
+        assert all(np.isfinite(v) for v in vals.values())
+
+    def test_tracker_less_hero_samples_belief_free(self):
+        # A blueprint-only / non-search hero has ``tracker is None``.  AIVAT must
+        # still draw card-disjoint holes (hero = own hole, opponents uniform over
+        # the available combos) and evaluate v end-to-end — the "make AIVAT ready
+        # for a blueprint hero" contract.
+        env = _flop_env(low=11, high=14, stacks=(300, 300), seed=7)
+        hero_seat = env.player_i
+        my_hole = tuple(sorted(int(c) for c in env.players[hero_seat].cards))
+        hero = SimpleNamespace(my_seat=hero_seat, my_hole=my_hole, tracker=None)
+        board = {int(c) for c in env.community_cards}
+        leaf = LeafConfig(policies=_policies(), n_rollouts=1)
+
+        vf = LeafValue(hero, leaf, np.random.default_rng(0), n_hole_samples=1)
+        for _ in range(30):
+            holes = vf._sample_joint(env)
+            flat = [c for pair in holes for c in pair]
+            assert len(set(flat)) == len(flat)               # card-disjoint
+            assert not (set(flat) & board)                    # none on the board
+            assert set(holes[hero_seat]) == set(my_hole)      # hero = own hole
+
+        legal = [a for a in env.legal_actions if a is not None]
+        vals = LeafValue(hero, leaf, np.random.default_rng(1),
+                         n_hole_samples=2).child_values(env, legal)
         assert set(vals) == set(legal)
         assert all(np.isfinite(v) for v in vals.values())
 
