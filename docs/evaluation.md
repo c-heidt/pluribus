@@ -491,8 +491,10 @@ loss. Two 6-max-specific breakdowns matter alongside the top line:
   `deck_seed`, compute `Δ = aivat_value(A) − aivat_value(B0)` per hand, and bootstrap
   the CI on `mean(Δ)`. Because the shared card-luck cancels, this CI is dramatically
   tighter than differencing the two arms' independent means — it is what makes a
-  small `A − B0` edge significant at ~10k hands. The learning curve is the same Δ,
-  bucketed by A's cumulative opponent-count at each hand.
+  small `A − B0` edge significant at ~10k hands. (The model-error *sweep* is the same Δ
+  computed at each injected `SyntheticOpponentModel` error level — see
+  [opponent_modeling.md](opponent_modeling.md) scope note; the old cumulative-count
+  "learning curve" was removed with the online learner.)
 
 **Search cost / budget health.** Are searches firing, and do they fit the budget?
 
@@ -681,9 +683,10 @@ Ordered so each step yields something usable before the next.
     (resume-safe, budget-disabling) + the hero-independence invariant comment in
     `_play_and_log_one`; `summarize._query_paired` + `_bootstrap_ci` in the report
     and human block. Tests: CRN deal-is-hero-independent gate, v2→v3 migration,
-    paired-mode total count, `_query_paired` deck-seed join.* The learning-curve
-    binning (bin A's hands by cumulative opponent-count, difference vs the paired
-    B0 hand) rides on Part I's online learner and lands with it.
+    paired-mode total count, `_query_paired` deck-seed join.* (The cumulative-count
+    learning-curve binning was dropped with the online learner; the model-quality axis is
+    now the injected `SyntheticOpponentModel` error sweep, each level its own `condition`
+    paired against the B0 baseline.)
 
 ## 10. Planned Components
 
@@ -775,8 +778,13 @@ final VACUUM INTO; run the §8 summary
 **Cross-condition pairing (common random numbers).** The single highest-leverage
 variance lever for comparing approaches (vanilla / B0 / A of
 [opponent_modeling.md](opponent_modeling.md) §7), and it costs **zero extra
-compute** — it is the same hands, seeded identically, not more hands. The
-mechanism is already latent in the deterministic seeding; this locks it:
+compute** — it is the same hands, seeded identically, not more hands. **The
+no-exploitation arm — pure Pluribus (B0 = search + empty model store; `vanilla`
+blueprint-only when the proxy runs no search) — is *always* the baseline**: every
+exploitation number is the paired `Δ = aivat_value(treatment) − aivat_value(B0)`
+on the shared `deck_seed`, i.e. the *incremental* value of exploiting, never a bare
+per-arm EV. The mechanism is already latent in the deterministic seeding; this
+locks it:
 
 - **Shared `run_seed` + identical `table_policy` + identical table shape.** Deal
   and seating are pure functions of `(run_seed, hand_index)` — `deck_seed =

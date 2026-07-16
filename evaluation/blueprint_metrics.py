@@ -13,6 +13,17 @@ touching a few GB instead of the whole table.  ``--full`` reads every chunk for
 exact frequencies.  Regret health is a training diagnostic, not a "did it learn"
 signal, so it is **off by default** (``--regret`` to include it, doubling I/O).
 
+.. important::
+   The strategy tables track the average strategy **pre-flop only** (street 0);
+   the post-flop average is reconstructed offline from the retained checkpoint
+   snapshots by ``poker_ai train average``.  So on a raw *training* checkpoint the
+   post-flop strategy-table metrics (play frequencies, determinism, coverage,
+   leaf ``avg_trusted`` share) read as empty / all-uniform / all-regret-fallback —
+   that is expected, not a training failure.  Point this tool at the **averaged
+   blueprint** produced by ``poker_ai train average`` to judge post-flop quality;
+   on a training checkpoint only the pre-flop numbers and the (all-street) regret
+   health are meaningful.
+
 Headline metrics, per street:
 
 - **Play frequencies** (visit-weighted): the strategy tables store the average

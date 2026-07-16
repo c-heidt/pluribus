@@ -9,6 +9,23 @@ confidence-weighted mixture of its model and its usual adversarial
 (Johanson & Bowling 2009) transplanted into the multiplayer depth-limited
 solver of [subgame_solving.md](subgame_solving.md).
 
+> **SCOPE UPDATE (2026-07-16) — the online-learned model was removed.** The
+> exploitation eval injects model quality as a *controlled variable* via
+> `SyntheticOpponentModel` (wrap the true opponent policy, dial `error`/`confidence`
+> — the shaping lives in `poker_ai/modeling/schedules.py`) rather than learning it; see
+> [safe_exploitation_research_design.md](safe_exploitation_research_design.md) §6 and
+> [[project_exploitation_eval_design]]. The learned `BayesOpponentModel` and its
+> coarse-count machinery (`counts.py`, `store.py`, `tiers.py`) **underperformed the
+> blueprint against blueprint-derived opponents and were deleted** — an A/B (visit-weighted
+> L1 to the true opponent) showed the tier abstraction's averaging cost exceeded the
+> learnable bias postflop, and the hierarchical-backoff variant made it worse. What
+> survives in `poker_ai/modeling/`: `model.py` (`OpponentModel` ABC + `SyntheticOpponentModel`),
+> `schedules.py`, `policy.py` (`ModelPolicy`). **The CW-RR approach below is unchanged** —
+> only the *source* of `σ̂` is now the synthetic oracle. Sections describing the learned
+> provider (the `Learned-model`/`Model form`/`Soft counts` rows of §3, §4.1's Bayes bullet,
+> §4.2, §4.4) and the online-learner steps (§7 learning-curve bullet, §9 Phase 5) are kept
+> only as a **design record** and marked *removed* inline; they are not implemented.
+
 ---
 
 ## 1. Background
@@ -43,9 +60,9 @@ is untouched. That is what makes the baseline a controlled comparison
 ### Goals
 
 - Per-opponent models `σ̂_j` at blueprint granularity, with per-infoset
-  confidence `c_j`, from **two providers**: synthetic (ground truth ± a
-  controlled error, for the design doc's §6.2 sweeps) and learned online
-  (Bayes-updated blueprint from observed actions).
+  confidence `c_j`. **Provider (as built):** synthetic — ground truth ± a controlled,
+  optionally scheduled error, for the design doc's §6.2 sweeps. *(A second, learned-online
+  provider was built then removed — see the scope note at top.)*
 - The (A-mix) clamp in the **MCCFR regime**, behind a per-search mapping that
   is empty by default — an empty mapping is bit-for-bit the baseline solve
   (condition B0 needs no separate code path).
@@ -68,9 +85,9 @@ is untouched. That is what makes the baseline a controlled comparison
 - **No vector-regime clamp in v1.** Modeled subgames force the MCCFR regime
   (`force_mccfr_when_modeled`, §6.6) until the matrix blend lands (§9 step 7);
   design doc §5 integration point 4 records the budget consequence.
-- **Learned model over a coarser abstraction, not the blueprint's.** The
-  online `BayesOpponentModel` keys counts on coarse behavioral buckets (§3,
-  §4.4) so a ~10k-game evaluation budget saturates confidence; the blueprint's
+- ~~**Learned model over a coarser abstraction, not the blueprint's.**~~ **REMOVED**
+  (scope note at top). The online `BayesOpponentModel` keyed counts on coarse behavioral
+  buckets (§3, §4.4) so a ~10k-game budget could saturate confidence; the blueprint's
   own cluster/infoset granularity (info_set = `(cluster, full betting history)`)
   spreads counts far too thin for `c` to ever leave 0. Synthetic models are
   unaffected. Deviations invisible in the coarse abstraction are invisible to
@@ -84,12 +101,12 @@ is untouched. That is what makes the baseline a controlled comparison
 | Parameter | Value |
 |---|---|
 | Mixture | Behavioral, per infoset: `σ̃ = c·σ̂ + (1−c)·x`, `x` = the seat's regret-matched strategy (A-mix) |
-| Learned-model abstraction | **Coarse behavioral buckets**, decoupled from the blueprint (§4.4). Model key `k(I) = (street, s, ctx)` with `s` = the lossless bucket preflop / a 10-tier equity bin postflop, and `ctx = (n_raises ∈ {0,1,2+}, facing_bet ∈ {0,1})`. Counts and confidence live over `k`; action space collapses to 4 classes `{fold, call/check, raise, all_in}`. The blueprint's own cluster/infoset granularity spreads a ~10k-game budget too thin for `c` to ever leave 0 — this is the fix. **Synthetic models are unaffected** — they wrap an exact policy at blueprint granularity. |
-| Model form (learned) | Per-query shrinkage onto the state's own blueprint row. `prior(a)` = this state's blueprint row collapsed to the 4 classes; `σ̂_coarse(k,a) = (τ·prior(a) + n(k,a)) / (τ + n(k))`; then **expand** to `state.legal_actions` (raise-class mass split across the legal `raise:frac` actions by the blueprint row, renormalized — the §4.3 machinery). `n = 0` recovers the exact per-state blueprint. |
+| Learned-model abstraction | **(REMOVED — design record; see scope note at top.)** **Coarse behavioral buckets**, decoupled from the blueprint (§4.4). Model key `k(I) = (street, s, ctx)` with `s` = the lossless bucket preflop / a 10-tier equity bin postflop, and `ctx = (n_raises ∈ {0,1,2+}, facing_bet ∈ {0,1})`. Counts and confidence live over `k`; action space collapses to 4 classes `{fold, call/check, raise, all_in}`. The blueprint's own cluster/infoset granularity spreads a ~10k-game budget too thin for `c` to ever leave 0 — this is the fix. **Synthetic models are unaffected** — they wrap an exact policy at blueprint granularity. |
+| Model form (learned) | **(REMOVED.)** Per-query shrinkage onto the state's own blueprint row. `prior(a)` = this state's blueprint row collapsed to the 4 classes; `σ̂_coarse(k,a) = (τ·prior(a) + n(k,a)) / (τ + n(k))`; then **expand** to `state.legal_actions` (raise-class mass split across the legal `raise:frac` actions by the blueprint row, renormalized — the §4.3 machinery). `n = 0` recovers the exact per-state blueprint. |
 | Confidence | `c_j(I) = min(p_max, n(k) / (n(k) + τ))` over the coarse bucket `k(I)`; unvisited buckets get `c = min(p_max, prior)` with `prior = 0` (fully adversarial where dataless) |
 | `p_max` grid | `{0.5, 0.8, 0.95}`; `1.0` with `c ≡ 1` is condition **B1**; default `0.8` |
 | Prior strength `τ` | Default `50` observations (shared by model and confidence; separable later if calibration demands) |
-| Count attribution | **Soft counts** at the round-boundary belief replay: an observed action credits each coarse bucket `k(cluster, ctx)` — collapsed to the action's class — proportionally to the tracker's pre-action belief mass over clusters (§6.3) |
+| Count attribution | **(REMOVED — no counts without the learned model.)** **Soft counts** at the round-boundary belief replay: an observed action credits each coarse bucket `k(cluster, ctx)` — collapsed to the action's class — proportionally to the tracker's pre-action belief mass over clusters (§6.3) |
 | Model freeze cadence | Per hand: the search and belief updates read a hand-start snapshot; observations buffer and commit at hand end (breaks the count↔belief feedback loop within a hand) |
 | Belief likelihood | Modeled seats: `σ̂_j` (the model, **not** the mixture — beliefs estimate actual behavior, the mixture is the solver's hedge); bot's own range and unmodeled seats: unchanged baseline (last-search average / blueprint) |
 | Leaf continuations | Modeled seat: 4 variants derived from `σ̂_j` (same ×5-reweight machinery); bot and unmodeled seats: blueprint variants, unchanged |
@@ -99,15 +116,15 @@ is untouched. That is what makes the baseline a controlled comparison
 
 ## 4. The model abstraction (`poker_ai/modeling/`)
 
-New top-level package:
+Top-level package (as built; the learned-model files were removed — see the scope note
+at the top of this doc):
 
 ```
 poker_ai/modeling/
-├── model.py     # OpponentModel ABC; SyntheticOpponentModel; BayesOpponentModel
-├── counts.py    # soft-count attribution from the boundary belief replay
-├── tiers.py     # cluster→strength-tier table from the LUT centroids (§4.4)
-├── store.py     # ModelStore: per-opponent registry, hand-boundary commit, save/load
+├── model.py     # OpponentModel ABC; SyntheticOpponentModel
+├── schedules.py # error/confidence schedules for the synthetic sweep (pure-vs-noisy)
 └── policy.py    # ModelPolicy(Policy): σ̂-backed drop-in next to BlueprintPolicy
+                 # REMOVED: counts.py, tiers.py, store.py, BayesOpponentModel
 ```
 
 ### 4.1 `OpponentModel` (`model.py`)
@@ -130,32 +147,27 @@ class OpponentModel(ABC):
         """c ∈ [0, p_max] at state.info_set."""
 ```
 
-- `SyntheticOpponentModel(policy, c_schedule, error)` — wraps any
-  exactly-known opponent policy (the evaluation's
+- `SyntheticOpponentModel(policy, confidence, *, error, seed, bias, p_max)` — the
+  **surviving provider** and the instrument for the eval. Wraps any exactly-known
+  opponent policy (the evaluation's
   [`BlueprintOpponent`](../evaluation/opponents.py) biased variants), with a
   constant-or-scheduled `c` and a **controlled perturbation** implementing the
-  design doc §6.2 model-error sweep (per-infoset probability shift with a
-  target ℓ1 distance, seeded). The sweeps run on this provider — the online
-  learner is *not* on the critical path for the headline experiments.
-- `BayesOpponentModel(tables, counts, tiers)` — the coarse-bucket Dirichlet
-  posterior of §3. `strategy` builds the 4-class prior by collapsing this
-  state's blueprint row (queried like
-  [`BlueprintPolicy.strategy`](../poker_ai/search/policy.py)), blends the
-  coarse counts `n(k)` from the `counts` table (§4.2) at key `k = π(state)`
-  (§4.4), then expands back onto `state.legal_actions` (raise mass split by the
-  blueprint row) before the legal-set remap; `confidence` reads `n(k)` from the
-  same table. The `tiers` argument is the cluster→tier table of §4.4.
+  design doc §6.2 model-error sweep (per-infoset probability shift toward a target ℓ1
+  distance, seeded). `error` and `confidence` may each be a `callable(state)` schedule;
+  `poker_ai/modeling/schedules.py` builds the pure-vs-noisy shapes (uniform / street-graded
+  / per-infoset-noisy error; calibrated / anti-calibrated / flat confidence).
+- ~~`BayesOpponentModel(tables, counts, tiers)`~~ — **REMOVED** (see scope note at top).
+  The learned coarse-bucket Dirichlet posterior underperformed the blueprint postflop
+  against blueprint-derived opponents; the eval injects quality via the synthetic provider
+  instead.
 
-### 4.2 Counts and the store (`counts.py`, `store.py`)
+### 4.2 Counts and the store (`counts.py`, `store.py`) — REMOVED
 
-Counts are keyed by the **coarse model key** `k = (street, s, ctx)` of §3/§4.4
-— not the blueprint's `(betting_round, info_set)` — with **4-class width**:
-`n[k] : float64[4]` over `{fold, call/check, raise, all_in}` (soft counts are
-fractional). `ModelStore` owns one counts table + model per
-`opponent_id`, exposes `snapshot(opponent_id) -> OpponentModel` (the frozen
-per-hand view), `buffer_observation(...)` and `commit_hand()`, and
-`save(path)` / `load(path)` as npz of the count tables (the blueprint itself
-is not duplicated).
+*Design record only; these files were deleted (scope note at top).* The learned model
+kept soft counts over a coarse model key `k = (street, s, ctx)` (4-class width
+`{fold, call/check, raise, all_in}`) in a per-`opponent_id` `ModelStore` with
+hand-boundary `buffer_observation`/`commit_hand` and npz `save`/`load`. Not needed by the
+controlled-injection eval, which supplies `σ̂` from an exactly-known policy.
 
 ### 4.3 `ModelPolicy` (`policy.py`)
 
@@ -166,40 +178,16 @@ A `Policy` subclass (same ABC as
 modeled seat's leaf continuations are "the model, fold-/call-/raise-biased
 ×5" with zero new machinery (design doc §5, integration point 2).
 
-### 4.4 Strength tiers from the existing LUT (`tiers.py`)
+### 4.4 Strength tiers from the existing LUT (`tiers.py`) — REMOVED
 
-The postflop `s` in the model key is a **10-tier equity bin per street**,
-derived from the abstraction the codebase already ships — **no new information
-abstraction is built**. The clustering's `centroids.joblib` already encodes
-strength: the river centroid is `[win, loss, tie]`
-([`information_abstraction/build/ehs.py`](../information_abstraction/build/ehs.py),
-`feature_dim = 3`) and the turn/flop centroids are histograms over the *next*
-street's clusters. Roll them back to a scalar equity-of-equity and bin:
-
-```python
-C = joblib.load(f"{lut_dir}/centroids.joblib")
-river_eq = C["river"][:, 0] + 0.5 * C["river"][:, 2]   # (n_river,) win + tie/2
-turn_eq  = C["turn"] @ river_eq                          # (n_turn,)  hist · river_eq
-flop_eq  = C["flop"] @ turn_eq                           # (n_flop,)  hist · turn_eq
-
-def tiers(eq, n=10):                                      # equal-frequency bins
-    edges = np.quantile(eq, np.linspace(0, 1, n + 1)[1:-1])
-    return np.digitize(eq, edges)                        # cluster_id -> tier in [0, n)
-```
-
-`n = 10` (equity deciles per street) is the resolved tier count: it collapses
-the LUT's per-street clusters ~5–20× so a ~10k-game budget saturates `τ` on the
-common `(street, tier, ctx)` buckets, while keeping enough resolution to
-separate strong/weak holdings. It is a per-street-overridable knob
-(`SolverConfig`/model config), not a hard constant. The result is a small
-`{street: cluster→tier int array}` artifact (npz) built once next to the LUT;
-`π` reads `tier = tiers[street][state.cluster]`. **Preflop stays lossless** —
-`s` is the raw preflop bucket (already coarse, and preflop is the
-highest-traffic street). Caveat: in production (~169 buckets × the `ctx`
-combos) preflop keys can still sit below `τ = 50` at 10k hands, so preflop `c`
-may plateau modest — **verify preflop saturation in the run; tier preflop too
-if `c` stalls.** The identical derivation runs unchanged on the production LUT
-(same centroid structure).
+*Design record only; `tiers.py` was deleted (scope note at top).* The learned model's
+postflop `s` was a 10-tier equity bin per street, derived from the shipped
+`centroids.joblib` (river centroid `[win, loss, tie]` → `win + tie/2`; turn/flop centroids
+are histograms over the next street, rolled back to a scalar equity-of-equity and
+equal-frequency binned), preflop lossless. Empirically this tiering was the source of the
+learned model's postflop underperformance (the bucket-average discards per-state structure
+the blueprint keeps), which is why the learned path was dropped in favor of injected
+model quality.
 
 ## 5. The solver clamp (MCCFR regime)
 
@@ -296,9 +284,10 @@ for live opponent seats — the per-hand frozen view.
 builds the per-seat `seat_policies` for the `LeafConfig` (four `ModelPolicy`
 variants per modeled seat).
 
-### 6.3 Belief likelihood and soft counts
+### 6.3 Belief likelihood (soft/hard counts REMOVED with the learned model)
 
-[`_make_sigma_for_combo`](../poker_ai/search/agent.py) becomes per-seat:
+[`_make_sigma_for_combo`](../poker_ai/search/agent.py) becomes per-seat (the
+belief-likelihood swap is unchanged — `σ̂` is now supplied by `SyntheticOpponentModel`):
 
 - **Modeled opponent seat:** the closure queries the hand-start model
   snapshot — `model.strategy(env_before.policy_state_for(combo, ...))` —
@@ -306,27 +295,13 @@ variants per modeled seat).
   design doc §5 integration point 1: reach beliefs and behavioral models
   agree. (The baseline used the last search's average policy here; that
   path remains for the bot's own range and unmodeled seats.)
-  **Resolution caveat (coarse model):** `σ̂` is constant across all blueprint
-  clusters in one tier, so a modeled opponent's action no longer discriminates
-  *within* a tier — the belief posterior for that seat coarsens to tier
-  granularity wherever counts are strong. The per-state prior keeps this benign
-  where data is thin (`σ̂ → blueprint` at `n = 0`, so beliefs → baseline), but
-  where the model is confident the ranges get blunter than the blueprint
-  likelihood would. Confirm on §8.6 that this doesn't cost more (worse ranges)
-  than the exploitation gains buy.
-- **Soft counts, same replay:** at the moment
-  `_apply_boundary_belief_update` replays `(seat, env_before, action)`, the
-  tracker's range for `seat` is the *pre-action* posterior — precisely the
-  attribution weight §3 calls for. The replay additionally emits, for each
-  cluster with belief mass `p_c`,
-  `store.buffer_observation(id, π(cluster, ctx), class(action), p_c)` —
-  projecting to the coarse model key (§4.4) and the action's 4-class label, so
-  many clusters collapse onto one bucket and counts concentrate.
-  `store.commit_hand()` runs in `on_hand_start` of the *next* hand (or an
-  explicit `on_hand_end` hook), keeping the within-hand model frozen.
-- **Showdown hard counts** (flag, default off, v2): when hole cards are
-  revealed, replay that opponent's whole-hand action log with unit counts on
-  the revealed hand's infosets, replacing that hand's soft counts.
+  *(The learned-model "resolution caveat" — `σ̂` constant within a tier blunting
+  beliefs — no longer applies: `SyntheticOpponentModel` wraps an exact policy at
+  blueprint granularity, so its `σ̂` discriminates within a tier.)*
+- ~~**Soft counts, same replay**~~ and ~~**Showdown hard counts**~~ — **REMOVED** with
+  the learned model (scope note at top). There is no `store.buffer_observation` /
+  `commit_hand` path; the boundary belief replay still updates ranges, it just no longer
+  emits counts.
 
 ### 6.4 Regime gating (`solver.py`)
 
@@ -376,6 +351,12 @@ to avoid a `(n_combos, n_rivers, width)` precompute.
   (`SyntheticOpponentModel` of the true opponent, `c ≡ 1`) as the naive-BR
   ceiling. All at matched search budgets (design doc §6.3); convergence curves
   logged, not just endpoints.
+  **The no-exploitation agent is *always* the baseline** — pure Pluribus (B0 =
+  search + empty model store at full scale; blueprint-only in the no-search
+  proxy). Every exploitation number is the **CRN-paired advantage over this
+  baseline** (the incremental value of exploiting); A, B, B1 and each
+  model-error sweep point are all differenced against the *same* B0 arm, never
+  reported as a bare EV. (design doc §6.1/§6.3.)
 - **Common random numbers across conditions (the free variance lever).** Every
   condition replays the **same per-hand deal seed** — hole cards, board, *and*
   the opponent-action RNG, keyed by hand index — so the shared-deal luck cancels
@@ -389,17 +370,11 @@ to avoid a `(n_combos, n_rivers, width)` precompute.
   so the existing `deck_seed` matches per hand and is the join key, plus a
   `max_hands` fixed-count mode (time-budget mode desyncs arms) and a `condition`
   label. Independent of this modeling package, so it can land first.
-- **Learning curve for free from the A run.** The online `BayesOpponentModel`
-  improves *within* the single A run, so bin A's hands by **cumulative counts
-  seen** for the acting opponent and report AIVAT EV (paired vs B0 on the same
-  deals) per bin — an EV-vs-data curve with no extra hands. Tag each hand with
-  the live model snapshot id (`model_checkpoint_interval`, snapshot every N
-  hands) so the binning is exact. Higher-fidelity variant if the free curve is
-  too noisy: **decouple observation from exploitation** — accumulate counts
-  while the opponent is observed under a fixed reference policy, snapshot the
-  model at intervals, and score each snapshot on held-out paired deals. This is
-  the "gains over the improving opponent model" deliverable; it makes the online
-  learner (not just the §6.2 synthetic sweeps) a headline result.
+- ~~**Learning curve for free from the A run.**~~ **REMOVED** with the online learner
+  (scope note at top): there is no `BayesOpponentModel` accumulating counts to bin by. The
+  "how good must the model be" question it approximated is answered *directly* by the
+  synthetic model-error sweep (design doc §6.2) — inject a known error level and read the
+  paired advantage, instead of inferring quality from opaque cumulative counts.
 - **Coverage-restricted reporting.** The `A − B0` signal lives only in hands
   where a modeled seat actually acted with `c > 0`; report the headline both
   overall **and restricted to modeled-decision hands** (mirrors §11.4's
@@ -463,27 +438,33 @@ Unit-first (fast, no functional pipeline in the iteration loop):
 Each step lands green before the next starts; steps 1–5 are the v1 critical
 path, 6–7 are follow-ups.
 
-1. `poker_ai/modeling/` package: `tiers.py` (cluster→tier from the LUT
-   centroids, §4.4), `OpponentModel`, `SyntheticOpponentModel`, `counts.py`
-   (coarse-bucket keying), `BayesOpponentModel` (per-state prior + coarse-count
-   blend + expand), `ModelStore`, `ModelPolicy` + unit tests (§8.2–4).
+1. `poker_ai/modeling/` package: `OpponentModel`, `SyntheticOpponentModel`,
+   `schedules.py` (error/confidence shaping), `ModelPolicy` + unit tests (§8.2–4).
+   *(The learned pieces — `tiers.py`, `counts.py`, `BayesOpponentModel`, `ModelStore` —
+   were built then **removed**; see the scope note at top.)*
 2. `SubgameContext.models` + the `_node_sigma` blend + `model_sigma_cache`
    + the baseline-equivalence regression (§8.1) and blend tests.
 3. `LeafConfig.seat_policies` + leaf resolution + tests.
-4. Agent wiring: snapshots, per-seat belief likelihood, soft-count buffering,
-   `force_mccfr_when_modeled` gate + determinism tests.
+4. Agent wiring: snapshots, per-seat belief likelihood,
+   `force_mccfr_when_modeled` gate + determinism tests. *(Soft-count buffering removed
+   with the learned model.)*
 5. Evaluation: `Pr_shuffle` opponent label, conditions vanilla/B0/A (+optional
    B1) in the runner, **cross-condition CRN** (built per
    [evaluation.md](evaluation.md) §9 step 10 — `max_hands` + shared
    `run_seed`/`deck_seed` + `condition`; can land first, independent of steps
    1–4), paired-difference AIVAT reporting, coverage-restricted slicing, schema
-   additions, the functional sanity test (§8.6). Learning-curve binning (§7)
-   rides on step 6's online learner.
-6. `BayesOpponentModel` online learner + showdown hard counts (flag) — the
-   "learning" condition; not required for the §6.2 sweeps.
+   additions, the functional sanity test (§8.6).
+6. ~~`BayesOpponentModel` online learner + showdown hard counts~~ — **REMOVED** (scope
+   note at top); the "how good must the model be" question is answered by the §6.2
+   synthetic error sweep instead of a learning curve.
 7. Vector-regime blend (§6.7); retire the regime gate.
 
 ## 10. Risks and Open Questions (Part I)
+
+*The first three risks below (model granularity ceiling, bet-sizing tells, soft-count
+circularity) were **specific to the removed learned model** and no longer bind — the
+synthetic provider is at blueprint granularity, sizing-aware, and count-free. Kept as
+design record.*
 
 - **Model granularity ceiling.** The learned model is *coarser* than the
   blueprint (10 equity tiers × coarse betting context, §4.4), so it can only

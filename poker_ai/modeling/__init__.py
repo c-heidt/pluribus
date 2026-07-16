@@ -1,21 +1,19 @@
 """Opponent modeling package (docs/opponent_modeling.md — Approach A / CW-RR).
 
-Per-opponent behavioral models over a **coarse** abstraction, decoupled from the
-blueprint so a ~10k-game evaluation budget can saturate per-infoset confidence
-(doc §3, §4). The public pieces:
+Pared down to the **synthetic-oracle** path the exploitation eval uses: model quality is
+*injected* as a controlled variable, not learned (see
+``docs/safe_exploitation_research_design.md`` §6). The public pieces:
 
-- :mod:`poker_ai.modeling.tiers` — the postflop strength-tier table derived from
-  the clustering's own LUT centroids (§4.4); the ``s`` dimension of the model key.
-- :mod:`poker_ai.modeling.counts` — the coarse-key projection ``π`` (§4.4), the
-  4-class action map, and the buffer/commit ``CountsTable`` (§4.2).
-- :mod:`poker_ai.modeling.model` — the :class:`OpponentModel` ABC,
-  :class:`SyntheticOpponentModel` (exact-known + ℓ1 sweep), and
-  :class:`BayesOpponentModel` (per-state prior + coarse-count Dirichlet blend, §3).
-- :mod:`poker_ai.modeling.store` — :class:`ModelStore`: the per-opponent registry
-  with hand-boundary commit and per-hand ``snapshot`` frozen views (§4.2).
+- :mod:`poker_ai.modeling.model` — the :class:`OpponentModel` ABC and
+  :class:`SyntheticOpponentModel` (wraps an exactly-known opponent policy with a
+  scheduled confidence and a controlled ℓ1 perturbation).
+- :mod:`poker_ai.modeling.schedules` — error/confidence *schedules* shaping how model
+  quality varies across infosets (the pure-vs-noisy axis: uniform / street-graded /
+  per-infoset-noisy error; calibrated / anti-calibrated / flat confidence).
 - :mod:`poker_ai.modeling.policy` — :class:`ModelPolicy`, the σ̂-backed drop-in
   ``Policy`` for modeled-seat leaf continuations (§4.3).
 
-These are Phase 1 (the standalone package).  The solver clamp, leaf wiring, and
-agent integration (Phases 2–4) consume them without further model-side machinery.
+The online-learned model (``BayesOpponentModel`` + the coarse-count ``tiers``/``counts``/
+``store`` machinery) was removed: it underperformed the blueprint against
+blueprint-derived opponents and is not needed for the controlled-injection eval.
 """
