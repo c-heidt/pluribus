@@ -265,6 +265,13 @@ _ACTION_BYTE: Dict[str, Dict[str, int]] = {
     for stage in _STAGE_ID
 }
 
+# Reverse maps for :func:`decode_info_set` (the pure-Python inverse of the encoder).
+_STAGE_NAME: Dict[int, str] = {v: k for k, v in _STAGE_ID.items()}
+_BYTE_ACTION: Dict[str, Dict[int, str]] = {
+    stage: {code: tok for tok, code in table.items()}
+    for stage, table in _ACTION_BYTE.items()
+}
+
 
 def _put_uvarint(buf: bytearray, value: int) -> None:
     """Append ``value`` (a non-negative int) to ``buf`` as unsigned LEB128."""
@@ -309,6 +316,56 @@ def encode_info_set(cluster: int, history_items) -> bytes:
             else:
                 buf.append(code)
     return bytes(buf)
+
+
+def _get_uvarint(data: bytes, pos: int) -> Tuple[int, int]:
+    """Read an unsigned LEB128 int from ``data`` at ``pos``; return ``(value, next_pos)``."""
+    result = 0
+    shift = 0
+    while True:
+        byte = data[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            return result, pos
+        shift += 7
+
+
+def decode_info_set(
+    info_set: bytes,
+) -> "Optional[Tuple[int, List[Tuple[str, List[str]]]]]":
+    """Inverse of :func:`encode_info_set`: ``bytes → (cluster, [(stage, actions), ...])``.
+
+    The exact structured fields behind an :attr:`info_set` key, recovered from the
+    bytes alone (no env / LUT needed — unlike :meth:`PokerEnv.info_set_fields`).
+    Used by the opponent-modeling coarse-key projection (opponent_modeling §4.4) to
+    read the card cluster and the betting context out of a
+    :class:`PolicyState.info_set`.  Returns ``None`` for the terminal/show-down
+    sentinel (:data:`_INFO_SET_DEFAULT`), which carries no cluster/history.
+    """
+    data = bytes(info_set)
+    if data == _INFO_SET_DEFAULT:
+        return None
+    cluster, pos = _get_uvarint(data, 0)
+    history: List[Tuple[str, List[str]]] = []
+    n = len(data)
+    while pos < n:
+        stage = _STAGE_NAME[data[pos]]
+        pos += 1
+        count, pos = _get_uvarint(data, pos)
+        rev = _BYTE_ACTION[stage]
+        actions: List[str] = []
+        for _ in range(count):
+            code = data[pos]
+            pos += 1
+            if code == _RAW_TOKEN_MARK:
+                length, pos = _get_uvarint(data, pos)
+                actions.append(data[pos : pos + length].decode("utf-8"))
+                pos += length
+            else:
+                actions.append(rev[code])
+        history.append((stage, actions))
+    return cluster, history
 
 
 # ---------------------------------------------------------------------------
