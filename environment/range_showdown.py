@@ -120,9 +120,19 @@ def removal_index(combo_cards: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]
 # rank range + the board tuple; ``combo_cards`` is rebuilt from the (already
 # cached) :func:`enumerate_combos`, so callers pass only hashable identifiers.
 # Returned arrays are read-only — callers must not mutate them.
+#
+# Sizing: the vector search regime re-ranks once per distinct sampled board, so
+# the working set is the subgame's candidate-completion count.  A turn root has
+# <= 46 (one river); a **flop** root has C(47, 2) = 1081 (turn+river) — past the
+# old 1024 and straight into thrash, which would silently turn a memo hit into a
+# full re-rank on every iteration.  ``test_no_reranking_in_iteration_loop`` is
+# the canary.  2048 covers a full-deck flop subgame with headroom; the entries
+# are per-combo rank/valid arrays (a few KB each on a 52-card deck).
 # --------------------------------------------------------------------------- #
 
-@lru_cache(maxsize=1024)
+_BOARD_CACHE_SIZE = 2048
+
+@lru_cache(maxsize=_BOARD_CACHE_SIZE)
 def _ranked_cached(low_card_rank: int, high_card_rank: int, board: Tuple[int, ...]):
     cards, _ = enumerate_combos(low_card_rank, high_card_rank)
     ranks, valid = rank_combos_on_board(cards, board)
@@ -131,7 +141,7 @@ def _ranked_cached(low_card_rank: int, high_card_rank: int, board: Tuple[int, ..
     return ranks, valid
 
 
-@lru_cache(maxsize=1024)
+@lru_cache(maxsize=_BOARD_CACHE_SIZE)
 def _valid_cached(low_card_rank: int, high_card_rank: int, board: Tuple[int, ...]):
     cards, _ = enumerate_combos(low_card_rank, high_card_rank)
     board_arr = np.asarray(board, dtype=cards.dtype)

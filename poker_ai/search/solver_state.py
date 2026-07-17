@@ -155,6 +155,8 @@ class SearchStats:
     runout_cache_hits: int = 0
     runout_cache_misses: int = 0
     runout_cache_size: int = 0
+    term_runout: int = 0          # terminals scored by decision-free runout_equity
+    term_payout: int = 0          # terminals scored by env.payout (fold/showdown)
 
     @property
     def cache_hits(self) -> int:
@@ -184,6 +186,8 @@ class SearchStats:
             runout_cache_hits=self.runout_cache_hits + other.runout_cache_hits,
             runout_cache_misses=self.runout_cache_misses + other.runout_cache_misses,
             runout_cache_size=self.runout_cache_size + other.runout_cache_size,
+            term_runout=self.term_runout + other.term_runout,
+            term_payout=self.term_payout + other.term_payout,
         )
         return merged
 
@@ -228,6 +232,15 @@ class SolverState:
     node_count: int = 0
     legal_at_hits: int = 0
     legal_at_misses: int = 0
+    # Per-terminal MCCFR evaluator mix (§ diagnostics): which of the two scalar
+    # terminal evaluators scored each terminal-visit — ``term_runout`` =
+    # decision-free all-in ``runout_equity`` (enumerate the board completions),
+    # ``term_payout`` = ``env.payout`` (folds, checked-down showdowns, and sampled
+    # all-in runouts when decision-free equity is off).  The ``decision_free``
+    # leaf-mode label only says the *former* is enabled; these say how often it
+    # actually fired.  Vector-regime terminals touch neither (vectorized showdown).
+    term_runout: int = 0
+    term_payout: int = 0
 
     @classmethod
     def empty(cls) -> "SolverState":
@@ -253,6 +266,8 @@ class SolverState:
         self.node_count = 0
         self.legal_at_hits = 0
         self.legal_at_misses = 0
+        self.term_runout = 0
+        self.term_payout = 0
         for cache in (self.leaf_value_cache, self.runout_cache):
             if hasattr(cache, "hits"):
                 cache.hits = 0
@@ -519,4 +534,6 @@ class SolverState:
             runout_cache_hits=getattr(self.runout_cache, "hits", 0),
             runout_cache_misses=getattr(self.runout_cache, "misses", 0),
             runout_cache_size=len(self.runout_cache),
+            term_runout=self.term_runout,
+            term_payout=self.term_payout,
         )

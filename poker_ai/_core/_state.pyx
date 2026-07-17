@@ -905,13 +905,13 @@ cdef class FastState:
         won = pot.compute_utility(stub, ranked)
         return {s: won[s] - self.pot_chips[s] for s in range(self.n_players)}
 
-    def vector_payout(self, int seat, int opp_seat, opp_reach, river, combo_cards):
+    def vector_payout(self, int seat, int opp_seat, opp_reach, runout, combo_cards):
         """Range-vs-range terminal value to ``seat`` — Phase-3b, byte-identical to
         ``PokerEnv.vector_payout``.
 
         The search vector regime's terminal settlement moved in-core: the caller
         (the compiled/adapter walk) supplies the CFR quantities it owns
-        (``opp_seat``'s reach, the sampled ``river``, the shared ``combo_cards``);
+        (``opp_seat``'s reach, the sampled ``runout``, the shared ``combo_cards``);
         everything else reads FastState fields.  ``pot_chips`` are the per-seat
         contributions PokerEnv captures as ``_terminal_contributions`` (same source
         ``payout`` uses).  It calls the **module-level** ``range_showdown``
@@ -920,8 +920,13 @@ cdef class FastState:
         method is byte-identical to the env by construction; only the field source
         differs.  Precondition (as in the env): a terminal with exactly two
         contesting seats.
+
+        ``runout`` is the sampled board completion — one card for a turn root,
+        two for a flop root, ``None`` for an already-complete board.  A bare int
+        is accepted as the one-card form (see ``poker_env._as_runout``).
         """
         from environment import range_showdown
+        from environment.poker_env import _as_runout
 
         if not self.is_terminal:
             raise ValueError("vector_payout is only defined at a terminal node.")
@@ -939,26 +944,31 @@ cdef class FastState:
         high = self._high_card_rank
         removal = range_showdown.removal_for(low, high)
         community = [self.board[s] for s in range(5)]
+        comp = _as_runout(runout)
+        # Board cards already public at the subgame root; the runout is the rest.
+        prefix_len = 5 - len(comp) if comp is not None else len(community)
 
         if self.is_active[seat] != 0 and self.is_active[opp_seat] != 0:
-            # Showdown: complete the board with the search's sampled river (or the
+            # Showdown: complete the board with the search's sampled runout (or the
             # already-complete board for a river subgame), then settle ranges.
-            board = community[:4] + [int(river)] if river is not None else community
+            board = community[:prefix_len] + list(comp) if comp is not None else community
             ranks, valid = range_showdown.ranked_board(low, high, board)
             return range_showdown.showdown_cfv(
                 ranks, valid, combo_cards, opp_reach, stake, dead=dead, removal=removal
             )
 
         # Fold: the still-active contesting seat wins; value is rank-independent.
+        # A fold sees only the runout cards dealt by the time it happened — from a
+        # flop root that is three cases (flop-/turn-/river-side), not two.
         winner = seat if self.is_active[seat] != 0 else opp_seat
         sign = 1.0 if winner == seat else -1.0
         real_len = self._terminal_board_len
         if real_len < 0:
             real_len = len(community)
-        if river is not None and real_len == 5:
-            board = community[:4] + [int(river)]
-        else:
+        if comp is None or real_len <= prefix_len:
             board = community[:real_len]
+        else:
+            board = community[:prefix_len] + list(comp[: real_len - prefix_len])
         valid = range_showdown.board_valid_mask(low, high, board)
         gain = stake + dead if winner == seat else stake
         return range_showdown.fold_cfv(

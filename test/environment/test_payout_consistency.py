@@ -117,7 +117,7 @@ def test_vector_payout_matches_concrete_settlement(stacks, seed):
                     continue
                 opp[:] = 0.0
                 opp[j_idx] = 1.0
-                vij = term.vector_payout(0, 1, opp, river=None)[i_idx]
+                vij = term.vector_payout(0, 1, opp, runout=None)[i_idx]
                 eng = _engine_net(root, line, i, j, 0, stacks)
                 assert abs(float(vij) - float(eng)) < 1e-9, (
                     f"combo {i_idx} vs {j_idx} on line {line}: "
@@ -231,7 +231,7 @@ def test_vector_payout_includes_dead_money(seed):
                 )
                 opp[:] = 0.0
                 opp[j_idx] = 1.0
-                vij = term.vector_payout(0, 1, opp, river=None)[i_idx]
+                vij = term.vector_payout(0, 1, opp, runout=None)[i_idx]
                 eng = _engine_net3(root, line, i, j, cc[k_idx], 0, stacks)
                 assert abs(float(vij) - float(eng)) < 1e-9, (
                     f"combo {i_idx} vs {j_idx} on line {line}: "
@@ -305,14 +305,136 @@ def test_turn_fold_value_is_river_independent(seed):
     rivers = [int(c) for c in np.unique(cc) if int(c) not in board_cards]
     assert len(rivers) >= 2
     for r in rivers:
-        v = env.vector_payout(winner, opp_seat, opp, river=r)
+        v = env.vector_payout(winner, opp_seat, opp, runout=r)
         assert np.allclose(v, correct, atol=1e-9), (
             f"seed {seed}: sampled river {r} changed the turn-fold value "
             f"(max |Δ|={np.abs(v - correct).max():.4f}, stake={stake})"
         )
     # And it agrees with the river-subgame convention (river=None → turn board).
     assert np.allclose(
-        env.vector_payout(winner, opp_seat, opp, river=None), correct, atol=1e-9
+        env.vector_payout(winner, opp_seat, opp, runout=None), correct, atol=1e-9
+    )
+
+
+def _fold_env_at(seed, stacks, street):
+    """Drive a heads-up hand to a fold terminal on ``street`` (1=flop, 2=turn).
+
+    Returns ``(env, board_at_fold)``.  The engine force-deals the community out
+    to five afterward, so ``board_at_fold`` is the only record of what the fold
+    actually saw — the generalisation of :func:`_turn_fold_env` to any street.
+    """
+    np.random.seed(seed)
+    env = PokerEnv(players=[Player(i, s) for i, s in enumerate(stacks)],
+                   low_card_rank=11, high_card_rank=14)
+    _stub_lut(env)
+    g = 0
+    while env.betting_round < street and not env.is_terminal and g < 60:
+        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        g += 1
+    assert env.betting_round == street
+    board_at_fold = list(env.community_cards)
+    raise_act = next(
+        (a for a in env.legal_actions if a and a.startswith("raise")), None
+    )
+    assert raise_act is not None
+    env.step_in_place(raise_act)
+    env.step_in_place("fold")
+    assert env.is_terminal and not env.is_decision_free
+    return env, board_at_fold
+
+
+def _fold_reference(env, board_at_fold, winner, opp_seat, opp, stake):
+    """River-/runout-independent fold value on the board the fold actually saw."""
+    low, high = env.low_card_rank, env.high_card_rank
+    removal = range_showdown.removal_for(low, high)
+    valid = range_showdown.board_valid_mask(low, high, board_at_fold)
+    avail = range_showdown.reach_after_removal(
+        env.combo_cards, np.where(valid, opp, 0.0), removal
+    )
+    return stake * np.where(valid, avail, 0.0)
+
+
+def _uniform_reach_on(env, board):
+    low, high = env.low_card_rank, env.high_card_rank
+    valid = range_showdown.board_valid_mask(low, high, board)
+    opp = np.where(valid, 1.0, 0.0)
+    return opp / opp.sum()
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_flop_fold_value_is_independent_of_both_runout_cards(seed):
+    """A flop-side fold must ignore a flop root's **two**-card sampled runout.
+
+    The flop analogue of :func:`test_turn_fold_value_is_river_independent`.  A
+    flop root supplies a (turn, river) completion, but a hand that folded on the
+    flop saw neither card — so its per-combo value must equal the value computed
+    on the three-card flop board, for every completion.  The pre-existing binary
+    ``real_len == 5`` test could not express this case.
+    """
+    env, flop_board = _fold_env_at(seed, (300, 300), street=1)
+    assert len(env.community_cards) == 5      # engine force-dealt turn + river
+    assert env.terminal_board_len == 3        # but the fold saw only the flop
+
+    winner = 0 if env.players[0].is_active else 1
+    opp_seat = 1 - winner
+    stake = float(min(env.terminal_contributions))
+    opp = _uniform_reach_on(env, flop_board)
+    correct = _fold_reference(env, flop_board, winner, opp_seat, opp, stake)
+
+    used = set(int(c) for c in flop_board)
+    deck = [int(c) for c in np.unique(env.combo_cards) if int(c) not in used]
+    assert len(deck) >= 4
+    completions = [(deck[0], deck[1]), (deck[2], deck[3]), (deck[1], deck[3])]
+    for comp in completions:
+        v = env.vector_payout(winner, opp_seat, opp, runout=list(comp))
+        assert np.allclose(v, correct, atol=1e-9), (
+            f"seed {seed}: completion {comp} changed the flop-fold value "
+            f"(max |Δ|={np.abs(v - correct).max():.4f}, stake={stake})"
+        )
+    assert np.allclose(
+        env.vector_payout(winner, opp_seat, opp, runout=None), correct, atol=1e-9
+    )
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_turn_fold_from_flop_root_uses_only_the_first_runout_card(seed):
+    """A turn-side fold under a flop root sees the turn but never the river.
+
+    The middle case a flop root introduces and the binary test could not: the
+    value must track ``runout[0]`` (the turn it saw) and ignore ``runout[1]``.
+    Getting this wrong leaks a card that was never dealt into card removal.
+    """
+    env, turn_board = _fold_env_at(seed, (300, 300), street=2)
+    assert env.terminal_board_len == 4
+    flop_board = turn_board[:3]
+    turn_card = int(turn_board[3])
+
+    winner = 0 if env.players[0].is_active else 1
+    opp_seat = 1 - winner
+    stake = float(min(env.terminal_contributions))
+    opp = _uniform_reach_on(env, turn_board)
+    # Truth: the four-card board the fold saw = flop + the turn it was dealt.
+    correct = _fold_reference(env, turn_board, winner, opp_seat, opp, stake)
+
+    used = set(int(c) for c in turn_board)
+    rivers = [int(c) for c in np.unique(env.combo_cards) if int(c) not in used]
+    assert len(rivers) >= 2
+
+    # Flop-root form: runout = (the dealt turn, some river).  Every river must
+    # give the same value, and it must equal the turn-board truth.
+    for r in rivers:
+        v = env.vector_payout(winner, opp_seat, opp, runout=[turn_card, r])
+        assert np.allclose(v, correct, atol=1e-9), (
+            f"seed {seed}: river {r} leaked into a turn-side fold under a flop "
+            f"root (max |Δ|={np.abs(v - correct).max():.4f})"
+        )
+
+    # And a *different* sampled turn must change the value — otherwise the test
+    # above would pass vacuously on a payout that ignores the runout entirely.
+    other_turn = next(r for r in rivers if r != turn_card)
+    v_other = env.vector_payout(winner, opp_seat, opp, runout=[other_turn, rivers[0]])
+    assert not np.allclose(v_other, correct, atol=1e-9), (
+        "changing the sampled turn must change a turn-side fold's card removal"
     )
 
 

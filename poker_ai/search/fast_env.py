@@ -108,9 +108,9 @@ class FastEnvAdapter:
     def undo(self, token) -> None:
         self._fast.undo(token)
 
-    def vector_payout(self, seat: int, opp_seat: int, opp_reach, river=None):
+    def vector_payout(self, seat: int, opp_seat: int, opp_reach, runout=None):
         return self._fast.vector_payout(
-            seat, opp_seat, opp_reach, river, self._combo_cards
+            seat, opp_seat, opp_reach, runout, self._combo_cards
         )
 
 

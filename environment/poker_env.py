@@ -28,6 +28,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    Union,
 )
 
 import numpy as np
@@ -241,6 +242,24 @@ action grid ever drifts.  Never fires for a valid canonicalised token."""
 _INFO_SET_DEFAULT: bytes = b"\x00__default__"
 """Sentinel key returned when the hole+board is missing from the LUT at a
 terminal / show-down node (mirrors the old JSON sentinel string)."""
+
+
+def _as_runout(
+    runout: "Optional[Union[int, Sequence[int]]]",
+) -> Optional[Tuple[int, ...]]:
+    """Normalise a sampled board completion to a tuple of eval-card ints.
+
+    ``vector_payout`` takes the cards a search sampled for the board's unseen
+    tail: one for a turn root, two for a flop root.  A bare ``int`` is accepted
+    as the one-card form so the many existing scalar call sites (and the
+    ``FastState`` twin) keep working unchanged.  ``None`` means "board already
+    complete" (a river root).
+    """
+    if runout is None:
+        return None
+    if isinstance(runout, (int, np.integer)):
+        return (int(runout),)
+    return tuple(int(c) for c in runout)
 
 
 def _canonical_action_tokens(stage: str) -> List[str]:
@@ -2231,7 +2250,7 @@ class PokerEnv:
         seat: int,
         opp_seat: int,
         opp_reach: "np.ndarray",
-        river: Optional[int] = None,
+        runout: "Optional[Union[int, Sequence[int]]]" = None,
     ) -> "np.ndarray":
         """Per-combo counterfactual value to ``seat`` vs the opponent's range.
 
@@ -2255,10 +2274,13 @@ class PokerEnv:
         opp_reach : numpy.ndarray
             ``(n_combos,)`` reach-weighted range of ``opp_seat`` (board masking
             and card removal are applied here).
-        river : int, optional
-            The board runout card the search sampled for this iteration (a turn
-            subgame's chance outcome).  ``None`` for a river subgame / complete
-            board.  The engine's own dealt river is ignored in favour of this.
+        runout : int or Sequence[int], optional
+            The board completion the search sampled for this iteration — the
+            cards not yet public at the subgame root.  One card for a turn root,
+            two (turn then river, in board order) for a flop root.  A bare
+            ``int`` is accepted as the one-card form.  ``None`` for a river
+            subgame / complete board.  The engine's own deal is ignored in favour
+            of this.
 
         Returns
         -------
@@ -2283,10 +2305,19 @@ class PokerEnv:
         removal = range_showdown.removal_for(low, high)
         community = list(self.community_cards)
 
+        comp = _as_runout(runout)
+        # Cards of the board that were already public at the subgame root: the
+        # search's sampled runout supplies exactly the rest.  A turn root sends
+        # one card (prefix 4), a flop root two (prefix 3).
+        prefix_len = 5 - len(comp) if comp is not None else len(community)
+
         if self.players[seat].is_active and self.players[opp_seat].is_active:
-            # Showdown: complete the board to five with the search's sampled river
-            # (substituting it for whatever the engine dealt), then settle ranges.
-            board = community[:4] + [int(river)] if river is not None else community
+            # Showdown: complete the board to five with the search's sampled
+            # runout (substituting it for whatever the engine dealt), then settle
+            # ranges.  The engine force-deals to five at every terminal, so the
+            # prefix slice is what discards its deal — slicing at a fixed 4 would
+            # silently keep the engine's turn card on a flop-rooted search.
+            board = community[:prefix_len] + list(comp) if comp is not None else community
             ranks, valid = range_showdown.ranked_board(low, high, board)
             return range_showdown.showdown_cfv(
                 ranks, valid, combo_cards, opp_reach, stake, dead=dead, removal=removal
@@ -2298,17 +2329,19 @@ class PokerEnv:
         # Mask the opponent reach by the board the hand actually reached.  The
         # engine force-deals the community out to five on a fold, so
         # ``len(community)`` is always 5 here and cannot distinguish a river-side
-        # fold from a turn-side one — ``terminal_board_len`` (captured before the
-        # force-deal) can.  Only a genuine river-side fold (real board complete)
-        # sees the search's sampled river; a pre-river fold uses the shorter board
-        # it saw, so card removal does not include cards that were never dealt.
+        # fold from an earlier one — ``terminal_board_len`` (captured before the
+        # force-deal) can.  A fold sees only the runout cards that had actually
+        # been dealt when it happened, so card removal never includes cards that
+        # were never turned over.  From a flop root that is three cases, not two:
+        # a flop-side fold (sees no runout card), a turn-side fold (sees the
+        # first), and a river-side fold (sees both).
         real_len = self._terminal_board_len
         if real_len is None:
             real_len = len(community)
-        if river is not None and real_len == 5:
-            board = community[:4] + [int(river)]
-        else:
+        if comp is None or real_len <= prefix_len:
             board = community[:real_len]
+        else:
+            board = community[:prefix_len] + list(comp[: real_len - prefix_len])
         # A fold needs only board-compatibility (no showdown ranking), so use the
         # rank-free mask — cheaper, and it never ranks a partial pre-river board.
         valid = range_showdown.board_valid_mask(low, high, board)

@@ -375,6 +375,6 @@ class TestSettleWinnersFlag:
         e_true.step_in_place(action, settle_winners=True)
         e_false.step_in_place(action, settle_winners=False)
         opp = np.ones(e_true.n_combos) / e_true.n_combos
-        vt = e_true.vector_payout(0, 1, opp, river=None)
-        vf = e_false.vector_payout(0, 1, opp, river=None)
+        vt = e_true.vector_payout(0, 1, opp, runout=None)
+        vf = e_false.vector_payout(0, 1, opp, runout=None)
         np.testing.assert_array_equal(vt, vf)

@@ -275,7 +275,9 @@ class _MCCFRSolver:
             if eq is None:
                 eq = env.runout_equity(rng=self.rng)
                 self.state.runout_cache[key] = eq
+            self.state.term_runout += 1
             return float(eq[i])
+        self.state.term_payout += 1
         return float(env.payout[i])
 
     def _leaf_value(self, env, profile: Dict[int, BiasClass], pk_base) -> np.ndarray:

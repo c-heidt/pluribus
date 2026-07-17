@@ -107,7 +107,7 @@ _STACKS = [
 @pytest.mark.parametrize("stacks", _STACKS)
 def test_vector_payout_matches_env(stacks):
     """Over many random terminals, ``FastState.vector_payout`` equals
-    ``PokerEnv.vector_payout`` byte-for-byte for random (seat, opp, reach, river)."""
+    ``PokerEnv.vector_payout`` byte-for-byte for random (seat, opp, reach, runout)."""
     n = len(stacks)
     compared = 0
     showdowns = 0
@@ -127,10 +127,16 @@ def test_vector_payout_matches_env(stacks):
         # the env evaluator, so exclude them (as _VectorSolver._rivers does).
         board_set = set(board)
         non_board = [c for c in cards if c not in board_set]
-        rivers = [None] + [
+        runouts = [None] + [
             non_board[rng.randint(len(non_board))]
             for _ in range(min(3, len(non_board)))
         ]
+        # Two-card completions (a **flop** root's chance outcome): the pair must
+        # be distinct and off-board, exactly as the regime's completion set is.
+        if len(non_board) >= 2:
+            for _ in range(2):
+                pair = rng.choice(len(non_board), size=2, replace=False)
+                runouts.append([non_board[int(pair[0])], non_board[int(pair[1])]])
         active = [s for s in range(n) if env.players[s].is_active]
         if len(active) == 2:
             showdowns += 1
@@ -143,13 +149,13 @@ def test_vector_payout_matches_env(stacks):
             pairs += [(0, 2), (2, 1), (1, 2)]
         for seat, opp in pairs:
             for reach in _reach_variants(combo_cards, board, rng):
-                for river in rivers:
-                    ev = env.vector_payout(seat, opp, reach, river=river)
-                    cv = cs.vector_payout(seat, opp, reach, river, combo_cards)
+                for runout in runouts:
+                    ev = env.vector_payout(seat, opp, reach, runout=runout)
+                    cv = cs.vector_payout(seat, opp, reach, runout, combo_cards)
                     assert ev.dtype == cv.dtype == np.float64
                     assert np.array_equal(ev, cv), (
                         f"stacks={stacks} seed={seed} pair=({seat},{opp}) "
-                        f"river={river}: {ev.tolist()} != {cv.tolist()}"
+                        f"runout={runout}: {ev.tolist()} != {cv.tolist()}"
                     )
                     compared += 1
     assert compared > 0, "no terminals reached — test vacuous"

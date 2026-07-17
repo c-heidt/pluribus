@@ -810,7 +810,7 @@ class TestVectorRegime:
                               if not (set(cc[k].tolist()) & set(cc[valid[0]].tolist())))
         opp = np.zeros(env.n_combos)
         opp[j] = 1.0
-        v = env.vector_payout(0, 1, opp, river=None)[i]
+        v = env.vector_payout(0, 1, opp, runout=None)[i]
         assert abs(abs(v) - matched) < 1e-9
 
     def test_freezing_pins_actual_hand_row(self):

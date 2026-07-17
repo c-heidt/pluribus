@@ -434,7 +434,33 @@ def start(
         "checkpoint."
     ),
 )
-def average_snapshots(train_dir, output_dir, scale, min_t):
+@click.option(
+    "--workers",
+    type=int,
+    default=1,
+    show_default=True,
+    help=(
+        "Post-flop (street, chunk) tasks to average concurrently.  Each task "
+        "streams one chunk at a time, so peak RAM is roughly workers * 800 MB "
+        "at the default chunk size — this flag is the memory dial as well as "
+        "the speed dial.  The work is embarrassingly parallel (each chunk reads "
+        "its own files and writes its own output), so speedup is near-linear "
+        "until the filesystem saturates."
+    ),
+)
+@click.option(
+    "--resume",
+    is_flag=True,
+    default=False,
+    help=(
+        "Continue an interrupted build in an existing --output_dir instead of "
+        "refusing it: artefacts already present are skipped.  Every output is "
+        "written atomically (temp + rename), so anything on disk is complete "
+        "and safe to skip — a killed job never leaves a half-written chunk that "
+        "resume would trust."
+    ),
+)
+def average_snapshots(train_dir, output_dir, scale, min_t, workers, resume):
     """Build a final blueprint by averaging a run's retained snapshots.
 
     Reconstructs the post-flop average strategy offline from the retained
@@ -451,6 +477,8 @@ def average_snapshots(train_dir, output_dir, scale, min_t):
         Path(output_dir),
         scale=SIGMA_SCALE_DEFAULT if scale is None else scale,
         min_t=min_t,
+        workers=workers,
+        resume=resume,
     )
 
 
