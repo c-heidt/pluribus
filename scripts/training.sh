@@ -162,6 +162,11 @@ if [ ! -d "$LUT_PATH" ]; then
   echo "Please run abstraction first using: sbatch scripts/abstraction_auto_resub.sh" >&2
   exit 1
 fi
+if [ ! -f "$LUT_PATH/card_info_lut.joblib" ]; then
+  echo "ERROR: $LUT_PATH has no card_info_lut.joblib — the abstraction build did" >&2
+  echo "       not finish (or this is the legacy pickle-dir layout, unsupported here)." >&2
+  exit 1
+fi
 
 # Per-job private working directory under TMPDIR.  Cluster doc says
 # always use TMPDIR; whether TMPDIR is per-job or shared across
@@ -176,15 +181,53 @@ mkdir -p "$WORK_DIR"
 # memmap lookup that misses the page cache becomes a network-FS round
 # trip (the LUT typically lives on shared /pfs storage).  Set
 # STAGE_LUT_LOCALLY=false to disable when local disk is too small.
+#
+# Stage the RUNTIME SUBSET ONLY.  The abstraction directory mixes two disjoint
+# classes of data, and only one of them is read after the build:
+#   * runtime mapping  — card_info_lut.joblib (pre-flop dict + MemmapLookup
+#     stubs) and each street's cluster_ids.dat (the uint16 combo→cluster
+#     memmap).  These are the ONLY files information_abstraction/lookup.py ever
+#     opens.  ~5.9 GiB on a 52-card deck (river 5.2 + turn 0.6 + flop 0.05).
+#   * build artefacts — merged_data.dat (the per-combo hand-strength/EHS feature
+#     vectors), all_combos.npy, clusters.npy, centroids.*, checkpoint.json.
+#     These are the k-means INPUTS, touched only by information_abstraction/
+#     build/*.  They dominate the ~250 GB on disk and are dead weight here.
+# So the filter below cuts the staged bytes ~40x with no behaviour change.
+LUT_RUNTIME_FILTER=(
+  --include='*/'
+  --include='card_info_lut.joblib'
+  --include='cluster_ids.dat'
+  --exclude='*'
+)
 STAGE_LUT_LOCALLY=${STAGE_LUT_LOCALLY:-true}
 if [ "$STAGE_LUT_LOCALLY" = "true" ]; then
+  SRC_LUT_PATH="$LUT_PATH"
   LOCAL_LUT_PATH="$WORK_DIR/lut"
-  echo "Staging LUT from $LUT_PATH to $LOCAL_LUT_PATH ..."
+  echo "Staging LUT (runtime subset) from $SRC_LUT_PATH to $LOCAL_LUT_PATH ..."
   mkdir -p "$LOCAL_LUT_PATH"
   rsync_start=$(date +%s)
-  rsync -a "$LUT_PATH/" "$LOCAL_LUT_PATH/"
+  rsync -a "${LUT_RUNTIME_FILTER[@]}" "$SRC_LUT_PATH/" "$LOCAL_LUT_PATH/"
   rsync_end=$(date +%s)
-  echo "LUT staged in $((rsync_end - rsync_start))s ($(du -sh "$LOCAL_LUT_PATH" | cut -f1))"
+  echo "LUT staged in $((rsync_end - rsync_start))s ($(du -sh "$LOCAL_LUT_PATH" | cut -f1) of $(du -sh "$SRC_LUT_PATH" | cut -f1) total)"
+
+  # Verify the subset is COMPLETE.  load_info_set_lut() rebinds each street's
+  # MemmapLookup to $LUT_PATH/<street>/cluster_ids.dat only *if that file
+  # exists*; otherwise it silently keeps the absolute path baked in at build
+  # time and every lookup goes back to the shared FS — precisely the cost this
+  # staging exists to avoid, with no error and no log line.  A filter that
+  # misses a file must fail loudly here, not degrade silently at runtime.
+  lut_missing=()
+  [ -f "$LOCAL_LUT_PATH/card_info_lut.joblib" ] || lut_missing+=("card_info_lut.joblib")
+  for src_ids in "$SRC_LUT_PATH"/*/cluster_ids.dat; do
+    [ -e "$src_ids" ] || continue          # unmatched glob
+    rel="${src_ids#$SRC_LUT_PATH/}"
+    [ -f "$LOCAL_LUT_PATH/$rel" ] || lut_missing+=("$rel")
+  done
+  if [ ${#lut_missing[@]} -ne 0 ]; then
+    echo "ERROR: staged LUT is incomplete — missing: ${lut_missing[*]}" >&2
+    echo "       LUT_RUNTIME_FILTER dropped a file the runtime needs." >&2
+    exit 1
+  fi
   LUT_PATH="$LOCAL_LUT_PATH"
 fi
 

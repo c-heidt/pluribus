@@ -11,9 +11,11 @@
 # snapshot, never the live node-local file.
 #
 # RESOURCE FOOTPRINT (real-time search loads both artifacts on the node):
-#   * Node-local disk: the LUT (~250 GB) and the blueprint (~150 GB) are both
-#     rsync'd to $TMPDIR, so the job needs ~420 GB of local scratch (the two staged
-#     copies + the small SQLite db).  We deliberately do NOT `#SBATCH --tmp=...` for
+#   * Node-local disk: only the LUT's *runtime subset* (~6 GiB — the cluster-id
+#     memmaps; the ~250 GB of hand-strength build artefacts are never staged, see
+#     LUT_RUNTIME_FILTER below) and the blueprint (~150 GB) are rsync'd to $TMPDIR,
+#     so the job needs ~170 GB of local scratch (the two staged copies + the small
+#     SQLite db).  We deliberately do NOT `#SBATCH --tmp=...` for
 #     it — like training.sh, staging goes to whatever $TMPDIR the node provides, and
 #     the runtime preflight `df` check below aborts early if the node cannot hold
 #     both.  (A hard `--tmp` reservation is rejected at submit time — "Temporary disk
@@ -105,6 +107,11 @@ if [ ! -d "$LUT_PATH" ]; then
   echo "Please run abstraction first using: sbatch scripts/abstraction_auto_resub.sh" >&2
   exit 1
 fi
+if [ ! -f "$LUT_PATH/card_info_lut.joblib" ]; then
+  echo "ERROR: $LUT_PATH has no card_info_lut.joblib — the abstraction build did" >&2
+  echo "       not finish (or this is the legacy pickle-dir layout, unsupported here)." >&2
+  exit 1
+fi
 if [ ! -d "$BLUEPRINT_PATH" ]; then
   echo "ERROR: BLUEPRINT_PATH not found at $BLUEPRINT_PATH" >&2
   exit 1
@@ -118,7 +125,7 @@ mkdir -p "$WORK_DIR"
 # Tear down the job-private scratch dir on ANY exit — armed here, immediately after
 # creation, so it also fires on the preflight disk-space `exit 1` and on any
 # `set -e` failure during staging (rsync/du/cp).  Arming it only after staging (as
-# training.sh does) would leak a partial 250 GB+ copy on node-local scratch if a
+# training.sh does) would leak a partial 150 GB+ copy on node-local scratch if a
 # stage fails or the preflight aborts — exactly the "tmp dir not cleaned up" case.
 # `rm -rf` on a not-yet-populated path is a harmless no-op.
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -138,13 +145,26 @@ fi
 STAGE_LUT_LOCALLY=${STAGE_LUT_LOCALLY:-true}
 STAGE_BLUEPRINT_LOCALLY=${STAGE_BLUEPRINT_LOCALLY:-true}
 
-# Preflight: the LUT (~250 GB) and blueprint (~150 GB) are large, so verify the
-# node-local filesystem can hold everything we intend to stage BEFORE rsync starts
-# — a half-staged copy that fills the disk mid-run is far worse than failing fast
-# here.  Needed = sum of the sources we will stage + a margin for the db/WAL.
+# Only the runtime mapping is staged, never the build artefacts — see the
+# LUT_RUNTIME_FILTER rationale below.  Sizing must use the same subset the rsync
+# will actually copy, or the preflight demands ~250 GB of scratch for a ~6 GiB
+# stage and rejects nodes that would have been fine.
+lut_runtime_kb() {
+  du -sck "$1"/card_info_lut.joblib "$1"/*/cluster_ids.dat 2>/dev/null \
+    | awk '$2 == "total" {print $1}'
+}
+
+# Preflight: the staged LUT subset (~6 GiB) and blueprint (~150 GB) are large, so
+# verify the node-local filesystem can hold everything we intend to stage BEFORE
+# rsync starts — a half-staged copy that fills the disk mid-run is far worse than
+# failing fast here.  Needed = sum of the sources we will stage + a margin.
 need_kb=0
 if [ "$STAGE_LUT_LOCALLY" = "true" ]; then
-  lut_kb=$(du -sk "$LUT_PATH" | cut -f1)
+  lut_kb=$(lut_runtime_kb "$LUT_PATH")
+  if [ -z "$lut_kb" ]; then
+    echo "ERROR: could not size the LUT runtime subset under $LUT_PATH." >&2
+    exit 1
+  fi
   need_kb=$((need_kb + lut_kb))
 fi
 if [ "$STAGE_BLUEPRINT_LOCALLY" = "true" ]; then
@@ -163,14 +183,52 @@ fi
 
 # Stage the LUT to node-local fast scratch (same rationale as training.sh: avoid a
 # network-FS round trip on every river memmap lookup that misses the page cache).
+#
+# Stage the RUNTIME SUBSET ONLY.  The abstraction directory mixes two disjoint
+# classes of data, and only one of them is read after the build:
+#   * runtime mapping  — card_info_lut.joblib (pre-flop dict + MemmapLookup
+#     stubs) and each street's cluster_ids.dat (the uint16 combo→cluster
+#     memmap).  These are the ONLY files information_abstraction/lookup.py ever
+#     opens.  ~5.9 GiB on a 52-card deck (river 5.2 + turn 0.6 + flop 0.05).
+#   * build artefacts — merged_data.dat (the per-combo hand-strength/EHS feature
+#     vectors), all_combos.npy, clusters.npy, centroids.*, checkpoint.json.
+#     These are the k-means INPUTS, touched only by information_abstraction/
+#     build/*.  They dominate the ~250 GB on disk and are dead weight here.
+# So the filter below cuts the staged bytes ~40x with no behaviour change.
+LUT_RUNTIME_FILTER=(
+  --include='*/'
+  --include='card_info_lut.joblib'
+  --include='cluster_ids.dat'
+  --exclude='*'
+)
 if [ "$STAGE_LUT_LOCALLY" = "true" ]; then
+  SRC_LUT_PATH="$LUT_PATH"
   LOCAL_LUT_PATH="$WORK_DIR/lut"
-  echo "Staging LUT from $LUT_PATH to $LOCAL_LUT_PATH ..."
+  echo "Staging LUT (runtime subset) from $SRC_LUT_PATH to $LOCAL_LUT_PATH ..."
   mkdir -p "$LOCAL_LUT_PATH"
   rsync_start=$(date +%s)
-  rsync -a "$LUT_PATH/" "$LOCAL_LUT_PATH/"
+  rsync -a "${LUT_RUNTIME_FILTER[@]}" "$SRC_LUT_PATH/" "$LOCAL_LUT_PATH/"
   rsync_end=$(date +%s)
-  echo "LUT staged in $((rsync_end - rsync_start))s ($(du -sh "$LOCAL_LUT_PATH" | cut -f1))"
+  echo "LUT staged in $((rsync_end - rsync_start))s ($(du -sh "$LOCAL_LUT_PATH" | cut -f1) of $(du -sh "$SRC_LUT_PATH" | cut -f1) total)"
+
+  # Verify the subset is COMPLETE.  load_info_set_lut() rebinds each street's
+  # MemmapLookup to $LUT_PATH/<street>/cluster_ids.dat only *if that file
+  # exists*; otherwise it silently keeps the absolute path baked in at build
+  # time and every lookup goes back to the shared FS — precisely the cost this
+  # staging exists to avoid, with no error and no log line.  A filter that
+  # misses a file must fail loudly here, not degrade silently at runtime.
+  lut_missing=()
+  [ -f "$LOCAL_LUT_PATH/card_info_lut.joblib" ] || lut_missing+=("card_info_lut.joblib")
+  for src_ids in "$SRC_LUT_PATH"/*/cluster_ids.dat; do
+    [ -e "$src_ids" ] || continue          # unmatched glob
+    rel="${src_ids#$SRC_LUT_PATH/}"
+    [ -f "$LOCAL_LUT_PATH/$rel" ] || lut_missing+=("$rel")
+  done
+  if [ ${#lut_missing[@]} -ne 0 ]; then
+    echo "ERROR: staged LUT is incomplete — missing: ${lut_missing[*]}" >&2
+    echo "       LUT_RUNTIME_FILTER dropped a file the runtime needs." >&2
+    exit 1
+  fi
   LUT_PATH="$LOCAL_LUT_PATH"
 fi
 
