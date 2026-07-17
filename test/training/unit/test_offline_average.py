@@ -20,6 +20,7 @@ import pytest
 from environment.action_space import MAX_ACTIONS_PER_STREET
 from poker_ai.blueprint.offline_average import (
     SIGMA_SCALE_DEFAULT,
+    average_chunk,
     average_street,
     build_final_blueprint,
     sigma_from_regret_chunk,
@@ -96,6 +97,81 @@ class TestAverageStreet:
         np.testing.assert_array_equal(got[0], exp0)
         np.testing.assert_array_equal(got[1], exp1)
         np.testing.assert_array_equal(got[2], exp2)
+
+    def test_workers_match_serial(self, tmp_path):
+        """Parallel averaging must produce byte-identical output to serial.
+
+        --workers only changes how many chunks are in flight (each is
+        self-contained), so it must never change the result.
+        """
+        r = 2
+        rng = np.random.default_rng(7)
+        snaps = []
+        for s in range(3):
+            d = tmp_path / f"checkpoint_{1000 * (s + 1)}"
+            # Several chunks so there is real work to spread across workers.
+            for chunk_id in range(4):
+                d.mkdir(parents=True, exist_ok=True)
+                arr = rng.integers(-40, 40, size=(50, 5)).astype(np.int32)
+                np.save(d / f"regret_{r}_chunk_{chunk_id:06d}.npy", arr)
+            snaps.append(d)
+        final = snaps[-1]
+
+        serial = tmp_path / "serial"
+        serial.mkdir()
+        n_serial = average_street(snaps, final, r, serial, 1_000_000, workers=1)
+
+        par = tmp_path / "par"
+        par.mkdir()
+        n_par = average_street(snaps, final, r, par, 1_000_000, workers=4)
+
+        assert n_serial == n_par == 4
+        for chunk_id in range(4):
+            name = f"strategy_{r}_chunk_{chunk_id:06d}.npy"
+            np.testing.assert_array_equal(
+                np.load(serial / name), np.load(par / name)
+            )
+
+    def test_resume_skips_complete_chunks(self, tmp_path):
+        """With resume, an existing output is skipped and left untouched."""
+        r = 3
+        snap = tmp_path / "checkpoint_1000"
+        self._write_regret(snap, r, np.array([[7, 0, 0, 0, 0]], dtype=np.int32))
+        out = tmp_path / "out"
+        out.mkdir()
+
+        assert average_chunk([snap], snap, r, 0, out, 1_000_000) is True
+        original = np.load(out / f"strategy_{r}_chunk_000000.npy").copy()
+
+        # Poison the existing output: resume must skip it (not recompute),
+        # proving the skip is real rather than an accidental rewrite.
+        poisoned = np.full((1, 5), 123, dtype=np.int32)
+        np.save(out / f"strategy_{r}_chunk_000000.npy", poisoned)
+        assert average_chunk([snap], snap, r, 0, out, 1_000_000, resume=True) is False
+        np.testing.assert_array_equal(
+            np.load(out / f"strategy_{r}_chunk_000000.npy"), poisoned
+        )
+
+        # Without resume it is recomputed, restoring the correct values.
+        assert average_chunk([snap], snap, r, 0, out, 1_000_000, resume=False) is True
+        np.testing.assert_array_equal(
+            np.load(out / f"strategy_{r}_chunk_000000.npy"), original
+        )
+
+    def test_output_is_written_atomically(self, tmp_path):
+        """No temp/partial file survives a completed chunk write.
+
+        Resume trusts "file exists" == "work finished", which is only sound if
+        writes are atomic (temp + rename), never in-place truncation.
+        """
+        r = 3
+        snap = tmp_path / "checkpoint_1000"
+        self._write_regret(snap, r, np.array([[5, 5, 0, 0, 0]], dtype=np.int32))
+        out = tmp_path / "out"
+        out.mkdir()
+        average_chunk([snap], snap, r, 0, out, 1_000_000)
+        names = sorted(p.name for p in out.iterdir())
+        assert names == [f"strategy_{r}_chunk_000000.npy"], names
 
     def test_row_absent_from_all_snapshots_stays_zero(self, tmp_path):
         r = 3
@@ -237,6 +313,45 @@ class TestBuildFinalBlueprint:
             )
         with pytest.raises(ValueError, match="info_set_encoding"):
             build_final_blueprint(train_dir, tmp_path / "out")
+
+    def test_resume_continues_interrupted_build(self, tmp_path):
+        """A second run with resume=True completes a partial output dir.
+
+        Simulates a killed job: the first build is interrupted after the index
+        copy, leaving a partial output that the default guard would reject.
+        """
+        train_dir = tmp_path / "train"
+        train_dir.mkdir()
+        tables = _new_tables(train_dir / "lmdb_index", "shm_w3")
+        try:
+            tables.regret[2].update_row("k0", 0, 1)
+            cp = train_dir / "checkpoint_1000"
+            _save_all_streets(tables, cp)
+            _write_state(cp, tables, t=1000)
+        finally:
+            tables.close()
+
+        out_dir = tmp_path / "out"
+        # First (complete) build, so we know the expected result.
+        build_final_blueprint(train_dir, out_dir)
+        expected = np.load(out_dir / "checkpoint_1000" / "strategy_2_chunk_000000.npy")
+
+        # Simulate an interruption: drop the averaged post-flop chunks but keep
+        # the copied index (exactly the state a killed job leaves).
+        for r in (1, 2, 3):
+            p = out_dir / "checkpoint_1000" / f"strategy_{r}_chunk_000000.npy"
+            if p.exists():
+                p.unlink()
+
+        # Without resume the existing lmdb_index is refused...
+        with pytest.raises(FileExistsError):
+            build_final_blueprint(train_dir, out_dir)
+        # ...with resume the build completes in place.
+        build_final_blueprint(train_dir, out_dir, resume=True)
+        np.testing.assert_array_equal(
+            np.load(out_dir / "checkpoint_1000" / "strategy_2_chunk_000000.npy"),
+            expected,
+        )
 
     def test_min_t_excludes_early_snapshots(self, tmp_path):
         # Two snapshots; min_t drops the earlier from the average but the later

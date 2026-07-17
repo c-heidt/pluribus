@@ -12,12 +12,18 @@
 #   # explicit dirs:
 #   sbatch --export=ALL,WORKSPACE=/path/to/ws,TRAIN_DIR=/ws/models/4player_52cards,OUTPUT_DIR=/ws/models/4player_52cards_blueprint strategy_average.sh
 #
-# MEMORY: the averager is STREAMING — it processes one (street, chunk) at a time
-# and holds at most one snapshot chunk plus one float64 accumulator in RAM
-# (~a few hundred MB), independent of the run's total on-disk footprint.  So even
-# when the retained checkpoints exceed 2 TB the job fits comfortably on one node;
-# --mem below is deliberately small to reflect that (raise it only if you enlarge
-# PLURIBUS_CHUNK_SIZE, which scales the per-chunk accumulator linearly).
+# MEMORY: the averager is STREAMING — each (street, chunk) task holds one
+# snapshot chunk plus one float64 accumulator (~800 MB at the default 4M-row
+# PLURIBUS_CHUNK_SIZE) and nothing else, independent of the run's total on-disk
+# footprint.  Peak RAM is therefore WORKERS * ~800 MB, so --workers is the memory
+# dial: even with >2 TB of retained checkpoints the job fits on one node.
+# --mem below covers WORKERS=16 (~13 GB) plus headroom; scale both together.
+#
+# RUNTIME: the work is embarrassingly parallel per chunk and I/O-bound once the
+# pool is wide.  Single-threaded on a 4p/200-100-100 run (~145 post-flop chunks
+# per snapshot, ~0.7 s each) it is ~1.5-2.5 h; with WORKERS=16 it drops to the
+# filesystem's read speed for the snapshot set.  If a job is cut short, resubmit
+# with RESUME=true — completed chunks are skipped.
 #SBATCH --job-name=pluribus-average
 #SBATCH --output=logs/average-%j.out
 #SBATCH --error=logs/average-%j_error.out
@@ -25,8 +31,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=12:00:00
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=16000mb
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=24000mb
 #SBATCH --signal=SIGTERM@120
 #SBATCH --mail-type=All
 
@@ -56,6 +62,15 @@ OUTPUT_DIR=${OUTPUT_DIR:-"${TRAIN_DIR}_blueprint"}
 #            average every retained checkpoint).
 SCALE=${SCALE:-}
 MIN_T=${MIN_T:-}
+
+# Concurrency / memory dial.  Peak RAM ≈ WORKERS * ~800 MB (one chunk in flight
+# per worker), so keep WORKERS <= --cpus-per-task and --mem >= WORKERS*0.8 GB +
+# headroom.  Defaults to the allocated CPU count.
+WORKERS=${WORKERS:-${SLURM_CPUS_PER_TASK:-4}}
+# Set RESUME=true to continue an interrupted build in an existing OUTPUT_DIR
+# (completed chunks are skipped; every output is written atomically so anything
+# present is finished).
+RESUME=${RESUME:-false}
 
 mkdir -p "$PROJECT_DIR/logs"
 
@@ -93,25 +108,28 @@ if ! compgen -G "$TRAIN_DIR/checkpoint_[0-9]*" > /dev/null; then
 fi
 N_SNAPSHOTS=$(compgen -G "$TRAIN_DIR/checkpoint_[0-9]*" | wc -l)
 
-# The averager refuses to overwrite an existing blueprint (it will not clobber
-# an lmdb_index).  Fail early with a clear message instead of deep in Python.
-if [ -e "$OUTPUT_DIR/lmdb_index" ]; then
+# The averager refuses to overwrite an existing blueprint unless resuming.
+# Fail early with a clear message instead of deep in Python.
+if [ -e "$OUTPUT_DIR/lmdb_index" ] && [ "$RESUME" != "true" ]; then
   echo "ERROR: $OUTPUT_DIR already contains a blueprint (lmdb_index present)." >&2
-  echo "       Remove it or choose a fresh OUTPUT_DIR." >&2
+  echo "       Choose a fresh OUTPUT_DIR, remove it, or resubmit with" >&2
+  echo "       RESUME=true to continue an interrupted build." >&2
   exit 1
 fi
 
-# Track whether we finished so the cleanup trap only removes a PARTIAL output
-# (a job killed mid-write leaves a half-copied lmdb_index that would block the
-# re-run's overwrite guard).  A successful build is kept.
+# NOTE: a partial output is deliberately NOT deleted on failure.  Every artefact
+# is written atomically (temp + rename), so whatever is on disk is complete work
+# — throwing it away would discard hours of averaging.  Resubmit with
+# RESUME=true instead and the finished chunks are skipped.
 DONE=0
-_cleanup() {
+_keep_partial_notice() {
   if [ "$DONE" -ne 1 ] && [ -d "$OUTPUT_DIR" ]; then
-    echo "[cleanup] build did not complete — removing partial output $OUTPUT_DIR" >&2
-    rm -rf "$OUTPUT_DIR"
+    echo "[exit] build did not complete — partial output KEPT at $OUTPUT_DIR" >&2
+    echo "[exit] resubmit with RESUME=true to continue where it stopped:" >&2
+    echo "       sbatch --export=ALL,WORKSPACE=$WORKSPACE,TRAIN_DIR=$TRAIN_DIR,OUTPUT_DIR=$OUTPUT_DIR,RESUME=true $0" >&2
   fi
 }
-trap _cleanup EXIT
+trap _keep_partial_notice EXIT
 
 echo "Building averaged blueprint with:"
 echo "  - Train dir:        $TRAIN_DIR"
@@ -120,11 +138,14 @@ echo "  - Retained snaps:   $N_SNAPSHOTS  ($(du -sh --apparent-size "$TRAIN_DIR"
 echo "  - Scale:            ${SCALE:-(default 1000000)}"
 echo "  - Min t:            ${MIN_T:-(default: latest-checkpoint warm-up)}"
 echo "  - CPUs:             ${SLURM_CPUS_PER_TASK:-4}"
+echo "  - Workers:          $WORKERS  (peak RAM ≈ $((WORKERS * 800)) MB)"
+echo "  - Resume:           $RESUME"
 
 # Build optional flags
 EXTRA_ARGS=()
 [ -n "$SCALE" ] && EXTRA_ARGS+=(--scale "$SCALE")
 [ -n "$MIN_T" ] && EXTRA_ARGS+=(--min_t "$MIN_T")
+[ "$RESUME" = "true" ] && EXTRA_ARGS+=(--resume)
 
 # Run in the background so this shell can forward slurm's grace-period SIGTERM
 # to the python process (same rationale as training.sh: the signal hits the bash
@@ -133,6 +154,7 @@ EXTRA_ARGS=()
 poker_ai train average \
   --train_dir "$TRAIN_DIR" \
   --output_dir "$OUTPUT_DIR" \
+  --workers "$WORKERS" \
   "${EXTRA_ARGS[@]}" &
 AVG_PID=$!
 

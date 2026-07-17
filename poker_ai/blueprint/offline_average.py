@@ -35,13 +35,23 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import joblib
 import numpy as np
 
+from utils.io import atomic_numpy_save
+
 log = logging.getLogger("poker_ai.blueprint.offline_average")
+
+#: Approximate peak resident memory of one in-flight ``(street, chunk)`` task at
+#: the default ``PLURIBUS_CHUNK_SIZE`` (4M rows): the float64 accumulator, the
+#: int64 presence counter, one int32 snapshot chunk, and NumPy's temporaries.
+#: Measured ~650-800 MB.  Total peak ≈ ``workers * _TASK_PEAK_MB``, which is how
+#: ``--workers`` doubles as the memory dial.
+_TASK_PEAK_MB = 800
 
 #: Integer scale applied to the averaged probability vector before it is stored
 #: in the ``int32`` strategy tables.  A row that averaged ``p`` (summing to 1
@@ -98,12 +108,99 @@ def _chunk_ids(checkpoint_dir: Path, prefix: str) -> List[int]:
     return sorted(ids)
 
 
+def average_chunk(
+    snapshot_dirs: List[Path],
+    final_dir: Path,
+    r: int,
+    chunk_id: int,
+    out_dir: Path,
+    scale: int,
+    resume: bool = False,
+) -> bool:
+    """Average one ``(street, chunk)`` across snapshots; the unit of work.
+
+    Self-contained and independent of every other chunk — it reads only its own
+    chunk file from each snapshot and writes only its own output — which is what
+    makes the build both parallelisable (``workers``) and resumable (``resume``).
+
+    Peak memory is one float64 accumulator + one int64 counter + one snapshot
+    chunk (~``_TASK_PEAK_MB``), independent of the snapshot count or the run's
+    total on-disk size.
+
+    Returns
+    -------
+    bool
+        ``True`` if the chunk was computed and written, ``False`` if it was
+        skipped because a complete output already existed (``resume``).
+    """
+    prefix = f"regret_{r}"
+    out_path = out_dir / f"strategy_{r}_chunk_{chunk_id:06d}.npy"
+    if resume and out_path.exists():
+        # Outputs are written atomically (temp + rename), so a file that exists
+        # is complete — safe to skip.
+        return False
+
+    # Shape only: mmap the header so we never pull the ~80 MB final chunk into
+    # RAM here (it is read again, once, inside the snapshot loop).
+    n_rows, n_actions = np.load(
+        final_dir / f"{prefix}_chunk_{chunk_id:06d}.npy", mmap_mode="r"
+    ).shape
+    acc = np.zeros((n_rows, n_actions), dtype=np.float64)
+    count = np.zeros(n_rows, dtype=np.int64)
+
+    for snap in snapshot_dirs:
+        path = snap / f"{prefix}_chunk_{chunk_id:06d}.npy"
+        if not path.exists():
+            # This snapshot had not allocated this chunk yet.
+            continue
+        arr = np.load(path)
+        k = min(arr.shape[0], n_rows)  # earlier snapshots may hold fewer rows
+        acc[:k] += sigma_from_regret_chunk(arr[:k])
+        count[:k] += 1
+        del arr  # release the ~80 MB snapshot chunk before the next load
+
+    out = np.zeros((n_rows, n_actions), dtype=np.int32)
+    present = count > 0
+    if present.any():
+        mean = acc[present] / count[present][:, None]
+        out[present] = np.rint(scale * mean).astype(np.int32)
+    # Rows present in no snapshot stay all-zero → the readout falls back to
+    # regret matching for them (mass 0 < min_strategy_mass).
+
+    # Atomic: a killed job never leaves a truncated .npy that a later --resume
+    # would mistake for finished work.
+    atomic_numpy_save(out, out_path)
+    return True
+
+
+def _average_chunk_task(args: Tuple) -> bool:
+    """Picklable ``ProcessPoolExecutor`` entry point for :func:`average_chunk`."""
+    return average_chunk(*args)
+
+
+def _run_chunk_tasks(tasks: List[Tuple], workers: int) -> int:
+    """Run ``(street, chunk)`` tasks serially or across a process pool.
+
+    Returns the number of chunks actually written (skipped-by-resume excluded).
+    Processes, not threads: each task's peak memory is then private and the
+    total ceiling is exactly ``workers * _TASK_PEAK_MB``.
+    """
+    if not tasks:
+        return 0
+    if workers <= 1:
+        return sum(_average_chunk_task(t) for t in tasks)
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        return sum(pool.map(_average_chunk_task, tasks))
+
+
 def average_street(
     snapshot_dirs: List[Path],
     final_dir: Path,
     r: int,
     out_dir: Path,
     scale: int,
+    workers: int = 1,
+    resume: bool = False,
 ) -> int:
     """Average the regret-matched strategy of street *r* across snapshots.
 
@@ -124,61 +221,46 @@ def average_street(
         Destination checkpoint directory for the ``strategy_{r}`` chunks.
     scale : int
         Integer scale for the stored pseudo-counts (see ``SIGMA_SCALE``).
+    workers : int, optional
+        Chunks to process concurrently (peak RAM ≈ ``workers * 800 MB``).
+    resume : bool, optional
+        Skip chunks whose output already exists.
 
     Returns
     -------
     int
-        Number of strategy chunks written for this street.
+        Number of strategy chunks written for this street (skipped excluded).
     """
-    prefix = f"regret_{r}"
-    written = 0
-    for chunk_id in _chunk_ids(final_dir, prefix):
-        # Shape only: mmap the header so we never pull the ~80 MB final chunk
-        # into RAM here (it is read again, once, inside the snapshot loop).
-        n_rows, n_actions = np.load(
-            final_dir / f"{prefix}_chunk_{chunk_id:06d}.npy", mmap_mode="r"
-        ).shape
-        # One float64 accumulator + one int64 presence counter per chunk, plus
-        # one snapshot chunk in flight at a time → peak RAM is ~a few hundred MB
-        # per chunk regardless of how many snapshots or how large the run's total
-        # on-disk footprint is (streaming, not load-everything).
-        acc = np.zeros((n_rows, n_actions), dtype=np.float64)
-        count = np.zeros(n_rows, dtype=np.int64)
-
-        for snap in snapshot_dirs:
-            path = snap / f"{prefix}_chunk_{chunk_id:06d}.npy"
-            if not path.exists():
-                # This snapshot had not allocated this chunk yet.
-                continue
-            arr = np.load(path)
-            k = min(arr.shape[0], n_rows)  # earlier snapshots may hold fewer rows
-            acc[:k] += sigma_from_regret_chunk(arr[:k])
-            count[:k] += 1
-            del arr  # release the ~80 MB snapshot chunk before the next load
-
-        out = np.zeros((n_rows, n_actions), dtype=np.int32)
-        present = count > 0
-        if present.any():
-            mean = acc[present] / count[present][:, None]
-            out[present] = np.rint(scale * mean).astype(np.int32)
-        # Rows present in no snapshot stay all-zero → the readout falls back to
-        # regret matching for them (mass 0 < min_strategy_mass).
-
-        np.save(out_dir / f"strategy_{r}_chunk_{chunk_id:06d}.npy", out)
-        written += 1
-    return written
+    tasks = [
+        (snapshot_dirs, final_dir, r, chunk_id, out_dir, scale, resume)
+        for chunk_id in _chunk_ids(final_dir, f"regret_{r}")
+    ]
+    return _run_chunk_tasks(tasks, workers)
 
 
 def _load_state(checkpoint_dir: Path) -> dict:
     return joblib.load(checkpoint_dir / "server_state.pkl")
 
 
-def _link_or_copy(src: Path, dst: Path) -> None:
-    """Hardlink *src* to *dst*, copying if hardlinking is unavailable."""
+def _link_or_copy(src: Path, dst: Path, resume: bool = False) -> None:
+    """Atomically materialise *src* at *dst* (hardlink, else copy).
+
+    ``os.link`` is already atomic; the cross-filesystem ``copy2`` fallback is
+    made atomic with a temp file + ``os.replace`` so an interrupted build never
+    leaves a truncated file that a later ``--resume`` would treat as complete.
+    """
+    if resume and dst.exists():
+        return
     try:
         os.link(src, dst)
+        return
+    except FileExistsError:
+        return
     except OSError:
-        shutil.copy2(src, dst)
+        pass
+    tmp = dst.with_name(dst.name + ".tmp")
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
 
 
 def _copy_lmdb_index(src_index: Path, dst_index: Path, n_players: int) -> None:
@@ -208,7 +290,16 @@ def _copy_lmdb_index(src_index: Path, dst_index: Path, n_players: int) -> None:
                 f"training run's index directory?"
             )
         dst_street = dst_index / f"street_{r}"
-        dst_street.mkdir(parents=True, exist_ok=True)
+        if dst_street.exists():
+            # Complete (the rename below is the last step) — resume past it.
+            continue
+        # Copy into a temp dir and rename: LMDB refuses to write into a
+        # non-empty dir, and an interrupted copy must not leave a half-written
+        # street_{r} that a later --resume would trust.
+        tmp_street = dst_index / f"street_{r}.tmp"
+        if tmp_street.exists():
+            shutil.rmtree(tmp_street)
+        tmp_street.mkdir(parents=True)
         env = lmdb.open(
             str(src_street), map_size=map_size, subdir=True,
             readonly=True, lock=False,
@@ -217,9 +308,10 @@ def _copy_lmdb_index(src_index: Path, dst_index: Path, n_players: int) -> None:
             # compact=True repacks the B-tree omitting free pages → smallest
             # long-lived blueprint index; cost is a one-shot tree walk, tiny
             # next to reading the run's regret snapshots.
-            env.copy(str(dst_street), compact=True)
+            env.copy(str(tmp_street), compact=True)
         finally:
             env.close()
+        os.replace(tmp_street, dst_street)
 
 
 def build_final_blueprint(
@@ -227,6 +319,8 @@ def build_final_blueprint(
     out_dir: Path,
     scale: int = SIGMA_SCALE_DEFAULT,
     min_t: Optional[int] = None,
+    workers: int = 1,
+    resume: bool = False,
 ) -> Path:
     """Build a final blueprint by averaging a run's retained snapshots.
 
@@ -236,7 +330,8 @@ def build_final_blueprint(
         Training directory containing ``lmdb_index/`` and the retained
         ``checkpoint_<t>/`` generations.
     out_dir : Path
-        Destination directory (created; must not already contain a blueprint).
+        Destination directory (created; must not already contain a blueprint
+        unless ``resume``).
     scale : int, optional
         Integer scale for the stored strategy pseudo-counts.
     min_t : int, optional
@@ -246,6 +341,14 @@ def build_final_blueprint(
         drops any sub-warm-up end-of-run checkpoint from the average.  The
         latest checkpoint is always used for the regret / pre-flop copy-through
         regardless of this filter.
+    workers : int, optional
+        ``(street, chunk)`` tasks to process concurrently.  Each task's peak
+        memory is private, so the total ceiling is ≈ ``workers * 800 MB`` —
+        this is the memory dial.  Default 1 (serial, ~800 MB).
+    resume : bool, optional
+        Continue into an existing *out_dir*, skipping artefacts that are
+        already complete.  Every output is written atomically, so anything
+        present is finished and safe to skip.  Use after an interrupted build.
 
     Returns
     -------
@@ -306,10 +409,11 @@ def build_final_blueprint(
     # ------------------------------------------------------------------
     out_dir.mkdir(parents=True, exist_ok=True)
     out_index = out_dir / "lmdb_index"
-    if out_index.exists():
+    if out_index.exists() and not resume:
         raise FileExistsError(
             f"{out_index} already exists — refusing to overwrite an existing "
-            f"blueprint. Choose a fresh --output_dir."
+            f"blueprint. Choose a fresh --output_dir, or pass --resume to "
+            f"continue an interrupted build."
         )
     _copy_lmdb_index(
         train_dir / "lmdb_index", out_index, int(final_state["n_players"])
@@ -325,25 +429,53 @@ def build_final_blueprint(
     for r in _ALL_STREETS:
         for chunk_id in _chunk_ids(final_dir, f"regret_{r}"):
             name = f"regret_{r}_chunk_{chunk_id:06d}.npy"
-            _link_or_copy(final_dir / name, out_cp / name)
+            _link_or_copy(final_dir / name, out_cp / name, resume=resume)
     for chunk_id in _chunk_ids(final_dir, "strategy_0"):
         name = f"strategy_0_chunk_{chunk_id:06d}.npy"
-        _link_or_copy(final_dir / name, out_cp / name)
+        _link_or_copy(final_dir / name, out_cp / name, resume=resume)
 
-    # Post-flop strategy: the offline snapshot average.
-    for r in _POSTFLOP_STREETS:
-        n = average_street(avg_snapshots, final_dir, r, out_cp, scale)
-        log.info("street %d: wrote %d averaged strategy chunk(s)", r, n)
+    # Post-flop strategy: the offline snapshot average.  All post-flop chunks
+    # go through ONE pool rather than a pool per street — the river alone is
+    # ~75% of the work, so a flat task list keeps every worker busy to the end
+    # instead of draining at each street boundary.
+    tasks = [
+        (avg_snapshots, final_dir, r, chunk_id, out_cp, scale, resume)
+        for r in _POSTFLOP_STREETS
+        for chunk_id in _chunk_ids(final_dir, f"regret_{r}")
+    ]
+    log.info(
+        "Averaging %d post-flop chunk(s) with %d worker(s) "
+        "(peak RAM ≈ %d x %d MB)%s",
+        len(tasks), workers, workers, _TASK_PEAK_MB,
+        " [resume: complete chunks skipped]" if resume else "",
+    )
+    written = _run_chunk_tasks(tasks, workers)
+    log.info(
+        "Post-flop strategy: %d chunk(s) written, %d already complete",
+        written, len(tasks) - written,
+    )
 
-    _link_or_copy(final_dir / "server_state.pkl", out_cp / "server_state.pkl")
+    _link_or_copy(
+        final_dir / "server_state.pkl", out_cp / "server_state.pkl", resume=resume
+    )
 
     log.info("Final blueprint written to %s (checkpoint %s)", out_dir, out_cp.name)
     return out_dir
 
 
-def _cli(train_dir: str, output_dir: str, scale: int, min_t: Optional[int]) -> None:
+def _cli(
+    train_dir: str,
+    output_dir: str,
+    scale: int,
+    min_t: Optional[int],
+    workers: int = 1,
+    resume: bool = False,
+) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    build_final_blueprint(Path(train_dir), Path(output_dir), scale=scale, min_t=min_t)
+    build_final_blueprint(
+        Path(train_dir), Path(output_dir), scale=scale, min_t=min_t,
+        workers=workers, resume=resume,
+    )
 
 
 if __name__ == "__main__":
@@ -354,5 +486,10 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--scale", type=int, default=SIGMA_SCALE_DEFAULT)
     parser.add_argument("--min_t", type=int, default=None)
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
-    _cli(args.train_dir, args.output_dir, args.scale, args.min_t)
+    _cli(
+        args.train_dir, args.output_dir, args.scale, args.min_t,
+        workers=args.workers, resume=args.resume,
+    )
