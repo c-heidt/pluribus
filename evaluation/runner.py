@@ -56,6 +56,17 @@ from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
+# Import order matters for the ``evaluator`` compiled kernel.  Its bind lives in
+# ``environment.evaluator`` behind ``except ImportError: pass``; if that module is
+# imported before ``poker_ai``, pulling in ``poker_ai._core`` re-enters the
+# ``environment`` package mid-import and the swallowed circular ImportError leaves
+# ``default_evaluator`` on pure Python — silently, with PLURIBUS_CORE_KERNELS set.
+# The ``poker_ai`` console-script entry imports the package first so it is unaffected,
+# but ``python -m evaluation.runner`` reaches ``environment`` first.  Import poker_ai
+# up front so the kernel binds regardless of entry point.  (Verified: without this,
+# default_evaluator.evaluate stays Python under -m even with the flag on.)
+import poker_ai  # noqa: F401  (ordering side-effect, not a name use)
+
 from environment.player import Player
 from environment.poker_env import PokerEnv
 from environment.utils import card_str

@@ -101,6 +101,87 @@ conda activate $CONDA_ENV
 
 cd "$PROJECT_DIR"
 
+# Per-node compiled kernels for real-time search.  Comma-separated names, or
+# ``all``; defaults to "" (= every kernel OFF, pure-Python reference) when unset,
+# so leaving it unset silently runs search on pure Python.  These are the leaf /
+# terminal drop-ins on the search hot path — ``regret_match_matrix`` (vector
+# regret matching), ``showdown`` (range-showdown CFV), ``runout`` (river runout),
+# and ``evaluator`` / ``settlement`` at every terminal.  They gate INDEPENDENTLY
+# of the search-walk core (PLURIBUS_SEARCH_CORE, left to the operator) and are
+# byte-identical drop-ins with their own parity gates, so ``all`` is a pure
+# throughput win.  Set "" to force the pure-Python baseline.  Requires the
+# extension to be BUILT (preflight below).
+export PLURIBUS_CORE_KERNELS=${PLURIBUS_CORE_KERNELS:-all}
+
+# Compiled search WALK core.  1 = drive the subgame solve through the compiled
+# core: the vector walk on the FastState betting engine (make/undo collapses out
+# of Python), the leaf rollout (the ~74% MCCFR cost) via the FastState rollout,
+# and the in-core blueprint policy read (the runner attaches the shm index cache
+# when this is on).  Byte-identical to the Python walk (parity-gated by
+# test/search/functional/test_search_core_golden.py et al.), fallback-retaining:
+# it reverts to the PokerEnv root when the core is unavailable or an off-tree
+# action was injected.  Set 0 to force the pure-Python walk (A/B baseline arm).
+export PLURIBUS_SEARCH_CORE=${PLURIBUS_SEARCH_CORE:-1}
+
+# Preflight: the requested kernels must be ACTUALLY LIVE, not merely requested.
+# Each rebinds itself at import behind ``except ImportError: pass``, so a
+# missing/stale .so — or the evaluator kernel's import-order trap — leaves the
+# pure-Python reference in place with no error, and search just runs slower.
+# Import through ``evaluation.runner`` (the real -m entry module, which forces
+# poker_ai first) and assert the rebinds happened for the terminal value layer
+# and the vector/showdown leaf ops.
+if [ -n "$PLURIBUS_CORE_KERNELS" ] || [ "$PLURIBUS_SEARCH_CORE" = "1" ]; then
+  if ! python - <<'PY'
+import os
+import sys
+import evaluation.runner  # real entry module; fixes evaluator import order
+from environment.evaluator import default_evaluator
+from environment.pot import Pot
+import environment.range_showdown as rs
+from poker_ai.search import vector as vec
+import poker_ai.search.mccfr as mccfr
+from poker_ai._core.flags import kernel_enabled, search_core_enabled
+
+# Leaf/terminal kernels (gated per-name by PLURIBUS_CORE_KERNELS).
+live = {
+    "evaluator": default_evaluator.hand_size_map[7].__module__.startswith("poker_ai._core"),
+    "settlement": Pot.compute_utility.__name__ == "_compute_utility_core",
+    "showdown": rs.showdown_cfv.__module__.startswith("poker_ai._core"),
+    "regret_match_matrix": "poker_ai._core" in getattr(
+        getattr(vec, "_regret_match_matrix", None), "__module__", ""),
+}
+dead = [k for k, ok in live.items() if kernel_enabled(k) and not ok]
+if dead:
+    sys.exit("kernels requested but NOT live (silent pure-Python fallback): %s"
+             % ", ".join(dead))
+
+# Search WALK core (gated by PLURIBUS_SEARCH_CORE).  mccfr rebinds
+# ``continuation_value`` to the FastState rollout at import when the flag is on;
+# if it did not, the leaf rollout silently ran on pure Python.
+walk = "off"
+if os.environ.get("PLURIBUS_SEARCH_CORE") == "1":
+    if not search_core_enabled():
+        sys.exit("PLURIBUS_SEARCH_CORE=1 but search_core_enabled() is False")
+    if mccfr.continuation_value.__module__ != "poker_ai.search.leaf_fast":
+        sys.exit("PLURIBUS_SEARCH_CORE=1 but the leaf rollout did not bind to the "
+                 "compiled core (mccfr.continuation_value is still pure Python)")
+    from poker_ai.search.fast_env import build_fast_walk_env  # noqa: F401
+    walk = "on"
+
+print("Search kernels live: %s  |  walk core: %s"
+      % (", ".join(k for k, ok in live.items() if ok) or "(none)", walk))
+PY
+  then
+    echo "ERROR: a requested compiled path silently fell back to pure Python" >&2
+    echo "       (extension missing/stale, or an import-order regression in" >&2
+    echo "       evaluation/runner.py).  Rebuild on this node:" >&2
+    echo "       python setup.py build_ext --inplace" >&2
+    echo "       (or unset PLURIBUS_CORE_KERNELS / set PLURIBUS_SEARCH_CORE=0 for" >&2
+    echo "       the pure-Python path)." >&2
+    exit 1
+  fi
+fi
+
 # Ensure LUT path exists
 if [ ! -d "$LUT_PATH" ]; then
   echo "ERROR: LUT path not found at $LUT_PATH" >&2
@@ -269,6 +350,8 @@ echo "  - Workers:                ${WORKERS:-(auto)}"
 echo "  - AIVAT:                  $AIVAT (hole samples: $AIVAT_HOLE_SAMPLES)"
 echo "  - Sync interval (hands):  $SYNC_INTERVAL_HANDS"
 echo "  - Sync interval (mins):   $SYNC_INTERVAL_MINUTES"
+echo "  - Core kernels:           ${PLURIBUS_CORE_KERNELS:-(none — pure Python)}"
+echo "  - Search walk core:       ${PLURIBUS_SEARCH_CORE:-0}"
 echo "  - LUT path:               $LUT_PATH"
 echo "  - Blueprint path:         $BLUEPRINT_PATH"
 echo "  - Stage LUT locally:      $STAGE_LUT_LOCALLY"
