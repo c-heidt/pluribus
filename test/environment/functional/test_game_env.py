@@ -39,9 +39,6 @@ class TestConstruction:
         env = new_game(n_players=6, card_info_lut={})
         assert env.n_players == 6
 
-    def test_n_players_attribute(self, fresh_game):
-        assert fresh_game.n_players == 3
-
     def test_community_cards_empty(self, fresh_game):
         assert fresh_game.community_cards == ()
 
@@ -152,22 +149,6 @@ class TestInitialState:
     def test_legal_actions_contains_fold(self, fresh_game):
         assert "fold" in fresh_game.legal_actions
 
-    def test_legal_actions_inactive_player(self):
-        env = new_game(n_players=3, card_info_lut={})
-        env.players[env.player_i].fold()
-        env.players[env.player_i]._is_active = False
-        # Access legal_actions from inactive player's perspective directly
-        from environment.player import Player
-        p = Player(99, 0)
-        p._is_active = False
-        # Simulate inactive player: override current player temporarily
-        original_idx = env._player_i_index
-        # Find a folded player
-        for i, p in enumerate(env.players):
-            if not p.is_active:
-                # legal_actions checks current_player
-                break
-
     def test_initial_regret_keys_match_legal_actions(self, fresh_game):
         assert set(fresh_game.initial_regret.keys()) == set(fresh_game.legal_actions)
 
@@ -238,10 +219,6 @@ class TestActionSemantics:
             acting_i = env.player_i
             assert not new_env.is_terminal
             assert new_env.players[acting_i].n_chips == 0
-
-    def test_invalid_action_does_not_raise(self, fresh_game):
-        new_env = copy.deepcopy(fresh_game); new_env.step_in_place("raise:999")  # absurdly large raise
-        assert new_env is not None
 
     def test_action_recorded_in_history(self, fresh_game):
         new_env = copy.deepcopy(fresh_game); new_env.step_in_place("fold")

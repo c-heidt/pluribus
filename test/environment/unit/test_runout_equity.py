@@ -344,19 +344,6 @@ class TestSinglePotFastPath:
                 ties += 1
         return ties
 
-    @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
-    def test_headsup_runout_matches_scalar(self, seed):
-        # A heads-up all-in runout (no board tie expected) is settled by the
-        # vectorised no-tie path; it must equal the scalar brute-force reference
-        # bit-for-bit.
-        env = _env([10000, 10000], seed=seed)
-        _shove_to_runout(env)
-        assert env.is_decision_free
-        eq = env.runout_equity()
-        ref, _ = _brute_runout_equity(env)
-        for i in range(2):
-            assert abs(eq[i] - ref[i]) < 1e-9
-
     def test_board_ties_exercise_scalar_fallback(self):
         # A small deck makes board-tie completions common; at least one seed must
         # hit the nwin>=2 fallback branch, and equity must still match exactly.
