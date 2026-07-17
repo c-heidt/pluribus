@@ -13,13 +13,16 @@ exercises the matched-stake / uncalled-excess handling).
 
 import collections
 import copy
+import itertools
 
 import numpy as np
 import pytest
 
+import environment.dynamics as dynamics
 from environment import range_showdown
 from environment.player import Player
 from environment.poker_env import PokerEnv
+from environment.pot import Pot
 
 
 def _stub_lut(env):
@@ -314,6 +317,95 @@ def test_turn_fold_value_is_river_independent(seed):
     assert np.allclose(
         env.vector_payout(winner, opp_seat, opp, runout=None), correct, atol=1e-9
     )
+
+
+def _flop_allin_showdown(seed, stacks=(10000, 10000)):
+    """Drive HU to a **flop** all-in showdown terminal (board force-dealt to 5).
+
+    Returns ``(env, flop)`` where ``flop`` is the three community cards public
+    when the all-in resolved — the prefix a flop-rooted search would keep, with
+    the remaining ``vector_payout`` runout supplying the turn + river.
+    """
+    np.random.seed(seed)
+    env = PokerEnv(players=[Player(i, s) for i, s in enumerate(stacks)],
+                   low_card_rank=11, high_card_rank=14)
+    _stub_lut(env)
+    g = 0
+    while env.betting_round < 1 and not env.is_terminal and g < 60:
+        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        g += 1
+    assert env.betting_round == 1
+    flop = list(env.community_cards)
+    env.step_in_place("all_in")
+    g = 0
+    while not env.is_terminal and g < 6:
+        env.step_in_place("all_in" if "all_in" in env.legal_actions else "call")
+        g += 1
+    assert env.is_terminal  # an all-in showdown is decision-free by nature
+    assert env.players[0].is_active and env.players[1].is_active  # both to showdown
+    return env, flop
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_flop_root_showdown_matches_concrete_settlement(seed):
+    """A flop-root 2-card completion showdown must settle to the chip.
+
+    The load-bearing path for a flop-rooted vector search: ``vector_payout`` with
+    a ``(turn, river)`` runout must equal the concrete net when those two hands
+    are dealt and the board is completed with exactly that turn + river.  Ground
+    truth is the shared evaluator + ``Pot.compute_utility`` (the engine's own
+    settlement primitives) on the completed board — independent of
+    ``showdown_cfv``'s vectorised internals, so this is not a circular check.
+    """
+    env, flop = _flop_allin_showdown(seed)
+    assert len(flop) == 3
+    tc = env.terminal_contributions
+    cc = env.combo_cards
+    flop_set = set(int(c) for c in flop)
+    deck = [int(c) for c in np.unique(cc) if int(c) not in flop_set]
+    assert len(deck) >= 2
+    turn, river = deck[0], deck[1]
+    board = flop + [turn, river]
+    board_set = flop_set | {turn, river}
+
+    valid = [
+        k for k in range(cc.shape[0])
+        if int(cc[k, 0]) not in board_set and int(cc[k, 1]) not in board_set
+    ]
+    rng = np.random.default_rng(seed)
+    hero = valid if len(valid) <= 8 else list(rng.choice(valid, 8, replace=False))
+
+    opp = np.zeros(env.n_combos)
+    checked = 0
+    for i_idx in hero:
+        for j_idx in valid:
+            hi, hj = cc[i_idx], cc[j_idx]
+            if set((int(hi[0]), int(hi[1]))) & set((int(hj[0]), int(hj[1]))):
+                continue
+            # Concrete ground truth: rank both hands on flop+turn+river, settle
+            # with the engine's Pot, take seat 0's net (won - its contribution).
+            groups = collections.defaultdict(list)
+            stub = [Player(0, 0), Player(1, 0)]
+            stub[0]._cards = [int(hi[0]), int(hi[1])]
+            stub[1]._cards = [int(hj[0]), int(hj[1])]
+            for s in (0, 1):
+                r = dynamics._evaluator.evaluate(board, stub[s]._cards)
+                groups[r].append(stub[s])
+            ranked = [groups[r] for r in sorted(groups)]
+            pot = Pot(2)
+            pot._chips = [tc[0], tc[1]]
+            won = pot.compute_utility(stub, ranked)
+            truth = won[0] - tc[0]
+
+            opp[:] = 0.0
+            opp[j_idx] = 1.0
+            got = env.vector_payout(0, 1, opp, runout=[turn, river])[i_idx]
+            assert abs(float(got) - float(truth)) < 1e-9, (
+                f"seed {seed}: combo {i_idx} vs {j_idx} on flop root "
+                f"turn={turn} river={river}: vector={got} concrete={truth}"
+            )
+            checked += 1
+    assert checked > 0
 
 
 def _fold_env_at(seed, stacks, street):
