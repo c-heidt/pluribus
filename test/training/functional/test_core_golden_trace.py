@@ -45,16 +45,24 @@ _LUT_PATH = "data/20cards_exact"
 
 # Frozen fingerprint of the merged regret + strategy tables after the run above.
 # See the module docstring for when and how to regenerate this.
-# Re-baselined 2026-07-05 after the follow-on betting-contract fixes that
-# complete the heads-up all-in work: (1) an over-the-top all-in now lets the
-# opponent call/fold instead of the street silently advancing with the shove
-# uncalled (``more_betting_needed`` compares live bets against the top bet,
-# all-in included), and (2) heads-up post-flop action order corrected so the big
-# blind leads and the button acts last.  Both reshape the N_PLAYERS=2 tree.
+# Re-baselined 2026-07-17 after the Pluribus-style strategy switch (commit
+# 598e567): ``update_strategy`` now returns at the end of the pre-flop round and
+# branches over ALL opponent actions instead of sampling one.  That moves the
+# digest on BOTH table kinds, as expected:
+#   * strategy — post-flop phi is never written online any more (streets 1-3 are
+#     now all-zero here; the post-flop blueprint comes from ``poker_ai train
+#     average`` over retained checkpoints).  Only street 0 carries phi mass.
+#   * regret   — NOT a regret-maths change.  ``strategy_step`` and ``cfr_step``
+#     share the global numpy RNG stream (singleprocess/train.py), so changing how
+#     many draws the strategy walk consumes shifts the stream and every later
+#     traversal takes a different (equally valid) trajectory.
+# Verified at re-baseline time: digest is identical with PLURIBUS_CORE_KERNELS
+# unset vs "all", and reproducible across runs.
 # Previous digests:
+#   7fef05fc8c7c421e8c667bd049530aeb3121c16aeb41ecbeb7f33bdd83243022  (pre preflop-only phi)
 #   4ca50490d570bd4a8318b03112dd40f0466796d89c4fd8ee5a9ddb350b4f99c9  (after _hand_over all-in fix)
 #   e23d93b6b08842048d37b58ee0c166e3c9260fd803712ead082d8efe5f221251  (pre all-in fixes)
-GOLDEN_DIGEST = "7fef05fc8c7c421e8c667bd049530aeb3121c16aeb41ecbeb7f33bdd83243022"
+GOLDEN_DIGEST = "00cb45e7dc0c67a2a2a7beb14068c3061a8f26be952ecf1c546be42ff147aed2"
 
 
 def train_and_digest(save_path: Path, *, n_iterations: int = N_ITERATIONS):
