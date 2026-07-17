@@ -48,7 +48,7 @@ from typing import Iterable, Iterator, List, Optional
 # Bump on any schema change (games.schema_version); lets analysis span runs (§6).
 # v2: + games.hu_from_street (HU coverage for B-HU, opponent-modeling doc §11.4).
 # v3: + games.condition (experiment arm for cross-condition CRN pairing, §10.1).
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +116,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     unique_pubkeys  INTEGER,
     cache_hits      INTEGER,
     cache_misses    INTEGER,
+    term_runout     INTEGER,
+    term_payout     INTEGER,
     action_played   TEXT,
     action_dist     TEXT,
     exploitability  REAL,
@@ -260,6 +262,8 @@ class DecisionRow:
     unique_pubkeys: Optional[int] = None
     cache_hits: Optional[int] = None
     cache_misses: Optional[int] = None
+    term_runout: Optional[int] = None            # decision-free runout_equity evals
+    term_payout: Optional[int] = None            # env.payout (fold/showdown) evals
     action_played: Optional[str] = None
     action_dist: Optional[str] = None            # JSON: root action distribution
     exploitability: Optional[float] = None
@@ -362,6 +366,10 @@ class ExperimentLog:
             con.execute("ALTER TABLE games ADD COLUMN hu_from_street INTEGER")
         if "condition" not in have:       # v2 → v3
             con.execute("ALTER TABLE games ADD COLUMN condition TEXT")
+        dhave = {r[1] for r in con.execute("PRAGMA table_info(decisions)")}
+        if "term_runout" not in dhave:    # v3 → v4: per-terminal evaluator mix
+            con.execute("ALTER TABLE decisions ADD COLUMN term_runout INTEGER")
+            con.execute("ALTER TABLE decisions ADD COLUMN term_payout INTEGER")
         # Indexes last — after the ALTERs, so an index on a freshly-migrated column
         # (idx_games_condition) has its column to reference.
         con.executescript(_INDEX_DDL)

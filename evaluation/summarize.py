@@ -373,15 +373,24 @@ def _query_approach(con: sqlite3.Connection) -> dict:
     counted as violations (older rows may not carry it).
     """
     total = _scalar(con, "SELECT COUNT(*) FROM decisions WHERE searched = 1") or 0
+    # ``term_runout``/``term_payout`` (per-terminal evaluator mix) are v4 columns;
+    # legacy (≤v3) DBs lack them, so fall back to NULL rather than crash.
+    dcols = {r[1] for r in con.execute("PRAGMA table_info(decisions)")}
+    term_sql = (
+        "SUM(term_runout) AS term_runout, SUM(term_payout) AS term_payout"
+        if {"term_runout", "term_payout"} <= dcols
+        else "NULL AS term_runout, NULL AS term_payout"
+    )
     approaches = _rows(
         con,
-        """
+        f"""
         SELECT regime, leaf_mode,
                COUNT(*)                                             AS searches,
                AVG(wall_seconds)                                    AS mean_wall,
                AVG(iterations)                                      AS mean_iters,
                AVG(CASE WHEN stop_reason = 'wall_cap' THEN 1.0 ELSE 0.0 END)
-                                                                    AS wallcap_rate
+                                                                    AS wallcap_rate,
+               {term_sql}
         FROM decisions
         WHERE searched = 1
         GROUP BY regime, leaf_mode
@@ -390,6 +399,8 @@ def _query_approach(con: sqlite3.Connection) -> dict:
     )
     for a in approaches:
         a["share"] = (a["searches"] / total) if total else None
+        tr, tp = a.get("term_runout") or 0, a.get("term_payout") or 0
+        a["runout_frac"] = (tr / (tr + tp)) if (tr + tp) else None
 
     routing_violations = _scalar(
         con,
@@ -662,11 +673,17 @@ def _print_human(report: dict) -> str:
     L.append("")
     L.append("SOLVER APPROACH  (share · mean wall · wall-cap rate · mean iters)")
     for a in ap["approaches"]:
+        # For MCCFR, show the actual terminal-evaluator mix — what fraction of
+        # terminal-evals hit decision-free runout_equity vs env.payout — so the
+        # 'decision_free' leaf-mode label (enabled ≠ used) can't mislead.
+        mix = ""
+        if a.get("runout_frac") is not None:
+            mix = f"   terms {_fmt(a['runout_frac'],'.0%')} runout / {_fmt(1 - a['runout_frac'],'.0%')} payout"
         L.append(
             f"  {str(a['regime']):<7} {str(a['leaf_mode'] or ''):<15} "
             f"{_fmt(a['share'],'.0%'):>5}   {_fmt(a['mean_wall'],'.1f')}s   "
             f"{_fmt(a['wallcap_rate'],'.0%')} wall-cap   "
-            f"{_fmt(a['mean_iters'],'.0f')} it"
+            f"{_fmt(a['mean_iters'],'.0f')} it{mix}"
         )
     L.append(f"  routing check: {'OK ✓' if ap['routing_ok'] else 'VIOLATIONS ✗'}")
 
