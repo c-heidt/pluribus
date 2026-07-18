@@ -644,6 +644,15 @@ class PokerEnv:
         # on exit — so a version mismatch is the sole invalidation signal.
         self._state_version: int = 0
         self._public_state_cache: Optional[Tuple[int, Tuple]] = None
+        # Memo of ``cluster_for`` keyed by ``(betting_stage, sorted hole+board)``.
+        # A pure function of the (immutable) ``card_info_lut`` and the card set,
+        # so it can never go stale for a fixed LUT; the expensive part it saves is
+        # the ``MemmapLookup`` combinatorial row-index + memmap read on the 52-card
+        # LUT.  Kept per-env and started empty on every copy (see ``__deepcopy__``)
+        # so it bounds to one traversal's distinct (street, board, combo) triples —
+        # the within-traversal repeats (same future-street node revisited across the
+        # traverser's action branches) are where the hits land.
+        self._cluster_cache: Dict[Tuple, int] = {}
         self._reset_betting_round_state()
 
         # Mark the first player to act
@@ -711,6 +720,9 @@ class PokerEnv:
         # (its own version counter) so it can never serve a stale entry.
         object.__setattr__(new, "_state_version", 0)
         object.__setattr__(new, "_public_state_cache", None)
+        # Cluster memo: a pure content-keyed cache; start the copy empty so it can
+        # never carry a stale entry and stays bounded to this env's own traversal.
+        object.__setattr__(new, "_cluster_cache", {})
         return new
 
     # ------------------------------------------------------------------
@@ -2430,8 +2442,16 @@ class PokerEnv:
         community); a conflicting combo has no LUT entry and raises
         ``KeyError``.
         """
+        stage = self._betting_stage
         lookup_cards = tuple(sorted(combo) + sorted(self.community_cards))
-        return int(self.card_info_lut[self._betting_stage][lookup_cards])
+        key = (stage, lookup_cards)
+        cid = self._cluster_cache.get(key)
+        if cid is None:
+            # A board-conflicting combo has no LUT entry and raises KeyError here
+            # (never cached), exactly as the un-memoised lookup did.
+            cid = int(self.card_info_lut[stage][lookup_cards])
+            self._cluster_cache[key] = cid
+        return cid
 
     @property
     def low_card_rank(self) -> int:

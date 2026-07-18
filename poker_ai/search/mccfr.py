@@ -103,6 +103,18 @@ class _MCCFRSolver:
             if total <= 0.0:
                 raise ValueError(f"MCCFR root: seat {s} has zero board-compatible reach.")
             self._weights[s] = w / total
+        # Precomputed inverse-CDF for the root-hole draw: the joint belief weights
+        # are fixed for the whole solve, so a per-seat cumulative built once here
+        # lets ``_sample_root_holes`` draw with one ``rng.random()`` + searchsorted
+        # instead of ``rng.choice(p=)`` rebuilding and revalidating a CDF per call.
+        # The cumulative is normalised to end exactly at 1.0 so the draw mirrors
+        # ``Generator.choice`` bit-for-bit (numpy's own p-path is cumsum → /cdf[-1]
+        # → random() → searchsorted(side="right")); the search stays byte-identical.
+        self._cdf: Dict[int, np.ndarray] = {}
+        for s, w in self._weights.items():
+            cdf = np.cumsum(w)
+            cdf /= cdf[-1]
+            self._cdf[s] = cdf
         self._iter = 0
 
     # ------------------------------------------------------------------
@@ -129,6 +141,19 @@ class _MCCFRSolver:
     # Joint root sampling (§6.5 step 1)
     # ------------------------------------------------------------------
 
+    def _draw_index(self, cdf: np.ndarray) -> int:
+        """Inverse-CDF draw ∝ the weights whose cumulative sum is ``cdf``.
+
+        One ``rng.random()`` + ``searchsorted`` in place of ``rng.choice(p=w)``:
+        the weights are fixed for the whole solve, so the cumulative is built once
+        (:attr:`_cdf`, normalised to end at 1.0) rather than rebuilt and revalidated
+        on every draw.  This is exactly what ``Generator.choice`` does internally, so
+        the draw is bit-for-bit identical; ``side="right"`` gives ``P(i) == w[i]`` and
+        never selects a zero-mass entry (a flat cdf step).  ``cdf[-1] == 1.0`` exactly
+        and ``rng.random() < 1.0``, so the index can never run past the last bin.
+        """
+        return int(np.searchsorted(cdf, self.rng.random(), side="right"))
+
     def _sample_root_holes(self) -> Dict[int, Tuple[int, int]]:
         """Draw one card-disjoint assignment from the joint belief.
 
@@ -145,7 +170,7 @@ class _MCCFRSolver:
             used: set = set()
             ok = True
             for s in self._all_seats:
-                ci = int(self.rng.choice(len(self._weights[s]), p=self._weights[s]))
+                ci = self._draw_index(self._cdf[s])
                 c0, c1 = int(cc[ci, 0]), int(cc[ci, 1])
                 if c0 in used or c1 in used:
                     ok = False
