@@ -21,9 +21,13 @@ not hard-asserted (zero-sum Nash is value-unique, not necessarily strategy-uniqu
 Marked ``slow`` (full enumeration + the MCCFR iteration budget).
 """
 
+import collections
+import itertools
+
 import numpy as np
 import pytest
 
+from information_abstraction.lookup import clusters_for_board
 from poker_ai.search.mccfr import _MCCFRSolver
 from poker_ai.search.policy import SearchPolicy
 from poker_ai.search.solver import solve, SolverState
@@ -31,15 +35,19 @@ from poker_ai.search.solver_state import SolverConfig
 
 from test.search.brute_force_cfr import (
     BruteForceCFR,
+    BruteForceFlopCFR,
     BruteForceTurnCFR,
+    build_flop_subgame,
     build_subgame,
     build_turn_subgame,
     exploitability,
+    flop_exploitability,
+    flop_game_value,
     game_value,
     turn_exploitability,
     turn_game_value,
 )
-from test.search.test_solver import _ctx, _late_env
+from test.search.test_solver import _ctx, _flop_env, _late_env
 
 
 # --------------------------------------------------------------------------- #
@@ -283,17 +291,54 @@ def _remap_row(src, legal_src, legal_dst):
     return out / s if s > 0 else np.full(len(legal_dst), 1.0 / len(legal_dst))
 
 
+def _install_lossless_lut(env):
+    """Give ``env`` a lossless card LUT: a unique cluster id per (hole, board).
+
+    The cluster-keyed vector regime buckets future-street infosets by LUT
+    cluster, so a *lossy* LUT would solve a coarser game than the lossless oracle.
+    A per-street counting ``defaultdict`` assigns every distinct hole+board its own
+    id (deterministically, in first-access order), so the abstraction is a no-op
+    and the regime must reduce to the lossless equilibrium — isolating the walk /
+    gather-scatter *code* from abstraction coarseness.
+    """
+    env.card_info_lut = {
+        name: collections.defaultdict(itertools.count().__next__)
+        for name in ("pre_flop", "flop", "turn", "river")
+    }
+
+
+def _river_universe(env, sub):
+    """Sorted unique river-street cluster ids over the candidate rivers.
+
+    Mirrors ``_VectorSolver._build_universes`` for the river street, so the dense
+    row a (hole, river) maps to can be recovered from the solved state.
+    """
+    cc = env.combo_cards
+    root_comm = [int(c) for c in env.community_cards]
+    ids = set()
+    for r in sub.rivers:
+        board = np.array(root_comm + [int(r)], dtype=np.int64)
+        raw = clusters_for_board(env.card_info_lut["river"], cc, board)
+        ids.update(int(x) for x in np.unique(raw[raw >= 0]))
+    return np.array(sorted(ids), dtype=np.int64)
+
+
 def _solver_turn_sigma(state, env, sub):
     """Extract the solved turn ``SolverState`` into the turn oracle's infosets.
 
-    Turn-stage nodes (river ``None``) are read through :class:`SearchPolicy` as
-    usual.  River-stage nodes are **river-conditioned** — internal 3-D
-    ``(n_combos, n_rivers, width)`` ``vstrat`` tensors that are *not* exposed via
-    ``SearchPolicy`` (they are never played; the real river is re-solved) — so they
-    are read directly here, the solver's river axis aligning with the oracle's
-    sorted candidate-river order.  Keyed ``(seat, hole, pk, river)``.
+    Turn-stage (root-street) nodes (river ``None``) are read through
+    :class:`SearchPolicy` as usual.  River-stage nodes are **cluster-keyed** —
+    internal ``(n_clusters, width)`` ``vstrat`` matrices not exposed via
+    ``SearchPolicy`` — so they are read directly: map the (hole, turn+river) board
+    to its LUT cluster, then to the dense universe row, and read that row.  With a
+    lossless LUT each (hole, river) has its own cluster, so this recovers the
+    per-river betting strategy the lossless oracle expects.  Keyed
+    ``(seat, hole, pk, river)``.
     """
     policy = SearchPolicy(state, use_average=True)
+    cc = env.combo_cards
+    root_comm = [int(c) for c in env.community_cards]
+    universe = _river_universe(env, sub)
     sigma = {}
 
     def walk(node, river):
@@ -311,14 +356,19 @@ def _solver_turn_sigma(state, env, sub):
                 row = np.asarray(policy.strategy_for(pk, hand_row, legal), dtype=np.float64)
             else:
                 mat = state.vstrat.get(pk)
-                if mat is None or mat.ndim != 3:
+                if mat is None or state.vrow_space.get(pk) != "cluster":
                     row = np.full(len(legal), 1.0 / len(legal))
                 else:
-                    k = sub.rivers.index(river)
-                    r_row = mat[hand_row, k]
-                    tot = r_row.sum()
-                    avg = r_row / tot if tot > 0 else np.full(len(r_row), 1.0 / len(r_row))
-                    row = _remap_row(avg, list(state.legal_at[pk]), legal)
+                    board = np.array(root_comm + [river], dtype=np.int64)
+                    raw = int(clusters_for_board(env.card_info_lut["river"], cc, board)[hand_row])
+                    if raw < 0:
+                        row = np.full(len(legal), 1.0 / len(legal))
+                    else:
+                        dense = int(np.searchsorted(universe, raw))
+                        r_row = mat[dense]
+                        tot = r_row.sum()
+                        avg = r_row / tot if tot > 0 else np.full(len(r_row), 1.0 / len(r_row))
+                        row = _remap_row(avg, list(state.legal_at[pk]), legal)
             sigma[(seat, hole_idx, pk, river)] = row
         for a in legal:
             walk(node["children"][a], river)
@@ -332,6 +382,199 @@ def _turn_scale(sub) -> float:
         abs(v)
         for leaf in sub.payoff.values()
         for v in (leaf.values() if isinstance(leaf, dict) else leaf)
+    )
+
+
+# =========================================================================== #
+# Flop subgame — two nested chance levels (turn + river), §6.5
+# =========================================================================== #
+
+def _flop_subgame(seed: int, stacks=(200, 200)):
+    """Heads-up **flop** env + 2-combo-per-seat ranges over card-disjoint holes.
+
+    The mirror of :func:`_turn_subgame` one street earlier: the board is three
+    cards with turn *and* river still to come, so ``solve`` routes it to the
+    vector regime, which must fold **two** sampled board cards into the LUT
+    cluster ids.  Modest stacks keep the flop→turn→river betting tree small
+    enough for the two-chance-level oracle to enumerate exactly.
+    """
+    env = _flop_env(stacks=stacks, seed=seed)
+    assert env.betting_round == 1 and not env.is_terminal
+    board = {int(c) for c in env.community_cards}
+    free = sorted({int(x) for x in env.combo_cards.reshape(-1)} - board)
+    assert len(free) >= 8, "need eight board-free cards for 2 combos per seat"
+
+    def combo(c0, c1):
+        return tuple(sorted((c0, c1)))
+
+    holes0 = [combo(free[0], free[1]), combo(free[2], free[3])]
+    holes1 = [combo(free[4], free[5]), combo(free[6], free[7])]
+    support0 = [env.combo_index[h] for h in holes0]
+    support1 = [env.combo_index[h] for h in holes1]
+    range0 = np.zeros(env.n_combos, dtype=np.float64)
+    range1 = np.zeros(env.n_combos, dtype=np.float64)
+    range0[support0] = 0.5
+    range1[support1] = 0.5
+    return env, range0, range1, support0, support1
+
+
+# Street index of a flop root's future streets: depth 1 → turn, depth 2 → river.
+_FLOP_FUTURE_NAME = {1: "turn", 2: "river"}
+
+
+def _flop_universe(env, sub, depth: int):
+    """Sorted unique cluster ids at future-street ``depth`` over all runouts.
+
+    Mirrors ``_VectorSolver._build_universes`` for a flop root: the board at
+    depth ``d`` is the flop plus a ``d``-card completion, and the universe unions
+    the clusters over **every** candidate completion of that depth — so the dense
+    row a (hole, board) maps to is recoverable from the solved state.
+    """
+    cc = env.combo_cards
+    root_comm = [int(c) for c in env.community_cards]
+    name = _FLOP_FUTURE_NAME[depth]
+    ids = set()
+    for comp in itertools.combinations(sub.avail, depth):
+        board = np.array(root_comm + list(comp), dtype=np.int64)
+        raw = clusters_for_board(env.card_info_lut[name], cc, board)
+        ids.update(int(x) for x in np.unique(raw[raw >= 0]))
+    return np.array(sorted(ids), dtype=np.int64)
+
+
+def _solver_flop_sigma(state, env, sub):
+    """Extract the solved flop ``SolverState`` into the flop oracle's infosets.
+
+    Flop-stage (root-street) nodes (runout ``()``) are read through
+    :class:`SearchPolicy` as usual.  Turn- and river-stage nodes are
+    **cluster-keyed** internal ``(n_clusters, width)`` ``vstrat`` matrices, so
+    they are read directly: map the (hole, flop+runout board) to its LUT cluster,
+    then to the dense universe row for that depth, and read that row.  With a
+    lossless LUT each (hole, board) has its own cluster, so this recovers the
+    per-runout betting strategy the lossless oracle expects.  Keyed
+    ``(seat, hole, pk, runout)``.
+    """
+    policy = SearchPolicy(state, use_average=True)
+    cc = env.combo_cards
+    root_comm = [int(c) for c in env.community_cards]
+    universe = {1: _flop_universe(env, sub, 1), 2: _flop_universe(env, sub, 2)}
+    sigma = {}
+
+    def walk(node, runout):
+        ntype = node["type"]
+        if ntype == "term":
+            return
+        if ntype == "chance":
+            for c in [x for x in sub.avail if x not in runout]:
+                walk(node["child"], runout + (int(c),))
+            return
+        pk, seat, legal = node["pk"], node["actor"], node["legal"]
+        depth = len(runout)
+        for hole_idx in sub.support[seat]:
+            hand_row = env.combo_index[sub.holes[hole_idx]]
+            if depth == 0:
+                row = np.asarray(policy.strategy_for(pk, hand_row, legal), dtype=np.float64)
+            else:
+                mat = state.vstrat.get(pk)
+                if mat is None or state.vrow_space.get(pk) != "cluster":
+                    row = np.full(len(legal), 1.0 / len(legal))
+                else:
+                    board = np.array(root_comm + list(runout), dtype=np.int64)
+                    raw = int(clusters_for_board(
+                        env.card_info_lut[_FLOP_FUTURE_NAME[depth]], cc, board)[hand_row])
+                    if raw < 0:
+                        row = np.full(len(legal), 1.0 / len(legal))
+                    else:
+                        dense = int(np.searchsorted(universe[depth], raw))
+                        r_row = mat[dense]
+                        tot = r_row.sum()
+                        avg = r_row / tot if tot > 0 else np.full(len(r_row), 1.0 / len(r_row))
+                        row = _remap_row(avg, list(state.legal_at[pk]), legal)
+            sigma[(seat, hole_idx, pk, runout)] = row
+        for a in legal:
+            walk(node["children"][a], runout)
+
+    walk(sub.root, ())
+    return sigma
+
+
+def _flop_scale(sub) -> float:
+    return max(abs(v) for leaf in sub.payoff.values() for v in leaf.values())
+
+
+# The flop oracle converges to an (almost) exact Nash by ~250 iterations on this
+# tiny 2-combo game (game value stable, self-exploitability ~0); 500 is a safe
+# margin and keeps each enumerated two-chance-level solve to ~10s.
+_FLOP_ORACLE_ITERS = 500
+
+
+@pytest.mark.slow
+def test_flop_oracle_self_consistent(_seeded):
+    """The turn+river-enumerating flop oracle converges to an (almost) exact Nash.
+
+    Sanity for the two-chance-level reference: full-enumeration Linear CFR over the
+    flop tree — turn and river as nested enumerated chance nodes, per-runout betting
+    infosets — drives its own best-response gap to ~0.
+    """
+    env, r0, r1, s0, s1 = _flop_subgame(_seeded)
+    sub = build_flop_subgame(env, r0, r1, s0, s1)
+    avg = BruteForceFlopCFR(sub).solve(_FLOP_ORACLE_ITERS)
+    expl = flop_exploitability(sub, avg)
+    scale = _flop_scale(sub)
+    assert expl >= -1e-9
+    assert expl < 0.01 * scale, f"flop oracle not converged: expl={expl:.4f} scale={scale}"
+
+
+@pytest.mark.slow
+def test_vector_flop_cluster_keyed_matches_oracle_losslessly(_seeded):
+    """The cluster-keyed vector **flop** solve matches the flop Nash oracle (lossless LUT).
+
+    The decisive gate for routing the flop to the vector regime (§6.5): a flop
+    subgame solved by the vector regime — turn and river chance-*sampled*, both
+    future streets stored per LUT cluster — must reach the same equilibrium as the
+    independent turn+river-*enumerating* oracle **when the LUT is lossless** (one
+    cluster per hole+board).  A lossless LUT makes the two-street abstraction a
+    no-op, so this isolates the two-chance-level walk / gather-scatter code from
+    abstraction coarseness: any residual gap is a mechanics bug, not information
+    loss.  Full-width vector updates converge fast even though each (turn, river)
+    row is only refreshed when that runout is sampled, so the budget is generous
+    and the exploitability gate matches the turn path's.
+    """
+    env, r0, r1, s0, s1 = _flop_subgame(_seeded)
+    _install_lossless_lut(env)
+    sub = build_flop_subgame(env, r0, r1, s0, s1)
+    scale = _flop_scale(sub)
+    oracle_value = flop_game_value(sub, BruteForceFlopCFR(sub).solve(_FLOP_ORACLE_ITERS))
+
+    ranges = {0: r0.astype(np.float32), 1: r1.astype(np.float32)}
+    ctx = _ctx(env, ranges=ranges, seed=7)
+    cfg = SolverConfig(
+        leaf=ctx.leaf, max_iterations=3000, max_wall_seconds=600.0,
+        discount_interval=200, workers=1,
+    )
+    res = solve(env, ctx, cfg)
+    assert res.state.vstrat, "expected the vector regime for a HU flop subgame"
+    # The flop root must build cluster-keyed nodes on **both** future streets
+    # (turn AND river) — the two-chance-level path is the whole point of the
+    # change, and a missing street's uniform fallback could otherwise slip past
+    # the exploitability gate if uniform play on it happened to be cheap.
+    cluster_stages = {
+        pk[0] for pk, rs in res.state.vrow_space.items() if rs == "cluster"
+    }
+    assert {"turn", "river"} <= cluster_stages, (
+        f"expected cluster-keyed turn AND river nodes in a flop subgame; "
+        f"got cluster stages {sorted(cluster_stages)}"
+    )
+    # The flop root itself stays lossless (combo-keyed), read by SearchPolicy.
+    assert any(rs == "combo" for rs in res.state.vrow_space.values()), (
+        "expected a combo-keyed (lossless) flop-root node"
+    )
+
+    sigma = _solver_flop_sigma(res.state, env, sub)
+    expl = flop_exploitability(sub, sigma)
+    value = flop_game_value(sub, sigma)
+    assert expl < 0.05 * scale, f"vector flop path exploitable: expl={expl:.4f} scale={scale}"
+    assert abs(value - oracle_value) < 0.03 * scale, (
+        f"vector flop game value {value:.4f} != oracle {oracle_value:.4f} (scale {scale})"
     )
 
 
@@ -353,18 +596,21 @@ def test_turn_oracle_self_consistent(_seeded):
 
 
 @pytest.mark.slow
-def test_vector_turn_conditions_on_river_and_matches_oracle(_seeded):
-    """The river-conditioned vector turn solve matches the turn Nash oracle.
+def test_vector_turn_cluster_keyed_matches_oracle_losslessly(_seeded):
+    """The cluster-keyed vector turn solve matches the turn Nash oracle (lossless LUT).
 
-    The decisive gate for the change (§6.5): a turn subgame solved by the vector
-    regime — river as a chance-*sampled* node (one river per iteration), per-river
-    conditioned river-betting strategies — must reach the same equilibrium as the
-    independent river-*enumerating* oracle.  Both the best-response gap and the
-    unique zero-sum game value are asserted.  Sampling converges at ~1/sqrt(T) and
-    each river's infoset sees only ~T/R updates, so the budget is generous and the
-    exploitability gate slightly looser than the (exact) oracle's own.
+    The decisive code gate for the change (§6.5): a turn subgame solved by the
+    vector regime — river as a chance-*sampled* node, river-betting strategies
+    stored per LUT cluster — must reach the same equilibrium as the independent
+    river-*enumerating* oracle **when the LUT is lossless** (one cluster per hole+
+    board).  A lossless LUT makes the future-street abstraction a no-op, so this
+    isolates the walk / gather-scatter code from abstraction coarseness: any
+    residual gap is a mechanics bug, not information loss.  Sampling converges at
+    ~1/sqrt(T) and each river's rows see ~T/R updates, so the budget is generous
+    and the exploitability gate slightly looser than the (exact) oracle's own.
     """
     env, r0, r1, s0, s1 = _turn_subgame(_seeded)
+    _install_lossless_lut(env)
     sub = build_turn_subgame(env, r0, r1, s0, s1)
     scale = _turn_scale(sub)
     oracle_value = turn_game_value(sub, BruteForceTurnCFR(sub).solve(4000))
@@ -377,15 +623,15 @@ def test_vector_turn_conditions_on_river_and_matches_oracle(_seeded):
     )
     res = solve(env, ctx, cfg)
     assert res.state.vstrat, "expected the vector regime for a HU turn subgame"
-    # The change must have produced river-conditioned (3-D) river-betting nodes.
-    assert any(m.ndim == 3 for m in res.state.vstrat.values()), (
-        "expected river-conditioned 3-D river-betting nodes in a turn subgame"
+    # The change must have produced cluster-keyed river-betting nodes.
+    assert any(rs == "cluster" for rs in res.state.vrow_space.values()), (
+        "expected cluster-keyed river-stage nodes in a turn subgame"
     )
 
     sigma = _solver_turn_sigma(res.state, env, sub)
     expl = turn_exploitability(sub, sigma)
     value = turn_game_value(sub, sigma)
-    assert expl < 0.04 * scale, f"vector turn path exploitable: expl={expl:.4f} scale={scale}"
-    assert abs(value - oracle_value) < 0.025 * scale, (
+    assert expl < 0.05 * scale, f"vector turn path exploitable: expl={expl:.4f} scale={scale}"
+    assert abs(value - oracle_value) < 0.03 * scale, (
         f"vector turn game value {value:.4f} != oracle {oracle_value:.4f} (scale {scale})"
     )

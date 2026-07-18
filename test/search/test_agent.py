@@ -182,6 +182,62 @@ def test_act_rounds2plus_reads_search_not_blueprint(_seeded):
     assert not spy_bp.called
 
 
+def test_act_falls_back_to_blueprint_when_node_unsolved(_seeded):
+    # A search ran, but the played node is NOT in the solved tree (a decision past a
+    # depth-limit leaf, or an off-tree line the tree does not contain). The agent
+    # must play the BLUEPRINT here, never a uniform guess over the legal actions.
+    blueprint = UniformPolicy()
+    env = _env()
+    agent = _agent(blueprint=blueprint)
+    agent.on_hand_start(env, my_seat=0)
+    agent.on_board_update(env, _to_flop(env))
+    _advance_to_my_turn(env, 0, 1)
+    if env.is_terminal or env.player_i != 0:
+        pytest.skip("bot not to act on the flop this layout")
+    assert agent.last_search is not None
+    # Simulate "the search does not cover this node": drop every registered node so
+    # the played public_key is absent from the solved tree.
+    agent.last_search.state.legal_at.clear()
+
+    legal, prob, searched = agent.play_distribution(env)
+    assert searched is False                       # blueprint fallback, not a search read
+    assert len(prob) == len(legal) and abs(float(np.sum(prob)) - 1.0) < 1e-6
+
+    frozen_before = len(agent.last_search.state.frozen)
+    with mock.patch.object(blueprint, "strategy", wraps=blueprint.strategy) as spy_bp:
+        action = agent.act(env)
+    assert spy_bp.called                           # played the blueprint
+    assert action in [a for a in env.legal_actions if a is not None]
+    # A fallback play pins nothing — there is no solved row to freeze.
+    assert len(agent.last_search.state.frozen) == frozen_before
+
+
+def _boom(*a, **k):
+    raise RuntimeError("solve blew up")
+
+
+def test_solve_failure_falls_back_to_blueprint(_seeded, monkeypatch):
+    # A solve that raises for ANY reason must not crash the hand: the agent clears
+    # last_search and plays the blueprint for the round.
+    blueprint = UniformPolicy()
+    env = _env()
+    agent = _agent(blueprint=blueprint)
+    agent.on_hand_start(env, my_seat=0)
+    monkeypatch.setattr(agent_mod, "solve", _boom)
+    agent.on_board_update(env, _to_flop(env))      # must not propagate the error
+    assert agent.last_search is None
+
+    _advance_to_my_turn(env, 0, 1)
+    if env.is_terminal or env.player_i != 0:
+        pytest.skip("bot not to act on the flop this layout")
+    _, _, searched = agent.play_distribution(env)
+    assert searched is False
+    with mock.patch.object(blueprint, "strategy", wraps=blueprint.strategy) as spy_bp:
+        action = agent.act(env)
+    assert spy_bp.called
+    assert action in [a for a in env.legal_actions if a is not None]
+
+
 # --------------------------------------------------------------------------- #
 # B. Boundary belief update
 # --------------------------------------------------------------------------- #

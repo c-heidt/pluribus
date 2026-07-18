@@ -101,8 +101,13 @@ def _stub_lut(env: PokerEnv) -> None:
     )
 
 
-def _flop_env(low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
-    """Heads-up env advanced to the flop over a small deck (exact runouts)."""
+def _preflop_env(low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
+    """Heads-up small-deck env at the preflop root (the MCCFR regime).
+
+    A heads-up *flop* subgame now routes to the vector regime (§6.5), so the
+    MCCFR fork-parallel tests root at the preflop instead — still ``_select_regime``
+    → MCCFR, heads-up play extending to real showdowns.
+    """
     np.random.seed(seed)
     env = PokerEnv(
         players=[Player(i, s) for i, s in enumerate(stacks)],
@@ -110,10 +115,6 @@ def _flop_env(low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
         high_card_rank=high,
     )
     _stub_lut(env)
-    guard = 0
-    while env.betting_round < 1 and not env.is_terminal and guard < 20:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
-        guard += 1
     return env
 
 
@@ -210,13 +211,14 @@ class TestAccumulate:
 
     def test_sums_vector_tables(self):
         pk = ("turn", ())
-        a = SolverState.empty(); a.ensure_vnode(pk, ("c", "r"), 0, 3)
+        a = SolverState.empty(); a.ensure_vnode(pk, ("c", "r"), 0, 3, "cluster")
         a.vregret[pk][:] = 1.0; a.vstrat[pk][:] = 2.0
-        b = SolverState.empty(); b.ensure_vnode(pk, ("c", "r"), 0, 3)
+        b = SolverState.empty(); b.ensure_vnode(pk, ("c", "r"), 0, 3, "cluster")
         b.vregret[pk][:] = 3.0; b.vstrat[pk][:] = 4.0
         m = SolverState.accumulate([a, b])
         np.testing.assert_allclose(m.vregret[pk], 4.0)
         np.testing.assert_allclose(m.vstrat[pk], 6.0)
+        assert m.vrow_space[pk] == "cluster"  # row space carries through the merge
 
     def test_baseline_added_exactly_once(self):
         # Each replica is seeded from `baseline`; merged must be base + Σ deltas,
@@ -306,7 +308,7 @@ class TestPlanner:
 class TestParallelSolve:
 
     def _run(self, *, workers, iters=40, seed=0):
-        env = _flop_env(seed=0)
+        env = _preflop_env(seed=0)  # HU preflop → MCCFR (flop now routes to vector)
         ctx = _ctx(env, seed=seed)
         return solve(env, ctx, _cfg(iters=iters, workers=workers))
 
@@ -356,7 +358,7 @@ class TestParallelSolve:
 
     def test_parallel_policy_is_valid(self):
         res = self._run(workers=3)
-        env = _flop_env(seed=0)
+        env = _preflop_env(seed=0)  # must match ``_run``'s root (MCCFR)
         pk = env.public_key
         hr = int(env.combo_index[tuple(sorted(int(c) for c in env.players[0].cards))])
         legal = [a for a in env.legal_actions if a is not None]
@@ -395,8 +397,9 @@ class TestParallelSolve:
 
     def test_warm_start_re_search_parallel(self):
         # A warm-started parallel re-search runs, keeps the baseline's frozen rows,
-        # and produces a non-empty merged state.
-        env = _flop_env(seed=0)
+        # and produces a non-empty merged state.  MCCFR path → preflop root (a HU
+        # flop now routes to the vector regime, §6.5).
+        env = _preflop_env(seed=0)
         ctx = _ctx(env, seed=0)
         first = solve(env, ctx, _cfg(iters=30, workers=1))
         pk = env.public_key
@@ -404,7 +407,7 @@ class TestParallelSolve:
         first.state.frozen[(pk, hr)] = np.full(
             first.state.width(pk), 1.0 / first.state.width(pk)
         )
-        env2 = _flop_env(seed=0)
+        env2 = _preflop_env(seed=0)
         ctx2 = _ctx(env2, seed=1)
         again = solve(env2, ctx2, _cfg(iters=30, workers=2), warm_start=first.state)
         assert (pk, hr) in again.state.frozen

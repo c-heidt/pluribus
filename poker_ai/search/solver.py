@@ -86,13 +86,18 @@ class SearchResult:
 
 
 def _select_regime(ctx: SubgameContext) -> str:
-    """Regime for ``ctx`` (§6.5): vector iff heads-up turn/river, else MCCFR.
+    """Regime for ``ctx`` (§6.5): vector iff heads-up flop/turn/river, else MCCFR.
 
-    Vector-form CFR is used for the *small / late* subgames — heads-up
-    (two live seats) rooted on the turn or river.  Everything else (round 1,
-    all of round 2, any multiway later subgame) uses external-sampling MCCFR.
+    Vector-form CFR is the *small / late* path — a heads-up (two live seats)
+    subgame rooted on the flop, turn, or river.  The paper routes a subgame to
+    the vector regime whenever it is "relatively large or early" is **false**
+    (main p.5, supp p.22); a heads-up post-preflop subgame is neither, so all of
+    it takes the vector path.  With the future streets keyed by LUT cluster (the
+    sampled board folded into the id, §6.5) a flop root needs no explicit
+    per-runout axis, so the flop joins the turn/river here.  Everything else —
+    the preflop root, and any multiway subgame — uses external-sampling MCCFR.
     """
-    if len(ctx.ranges) == 2 and ctx.street_at_root in (2, 3):
+    if len(ctx.ranges) == 2 and ctx.street_at_root in (1, 2, 3):
         return "vector"
     return "mccfr"
 

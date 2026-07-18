@@ -13,7 +13,7 @@ regression oracle** for the search compiled-core rewrite:
 - Phases 3-4 additionally assert the compiled walk reproduces them
   (``digest(core) == digest(python)``).
 
-Two regimes are pinned independently: an MCCFR heads-up **flop** subgame
+Two regimes are pinned independently: an MCCFR heads-up **preflop** subgame
 (``regret`` + ``strat_sum``, keyed ``(public_key, hand_row)``) and a vector
 heads-up **turn** subgame (``vregret`` + ``vstrat``, keyed ``public_key``).  A
 stub LUT (every hand → bucket 0) keeps the fixture self-contained (no ``data/``
@@ -44,7 +44,7 @@ import pytest
 from poker_ai.search.solver import solve
 from poker_ai.search.solver_state import SolverConfig
 
-from test.search.test_solver import _ctx, _flop_env, _late_env
+from test.search.test_solver import _ctx, _preflop_env, _late_env
 
 # Fixed seeds for the two reference solves (fixture deal seed / ctx.rng seed).
 _ENV_SEED = 0
@@ -52,8 +52,8 @@ _RNG_SEED = 7
 _N_ITERS = 50
 
 # Frozen fingerprints — see the module docstring for when and how to regenerate.
-GOLDEN_DIGEST_MCCFR = "7d27f5549a09e0f0ad359c5c24c244001e50ed36454e7665d3c47edc7fdff675"
-GOLDEN_DIGEST_VECTOR = "e03b98a90c6f717a872bf4887875aa172548d329ceab16ea30317e92c22f35c0"
+GOLDEN_DIGEST_MCCFR = "a1f716d14b9a7d431384cc397ee80e7d3b0bb24187af1c0b397d48a9c560d91f"
+GOLDEN_DIGEST_VECTOR = "7e6e3da6534d92c5e9a808a48b9da06054558cbb4a7ee8727fab0efa23113db2"
 
 
 def _digest_tables(*tables) -> str:
@@ -73,9 +73,15 @@ def _digest_tables(*tables) -> str:
 
 
 def _solve_mccfr():
-    """Deterministic MCCFR heads-up flop solve → its ``SolverState``."""
-    env = _flop_env(seed=_ENV_SEED)
-    assert env.betting_round == 1 and not env.is_terminal
+    """Deterministic MCCFR heads-up preflop solve → its ``SolverState``.
+
+    A heads-up *flop* subgame now routes to the vector regime (§6.5 cluster-keyed
+    future streets), so the MCCFR golden trace roots at the preflop instead — one
+    street earlier, still ``_select_regime`` → MCCFR, and heads-up play extends to
+    real showdowns, exercising the full external-sampling walk.
+    """
+    env = _preflop_env(seed=_ENV_SEED)
+    assert env.betting_round == 0 and not env.is_terminal
     ctx = _ctx(env, seed=_RNG_SEED)
     cfg = SolverConfig(
         leaf=ctx.leaf, max_iterations=_N_ITERS, max_wall_seconds=60.0,

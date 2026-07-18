@@ -20,10 +20,10 @@ Two regimes, two nondeterminism profiles:
   :class:`ReplaySampler` substitute ``sample_index`` in the ``mccfr`` **and** ``leaf``
   module namespaces.
 - **Vector** (``vector.py``) samples **nothing** inside the walk — ``_walk`` is
-  full-width (every action expanded).  The only draw is the per-iteration river
-  ``_sampled_k`` chosen in ``iterate()``.  So a vector pass is *fully deterministic*
-  given the river: :func:`run_vector_pass` pins ``_sampled_k`` and the byte-exact
-  gate is simply ``core(river) == python(river)`` (no sampler needed).
+  full-width (every action expanded).  The only draw is the per-iteration board
+  ``_completion`` chosen in ``iterate()``.  So a vector pass is *fully deterministic*
+  given the completion: :func:`run_vector_pass` pins it and the byte-exact gate is
+  simply ``core(completion) == python(completion)`` (no sampler needed).
 
 This module is import-only (no ``test_`` prefix) so pytest does not collect it;
 the self-tests in ``functional/test_core_diff_harness.py`` and later phases import
@@ -208,20 +208,28 @@ def run_strategy_replay(solver, env, i, holes, choices):
     return snapshot(solver.state.strat_sum)
 
 
-def run_vector_pass(solver, sampled_k):
-    """Run one vector-regime pass with a pinned river; return ``(vregret, vstrat)``.
+def run_vector_pass(solver, completion=None):
+    """Run one vector pass with a pinned board completion; return ``(vregret, vstrat)``.
 
-    ``_walk`` samples nothing, so a pass is fully deterministic given the river
-    ``sampled_k`` (``None`` for a river subgame with no chance node).  Reproduces
-    ``_VectorSolver.iterate`` with the river fixed instead of drawn, so Phases 3-4
-    can compare ``core(sampled_k) == python(sampled_k)`` directly.
+    ``_walk`` samples nothing, so a pass is fully deterministic given the sampled
+    runout ``completion`` (a tuple of cards: ``()`` for a river subgame, one card
+    for a turn root, two for a flop root).  ``None`` defaults to the solver's first
+    available card(s), a stable deterministic pin.  Reproduces
+    ``_VectorSolver.iterate`` with the completion fixed instead of drawn, so the
+    env-vs-FastState walk can be compared ``core(completion) == python(completion)``.
     """
-    solver._sampled_k = sampled_k
+    if completion is None:
+        completion = tuple(int(solver._avail[i]) for i in range(solver._n_completion))
+    solver._completion = tuple(completion)
+    if solver._n_completion:
+        solver._refresh_cluster_maps(solver._completion)
+    else:
+        solver._feas_full = None
     s0, s1 = solver._seats
     # Walk whatever env the solver was configured with — the ``PokerEnv`` root by
     # default, or the compiled ``FastEnvAdapter`` under PLURIBUS_SEARCH_CORE
     # (Phase 3c); the two must produce byte-identical tables.
     walk_env = getattr(solver, "_walk_env", solver.root_env)
-    solver._walk(walk_env, s0, solver._reach[s0], solver._reach[s1], None)
-    solver._walk(walk_env, s1, solver._reach[s1], solver._reach[s0], None)
+    solver._walk(walk_env, s0, solver._reach[s0], solver._reach[s1])
+    solver._walk(walk_env, s1, solver._reach[s1], solver._reach[s0])
     return snapshot(solver.state.vregret), snapshot(solver.state.vstrat)

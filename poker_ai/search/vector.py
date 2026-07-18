@@ -1,55 +1,65 @@
 """Vector-form Linear CFR regime for the subgame solver (§6.5).
 
-The vector regime is the *small / late* path: **heads-up turn/river** subgames.
-It is the designed-in counterpart to :mod:`mccfr`, and persists into the **same**
-:class:`SolverState` (and is read by the same :class:`SearchPolicy`) — only the
-*storage shape* differs (per-public-node matrices, see below).
+The vector regime is the *small / late* path: **heads-up** subgames rooted on the
+flop, turn, or river.  It is the designed-in counterpart to :mod:`mccfr`, and
+persists into the **same** :class:`SolverState` (read by the same
+:class:`SearchPolicy`) — only the *storage shape* differs (per-public-node
+matrices, see below).
 
 Design (per §6.5):
 
 - Carry a **per-combo reach vector per player** (``reach[p] = ctx.ranges[p]`` at
   the root), not a sampled concrete hand.
 - **Expand every action at every decision node** (no action sampling); **sample
-  one river per iteration** at the river chance node (chance-sampled MCCFR),
-  leaving the tree deterministic for that iteration.  The betting tree is hole-
-  and card-independent, so a single make/undo env walk serves every combo at
-  once; the engine's own river deal is **ignored** and a river sampled from the
-  ranges' candidate set (via ``ctx.rng``) is used as that iteration's public
-  river — the correct chance distribution over ranges, free of global-RNG
-  dependence, and only one river's worth of work per iteration (not all ``R``).
-- **River betting still conditions on the river card.**  Each candidate river has
-  its own regret / strategy-sum slice (storage is ``(n_combos, n_rivers, width)``
-  for river-stage nodes); an iteration touches only the **sampled** river's slice,
-  so over iterations every river converges separately — the same river-conditioned
-  equilibrium the exact enumeration reaches, estimated by chance sampling.
+  one board completion per iteration** at the chance nodes (chance-sampled CFR),
+  leaving the tree deterministic for that iteration.  A flop root samples a
+  *(turn, river)* pair; a turn root samples a river; a river root samples
+  nothing.  The betting tree is hole- and card-independent, so a single make/undo
+  env walk serves every combo at once; the engine's own board deal is **ignored**
+  and the completion sampled from the deck (via ``ctx.rng``) is used as that
+  iteration's public runout — the correct chance distribution over ranges, free
+  of global-RNG dependence, and only one completion's work per iteration.
+
+Storage — root street lossless, future streets clustered (§6.5):
+
+- A **root-street** decision node is ``(n_combos, width)``, one row per
+  ``combo_index`` (lossless).  These are the rows :class:`SearchPolicy` reads for
+  the bot's actual hand, keyed ``(public_key, combo_index)`` — unchanged.
+- A **future-street** decision node is ``(n_clusters, width)``, one row per LUT
+  cluster reachable in the subgame.  The sampled board is folded into the cluster
+  id (``cluster_for`` keys on the full community), so there is **no explicit river
+  axis** — different runouts land in different clusters, and holes sharing a
+  cluster share a row (the paper's lossy future-street abstraction).  The walk
+  stays per-combo: it *gathers* each combo's cluster row to form a per-combo
+  strategy, then *scatters* the per-combo regret/strategy deltas back into the
+  cluster rows (a segment-sum).  These nodes are internal to the solve (the next
+  round is a fresh subgame) and are never read externally — the ``vrow_space``
+  guard in :class:`SolverState` enforces that.
+
 - Regret / strategy-sum updates are **reach-weighted per combo** (float64).  The
   per-combo counterfactual value carries the opponent reach (folded into the
   terminals, with card removal); the strategy sum carries the player's own reach.
   Alternating updates: each ``iterate`` runs one tree pass per seat.
 - **Settlement is the env's job.**  At a terminal the regime calls
-  :meth:`environment.poker_env.PokerEnv.vector_payout` — the env-owned vectorised
-  payout — passing only the CFR quantities (the traverser seat, the opponent
-  reach, and the sampled river).  The env handles the matched stake, showdown vs
-  fold, board completion, card removal, and ranking (cached); this regime does no
-  settlement and never imports the showdown primitives.
-
-These per-combo rows persist into the **same** :class:`SolverState`: turn/river
-**decision** nodes are ``(n_combos, width)`` matrices keyed by ``public_key`` whose
-combo axis is ``combo_index`` (lossless at every depth) — so :class:`SearchPolicy`
-reads them keyed ``(public_key, combo_index)`` with no changes.  A turn subgame's
-internal **river-stage** nodes carry an extra river axis (``(n_combos, n_rivers,
-width)``) for per-river conditioning; these are never read by the policy (the agent
-re-solves a river subgame for the actual river), so the river axis is internal.
+  :meth:`environment.poker_env.PokerEnv.vector_payout`, passing the traverser
+  seat, the opponent reach, and the sampled runout.  The env handles the matched
+  stake, showdown vs fold, board completion, card removal, and ranking (cached);
+  this regime does no settlement and never imports the showdown primitives.
 """
 
 from __future__ import annotations
 
+import itertools
 from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+from information_abstraction.lookup import clusters_for_board
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.solver_state import SolverConfig, SolverState
+
+# Street index -> LUT street key, for the future-street cluster lookups.
+_STREET_NAME = {0: "pre_flop", 1: "flop", 2: "turn", 3: "river"}
 
 
 def _regret_match_matrix(regret: np.ndarray) -> np.ndarray:
@@ -60,9 +70,9 @@ def _regret_match_matrix(regret: np.ndarray) -> np.ndarray:
     strategy is proportional to its positive cumulative regret, falling back to
     uniform over the ``width`` actions when a row has no positive regret.
 
-    Action ``width`` is always the last axis, so this serves both the
-    ``(n_combos, width)`` turn/river nodes and the river-conditioned
-    ``(n_combos, n_rivers, width)`` nodes (§6.5) without reshaping.
+    Action ``width`` is always the last axis, so this serves both a
+    root-street ``(n_combos, width)`` node and a future-street
+    ``(n_clusters, width)`` node (§6.5) without reshaping.
     """
     pos = np.maximum(regret, 0.0)
     total = pos.sum(axis=-1, keepdims=True)
@@ -90,13 +100,18 @@ except ImportError:
 
 
 class _VectorSolver:
-    """Heads-up turn/river vector-form Linear CFR over a fixed subgame root.
+    """Heads-up flop/turn/river vector-form Linear CFR over a fixed subgame root.
 
     Constructed with the same ``(root_env, state, ctx, cfg, rng)`` surface as
     :class:`poker_ai.search.mccfr._MCCFRSolver` so :func:`solve` dispatches on the
     selected regime uniformly.  One :meth:`iterate` is two tree passes (one per
     seat, alternating updates); the orchestrator drives the iteration count, the
     Linear-CFR discount, and result extraction.
+
+    Root-street decision nodes are stored lossless (one row per combo); future
+    streets are stored per LUT cluster (§6.5), the sampled board folded into the
+    cluster id.  The walk stays per-combo — it gathers each combo's cluster row to
+    a per-combo strategy and scatters the per-combo deltas back into cluster rows.
     """
 
     def __init__(self, root_env, state: SolverState, ctx: SubgameContext,
@@ -151,102 +166,154 @@ class _VectorSolver:
         self._my_combo: Optional[int] = root_env.combo_index.get(my)
         self._my_seat = ctx.my_seat
 
-        # The river index sampled for the current iteration (set in ``iterate``);
-        # ``None`` for a river subgame (no chance node) or before the first pass.
-        self._sampled_k: Optional[int] = None
+        # Future streets (§6.5): each is stored per LUT cluster.  ``street ==
+        # street_at_root`` is lossless (combo rows); deeper streets fold the
+        # sampled runout into the cluster id, so no explicit river axis is needed.
+        self._street_at_root = ctx.street_at_root
+        self._future = list(range(self._street_at_root + 1, 4))
+        self._n_completion = len(self._future)          # 0 (river) / 1 (turn) / 2 (flop)
 
-        # River chance node (§6.5): a turn subgame's river is an explicit chance
-        # node, **sampled** one card per iteration (chance-sampled MCCFR) while
-        # each river keeps its own conditioned regret/strategy slice.  A river
-        # subgame has no chance node.
-        if ctx.street_at_root >= 3:
-            self._rivers: Optional[np.ndarray] = None
-            self._feas: Optional[np.ndarray] = None
-        else:
-            board = set(int(c) for c in root_env.community_cards)
-            self._rivers = np.array(
-                [int(c) for c in np.unique(root_env.combo_cards) if int(c) not in board],
-                dtype=np.int64,
+        self._combo_cards = np.asarray(root_env.combo_cards, dtype=np.int64)
+        self._lut = root_env.card_info_lut
+        self._root_comm = [int(c) for c in root_env.community_cards]
+        if self._n_completion:
+            avail = sorted(
+                set(int(c) for c in np.unique(self._combo_cards)) - set(self._root_comm)
             )
-            # Per-(combo, river) feasibility: a combo cannot be held when the
-            # river is one of its hole cards.  Board conflicts are already zeroed
-            # in ``self._reach`` (board_compatible), so ``feas`` need only exclude
-            # the river card itself.  Shape ``(n_combos, R)``, float for masking.
-            cc = root_env.combo_cards
-            rv = self._rivers
-            conflict = (cc[:, 0:1] == rv[None, :]) | (cc[:, 1:2] == rv[None, :])
-            self._feas = (~conflict).astype(np.float64)
+            self._avail = np.array(avail, dtype=np.int64)
+            # Deterministic per-street cluster universes (union over every
+            # candidate completion) → identical local row layout across parallel
+            # replicas, so ``SolverState.accumulate`` sums aligned rows.
+            self._universe = self._build_universes()
+        else:
+            self._avail = np.empty(0, dtype=np.int64)
+            self._universe = {}
+
+        # Per-iteration cluster maps + scatter plans (filled in :meth:`iterate`).
+        self._completion: Tuple[int, ...] = ()
+        self._cluster_of: Dict[int, np.ndarray] = {}    # street -> (n_combos,) dense row, -1 infeasible
+        self._feas: Dict[int, np.ndarray] = {}          # street -> (n_combos,) 0/1 board-feasibility
+        self._scatter: Dict[int, Tuple] = {}            # street -> (sorted_combos, seg_starts, seg_cluster)
+        self._feas_full: Optional[np.ndarray] = None    # feasibility for the full completion
+
+    def _build_universes(self) -> Dict[int, np.ndarray]:
+        """Sorted unique LUT cluster ids reachable at each future street.
+
+        For street ``s`` the board is the root community plus the first
+        ``s - street_at_root`` completion cards; the universe unions the clusters
+        over **every** candidate completion of that depth, so the dense local row
+        index (a ``searchsorted`` into this array) is fixed for the whole search
+        and identical across replicas.  Bucket-count-agnostic: it reads only the
+        ids the LUT actually produces here, never a cluster total.
+        """
+        universe: Dict[int, np.ndarray] = {}
+        avail = self._avail.tolist()
+        for s in self._future:
+            name = _STREET_NAME[s]
+            depth = s - self._street_at_root
+            ids: set = set()
+            for comp in itertools.combinations(avail, depth):
+                board = np.array(self._root_comm + list(comp), dtype=np.int64)
+                raw = clusters_for_board(self._lut[name], self._combo_cards, board)
+                ids.update(int(x) for x in np.unique(raw[raw >= 0]))
+            universe[s] = np.array(sorted(ids), dtype=np.int64)
+        return universe
+
+    def _refresh_cluster_maps(self, completion: Tuple[int, ...]) -> None:
+        """Per-iteration: dense cluster row + feasibility + scatter plan per street.
+
+        ``completion`` is the sampled runout (turn[, river]); at street ``s`` the
+        board carries its first ``s - street_at_root`` cards.  The scatter plan
+        pre-sorts the feasible combos by cluster row so a node's regret/strategy
+        update is a ``reduceat`` segment-sum rather than an ``np.add.at``.
+        """
+        for s in self._future:
+            name = _STREET_NAME[s]
+            depth = s - self._street_at_root
+            board = np.array(self._root_comm + list(completion[:depth]), dtype=np.int64)
+            raw = clusters_for_board(self._lut[name], self._combo_cards, board)
+            valid = raw >= 0
+            dense = np.full(self._n_combos, -1, dtype=np.int64)
+            dense[valid] = np.searchsorted(self._universe[s], raw[valid])
+            self._cluster_of[s] = dense
+            self._feas[s] = valid.astype(np.float64)
+            fcombos = np.flatnonzero(valid)
+            fclusters = dense[fcombos]
+            order = np.argsort(fclusters, kind="stable")
+            sorted_combos = fcombos[order]
+            sorted_clusters = fclusters[order]
+            seg_starts = np.concatenate(
+                ([0], np.flatnonzero(np.diff(sorted_clusters)) + 1)
+            ).astype(np.intp)
+            seg_cluster = sorted_clusters[seg_starts]
+            self._scatter[s] = (sorted_combos, seg_starts, seg_cluster)
+        # Full-completion feasibility (deepest future street) — used to mask the
+        # opponent reach at a showdown that completes the whole board at once.
+        self._feas_full = self._feas[self._future[-1]]
 
     # ------------------------------------------------------------------
     # One iteration (§6.5 vector regime)
     # ------------------------------------------------------------------
 
     def iterate(self) -> None:
-        # Chance-sampled river: a turn subgame's river chance node draws one
-        # public river for the whole iteration (used wherever the river is
-        # resolved this pass), so the cost is one river's work, not R.  Each
-        # river still owns its conditioned regret/strategy slice, so over
-        # iterations every river converges.  A river subgame has no chance node.
-        self._sampled_k = (
-            int(self.rng.integers(len(self._rivers)))
-            if self._rivers is not None
-            else None
-        )
+        # Chance-sampled runout: draw the whole board completion once for this
+        # iteration (a (turn, river) pair from a flop root, a river from a turn
+        # root, nothing from a river root).  Sampling without replacement over the
+        # available deck gives the uniform chance measure over ordered runouts.
+        if self._n_completion:
+            idx = self.rng.choice(
+                len(self._avail), size=self._n_completion, replace=False
+            )
+            self._completion = tuple(int(self._avail[i]) for i in idx)
+            self._refresh_cluster_maps(self._completion)
+        else:
+            self._completion = ()
+            self._feas_full = None
         s0, s1 = self._seats
-        # Alternating updates: one full tree pass per traverser (river_k=None at
-        # the root — turn betting / river-subgame nodes sit above the chance node).
-        # ``_walk_env`` is the compiled FastState adapter under PLURIBUS_SEARCH_CORE
-        # (else the PokerEnv root) — byte-identical, only make/undo speed differs.
-        self._walk(self._walk_env, s0, self._reach[s0], self._reach[s1], None)
-        self._walk(self._walk_env, s1, self._reach[s1], self._reach[s0], None)
+        # Alternating updates: one full tree pass per traverser.  ``_walk_env`` is
+        # the compiled FastState adapter under PLURIBUS_SEARCH_CORE (else the
+        # PokerEnv root) — same walk, only make/undo speed differs.
+        self._walk(self._walk_env, s0, self._reach[s0], self._reach[s1])
+        self._walk(self._walk_env, s1, self._reach[s1], self._reach[s0])
 
     # ------------------------------------------------------------------
     # Recursion (always entered on a non-terminal node)
     # ------------------------------------------------------------------
 
-    def _walk(self, env, p: int, pi_p: np.ndarray, pi_o: np.ndarray,
-              river_k: Optional[int]) -> np.ndarray:
+    def _walk(self, env, p: int, pi_p: np.ndarray, pi_o: np.ndarray) -> np.ndarray:
         """One CFR tree pass for traverser ``p``.
 
-        Reach vectors are always ``(n_combos,)`` — the river chance node is
-        *sampled*, so a single river is in play per iteration and the walk never
-        carries a river axis.  ``river_k`` selects the storage slice: ``None``
-        above the chance node (turn betting / river-subgame nodes are 2-D
-        ``(n_combos, width)``), and the sampled river index below it (river-stage
-        nodes are stored ``(n_combos, n_rivers, width)`` for per-river
-        conditioning, but only the ``river_k`` slice — a 2-D view — is read and
-        written this iteration).
+        Reach vectors are always ``(n_combos,)``.  The node's row space is set by
+        its street: the root street is lossless (row == ``combo_index``); a future
+        street is clustered (``self._cluster_of[street]`` maps each combo to its
+        dense cluster row).  For a clustered node the per-combo strategy is a
+        gather of the cluster rows, and the per-combo regret/strategy deltas are
+        scattered (segment-summed) back into the cluster rows.
         """
+        street = env.betting_round
         actor = env.player_i
         legal = tuple(a for a in env.legal_actions if a is not None)
         pk = env.public_key
-        below_chance = river_k is not None
-        # River-stage nodes allocate a river axis (per-river conditioning); turn
-        # / river-subgame nodes stay 2-D.
-        n_rivers = (
-            len(self._rivers) if (below_chance and self._rivers is not None) else None
-        )
-        self.state.ensure_vnode(pk, legal, actor, self._n_combos, n_rivers)
-        # Below the chance node, operate on the sampled river's 2-D slice (a view,
-        # so in-place ``+=`` writes back into the 3-D store); above it, the node is
-        # already 2-D.
-        if below_chance:
-            regret = self.state.vregret[pk][:, river_k, :]
-            strat = self.state.vstrat[pk][:, river_k, :]
+        is_root = street == self._street_at_root
+        if is_root:
+            n_rows, row_space, cof = self._n_combos, "combo", None
         else:
-            regret = self.state.vregret[pk]
-            strat = self.state.vstrat[pk]
-        sigma = _regret_match_matrix(regret)
+            cof = self._cluster_of[street]
+            n_rows, row_space = len(self._universe[street]), "cluster"
+        self.state.ensure_vnode(pk, legal, actor, n_rows, row_space)
+        regret = self.state.vregret[pk]                 # (n_rows, width)
+        strat = self.state.vstrat[pk]
+        sigma_rows = _regret_match_matrix(regret)       # (n_rows, width)
+        # Per-combo strategy: identity for a root node, a cluster gather otherwise
+        # (infeasible combos map to row 0 — harmless, their reach is zeroed below).
+        sigma = sigma_rows if is_root else sigma_rows[np.where(cof >= 0, cof, 0)]
 
-        # Freezing (§5): the bot's pinned actual-hand row is substituted at **every**
-        # visit to the bot's node — including when the opponent is the traverser, so
-        # the bot's frozen reach propagates into ``pi_o`` (mirrors the MCCFR
-        # ``_node_sigma`` / ``_frozen_or`` behaviour, which is traverser-agnostic).
-        # Frozen rows are only ever set on the bot's *current-round* (turn / river)
-        # decisions, never on a turn subgame's internal river-continuation nodes —
-        # so in practice this fires only on 2-D nodes; the broadcast keeps it safe.
+        # Freezing (§5): the bot's pinned actual-hand row is substituted at every
+        # visit to the bot's node.  Frozen rows are only ever set on the bot's
+        # current (root-street) decisions, so this fires on combo nodes only.
         apply_frozen = (
-            actor == self._my_seat
+            is_root
+            and actor == self._my_seat
             and self._my_combo is not None
             and (pk, self._my_combo) in self.state.frozen
         )
@@ -262,7 +329,7 @@ class _VectorSolver:
                 # (vector_payout), so the env's concrete hand ranking + chip
                 # distribution at a terminal is discarded — skip it (§6.5).
                 token = env.step_in_place(action, settle_winners=False)
-                v += self._child(env, p, pi_p, pi_o * sigma[:, a_idx], river_k)
+                v += self._child(env, p, pi_p, pi_o * sigma[:, a_idx], street)
                 env.undo(token)
             return v
 
@@ -270,7 +337,7 @@ class _VectorSolver:
         child_vs = np.empty((len(legal), self._n_combos), dtype=np.float64)
         for a_idx, action in enumerate(legal):
             token = env.step_in_place(action, settle_winners=False)
-            child_vs[a_idx] = self._child(env, p, pi_p * sigma[:, a_idx], pi_o, river_k)
+            child_vs[a_idx] = self._child(env, p, pi_p * sigma[:, a_idx], pi_o, street)
             env.undo(token)
         cv = np.moveaxis(child_vs, 0, -1)             # (n_combos, width)
         v = (sigma * cv).sum(axis=-1)                 # (n_combos,)
@@ -281,60 +348,56 @@ class _VectorSolver:
             # ``actor == p``, so this fires only when the bot traverses itself).
             delta[self._my_combo] = 0.0
             strat_delta[self._my_combo] = 0.0
-        regret += delta       # in-place; via the slice view this writes the store
-        strat += strat_delta
+        if is_root:
+            regret += delta                           # in-place: writes the store
+            strat += strat_delta
+        else:
+            # All combos in a cluster share one row (§6.5), so the row update is
+            # the sum of their per-combo deltas — a presorted segment-sum.
+            self._scatter_add(regret, delta, street)
+            self._scatter_add(strat, strat_delta, street)
         return v
 
+    def _scatter_add(self, table: np.ndarray, per_combo: np.ndarray, street: int) -> None:
+        """Segment-sum the feasible combos' rows of ``per_combo`` into ``table``.
+
+        The combo→cluster map is fixed for the whole iteration, so the sort +
+        segment boundaries are precomputed once (``_refresh_cluster_maps``) and a
+        ``reduceat`` does the grouping — cheaper than ``np.add.at`` on every node.
+        ``seg_cluster`` holds each segment's distinct cluster row, so the final
+        fancy-index add has no duplicate targets.
+        """
+        sorted_combos, seg_starts, seg_cluster = self._scatter[street]
+        grouped = per_combo[sorted_combos]            # (n_feasible, width)
+        seg_sums = np.add.reduceat(grouped, seg_starts, axis=0)
+        table[seg_cluster] += seg_sums
+
     def _child(self, env, p: int, pi_p: np.ndarray, pi_o: np.ndarray,
-               river_k: Optional[int]) -> np.ndarray:
+               parent_street: int) -> np.ndarray:
         s0, s1 = self._seats
         opp = s1 if p == s0 else s0
-        terminal = self.ctx.depth_limit.classify(env) == "terminal"
 
-        if terminal:
-            if river_k is not None:
-                # Below the chance node: settle for the iteration's sampled river.
-                return env.vector_payout(p, opp, pi_o, int(self._rivers[river_k]))
-            if self._rivers is not None and self._terminal_needs_river(env):
-                # The turn→river chance node *at* a terminal: a turn all-in
-                # showdown (board completed by the river) or a river-side fold
-                # reached directly.  Settle for the sampled river, feasibility-
-                # masking the opponent reach for that river.
-                k = self._sampled_k
-                return env.vector_payout(
-                    p, opp, pi_o * self._feas[:, k], int(self._rivers[k])
-                )
-            # Turn-side terminal (river-independent), or a river subgame terminal.
-            return env.vector_payout(p, opp, pi_o, None)
+        if self.ctx.depth_limit.classify(env) == "terminal":
+            runout = self._completion or None
+            if env.players[s0].is_active and env.players[s1].is_active:
+                # Showdown: the board completes to five with the whole sampled
+                # runout.  Mask pi_o by full-completion feasibility so an all-in
+                # that reached the terminal *before* the chance nodes were walked
+                # still excludes combos holding a completion card (mirrors the
+                # per-crossing masking below).  No-op for a river root.
+                reach = pi_o if self._feas_full is None else pi_o * self._feas_full
+                return env.vector_payout(p, opp, reach, runout=runout)
+            # Fold: pi_o is already masked to the fold's street by the crossings
+            # below; vector_payout's fold path selects the board it saw via
+            # terminal_board_len.
+            return env.vector_payout(p, opp, pi_o, runout=runout)
 
-        if (
-            self._rivers is not None
-            and river_k is None
-            and env.betting_round > self.ctx.street_at_root
-        ):
-            # The turn→river chance node *before* river betting: descend into the
-            # sampled river's slice, feasibility-masking BOTH reach vectors so
-            # impossible (combo, river) rows never carry reach at interior river-
-            # betting nodes (mandatory — the terminal showdown mask alone is not
-            # enough).  No 1/R: chance sampling already gives the expectation.
-            k = self._sampled_k
-            feas_k = self._feas[:, k]
-            return self._walk(env, p, pi_p * feas_k, pi_o * feas_k, k)
+        if env.betting_round > parent_street:
+            # Crossed a chance node (the board grew by one card): mask both reaches
+            # by the new street's board feasibility, so a combo holding the freshly
+            # dealt completion card carries no reach below it.  No 1/R — chance
+            # sampling already gives the expectation.
+            feas = self._feas[env.betting_round]
+            return self._walk(env, p, pi_p * feas, pi_o * feas)
 
-        return self._walk(env, p, pi_p, pi_o, river_k)
-
-    # ------------------------------------------------------------------
-    # River chance node helper (turn subgame only)
-    # ------------------------------------------------------------------
-
-    def _terminal_needs_river(self, env) -> bool:
-        """Does the river chance affect this (turn-subgame) terminal?
-
-        A showdown always integrates the river (it completes the board); a fold
-        does so only if it is a genuine river-side fold (the real board reached
-        five) — a turn-side fold is river-independent.
-        """
-        s0, s1 = self._seats
-        if env.players[s0].is_active and env.players[s1].is_active:
-            return True
-        return env.terminal_board_len == 5
+        return self._walk(env, p, pi_p, pi_o)

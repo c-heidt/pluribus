@@ -5,15 +5,19 @@ The solver is exercised at three levels:
 - **Exact units** — ``SolverState`` table ops (regret matching, widening, discount,
   averaging), the regime selector, the joint root sampler, ``SearchPolicy`` reads,
   and the freezing gate.  These are deterministic and assert exact behaviour.
-- **Integration** — ``solve()`` on a heads-up **flop** subgame (the MCCFR regime's
-  terminal-only setting: no depth-limit leaf, exact small-deck runouts) runs,
-  produces valid strategies, is deterministic, and reuses warm-start state.
+- **Integration** — ``solve()`` on a heads-up **preflop** subgame (the MCCFR
+  regime's terminal-only setting: no depth-limit leaf, exact small-deck runouts)
+  runs, produces valid strategies, is deterministic, and reuses warm-start state.
 - **Convergence (fast)** — the average strategy stabilises over iterations.
 
-The heads-up flop subgame (`street_at_root == 1`, two live seats) is chosen
-deliberately: ``_select_regime`` routes it to MCCFR, and ``DepthLimit.classify``
-makes it terminal-only, so the traversal walks flop→turn→river to real showdowns
-without the continuation meta-game — isolating the core CFR loop.
+The heads-up **preflop** subgame (`street_at_root == 0`, two live seats) is the
+MCCFR isolation fixture: ``_select_regime`` routes it to MCCFR, and heads-up play
+extends to showdown (no ``n_players_at_root > 2`` depth limit), so the traversal
+walks preflop→flop→turn→river to real showdowns without the continuation
+meta-game — isolating the core CFR loop.  (A heads-up *flop* subgame now routes to
+the **vector** regime — §6.5 cluster-keyed future streets — so it is covered by
+``TestVectorRegime``, not here; the ``_flop_env`` helper is retained for the
+tests that construct ``_MCCFRSolver`` directly, bypassing the regime router.)
 """
 
 import collections
@@ -73,6 +77,26 @@ def _flop_env(low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
     return env
 
 
+def _preflop_env(low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
+    """Heads-up small-deck env at the preflop root (``street_at_root == 0``).
+
+    The MCCFR isolation fixture: ``_select_regime`` routes a heads-up preflop
+    subgame to MCCFR, and heads-up play extends to showdown, so a ``solve`` walks
+    the full betting tree to real small-deck showdowns.  (Since the router now
+    sends a heads-up *flop* subgame to the vector regime, the MCCFR integration /
+    convergence tests root at the preflop instead — one street earlier, same
+    "walk to showdown, no continuation meta-game" property.)
+    """
+    np.random.seed(seed)
+    env = PokerEnv(
+        players=[Player(i, s) for i, s in enumerate(stacks)],
+        low_card_rank=low,
+        high_card_rank=high,
+    )
+    _stub_lut(env)
+    return env
+
+
 def _advance_to(env: PokerEnv, target_round: int) -> PokerEnv:
     """Walk a heads-up env (calls/checks only) to ``target_round``."""
     guard = 0
@@ -124,7 +148,7 @@ class TestRegimeSelect:
 
     @pytest.mark.parametrize("street,n,expected", [
         (0, 2, "mccfr"),   # preflop HU
-        (1, 2, "mccfr"),   # flop HU (round-2)
+        (1, 2, "vector"),  # flop HU (cluster-keyed future streets, §6.5)
         (2, 2, "vector"),  # turn HU
         (3, 2, "vector"),  # river HU
         (2, 3, "mccfr"),   # turn 3-way (multiway → MCCFR)
@@ -365,7 +389,7 @@ class TestPassSeparation:
 class TestSolveIntegration:
 
     def test_runs_and_builds_valid_strategies(self):
-        env = _flop_env(seed=7)
+        env = _preflop_env(seed=7)
         ctx = _ctx(env)
         res = solve(env, ctx, _cfg(ctx, iters=40))
         assert res.iterations_run == 40
@@ -384,7 +408,7 @@ class TestSolveIntegration:
         # RNG unification deferred).  Same ctx seed + same global seed → identical
         # tables.
         def run():
-            env = _flop_env(seed=8)
+            env = _preflop_env(seed=8)
             ctx = _ctx(env, seed=11)
             np.random.seed(99)
             return solve(env, ctx, _cfg(ctx, iters=30))
@@ -395,12 +419,12 @@ class TestSolveIntegration:
             np.testing.assert_allclose(r1.state.regret[k], r2.state.regret[k])
 
     def test_warm_start_reuses_state(self):
-        env = _flop_env(seed=9)
+        env = _preflop_env(seed=9)
         ctx = _ctx(env, seed=2)
         first = solve(env, ctx, _cfg(ctx, iters=20))
         keys_before = set(first.state.regret)
         # re-search the same root with the carried state
-        env2 = _flop_env(seed=9)
+        env2 = _preflop_env(seed=9)
         ctx2 = _ctx(env2, seed=3)
         second = solve(env2, ctx2, _cfg(ctx2, iters=20), warm_start=first.state)
         assert second.state is first.state                 # reused in place
@@ -411,12 +435,12 @@ class TestSolveIntegration:
         # warm re-search must report only ITS work — like iterations_run, which is
         # counted fresh per solve().  Without the reset every re-searched `decisions`
         # row would inflate node_count/cache stats cumulatively over the hand.
-        env = _flop_env(seed=9)
+        env = _preflop_env(seed=9)
         ctx = _ctx(env, seed=2)
         first = solve(env, ctx, _cfg(ctx, iters=20))
         n1 = first.stats.node_count
         assert n1 > 0 and first.stats.legal_at_misses > 0
-        env2 = _flop_env(seed=9)
+        env2 = _preflop_env(seed=9)
         ctx2 = _ctx(env2, seed=3)
         second = solve(env2, ctx2, _cfg(ctx2, iters=20), warm_start=first.state)
         # Same tree + same iters → per-search node count, NOT ~2x (cumulative).
@@ -425,13 +449,17 @@ class TestSolveIntegration:
         # misses this re-search than the fresh solve had (cumulative would be ≥).
         assert second.stats.legal_at_misses < first.stats.legal_at_misses
 
-    def test_runout_terminal_flag_changes_values(self):
-        # Flag on (exact equity) vs off (sampled payout) should generally differ on
-        # a subgame that reaches all-in runouts; both must produce valid strategies.
-        env = _flop_env(seed=10)
+    def test_mccfr_solve_reaches_runout_terminals(self):
+        # Smoke: an MCCFR preflop solve walks to real all-in runout terminals and
+        # completes.  (A preflop root forces the sampled-runout leaf mode — the
+        # decision-free equity flag is inert at ``street_at_root == 0``, §
+        # ``_leaf_mode`` — so the on/off comparison lives with the multiway MCCFR
+        # subgames, not this heads-up isolation fixture.)
+        env = _preflop_env(seed=10)
         ctx_on = _ctx(env, seed=1)
         res = solve(env, ctx_on, _cfg(ctx_on, iters=20))
         assert res.iterations_run == 20
+        assert res.regime == "mccfr"
 
 
 # --------------------------------------------------------------------------- #
@@ -521,7 +549,7 @@ class TestConvergence:
     def test_average_strategy_stabilises(self, _seeded):
         # A converging solver's *average* strategy settles: the root range-average
         # should drift only a little as iterations grow.  We solve the same
-        # heads-up flop subgame twice from identical seeds — N and 2N iterations —
+        # heads-up preflop subgame twice from identical seeds — N and 2N iterations —
         # and bound the change.  This is a genuine convergence property; it does
         # not pin the exact equilibrium (a brute-force tabular-CFR cross-check
         # would — a candidate strengthening).
@@ -533,7 +561,7 @@ class TestConvergence:
         trial = _seeded
 
         def root_range_average(iters):
-            env = _flop_env(seed=12 + trial)
+            env = _preflop_env(seed=12 + trial)
             ctx = _ctx(env, seed=4 + trial)
             pk = env.public_key
             width = len([a for a in env.legal_actions if a is not None])
@@ -582,7 +610,7 @@ class TestVectorRegime:
     def test_ensure_vnode_allocates_and_discount_scales(self):
         st = SolverState.empty()
         pk = ("turn", ())
-        st.ensure_vnode(pk, ("fold", "call"), actor=0, n_combos=6)
+        st.ensure_vnode(pk, ("fold", "call"), actor=0, n_rows=6, row_space="combo")
         assert st.vregret[pk].shape == (6, 2) and st.vstrat[pk].shape == (6, 2)
         st.vregret[pk][:] = 2.0
         st.vstrat[pk][:] = 4.0
@@ -592,9 +620,9 @@ class TestVectorRegime:
     def test_vnode_widening_grows_columns_preserving_values(self):
         st = SolverState.empty()
         pk = ("turn", ())
-        st.ensure_vnode(pk, ("fold", "call"), actor=0, n_combos=3)
+        st.ensure_vnode(pk, ("fold", "call"), actor=0, n_rows=3, row_space="combo")
         st.vregret[pk][:] = [[1.0, 2.0]]
-        st.ensure_vnode(pk, ("fold", "call", "raise:1.0"), actor=0, n_combos=3)
+        st.ensure_vnode(pk, ("fold", "call", "raise:1.0"), actor=0, n_rows=3, row_space="combo")
         assert st.vregret[pk].shape == (3, 3)
         np.testing.assert_allclose(st.vregret[pk][:, :2], [[1.0, 2.0]] * 3)
         np.testing.assert_allclose(st.vregret[pk][:, 2], [0.0, 0.0, 0.0])
@@ -602,7 +630,7 @@ class TestVectorRegime:
     def test_state_reads_matrix_rows(self):
         st = SolverState.empty()
         pk = ("turn", ())
-        st.ensure_vnode(pk, ("fold", "call", "raise"), actor=0, n_combos=4)
+        st.ensure_vnode(pk, ("fold", "call", "raise"), actor=0, n_rows=4, row_space="combo")
         st.vregret[pk][2] = [0.0, 3.0, 1.0]
         np.testing.assert_allclose(st.sigma((pk, 2)), [0.0, 0.75, 0.25], atol=1e-6)
         st.vstrat[pk][2] = [2.0, 1.0, 1.0]
@@ -611,19 +639,31 @@ class TestVectorRegime:
 
     # -- terminal / value correctness -------------------------------------- #
 
-    def test_root_value_is_zero_sum(self):
+    @pytest.mark.parametrize("target", [2, 3])
+    def test_root_value_is_zero_sum(self, target):
         # Under uniform play (fresh state) the reach-weighted root value to each
         # seat sums to zero — a property that holds only if the showdown/fold
-        # stake is the matched contribution and card removal is consistent.
-        env = _late_env(3, seed=5)  # river: deterministic, no chance node
+        # stake is the matched contribution and card removal is consistent.  A
+        # turn root (target=2) exercises the cluster-keyed river-stage nodes and
+        # the chance-node feasibility masking; a river root (target=3) is lossless.
+        env = _late_env(target, seed=5)
         ctx = _ctx(env)
         cfg = _cfg(ctx, iters=1)
         s0, s1 = sorted(ctx.ranges)
         bc = np.asarray(ctx.board_compatible, dtype=np.float64)
         r0 = np.asarray(ctx.ranges[s0], np.float64) * bc
         r1 = np.asarray(ctx.ranges[s1], np.float64) * bc
-        v0 = _VectorSolver(env, SolverState.empty(), ctx, cfg, ctx.rng)._walk(env, s0, r0, r1, None)
-        v1 = _VectorSolver(env, SolverState.empty(), ctx, cfg, ctx.rng)._walk(env, s1, r1, r0, None)
+        # A single iteration must sample its runout before the walk (turn root).
+        sv0 = _VectorSolver(env, SolverState.empty(), ctx, cfg, ctx.rng)
+        sv1 = _VectorSolver(env, SolverState.empty(), ctx, cfg, ctx.rng)
+        for sv in (sv0, sv1):
+            if sv._n_completion:
+                comp = tuple(int(sv._avail[i]) for i in
+                             sv.rng.choice(len(sv._avail), sv._n_completion, replace=False))
+                sv._completion = comp
+                sv._refresh_cluster_maps(comp)
+        v0 = sv0._walk(env, s0, r0, r1)
+        v1 = sv1._walk(env, s1, r1, r0)
         big = abs(float(r0 @ v0)) + abs(float(r1 @ v1)) + 1.0
         assert abs(float(r0 @ v0) + float(r1 @ v1)) < 1e-6 * big
 
@@ -636,21 +676,26 @@ class TestVectorRegime:
             assert _select_regime(ctx) == "vector"
             res = solve(env, ctx, _cfg(ctx, iters=25))
             assert len(res.state.vregret) > 0
+            saw_cluster = False
             for pk, legal in res.state.legal_at.items():
                 mat = res.state.vregret.get(pk)
-                if mat is not None and mat.ndim == 3:
-                    # River-conditioned turn-subgame node (§6.5): a per-river
-                    # betting strategy, internal to the solve (not externally
-                    # read — the river is played from a fresh river subgame).
-                    # Validate the per-(combo, river) regret-matched rows directly.
+                if mat is None:
+                    continue
+                if res.state.vrow_space.get(pk) == "cluster":
+                    # Future-street node (§6.5): rows are LUT clusters, internal to
+                    # the solve (never read externally — the next round is a fresh
+                    # subgame).  Validate the regret-matched cluster rows directly.
+                    saw_cluster = True
                     sig = _regret_match_matrix(mat)
-                    assert sig.shape == (mat.shape[0], mat.shape[1], len(legal))
+                    assert sig.shape == mat.shape
                     np.testing.assert_allclose(sig.sum(axis=-1), 1.0, atol=1e-5)
                     continue
                 for pol in (res.policy, res.average_policy):
                     d = pol.strategy_for(pk, 0, legal)
                     assert d.shape == (len(legal),)
                     assert abs(d.sum() - 1.0) < 1e-5 and (d >= -1e-9).all()
+            if target == 2:
+                assert saw_cluster, "a turn root must build cluster-keyed river nodes"
 
     def test_determinism_independent_of_global_rng(self):
         # The river is sampled from ctx.rng, so the result must not depend on the
@@ -684,11 +729,14 @@ class TestVectorRegime:
 
         monkeypatch.setattr(rs, "rank_combos_on_board", spy)
         solver = _VectorSolver(env, SolverState.empty(), ctx, _cfg(ctx, iters=1), ctx.rng)
-        n_candidate_rivers = len(solver._rivers)
+        n_candidate = len(solver._avail)
         for _ in range(40):
             solver.iterate()
-        # bounded by distinct boards, independent of the 40 iterations / node count
-        assert 0 < calls["n"] <= n_candidate_rivers
+        # Ranking happens only at showdown terminals, on the sampled runout's
+        # 5-card board — one distinct board per distinct completion, memoised.  So
+        # the count is bounded by the distinct completions sampled (<= the 40
+        # iterations and <= the candidate cards), never by node count * iterations.
+        assert 0 < calls["n"] <= min(40, n_candidate)
 
     def test_search_policy_reads_vector_result_and_frozen(self):
         env = _late_env(2, seed=4)
@@ -710,26 +758,28 @@ class TestVectorRegime:
             res.policy.strategy_for(pk, ci, legal), frozen, atol=1e-6
         )
 
-    def test_turn_subgame_conditions_river_betting(self):
-        # The river-conditioned change (§6.5): a turn subgame builds 3-D river-stage
-        # nodes whose average river-betting strategy genuinely **differs across the
-        # river card** — the property a river-blind strategy could not represent.
-        # The river is chance-*sampled* (one per iteration), but each river keeps its
-        # own conditioned slice, so over iterations the per-river strategies diverge.
+    def test_future_street_nodes_are_cluster_keyed(self):
+        # §6.5: a turn root stores its river-stage betting nodes per LUT cluster
+        # (row_space "cluster"), not per combo — the sampled board is folded into
+        # the cluster id, so there is no explicit river axis.  Root-street nodes
+        # stay combo-keyed.  (That the cluster id conditions on the board is the
+        # batch-lookup's contract, covered in test_batch_cluster_lookup.)
         env = _late_env(2, seed=6)
         ctx = _ctx(env)
-        res = solve(env, ctx, _cfg(ctx, iters=250))
-        river_nodes = [m for m in res.state.vstrat.values() if m.ndim == 3]
-        assert river_nodes, "expected river-conditioned 3-D river-betting nodes"
-        spread = 0.0
-        for m in river_nodes:
-            tot = m.sum(axis=-1, keepdims=True)
-            avg = np.where(tot > 0, m / np.where(tot > 0, tot, 1.0), 0.0)
-            mass = m.sum(axis=(1, 2)) > 0
-            if mass.any():
-                a0 = avg[mass, :, 0]  # action-0 prob per (combo, river)
-                spread = max(spread, float((a0.max(1) - a0.min(1)).max()))
-        assert spread > 0.0, "river betting did not condition on the river card"
+        res = solve(env, ctx, _cfg(ctx, iters=60))
+        spaces = res.state.vrow_space
+        assert set(spaces.values()) == {"combo", "cluster"}, (
+            "a turn root must have both a combo-keyed root street and "
+            "cluster-keyed river-stage nodes"
+        )
+        n_combos = env.n_combos
+        for pk, mat in res.state.vregret.items():
+            if spaces[pk] == "combo":
+                assert mat.shape[0] == n_combos
+            else:
+                # A cluster node has one row per reachable cluster — bounded by the
+                # LUT's bucket count, and typically far fewer than n_combos.
+                assert 1 <= mat.shape[0] <= n_combos
 
     def test_turn_sampling_is_reproducible_given_seed(self):
         # The river chance node is sampled from ``ctx.rng`` (not the engine's
@@ -745,24 +795,33 @@ class TestVectorRegime:
         for k in a.state.vregret:
             np.testing.assert_array_equal(a.state.vregret[k], b.state.vregret[k])
 
-    def test_infeasible_combo_river_rows_are_masked(self):
-        # A (combo, river) pair whose combo holds the river card is an impossible
-        # deal: feasibility masking at the chance node must leave it zero strat-sum
-        # (for a sampled river it is masked; an unsampled river stays all-zero).
-        env = _late_env(2, seed=6)
+    def test_completion_masks_infeasible_combos(self):
+        # A combo holding a sampled completion (turn/river) card is an impossible
+        # deal below that chance node.  The per-street feasibility mask must zero
+        # it (``_feas`` == 0) and give it no cluster row (``_cluster_of`` == -1),
+        # so it carries no reach and is excluded from the scatter-add — the
+        # replacement for the old per-(combo, river) row masking.
+        env = _late_env(2, seed=6)  # turn root: one future street (river)
         ctx = _ctx(env)
-        res = solve(env, ctx, _cfg(ctx, iters=60))
-        board = {int(c) for c in env.community_cards}
-        rivers = sorted({int(x) for x in np.unique(env.combo_cards)} - board)
+        sv = _VectorSolver(env, SolverState.empty(), ctx, _cfg(ctx, iters=1), ctx.rng)
+        assert sv._n_completion == 1
+        river = int(sv._avail[0])
+        sv._refresh_cluster_maps((river,))
         cc = env.combo_cards
-        checked = False
-        for m in (m for m in res.state.vstrat.values() if m.ndim == 3):
-            for k, r in enumerate(rivers):
-                conflict = (cc[:, 0] == r) | (cc[:, 1] == r)
-                if conflict.any():
-                    assert np.all(m[conflict, k, :] == 0.0)
-                    checked = True
-        assert checked, "expected at least one infeasible (combo, river) row to check"
+        holds_river = (cc[:, 0] == river) | (cc[:, 1] == river)
+        assert holds_river.any(), "fixture must contain combos holding the river card"
+        s = sv._future[0]
+        # Combos holding the river are impossible below the chance node → masked.
+        assert np.all(sv._feas[s][holds_river] == 0.0)
+        assert np.all(sv._cluster_of[s][holds_river] == -1)
+        # Feasibility == full-board compatibility (root board + the river card);
+        # every feasible combo gets a valid dense cluster row within the node.
+        full_board = np.array(sv._root_comm + [river], dtype=np.int64)
+        compatible = ~(np.isin(cc[:, 0], full_board) | np.isin(cc[:, 1], full_board))
+        assert compatible.any()
+        np.testing.assert_array_equal(sv._feas[s] > 0, compatible)
+        assert np.all(sv._cluster_of[s][compatible] >= 0)
+        assert sv._cluster_of[s][compatible].max() < len(sv._universe[s])
 
     def test_unequal_allin_stake_is_matched_not_max(self):
         # Heads-up unequal stacks: a short stack calls all-in for less against a

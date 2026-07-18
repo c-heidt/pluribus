@@ -263,24 +263,41 @@ class TestApproachAndSearch:
         log, _ = db
         with log.game():
             gid = log.log_game(_game(0))
-            # A vector search on the FLOP (not turn/river) → routing violation.
+            # A vector search on the PREFLOP (the vector envelope is heads-up
+            # flop/turn/river, §6.5 — preflop is always MCCFR) → routing violation.
             self._dec(log, gid, regime="vector", leaf_mode="exact_range",
-                      betting_stage="flop", num_live=2, stop_reason="iteration_cap",
+                      betting_stage="preflop", num_live=2, stop_reason="iteration_cap",
                       wall_seconds=1.0, iterations=100, cache_hits=1, cache_misses=0)
         rep = build_report(log._con)
         assert rep["approach"]["routing_ok"] is False
         assert rep["approach"]["routing_violations"] == 1
         assert "routing" in {f["key"] for f in rep["flags"]}
 
-    def test_vector_at_turn_headsup_is_clean(self, db):
+    def test_vector_multiway_flagged(self, db):
         log, _ = db
         with log.game():
             gid = log.log_game(_game(0))
+            # Vector must be heads-up: a multiway (num_live != 2) vector search is a
+            # routing violation even on an in-envelope street.
             self._dec(log, gid, regime="vector", leaf_mode="exact_range",
-                      betting_stage="turn", num_live=2, stop_reason="wall_cap",
+                      betting_stage="flop", num_live=3, stop_reason="wall_cap",
                       wall_seconds=2.0, iterations=9000, cache_hits=9, cache_misses=1)
         rep = build_report(log._con)
+        assert rep["approach"]["routing_ok"] is False
+        assert rep["approach"]["routing_violations"] == 1
+
+    def test_vector_headsup_flop_turn_river_is_clean(self, db):
+        # §6.5: the vector regime fires heads-up on flop, turn, AND river — all clean.
+        log, _ = db
+        with log.game():
+            gid = log.log_game(_game(0))
+            for stage in ("flop", "turn", "river"):
+                self._dec(log, gid, regime="vector", leaf_mode="exact_range",
+                          betting_stage=stage, num_live=2, stop_reason="wall_cap",
+                          wall_seconds=2.0, iterations=9000, cache_hits=9, cache_misses=1)
+        rep = build_report(log._con)
         assert rep["approach"]["routing_ok"] is True
+        assert rep["approach"]["routing_violations"] == 0
 
     def test_search_cost_and_budget_flag(self, db):
         log, _ = db

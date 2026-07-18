@@ -26,6 +26,7 @@ chip-denominated round-1 trigger).  See ``docs/subgame_solving.md`` §4–§6.6.
 from __future__ import annotations
 
 import copy
+import logging
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
@@ -35,6 +36,8 @@ from poker_ai.search.context import SubgameContext
 from poker_ai.search.policy import BiasClass, Policy
 from poker_ai.search.ranges import RangeTracker
 from poker_ai.search.solver import SearchResult, SolverConfig, solve
+
+logger = logging.getLogger(__name__)
 
 
 class SearchAgent:
@@ -151,40 +154,79 @@ class SearchAgent:
                 and action in env_before.legal_actions
                 and self._offtree_gap(env_before, action) > self._offtree_threshold
             ):
-                self.last_search = solve(
-                    self._root_env, self._ctx, self._cfg,
-                    warm_start=self.last_search.state,
-                )
+                try:
+                    self.last_search = solve(
+                        self._root_env, self._ctx, self._cfg,
+                        warm_start=self.last_search.state,
+                    )
+                except Exception:
+                    # A warm re-search failure keeps the prior search: it is a valid
+                    # solve of the same root (just without this off-tree branch), so
+                    # it still plays better than the blueprint. Logged, not silent.
+                    logger.exception(
+                        "warm re-search failed (seat %s) — keeping the prior search",
+                        self.my_seat,
+                    )
         else:
             self._maybe_trigger_round1(env_before, action)
 
     def act(self, env: PokerEnv) -> str:
         """Return the action the bot plays at its current decision.
 
-        Round 1 with no search: sample the blueprint.  Otherwise: sample the
-        search's **final-iteration** strategy for the bot's actual hand and pin
-        that mixed strategy into the freeze map so a re-search keeps it fixed.
+        Delegates to :meth:`play_distribution` — the single source of truth for the
+        played σ (searched final-iteration strategy, or the blueprint fallback when
+        the search has no strategy for this node) — samples it, and, when the play
+        came from the search, pins the actual-hand row into the freeze map so a
+        within-round re-search keeps it fixed (§5).
         """
-        if self.last_search is None:
-            state = env.policy_state_for(self.my_hole, for_blueprint=True)
-            prob = self._blueprint.strategy(state, "none")
-            return self._sample(prob, list(state.legal_actions))
-
-        pk = self._solved_public_key(env)
-        hr = self._hand_row(env)
-        legal = [a for a in env.legal_actions if a is not None]
-        prob = np.asarray(
-            self.last_search.policy.strategy_for(pk, hr, legal), dtype=np.float64
-        )
-        total = prob.sum()
-        prob = prob / total if total > 0 else np.full(len(legal), 1.0 / len(legal))
+        legal, prob, searched = self.play_distribution(env)
         action = self._sample(prob, legal)
-        # Freeze the actual-hand row at the (normalised) mixed σ just played — not
-        # the realised sample — so a within-round re-search keeps it pinned (§5).
-        st = self.last_search.state
-        st.legal_at.setdefault(pk, tuple(legal))
-        st.frozen[(pk, hr)] = prob
+        if searched:
+            # Freeze the actual-hand row at the (normalised) mixed σ just played —
+            # not the realised sample — so a within-round re-search keeps it pinned.
+            pk = self._solved_public_key(env)
+            hr = self._hand_row(env)
+            st = self.last_search.state
+            st.legal_at.setdefault(pk, tuple(legal))
+            st.frozen[(pk, hr)] = prob
         return action
+
+    def play_distribution(
+        self, env: PokerEnv
+    ) -> Tuple[List[str], np.ndarray, bool]:
+        """The exact ``(legal, probs, searched)`` the bot plays at ``env``.
+
+        The single source of truth for the played σ — shared by :meth:`act` and the
+        runner's decision logging / AIVAT correction, which must agree with what was
+        actually played.  Returns the searched **final-iteration** strategy for the
+        bot's actual hand (``searched=True``) only when the search covers this node;
+        otherwise falls back to the blueprint (``searched=False``).
+
+        The blueprint fallback fires whenever the search produced **no** usable
+        strategy for this decision — round 1 with no search, a failed solve
+        (``last_search is None``), or a node the solved tree does not contain: a
+        decision *past a depth-limit leaf* (the multiway within-round gap), or an
+        off-tree line neither injected nor translatable (``_solved_public_key``'s
+        key absent from ``legal_at``).  In every such case the bot plays the
+        blueprint rather than a uniform guess over its legal actions (§6.6).
+        """
+        if self.last_search is not None:
+            pk = self._solved_public_key(env)
+            if pk in self.last_search.state.legal_at:
+                hr = self._hand_row(env)
+                legal = [a for a in env.legal_actions if a is not None]
+                prob = np.asarray(
+                    self.last_search.policy.strategy_for(pk, hr, legal),
+                    dtype=np.float64,
+                )
+                total = prob.sum()
+                prob = prob / total if total > 0 else np.full(len(legal), 1.0 / len(legal))
+                return legal, prob, True
+        # Blueprint fallback (no search, failed solve, or a node the search does
+        # not cover) — play the blueprint, never a uniform guess.
+        state = env.policy_state_for(self.my_hole, for_blueprint=True)
+        prob = np.asarray(self._blueprint.strategy(state, "none"), dtype=np.float64)
+        return list(state.legal_actions), prob, False
 
     # ----------------------------------------------------------------- #
     # Public mechanism (a chip-aware runner may also call this directly)
@@ -218,7 +260,13 @@ class SearchAgent:
                 self.tracker.on_seat_folded(seat)
 
     def _solve_and_store(self, root_env: PokerEnv) -> None:
-        """Build the ctx from the current ranges, solve, and store the result."""
+        """Build the ctx from the current ranges, solve, and store the result.
+
+        A solve that raises *for any reason* must not crash the hand: it is logged
+        loudly and ``last_search`` is cleared, so :meth:`act` / :meth:`play_distribution`
+        fall back to the blueprint for this round rather than propagating the error
+        or reading a stale prior-round search (§6.6 robustness).
+        """
         self._root_env = root_env
         self._ctx = SubgameContext.from_runtime(
             root_env,
@@ -229,7 +277,14 @@ class SearchAgent:
             self._cfg.leaf,
             self._rng,
         )
-        self.last_search = solve(root_env, self._ctx, self._cfg)
+        try:
+            self.last_search = solve(root_env, self._ctx, self._cfg)
+        except Exception:
+            logger.exception(
+                "subgame solve failed (seat %s, street %s) — falling back to the "
+                "blueprint for this round", self.my_seat, root_env.betting_round,
+            )
+            self.last_search = None
         self._searched_this_round = True
 
     def _make_sigma_for_combo(

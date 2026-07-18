@@ -367,10 +367,12 @@ def _query_approach(con: sqlite3.Connection) -> dict:
     """Solver-approach usage mix + budget health + a routing correctness check (§8).
 
     ``(regime, leaf_mode)`` is the approach.  Routing check: the vector regime must
-    fire only heads-up (``num_live == 2``) on turn/river (subgame §6.4.1) — a
-    mis-routed solver is a correctness bug the usage mix alone would hide.  The
-    check is scoped to that clearest envelope; ``num_live IS NULL`` rows are not
-    counted as violations (older rows may not carry it).
+    fire only heads-up (``num_live == 2``) on flop/turn/river (subgame §6.5 — a HU
+    post-preflop subgame is "small/late", so all of it takes the vector path with
+    the future streets keyed by LUT cluster) — a mis-routed solver is a correctness
+    bug the usage mix alone would hide.  The check is scoped to that clearest
+    envelope; ``num_live IS NULL`` rows are not counted as violations (older rows
+    may not carry it).
     """
     total = _scalar(con, "SELECT COUNT(*) FROM decisions WHERE searched = 1") or 0
     # ``term_runout``/``term_payout`` (per-terminal evaluator mix) are v4 columns;
@@ -405,7 +407,7 @@ def _query_approach(con: sqlite3.Connection) -> dict:
     routing_violations = _scalar(
         con,
         "SELECT COUNT(*) FROM decisions WHERE searched = 1 AND regime = 'vector' "
-        "AND (betting_stage NOT IN ('turn', 'river') "
+        "AND (betting_stage NOT IN ('flop', 'turn', 'river') "
         "     OR (num_live IS NOT NULL AND num_live != 2))",
     ) or 0
     return {
@@ -566,7 +568,7 @@ def _evaluate_flags(report: dict) -> List[dict]:
         flags.append({
             "level": "warn", "key": "routing",
             "message": f"{report['approach']['routing_violations']} vector searches "
-                       "fired outside heads-up turn/river",
+                       "fired outside heads-up flop/turn/river",
         })
 
     # thin resolution — range metrics rest on very few showdowns (weak evidence).

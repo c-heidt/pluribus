@@ -118,10 +118,10 @@ class TestVectorDeterministicPass:
     def test_pass_deterministic_given_river(self):
         env, ctx = self._vector_baseline()
         s1 = _VectorSolver(env, SolverState.empty(), ctx, _cfg(ctx.leaf), ctx.rng)
-        vr1, vs1 = core_diff.run_vector_pass(s1, sampled_k=0)
+        vr1, vs1 = core_diff.run_vector_pass(s1)
         assert vr1, "vector pass allocated no nodes — vacuous"
 
         s2 = _VectorSolver(env, SolverState.empty(), ctx, _cfg(ctx.leaf), ctx.rng)
-        vr2, vs2 = core_diff.run_vector_pass(s2, sampled_k=0)
+        vr2, vs2 = core_diff.run_vector_pass(s2)
         core_diff.assert_tables_equal(vr1, vr2)
         core_diff.assert_tables_equal(vs1, vs2)

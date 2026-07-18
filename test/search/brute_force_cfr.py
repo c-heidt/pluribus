@@ -655,3 +655,351 @@ def turn_br_value(sub: TurnSubgame, br_player: int, sigma_opp: Mapping[TInfoset,
 def turn_exploitability(sub: TurnSubgame, sigma: Mapping[TInfoset, np.ndarray]) -> float:
     """Best-response gap of ``sigma`` for the turn subgame (≥ 0; 0 at Nash)."""
     return turn_br_value(sub, 0, sigma) + turn_br_value(sub, 1, sigma)
+
+
+# =========================================================================== #
+# Flop subgame oracle — turn AND river as nested, enumerated chance nodes (§6.5)
+# =========================================================================== #
+#
+# A HU **flop** subgame is flop betting → **turn chance** → per-turn turn betting
+# → **river chance** → per-(turn, river) river betting → showdown.  With the
+# vector regime routing the flop to itself (cluster-keyed future streets), it must
+# match the exact Nash of this two-chance-level game, so this oracle generalises
+# the turn oracle: infosets and payoffs are keyed by a **runout tuple** that grows
+# as chance nodes are crossed — ``()`` in flop betting, ``(turn,)`` in turn
+# betting, ``(turn, river)`` in river betting.  Each chance node deals the next
+# board card uniformly over the still-undealt candidates (``1/N`` at that level,
+# a card conflicting with either hole contributing 0 — impossible deal), exactly
+# the measure the solver samples (turn without replacement, then river).  An
+# all-in showdown that ends betting before the river force-deals the remaining
+# board: it is modelled as the corresponding **stack** of chance nodes above a
+# full-depth leaf, so its value integrates over the same runout distribution.
+
+FInfoset = Tuple[int, int, Tuple, Tuple[int, ...]]  # (seat, hole, pk, runout)
+
+
+def _stage_runout(env, runout: Sequence[int]) -> None:
+    """Force ``runout`` (turn[, river]) to be the next community cards dealt.
+
+    Generalises :func:`_stage_river` to a multi-card completion: reorders the
+    deck's still-undealt tail so ``runout`` comes first (in board order), leaving
+    the remaining undealt cards after it (their order is immaterial — only the
+    first ``len(runout)`` are turned over on the way to a five-card board).  Used
+    on a fresh ``with_hole_cards`` copy when reading a turn-/river-side terminal.
+    """
+    deck = env.deck
+    idx = int(deck._idx)
+    want = [int(c) for c in runout]
+    undealt = [int(c) for c in deck._cards[idx:]]
+    for c in want:
+        if c not in undealt:
+            raise ValueError(f"runout card {c} already dealt.")
+    rest = [c for c in undealt if c not in want]
+    deck._cards[idx:] = np.array(want + rest, dtype=deck._cards.dtype)
+
+
+@dataclass
+class FlopSubgame:
+    """Static tree + payoff tensors of one HU flop subgame (turn+river enumerated).
+
+    ``root`` carries ``{"type": "chance", "child": ...}`` nodes at each board
+    crossing (a betting continuation into the next street, or an all-in showdown
+    that force-deals it — the latter a stack of chance nodes).  ``payoff[leaf]``
+    is keyed by ``(a, b) + runout`` where ``runout`` has as many cards as chance
+    nodes crossed to reach the leaf: ``(a, b)`` in flop betting, ``(a, b, turn)``
+    in turn betting, ``(a, b, turn, river)`` in river betting.
+    """
+
+    root: dict
+    payoff: Dict[int, dict]
+    support: Dict[int, List[int]]
+    holes: Dict[int, Hole]
+    weight: Dict[Pair, float]
+    avail: List[int]   # candidate board cards (deck minus the flop board)
+
+
+def build_flop_subgame(
+    env,
+    range0: Sequence[float],
+    range1: Sequence[float],
+    support0: Sequence[int],
+    support1: Sequence[int],
+) -> FlopSubgame:
+    """Capture the flop public tree (with turn+river chance nodes) + payoff tensors.
+
+    ``env`` must be a heads-up **flop** state (3-card board, not terminal).  The
+    betting tree is runout-independent in structure, so it is walked once via
+    make/undo; a chance node is inserted wherever the board grows — either betting
+    continuing into the next street, or an all-in showdown that force-deals the
+    rest of the board (a stack of ``2 - depth`` chance nodes above a full-depth
+    leaf).  Payoffs are read from concrete ``env.payout`` replays with the runout
+    forced for turn-/river-side terminals.
+    """
+    street = int(env.betting_round)
+    board = {int(c) for c in env.community_cards}
+    avail = sorted({int(x) for x in np.unique(env.combo_cards)} - board)
+
+    holes: Dict[int, Hole] = {
+        idx: tuple(int(x) for x in env.combo_cards[idx])
+        for idx in set(support0) | set(support1)
+    }
+
+    leaves: List[Tuple[List[str], int]] = []  # (line, depth ∈ {0, 1, 2})
+
+    def build(e, line: List[str], depth: int) -> dict:
+        if e.is_terminal:
+            leaf_id = len(leaves)
+            leaves.append((list(line), depth))
+            return {"type": "term", "leaf": leaf_id, "pk": e.public_key}
+        legal = [a for a in e.legal_actions if a is not None]
+        node = {
+            "type": "node",
+            "actor": e.player_i,
+            "pk": e.public_key,
+            "legal": legal,
+            "children": {},
+        }
+        for a in legal:
+            token = e.step_in_place(a)
+            n_wrap, child_depth = 0, depth
+            if e.is_terminal:
+                # An all-in showdown ends betting before the river: the engine
+                # force-deals the rest of the board, so its value still depends on
+                # the whole runout — model that as 2−depth stacked chance nodes and
+                # key the leaf at full depth.  A fold is board-independent (keyed at
+                # the current depth), so no wrap.
+                if e.players[0].is_active and e.players[1].is_active and depth < 2:
+                    n_wrap, child_depth = 2 - depth, 2
+            elif e.betting_round > street + depth:
+                # Betting crossed into the next street: one card was dealt.
+                n_wrap, child_depth = 1, depth + 1
+            child = build(e, line + [a], child_depth)
+            for _ in range(n_wrap):
+                child = {"type": "chance", "child": child}
+            node["children"][a] = child
+            e.undo(token)
+        return node
+
+    root = build(env, [], 0)
+
+    # --- Chance measure: joint hole deal over card-disjoint support pairs. ---
+    raw: Dict[Pair, float] = {}
+    for a in support0:
+        for b in support1:
+            if set(holes[a]) & set(holes[b]):
+                continue
+            raw[(a, b)] = float(range0[a]) * float(range1[b])
+    total = sum(raw.values())
+    if total <= 0.0:
+        raise ValueError("flop subgame has no card-disjoint support pairs with mass.")
+    weight = {pair: m / total for pair, m in raw.items()}
+
+    # --- Payoff tensors: replay each line per pair (+ per runout for depth ≥ 1). --
+    def _runouts_for(depth: int, a: int, b: int):
+        """Ordered runouts of length ``depth`` from ``avail``, card-removal applied."""
+        if depth == 0:
+            yield ()
+            return
+        for turn in avail:
+            if turn in holes[a] or turn in holes[b]:
+                continue
+            if depth == 1:
+                yield (turn,)
+                continue
+            for river in avail:
+                if river == turn or river in holes[a] or river in holes[b]:
+                    continue
+                yield (turn, river)
+
+    payoff: Dict[int, dict] = {}
+    for leaf_id, (line, depth) in enumerate(leaves):
+        row: dict = {}
+        for (a, b) in raw:
+            for runout in _runouts_for(depth, a, b):
+                e2 = env.with_hole_cards([holes[a], holes[b]])
+                if runout:
+                    _stage_runout(e2, runout)
+                for action in line:
+                    if e2.is_terminal:
+                        break
+                    e2.step_in_place(action)
+                row[(a, b) + runout] = float(e2.payout[0])
+        payoff[leaf_id] = row
+
+    return FlopSubgame(
+        root=root,
+        payoff=payoff,
+        support={0: list(support0), 1: list(support1)},
+        holes=holes,
+        weight=weight,
+        avail=list(avail),
+    )
+
+
+class BruteForceFlopCFR:
+    """Full-enumeration Linear CFR over a :class:`FlopSubgame` (turn+river enumerated).
+
+    Mirrors :class:`BruteForceTurnCFR` but threads a **runout tuple** through the
+    two chance levels: ``()`` above the turn chance, ``(turn,)`` above the river
+    chance, ``(turn, river)`` below.  Each chance node deals the next candidate
+    card uniformly (``1/N`` at that level; a card in either hole contributes 0 —
+    card removal), so betting infosets and payoffs are per-runout.
+    """
+
+    def __init__(self, subgame: FlopSubgame) -> None:
+        self.sub = subgame
+        self.regret: Dict[FInfoset, np.ndarray] = {}
+        self.strat: Dict[FInfoset, np.ndarray] = {}
+
+    def _row(self, table, key, width):
+        row = table.get(key)
+        if row is None:
+            row = np.zeros(width, dtype=np.float64)
+            table[key] = row
+        return row
+
+    def iterate(self, t: float) -> None:
+        for (a, b), w in self.sub.weight.items():
+            self._cfr(self.sub.root, a, b, 1.0, 1.0, w, t, ())
+
+    def _cfr(self, node, a, b, r0, r1, w, t, runout: Tuple[int, ...]) -> float:
+        ntype = node["type"]
+        if ntype == "term":
+            return self.sub.payoff[node["leaf"]].get((a, b) + runout, 0.0)
+        if ntype == "chance":
+            cands = [c for c in self.sub.avail if c not in runout]
+            inv = 1.0 / len(cands)
+            val = 0.0
+            for c in cands:
+                if c in self.sub.holes[a] or c in self.sub.holes[b]:
+                    continue  # impossible deal → contributes 0 (1/N convention)
+                val += inv * self._cfr(
+                    node["child"], a, b, r0, r1, w * inv, t, runout + (int(c),)
+                )
+            return val
+        seat = node["actor"]
+        legal = node["legal"]
+        width = len(legal)
+        hole = a if seat == 0 else b
+        key = (seat, hole, node["pk"], runout)
+        regret = self._row(self.regret, key, width)
+        sigma = _regret_match(regret)
+        util = np.empty(width, dtype=np.float64)
+        node_util = 0.0
+        for k, action in enumerate(legal):
+            child = node["children"][action]
+            if seat == 0:
+                u = self._cfr(child, a, b, r0 * sigma[k], r1, w, t, runout)
+            else:
+                u = self._cfr(child, a, b, r0, r1 * sigma[k], w, t, runout)
+            util[k] = u
+            node_util += sigma[k] * u
+        if seat == 0:
+            cf_reach, own_reach, sign = w * r1, r0, 1.0
+        else:
+            cf_reach, own_reach, sign = w * r0, r1, -1.0
+        regret += t * cf_reach * sign * (util - node_util)
+        self._row(self.strat, key, width)[:] += t * own_reach * sigma
+        return node_util
+
+    def solve(self, iterations: int) -> Dict[FInfoset, np.ndarray]:
+        for t in range(1, iterations + 1):
+            self.iterate(float(t))
+        out: Dict[FInfoset, np.ndarray] = {}
+        for key, row in self.strat.items():
+            total = row.sum()
+            out[key] = row / total if total > 0.0 else np.full(len(row), 1.0 / len(row))
+        return out
+
+
+def _flop_sigma_row(sigma, seat, hole, node, runout) -> np.ndarray:
+    row = sigma.get((seat, hole, node["pk"], runout))
+    if row is None:
+        n = len(node["legal"])
+        return np.full(n, 1.0 / n)
+    return row
+
+
+def flop_game_value(sub: FlopSubgame, sigma: Mapping[FInfoset, np.ndarray]) -> float:
+    """Expected value to seat 0 of ``sigma`` (turn+river chance enumerated)."""
+
+    def ev(node, a, b, runout) -> float:
+        ntype = node["type"]
+        if ntype == "term":
+            return sub.payoff[node["leaf"]].get((a, b) + runout, 0.0)
+        if ntype == "chance":
+            cands = [c for c in sub.avail if c not in runout]
+            inv = 1.0 / len(cands)
+            v = 0.0
+            for c in cands:
+                if c in sub.holes[a] or c in sub.holes[b]:
+                    continue
+                v += inv * ev(node["child"], a, b, runout + (int(c),))
+            return v
+        seat = node["actor"]
+        hole = a if seat == 0 else b
+        row = _flop_sigma_row(sigma, seat, hole, node, runout)
+        total = 0.0
+        for k, action in enumerate(node["legal"]):
+            if row[k] != 0.0:
+                total += row[k] * ev(node["children"][action], a, b, runout)
+        return total
+
+    return float(sum(w * ev(sub.root, a, b, ()) for (a, b), w in sub.weight.items()))
+
+
+def flop_br_value(sub: FlopSubgame, br_player: int, sigma_opp: Mapping[FInfoset, np.ndarray]) -> float:
+    """Exact best-response value for ``br_player`` (turn+river chance enumerated)."""
+    opp = 1 - br_player
+
+    def rec(node, my_hole, opp_reach, runout) -> float:
+        ntype = node["type"]
+        if ntype == "term":
+            v = 0.0
+            for ob, r in opp_reach.items():
+                pair = (my_hole, ob) if br_player == 0 else (ob, my_hole)
+                p0 = sub.payoff[node["leaf"]].get(pair + runout)
+                if p0 is not None:
+                    v += r * (p0 if br_player == 0 else -p0)
+            return v
+        if ntype == "chance":
+            cands = [c for c in sub.avail if c not in runout]
+            inv = 1.0 / len(cands)
+            v = 0.0
+            for c in cands:
+                if c in sub.holes[my_hole]:
+                    continue  # my hand cannot see its own card on the board
+                sub_reach = {ob: rv for ob, rv in opp_reach.items() if c not in sub.holes[ob]}
+                if sub_reach:
+                    v += inv * rec(node["child"], my_hole, sub_reach, runout + (int(c),))
+            return v
+        seat = node["actor"]
+        legal = node["legal"]
+        if seat == br_player:
+            return max(rec(node["children"][a], my_hole, opp_reach, runout) for a in legal)
+        v = 0.0
+        for k, action in enumerate(legal):
+            nxt: Dict[int, float] = {}
+            for ob, rv in opp_reach.items():
+                s = _flop_sigma_row(sigma_opp, seat, ob, node, runout)[k]
+                if rv * s != 0.0:
+                    nxt[ob] = nxt.get(ob, 0.0) + rv * s
+            if nxt:
+                v += rec(node["children"][action], my_hole, nxt, runout)
+        return v
+
+    total = 0.0
+    for my_hole in sub.support[br_player]:
+        opp_reach = {
+            ob: sub.weight[(my_hole, ob) if br_player == 0 else (ob, my_hole)]
+            for ob in sub.support[opp]
+            if ((my_hole, ob) if br_player == 0 else (ob, my_hole)) in sub.weight
+        }
+        if opp_reach:
+            total += rec(sub.root, my_hole, opp_reach, ())
+    return float(total)
+
+
+def flop_exploitability(sub: FlopSubgame, sigma: Mapping[FInfoset, np.ndarray]) -> float:
+    """Best-response gap of ``sigma`` for the flop subgame (≥ 0; 0 at Nash)."""
+    return flop_br_value(sub, 0, sigma) + flop_br_value(sub, 1, sigma)

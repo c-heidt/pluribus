@@ -214,6 +214,13 @@ class SolverState:
     # (vector) never both populate; the readers below dispatch on which is present.
     vregret: Dict[PublicKey, np.ndarray] = field(default_factory=dict)
     vstrat: Dict[PublicKey, np.ndarray] = field(default_factory=dict)
+    # Row space of each vector node: ``"combo"`` (root street — lossless, one row
+    # per ``combo_index``, externally readable by :class:`SearchPolicy`) or
+    # ``"cluster"`` (a future street — one row per LUT cluster reachable in the
+    # subgame, §6.5 lossy abstraction; internal to the solve, never read
+    # externally).  The read guards in :meth:`sigma` / :meth:`average_sigma`
+    # consult this so a cluster node cannot be mis-read as if keyed by combo.
+    vrow_space: Dict[PublicKey, str] = field(default_factory=dict)
     # Search-lifetime caches (§6.4.2, §6.7 Tier 1).  Both hold values that are
     # **invariant across CFR iterations** for a fixed key, so they are *not*
     # touched by ``discount`` and persist across a warm-started re-search:
@@ -311,6 +318,7 @@ class SolverState:
                 out.legal_at[pk] = legal
             for pk, actor in baseline.actor_at.items():
                 out.actor_at[pk] = actor
+            out.vrow_space.update(baseline.vrow_space)
             out.frozen = {k: v.copy() for k, v in baseline.frozen.items()}
             for name in _TABLES:
                 dst = getattr(out, name)
@@ -321,6 +329,8 @@ class SolverState:
                 out.legal_at.setdefault(pk, legal)
             for pk, actor in st.actor_at.items():
                 out.actor_at.setdefault(pk, actor)
+            for pk, rs in st.vrow_space.items():
+                out.vrow_space.setdefault(pk, rs)
             for name in _TABLES:
                 dst = getattr(out, name)
                 base = getattr(baseline, name) if baseline is not None else None
@@ -376,30 +386,35 @@ class SolverState:
         public_key: PublicKey,
         legal_actions: Sequence[str],
         actor: int,
-        n_combos: int,
-        n_rivers: "int | None" = None,
+        n_rows: int,
+        row_space: str,
     ) -> None:
         """Register a public node and lazily allocate its vector-regime matrices.
 
         Like :meth:`ensure_node` (it delegates the ``legal_at``/``actor_at``
         bookkeeping and warm-start widening — which now also grows the matrix
         **columns**), but additionally allocates the ``vregret``/``vstrat``
-        matrices for ``public_key`` on first visit.  The combo axis is indexed by
-        ``combo_index`` (lossless at every depth, §6.5).
+        matrices ``(n_rows, width)`` for ``public_key`` on first visit.
 
-        ``n_rivers`` adds a **river axis** for the river-conditioned turn regime
-        (§6.5): a river-stage node below the turn→river chance node carries a
-        per-river strategy, so its matrices are ``(n_combos, n_rivers, width)``.
-        Turn-stage nodes (and every river-subgame node) pass ``None`` and stay
-        ``(n_combos, width)``.  The action ``width`` is always the **last** axis,
-        so the rest of the table ops (regret matching, widening) are axis-aware.
+        The first (``n_rows``) axis is the node's **row space** (§6.5):
+
+        - ``row_space == "combo"`` — a **root-street** node, ``n_rows == n_combos``,
+          one lossless row per ``combo_index`` (the rows :class:`SearchPolicy`
+          reads for the bot's actual hand);
+        - ``row_space == "cluster"`` — a **future-street** node, ``n_rows`` = the
+          number of LUT clusters reachable in this subgame, one row per cluster
+          (lossy abstraction; the sampled board is folded into the cluster id, so
+          no explicit river axis is needed).
+
+        The action ``width`` is always the **last** axis, so the table ops
+        (regret matching, widening) are axis-agnostic.
         """
         self.ensure_node(public_key, legal_actions, actor)
         if public_key not in self.vregret:
             width = len(self.legal_at[public_key])
-            shape = (n_combos, width) if n_rivers is None else (n_combos, n_rivers, width)
-            self.vregret[public_key] = np.zeros(shape, dtype=np.float64)
-            self.vstrat[public_key] = np.zeros(shape, dtype=np.float64)
+            self.vregret[public_key] = np.zeros((n_rows, width), dtype=np.float64)
+            self.vstrat[public_key] = np.zeros((n_rows, width), dtype=np.float64)
+            self.vrow_space[public_key] = row_space
 
     def _grow_rows(
         self,
@@ -418,8 +433,8 @@ class SolverState:
                     grown[cols] = old
                     table[key] = grown
         # Vector regime: grow the per-public-node matrices along the **last**
-        # (action) axis — works for both 2-D ``(n_combos, width)`` turn/river
-        # nodes and 3-D ``(n_combos, n_rivers, width)`` river-conditioned nodes.
+        # (action) axis.  Both row spaces are 2-D ``(n_rows, width)``, so the
+        # leading-axis-preserving grow below is uniform.
         for table in (self.vregret, self.vstrat):
             mat = table.get(public_key)
             if mat is not None:
@@ -445,16 +460,19 @@ class SolverState:
         (:mod:`mccfr`, :class:`SearchPolicy`) under that guard, not here.
 
         Vector regime: when ``key``'s public node has a regret **matrix**
-        (``vregret``), regret-match its ``combo_index`` row.
+        (``vregret``), regret-match its ``combo_index`` row — but only for a
+        **combo**-keyed (root-street) node.  A cluster-keyed future-street node is
+        internal to the solve (its rows are LUT clusters, not combos, and the
+        next round is played from a fresh subgame) and must not be read here.
         """
         mat = self.vregret.get(key[0])
         if mat is not None:
-            if mat.ndim != 2:
+            if self.vrow_space.get(key[0]) == "cluster":
                 raise ValueError(
-                    "sigma() read a river-conditioned vector node "
-                    f"{key[0]!r} (ndim={mat.ndim}); such turn-subgame river "
-                    "nodes are internal to the solve and must not be read "
-                    "externally (the river is played from a fresh river subgame)."
+                    "sigma() read a cluster-keyed vector node "
+                    f"{key[0]!r}; such future-street nodes are internal to the "
+                    "solve (rows are LUT clusters, not combos) and must not be "
+                    "read externally (the next round is a fresh subgame)."
                 )
             return calculate_strategy_from_row(mat[key[1]])
         width = len(self.legal_at[key[0]])
@@ -491,16 +509,17 @@ class SolverState:
     def average_sigma(self, key: Key) -> "np.ndarray | None":
         """Normalised cumulative strategy at ``key``; ``None`` if unaccumulated.
 
-        Vector regime: read the ``combo_index`` row of the ``vstrat`` matrix.
+        Vector regime: read the ``combo_index`` row of the ``vstrat`` matrix — a
+        combo-keyed (root-street) node only; a cluster-keyed future-street node is
+        internal to the solve and must not be read externally.
         """
         mat = self.vstrat.get(key[0])
         if mat is not None:
-            if mat.ndim != 2:
+            if self.vrow_space.get(key[0]) == "cluster":
                 raise ValueError(
-                    "average_sigma() read a river-conditioned vector node "
-                    f"{key[0]!r} (ndim={mat.ndim}); such turn-subgame river "
-                    "nodes are internal to the solve and must not be read "
-                    "externally."
+                    "average_sigma() read a cluster-keyed vector node "
+                    f"{key[0]!r}; such future-street nodes are internal to the "
+                    "solve and must not be read externally."
                 )
             row = mat[key[1]]
         else:

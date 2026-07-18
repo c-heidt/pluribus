@@ -271,7 +271,7 @@ def _dist_json(actions: List[str], probs) -> str:
 
 
 def _capture_hero_decision(
-    hero: SearchAgent, env: PokerEnv, action: str, blueprint_policy: Policy
+    hero: SearchAgent, env: PokerEnv, action: str
 ) -> DecisionRow:
     """Build the ``decisions`` row for the hero's just-chosen (un-stepped) action.
 
@@ -282,22 +282,20 @@ def _capture_hero_decision(
     solver-run columns come from ``hero.last_search`` (populated in step 1).
     """
     stage = _STAGE.get(env.betting_stage, env.betting_stage)
-    legal = [a for a in env.legal_actions if a is not None]
     num_live = sum(1 for p in env.players if p.is_active)
     pot_before = float(env.pot_size)
     to_call = float(_to_call(env))
     hero_stack = float(env.players[hero.my_seat].n_chips)
 
-    if hero.last_search is not None:
+    # The EXACT σ the bot played (agent.play_distribution — the single source of
+    # truth ``act`` also uses).  ``searched`` is False not only for a round-1
+    # blueprint play but also when the search exists yet does not cover this node (a
+    # decision past a depth-limit leaf, or an off-tree line): the bot then played the
+    # blueprint fallback, so the decision is logged as a blueprint play — never the
+    # search's regime over a uniform guess.
+    played_legal, played_probs, searched = hero.play_distribution(env)
+    if searched:
         res = hero.last_search
-        # Read the played distribution under the SAME key the agent sampled from in
-        # ``act`` (agent._solved_public_key): a translated near-canonical off-tree
-        # node resolves to the canonical branch, so the raw ``env.public_key`` would
-        # miss the solved tree and ``strategy_for`` would log a uniform fallback.
-        # (Currently on-tree for blueprint opponents, but robust for off-tree ones.)
-        pk = hero._solved_public_key(env)
-        hr = hero._hand_row(env)
-        dist = np.asarray(res.policy.strategy_for(pk, hr, legal), dtype=np.float64)
         wall = float(res.wall_seconds)
         stats = res.stats
         return DecisionRow(
@@ -321,12 +319,11 @@ def _capture_hero_decision(
             term_runout=int(stats.term_runout),
             term_payout=int(stats.term_payout),
             action_played=action,
-            action_dist=_dist_json(legal, dist),
+            action_dist=_dist_json(played_legal, played_probs),
         )
 
-    # Round-1 blueprint play (no search fired).
-    state = env.policy_state_for(hero.my_hole, for_blueprint=True)
-    probs = np.asarray(blueprint_policy.strategy(state, "none"), dtype=np.float64)
+    # Blueprint play — round 1 (no search), or the search-miss / failed-solve
+    # fallback (the bot played the blueprint at this node).
     return DecisionRow(
         betting_stage=stage,
         regime="blueprint",
@@ -336,40 +333,22 @@ def _capture_hero_decision(
         to_call=to_call,
         hero_stack=hero_stack,
         action_played=action,
-        action_dist=_dist_json(list(state.legal_actions), probs),
+        action_dist=_dist_json(played_legal, played_probs),
     )
 
 
 def _hero_played_dist(
-    hero: SearchAgent, env: PokerEnv, blueprint_policy: Policy
+    hero: SearchAgent, env: PokerEnv
 ) -> Tuple[List[str], np.ndarray]:
     """The hero's just-played action distribution ``(legal, probs)`` at ``env``.
 
-    Mirrors :meth:`SearchAgent.act` branch-for-branch so the returned ``probs`` are
-    the *exact* distribution the hero sampled from — the searched final-iteration σ
-    (read under the same ``_solved_public_key`` / ``_hand_row`` key ``act`` froze the
-    played row at, so post-``act`` it returns the pinned played mix) on rounds 2–4,
-    or the round-1 blueprint σ.  ``legal`` is the same list ``act`` sampled over
-    (env-filtered on searched rounds, ``state.legal_actions`` on round 1), so the
-    sampled action is always a member — this is the ``π`` AIVAT corrects with (§10.2)
-    and it matches the logged ``decisions.action_dist``.
+    Delegates to :meth:`SearchAgent.play_distribution` — the exact σ the hero
+    sampled from (the searched final-iteration mix, read post-``act`` so a pinned
+    played row returns unchanged; or the blueprint fallback when the search does not
+    cover this node).  This is the ``π`` AIVAT corrects with (§10.2) and it matches
+    the logged ``decisions.action_dist`` because both come from the same method.
     """
-    if hero.last_search is not None:
-        pk = hero._solved_public_key(env)
-        hr = hero._hand_row(env)
-        legal = [a for a in env.legal_actions if a is not None]
-        probs = np.asarray(
-            hero.last_search.policy.strategy_for(pk, hr, legal), dtype=np.float64
-        )
-    else:
-        state = env.policy_state_for(hero.my_hole, for_blueprint=True)
-        legal = list(state.legal_actions)
-        probs = np.asarray(blueprint_policy.strategy(state, "none"), dtype=np.float64)
-    total = probs.sum()
-    if total > 0:
-        probs = probs / total
-    elif legal:
-        probs = np.full(len(legal), 1.0 / len(legal))
+    legal, probs, _ = hero.play_distribution(env)
     return legal, probs
 
 
@@ -437,13 +416,11 @@ def play_hand(
         env_before = copy.deepcopy(env)          # act/sample don't step, so this is
         if seat == hero_seat:                    # still the pre-action state
             action = hero.act(env)
-            decisions.append(
-                _capture_hero_decision(hero, env, action, blueprint_policy)
-            )
+            decisions.append(_capture_hero_decision(hero, env, action))
             # AIVAT action-node correction at the hero's known-policy node (§10.2):
             # the played σ is the exact control-variate weighting.
             if aivat is not None:
-                legal, probs = _hero_played_dist(hero, env, blueprint_policy)
+                legal, probs = _hero_played_dist(hero, env)
                 aivat.correct_action(env_before, seat, action, legal, probs)
         elif aivat is not None:
             # Sample the opponent from its exact known policy AND correct that node.
