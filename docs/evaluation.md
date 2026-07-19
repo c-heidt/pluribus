@@ -256,7 +256,12 @@ CREATE TABLE decisions (
     action_played   TEXT,                  -- the sampled action
     action_dist     TEXT,                  -- JSON: root action distribution
     exploitability  REAL,                  -- NULL until the exploitability evaluator exists (§10.3)
-    game_value      REAL                   -- NULL until then
+    game_value      REAL,                  -- NULL until then
+    blueprint_weight REAL                  -- blueprint-prior mass mixed into the played σ:
+                                           -- 1.0 on a pure-blueprint play, kappa/(mass+kappa)
+                                           -- on a covered-but-under-trained search read, ~0 when
+                                           -- well-trained. High mean/heavy-rate ⇒ search adds
+                                           -- little over the prior (§6.6 shrinkage).
 );
 
 -- One row per (opponent seat, belief snapshot), resolved at showdown (§7).

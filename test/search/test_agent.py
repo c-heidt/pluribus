@@ -40,19 +40,23 @@ def _env(n_players=2, stacks=None, low=11, high=14) -> PokerEnv:
     return env
 
 
-def _cfg(leaf, iters=20) -> SolverConfig:
+def _cfg(leaf, iters=20, kappa=0.0) -> SolverConfig:
+    # Default kappa=0 so the toy-search agent tests exercise the *pure search* read
+    # path (a 20-iter toy search leaves most rows starved, so the production default
+    # kappa would shrink nearly every read toward the blueprint and mask what these
+    # tests check).  The shrinkage itself is covered by test_blueprint_prior_shrinkage.
     return SolverConfig(
         leaf=leaf, max_iterations=iters, max_wall_seconds=30.0, discount_interval=20,
-        workers=1,
+        workers=1, blueprint_prior_kappa=kappa,
     )
 
 
-def _agent(blueprint=None, **kw) -> SearchAgent:
+def _agent(blueprint=None, kappa=0.0, **kw) -> SearchAgent:
     leaf = LeafConfig(policies=_policies(), n_rollouts=2)
     return SearchAgent(
         leaf_policies=leaf.policies,
         blueprint_policy=blueprint or UniformPolicy(),
-        solver_cfg=_cfg(leaf),
+        solver_cfg=_cfg(leaf, kappa=kappa),
         rng=np.random.default_rng(0),
         **kw,
     )
@@ -199,8 +203,9 @@ def test_act_falls_back_to_blueprint_when_node_unsolved(_seeded):
     # the played public_key is absent from the solved tree.
     agent.last_search.state.legal_at.clear()
 
-    legal, prob, searched = agent.play_distribution(env)
+    legal, prob, searched, bp_w = agent.play_distribution(env)
     assert searched is False                       # blueprint fallback, not a search read
+    assert bp_w == 1.0                             # a pure-blueprint play
     assert len(prob) == len(legal) and abs(float(np.sum(prob)) - 1.0) < 1e-6
 
     frozen_before = len(agent.last_search.state.frozen)
@@ -230,7 +235,7 @@ def test_solve_failure_falls_back_to_blueprint(_seeded, monkeypatch):
     _advance_to_my_turn(env, 0, 1)
     if env.is_terminal or env.player_i != 0:
         pytest.skip("bot not to act on the flop this layout")
-    _, _, searched = agent.play_distribution(env)
+    _, _, searched, _ = agent.play_distribution(env)
     assert searched is False
     with mock.patch.object(blueprint, "strategy", wraps=blueprint.strategy) as spy_bp:
         action = agent.act(env)
@@ -298,6 +303,80 @@ def test_boundary_search_branch_uses_average_policy(_seeded):
         agent.on_board_update(env, turn_new)
     assert spy_avg.called
     assert not spy_bp.called
+
+
+# --------------------------------------------------------------------------- #
+# B'. Blueprint-prior shrinkage (§6.6) — low-mass rows fall back to the blueprint
+# --------------------------------------------------------------------------- #
+
+def test_blueprint_prior_shrinkage_blends_by_mass(_seeded):
+    # The played σ = (mass·search + kappa·blueprint)/(mass + kappa): pure blueprint at
+    # mass 0, pure search as mass ⇒ ∞, an even mix at mass == kappa.
+    agent = _agent(kappa=4.0)
+    search = np.array([1.0, 0.0])          # search fully commits to action 0
+    bp = np.array([0.0, 1.0])              # blueprint fully commits to action 1
+    calls = {"n": 0}
+
+    def bp_fn():
+        calls["n"] += 1
+        return bp
+
+    out_lo, w_lo = agent._shrink_to_blueprint(search, 0.0, bp_fn)
+    assert w_lo == pytest.approx(1.0)                 # kappa/(0+kappa) = 1
+    assert out_lo == pytest.approx([0.0, 1.0])        # → the blueprint
+
+    out_mid, w_mid = agent._shrink_to_blueprint(search, 4.0, bp_fn)
+    assert w_mid == pytest.approx(0.5)                # kappa/(kappa+kappa)
+    assert out_mid == pytest.approx([0.5, 0.5])
+
+    # A well-trained row: blueprint weight < 0.1% → skipped entirely (lazy: no fetch).
+    fetched_before = calls["n"]
+    out_hi, w_hi = agent._shrink_to_blueprint(search, 40_000.0, bp_fn)
+    assert w_hi == 0.0
+    assert out_hi == pytest.approx([1.0, 0.0])        # → the search, untouched
+    assert calls["n"] == fetched_before               # blueprint thunk not called
+
+
+def test_blueprint_prior_kappa_zero_disables_shrinkage(_seeded):
+    agent = _agent(kappa=0.0)
+    search = np.array([1.0, 0.0])
+    out, w = agent._shrink_to_blueprint(
+        search, 0.0, lambda: (_ for _ in ()).throw(AssertionError("must not fetch"))
+    )
+    assert w == 0.0
+    assert out == pytest.approx([1.0, 0.0])
+
+
+def test_play_distribution_reports_blueprint_weight(_seeded):
+    # A covered (searched) decision reports the exact shrinkage weight from the node's
+    # mass, so the evaluation can log how much of the play was blueprint prior.
+    env = _env()
+    agent = _agent(kappa=5.0)
+    agent.on_hand_start(env, my_seat=0)
+    agent.on_board_update(env, _to_flop(env))
+    _advance_to_my_turn(env, 0, 1)
+    if env.is_terminal or env.player_i != 0:
+        pytest.skip("bot not to act on the flop this layout")
+
+    legal, prob, searched, bp_w = agent.play_distribution(env)
+    assert searched is True
+    assert 0.0 <= bp_w <= 1.0
+    assert abs(float(prob.sum()) - 1.0) < 1e-6
+    # The reported weight is exactly kappa/(mass+kappa) (or 0 when negligible).
+    pk = agent._solved_public_key(env)
+    hr = agent._hand_row(env)
+    mass = agent.last_search.policy.mass(pk, hr)
+    w_expected = 5.0 / (mass + 5.0)
+    assert bp_w == pytest.approx(w_expected if w_expected >= 1e-3 else 0.0)
+
+
+def test_mass_zero_for_unseen_key(_seeded):
+    env = _env()
+    agent = _agent(kappa=5.0)
+    agent.on_hand_start(env, my_seat=0)
+    agent.on_board_update(env, _to_flop(env))
+    pol = agent.last_search.policy
+    assert pol.mass(("no-such-public-key",), 0) == 0.0
 
 
 def test_fold_moves_seat_to_folded_after_replay(_seeded):

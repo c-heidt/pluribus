@@ -121,7 +121,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     action_played   TEXT,
     action_dist     TEXT,
     exploitability  REAL,
-    game_value      REAL
+    game_value      REAL,
+    blueprint_weight REAL
 );
 
 CREATE TABLE IF NOT EXISTS range_quality (
@@ -268,6 +269,7 @@ class DecisionRow:
     action_dist: Optional[str] = None            # JSON: root action distribution
     exploitability: Optional[float] = None
     game_value: Optional[float] = None
+    blueprint_weight: Optional[float] = None     # blueprint-prior mass mixed in (§8)
 
 
 @dataclass
@@ -370,6 +372,8 @@ class ExperimentLog:
         if "term_runout" not in dhave:    # v3 → v4: per-terminal evaluator mix
             con.execute("ALTER TABLE decisions ADD COLUMN term_runout INTEGER")
             con.execute("ALTER TABLE decisions ADD COLUMN term_payout INTEGER")
+        if "blueprint_weight" not in dhave:  # v4 → v5: blueprint-prior shrinkage
+            con.execute("ALTER TABLE decisions ADD COLUMN blueprint_weight REAL")
         # Indexes last — after the ALTERs, so an index on a freshly-migrated column
         # (idx_games_condition) has its column to reference.
         con.executescript(_INDEX_DDL)

@@ -885,6 +885,24 @@ Lifecycle (Algorithm 2):
    - Rounds 2–4: read the action from the already-computed
      `last_search.policy` (final iteration) at the actual hand's row — **no solve
      here**. Record the σ used into `last_search.state.frozen` for that infoset.
+
+   **Blueprint-prior shrinkage.** Off-path infosets are, by construction,
+   reached with low probability, so their reach-weighted training mass is tiny —
+   the final-iteration row there is near-uniform (few regret updates) and the
+   average is one-sample noise. Rather than play (or believe) that under-trained
+   row, the read seam shrinks σ toward the blueprint by
+   `w = kappa / (mass + kappa)`, where `mass = SolverState.mass(key)` is the row's
+   cumulative-strategy sum. A genuinely trained row (mass in the hundreds–
+   thousands) is essentially untouched (`w ≈ 0`); a starved row (mass ≈ 0.01)
+   falls back almost entirely to the blueprint — a strictly better default than
+   uniform, and the production analog of "fill untrained infosets from an oracle."
+   The blend is applied at the agent seam (which holds the blueprint + env), so it
+   covers **both** solver regimes through the shared `SearchPolicy` reader, on both
+   the played final-iterate and the belief-update average. `kappa`
+   (`SolverConfig.blueprint_prior_kappa`, default 5; `0` disables) sits in the
+   empirical bimodal gap between noise and genuine mass. The mixed-in weight is
+   logged per decision (`decisions.blueprint_weight`, §evaluation) so an
+   over-frequent fallback — search adding little over the prior — is visible.
 4. **`on_observed_action`** — append to `pending_actions`. On rounds 2–4, if the
    action was off-tree (the runtime injected it), **re-search the same root** with
    `warm_start=self.last_search.state`; the frozen rows keep the bot's

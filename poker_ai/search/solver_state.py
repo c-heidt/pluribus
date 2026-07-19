@@ -73,6 +73,15 @@ class SolverConfig:
     # solver); ``>1`` → that many independent MCCFR replicas, merged once at the end
     # (:meth:`SolverState.accumulate`).  See :mod:`poker_ai.search.parallel`.
     workers: "int | None" = None
+    # Blueprint-prior shrinkage strength (§6.6).  At read time a solved row's
+    # strategy is pulled toward the blueprint by weight ``kappa / (mass + kappa)``,
+    # where ``mass`` is the row's reach-weighted cumulative-strategy sum.  Genuinely
+    # trained rows (mass in the hundreds–thousands) are essentially untouched; barely
+    # reached off-path rows (mass ~0.01, one-sample noise) fall back almost entirely
+    # to the blueprint instead of a near-uniform under-trained guess.  ``kappa`` sits
+    # in the empirical bimodal gap between noise and genuine mass.  ``0.0`` disables
+    # the shrinkage (pure search rows, the pre-shrinkage behaviour).
+    blueprint_prior_kappa: float = 5.0
 
 
 def _hand_row(env: "PokerEnv", combo: Sequence[int], street_at_root: int) -> int:
@@ -530,6 +539,26 @@ class SolverState:
         if total <= 0.0:
             return None
         return (row / total).astype(np.float32)
+
+    def mass(self, key: Key) -> float:
+        """Reach-weighted cumulative-strategy mass at ``key`` (0.0 if unaccumulated).
+
+        This is the un-normalised denominator of :meth:`average_sigma` — the
+        row's ``strat_sum`` (MCCFR) or ``vstrat`` combo-row (vector) sum.  It is
+        the search's *confidence* at this infoset: high on the on-path rows it
+        trained full-width, near-zero on barely-reached off-path rows.  The read
+        seam (:class:`SearchPolicy` / :class:`~poker_ai.search.agent.SearchAgent`)
+        uses it to shrink the strategy toward the blueprint.  Combo-keyed
+        (root-street) reads only, mirroring :meth:`average_sigma`; a cluster-keyed
+        future-street node is internal to the solve and never read here.
+        """
+        mat = self.vstrat.get(key[0])
+        if mat is not None:
+            if self.vrow_space.get(key[0]) == "cluster":
+                return 0.0
+            return float(mat[key[1]].sum())
+        row = self.strat_sum.get(key)
+        return float(row.sum()) if row is not None else 0.0
 
     # ------------------------------------------------------------------
     # Instrumentation snapshot (eval doc §9.1)

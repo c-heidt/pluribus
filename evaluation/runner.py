@@ -293,7 +293,7 @@ def _capture_hero_decision(
     # decision past a depth-limit leaf, or an off-tree line): the bot then played the
     # blueprint fallback, so the decision is logged as a blueprint play — never the
     # search's regime over a uniform guess.
-    played_legal, played_probs, searched = hero.play_distribution(env)
+    played_legal, played_probs, searched, blueprint_weight = hero.play_distribution(env)
     if searched:
         res = hero.last_search
         wall = float(res.wall_seconds)
@@ -320,10 +320,15 @@ def _capture_hero_decision(
             term_payout=int(stats.term_payout),
             action_played=action,
             action_dist=_dist_json(played_legal, played_probs),
+            # How much blueprint prior the search read was shrunk toward at this
+            # (covered) node — 0.0 when well-trained, →1 when starved (§8).
+            blueprint_weight=float(blueprint_weight),
         )
 
     # Blueprint play — round 1 (no search), or the search-miss / failed-solve
-    # fallback (the bot played the blueprint at this node).
+    # fallback (the bot played the blueprint at this node).  ``blueprint_weight``
+    # is 1.0 here (a pure-blueprint play), so the column reads uniformly across
+    # both the full fallback and the shrinkage.
     return DecisionRow(
         betting_stage=stage,
         regime="blueprint",
@@ -334,6 +339,7 @@ def _capture_hero_decision(
         hero_stack=hero_stack,
         action_played=action,
         action_dist=_dist_json(played_legal, played_probs),
+        blueprint_weight=float(blueprint_weight),
     )
 
 
@@ -348,7 +354,7 @@ def _hero_played_dist(
     cover this node).  This is the ``π`` AIVAT corrects with (§10.2) and it matches
     the logged ``decisions.action_dist`` because both come from the same method.
     """
-    legal, probs, _ = hero.play_distribution(env)
+    legal, probs, _, _ = hero.play_distribution(env)
     return legal, probs
 
 
