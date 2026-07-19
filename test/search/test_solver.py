@@ -943,19 +943,22 @@ class TestSearchLifetimeCaches:
         return env
 
     def _count_continuation(self, monkeypatch):
-        """Patch the solver's ``continuation_value`` with a counting wrapper that
-        records the same key ``_leaf_value`` memoises on; delegates to the real fn."""
+        """Patch the solver's ``continuation_value_vector`` with a counting wrapper
+        that records the same key ``_vleaf_value`` memoises on (the traverser hole is
+        dropped — one per-combo vector serves every combo); delegates to the real fn."""
         import poker_ai.search.mccfr as mod
         keys = []
-        original = mod.continuation_value
+        original = mod.continuation_value_vector
 
-        def wrapper(env, profile, ctx, runout_cache=None):
+        def wrapper(env, profile, ctx, traverser_seat, runout_cache=None):
             n = env.n_players
-            hk = tuple(tuple(int(c) for c in env.players[s].cards) for s in range(n))
-            keys.append((env.public_key, hk, tuple(sorted(profile.items()))))
-            return original(env, profile, ctx, runout_cache=runout_cache)
+            hk = tuple(tuple(int(c) for c in env.players[s].cards)
+                       for s in range(n) if s != traverser_seat)
+            keys.append((env.public_key, traverser_seat, hk,
+                         tuple(sorted(profile.items()))))
+            return original(env, profile, ctx, traverser_seat, runout_cache=runout_cache)
 
-        monkeypatch.setattr(mod, "continuation_value", wrapper)
+        monkeypatch.setattr(mod, "continuation_value_vector", wrapper)
         return keys
 
     def test_leaf_value_computed_once_per_key(self, monkeypatch):
@@ -992,9 +995,9 @@ class TestSearchLifetimeCaches:
             return solve(env, ctx, _cfg(ctx, iters=25))
 
         r1, r2 = run(), run()
-        assert set(r1.state.regret) == set(r2.state.regret)
-        for k in r1.state.regret:
-            np.testing.assert_allclose(r1.state.regret[k], r2.state.regret[k])
+        assert set(r1.state.vregret) == set(r2.state.vregret)
+        for k in r1.state.vregret:
+            np.testing.assert_allclose(r1.state.vregret[k], r2.state.vregret[k])
         # The caches themselves reproduce key-for-key under a fixed seed.
         assert set(r1.state.leaf_value_cache) == set(r2.state.leaf_value_cache)
 

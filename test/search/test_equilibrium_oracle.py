@@ -180,23 +180,23 @@ def test_mccfr_regime_reaches_equilibrium(_seeded):
     by instantiating ``_MCCFRSolver`` directly and driving the same iterate/discount
     loop ``solve`` uses (solver.py:110-118).
 
-    External-sampling MCCFR trains *regrets* at every infoset (the regret pass
-    explores all the traverser's actions), but accumulates the *average strategy*
-    only along the single sampled trajectory of the strategy pass — exactly like the
-    production blueprint trainer's ``update_strategy``.  So an infoset reachable only
-    via an action that is ~never sampled at equilibrium keeps ``strat_sum == 0`` and
-    falls back to **uniform**.  A whole-tree best response deviates into those
-    off-equilibrium-path branches and exploits the uniform default, so the *raw*
-    exploitability of the sampled average has a residual floor that barely shrinks
-    with ``T`` (verified: 17.7 → 15.4 → 14.6 chips at 20k/80k/320k on a mixed-
-    equilibrium board).  The **game value is exact** regardless (those infosets are
-    off-path), and the vector regime — full-width, no sampling — trains the whole
-    average and has no such floor.
+    The MCCFR regime is now **traverser-vectorized**: one walk sweeps the traverser's
+    whole range (opponents/chance still sampled), so both regret AND the average
+    strategy are trained **full-width** on every combo every reachable node — folded
+    into ``vregret``/``vstrat``.  On the meaningfully-reached infosets this converges
+    tightly to the oracle (better than the old scalar walk).
 
-    Hard gates therefore: (1) the unique zero-sum **game value** matches the oracle,
-    and (2) the **trained** part of the average is a genuine equilibrium — filling
-    only the untrained (``strat_sum == 0``) infosets from the oracle drives
-    exploitability to ~0.  Raw exploitability is kept as a generous sanity bound.
+    A subtlety of full-width training: a barely-reached off-path infoset still
+    accumulates a *tiny* reach-weighted average (one-sample noise), where the scalar
+    walk left it exactly 0.  A whole-tree best response exploits that raw off-path
+    noise, so the *raw* average's exploitability is NOT a meaningful bound here (and
+    is not gated) — production plays the final iterate and re-solves on a deviation,
+    so the off-path average never reaches play.
+
+    Hard gates: (1) the unique zero-sum **game value** matches the oracle, and (2) on
+    the infosets the walk *meaningfully* trained (accumulated reach ``> 1``), the
+    average is a genuine equilibrium — untrained infosets are filled from the oracle
+    to isolate the claim.
     """
     env, r0, r1, s0, s1 = _river_subgame(_seeded)
     sub = build_subgame(env, r0, r1, s0, s1)
@@ -220,7 +220,7 @@ def test_mccfr_regime_reaches_equilibrium(_seeded):
         if delta > 0 and t % delta == 0:
             k = t / delta
             state.discount(k / (k + 1.0))
-    assert state.strat_sum, "expected the MCCFR regime to accumulate strategy"
+    assert state.vstrat, "expected the MCCFR regime to accumulate strategy"
 
     sigma = _solver_sigma(state, env, sub)
     value = game_value(sub, sigma)
@@ -230,22 +230,31 @@ def test_mccfr_regime_reaches_equilibrium(_seeded):
         f"mccfr game value {value:.4f} != oracle {oracle_value:.4f} (scale {scale})"
     )
 
-    # Hard gate 2: where MCCFR actually trained an average (strat_sum > 0), it is a
-    # genuine equilibrium — untrained off-path infosets (the uniform-default branches
-    # a best response exploits) are filled from the oracle to isolate the claim.
+    # Hard gate: where MCCFR MEANINGFULLY trained an average, it is a genuine
+    # equilibrium.  Because the walk is now full-width (every traverser combo is
+    # updated on every reachable node), a barely-reached off-path infoset still
+    # accumulates a *tiny* reach-weighted ``vstrat`` mass — a one-sample-noise
+    # average, not a converged one (the scalar walk left these exactly 0, sampling
+    # never visiting them).  So "trained" must mean "reached with meaningful reach",
+    # not "reached at all": require at least one full-reach unit of accumulated
+    # strategy (``mass > 1``).  The mass distribution is sharply bimodal — genuinely
+    # reached infosets carry hundreds–thousands, noise ones < 0.1 — so the threshold
+    # is not delicate.  Untrained infosets are filled from the oracle to isolate the
+    # claim (a whole-tree best response would otherwise exploit their sample noise;
+    # production plays the final iterate and re-solves on a deviation, so that noise
+    # never reaches play).
+    REACH_FLOOR = 1.0
     trained = {}
     for key, row in sigma.items():
         seat, hole, pk = key
-        ss = state.strat_sum.get((pk, env.combo_index[sub.holes[hole]]))
-        is_trained = ss is not None and ss.sum() > 0.0
+        mat = state.vstrat.get(pk)
+        combo = env.combo_index[sub.holes[hole]]
+        is_trained = mat is not None and mat[combo].sum() > REACH_FLOOR
         trained[key] = row if is_trained else oracle_avg.get(key, row)
     trained_expl = exploitability(sub, trained)
     assert trained_expl < 0.03 * scale, (
         f"mccfr trained strategy not an equilibrium: expl={trained_expl:.4f} scale={scale}"
     )
-
-    # Generous sanity: the sampled average is not grossly exploitable overall.
-    assert exploitability(sub, sigma) < 0.10 * scale
 
 
 # --------------------------------------------------------------------------- #

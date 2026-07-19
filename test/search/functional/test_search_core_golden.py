@@ -52,13 +52,12 @@ _RNG_SEED = 7
 _N_ITERS = 50
 
 # Frozen fingerprints — see the module docstring for when and how to regenerate.
-# MCCFR regenerated 2026-07-18: the regime now walks ``root_env`` in place (reseat
-# per iteration) instead of deepcopying it, and samples the per-iteration board from
-# a dedicated child RNG rather than the global ``np.random`` — so the board-sampling
-# stream differs from the prior build (the CFR maths is unchanged: proven byte-
-# identical to the old ``with_hole_cards`` walk at a board-frozen river root, and the
-# equilibrium oracle still converges).
-GOLDEN_DIGEST_MCCFR = "7133099998a84778e3d4f1157d86b2a883fdf160e7f3c55c0f26da9f9eb5cd0c"
+# MCCFR regenerated 2026-07-19: the regime is now traverser-vectorized — one walk
+# sweeps the traverser's whole range (opponents/chance still sampled), folding regret
+# + average strategy into the shared ``vregret``/``vstrat`` matrices (this fixture is
+# a HU preflop root, whose depth-limit leaf is the vectorized continuation meta-game).
+# A deliberate maths change from the prior scalar external-sampling walk.
+GOLDEN_DIGEST_MCCFR = "05e91c0061ed1a6cc680c44453cccaf2d6240663ddd9493ff382610b90fb9911"
 GOLDEN_DIGEST_VECTOR = "7e6e3da6534d92c5e9a808a48b9da06054558cbb4a7ee8727fab0efa23113db2"
 
 
@@ -114,7 +113,10 @@ def _solve_vector():
 
 def _mccfr_digest() -> str:
     st = _solve_mccfr()
-    return _digest_tables(st.regret, st.strat_sum)
+    # The MCCFR regime is now traverser-vectorized: it writes the shared
+    # ``vregret``/``vstrat`` matrices (per public_key), not the scalar
+    # ``regret``/``strat_sum`` dicts.
+    return _digest_tables(st.vregret, st.vstrat)
 
 
 def _vector_digest() -> str:
@@ -155,7 +157,7 @@ class TestGoldenTrace:
     def test_tables_nonempty(self):
         """Both regimes actually allocate rows, so the traces are non-vacuous."""
         st_m = _solve_mccfr()
-        assert st_m.regret and st_m.strat_sum
+        assert st_m.vregret and st_m.vstrat
         st_v = _solve_vector()
         assert st_v.vregret and st_v.vstrat
 

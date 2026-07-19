@@ -196,3 +196,71 @@ def continuation_value(
         for tok in reversed(tokens):
             e.undo(tok)
     return accum / cfg.n_rollouts
+
+
+def continuation_value_vector(
+    frontier_env: PokerEnv,
+    profile: Mapping[int, BiasClass],
+    ctx: SubgameContext,
+    traverser_seat: int,
+    runout_cache: dict | None = None,
+) -> np.ndarray:
+    """Per-traverser-combo continuation value of a fixed profile (§6.4, vectorized).
+
+    The vector twin of :func:`continuation_value` for the traverser-vectorized
+    MCCFR walk: ``traverser_seat``'s hand is swept over **all** combos while every
+    other seat holds its concrete sampled hole.  Per rollout a single action line
+    is played out using the frontier's concrete holes — the phantom traverser hole
+    picks the line (the shared-line approximation, in the spirit of the §6.4 leaf
+    already being a sampled estimate) — and the reached terminal is settled for
+    **every** traverser combo at once via
+    :meth:`environment.poker_env.PokerEnv.vector_payout_concrete`.
+
+    Returns ``(n_combos,)`` float64: entry ``c`` is the mean chip delta to
+    ``traverser_seat`` holding combo ``c`` (``0`` on combos it cannot hold given
+    the board and the other seats' cards).  ``runout_cache`` is accepted for
+    signature parity with :func:`continuation_value` but unused: v1 scores a
+    decision-free all-in on its single force-dealt board (variance absorbed across
+    iterations), not the per-combo exact board-average — a bounded later refinement.
+    """
+    del runout_cache  # v1: single-board settlement (see docstring)
+    cfg = ctx.leaf
+    rng = ctx.rng
+    n_combos = frontier_env.n_combos
+    if frontier_env.is_terminal:
+        return frontier_env.vector_payout_concrete(traverser_seat)
+    if cfg.n_rollouts <= 0:
+        return np.zeros(n_combos, dtype=np.float64)
+
+    n = frontier_env.n_players
+    holes: List[Tuple[int, int]] = [
+        tuple(int(c) for c in frontier_env.players[i].cards) for i in range(n)
+    ]
+    accum = np.zeros(n_combos, dtype=np.float64)
+    e = frontier_env.with_hole_cards(holes)
+    for r in range(cfg.n_rollouts):
+        if r > 0:
+            e.deck.shuffle_undealt()
+        tokens: List = []
+        while not e.is_terminal:
+            seat = e.player_i
+            if seat not in profile:
+                raise ValueError(
+                    f"continuation_value_vector: profile is missing acting seat "
+                    f"{seat}; it must cover every seat that can act."
+                )
+            c = profile[seat]
+            state = e.policy_state_for(
+                tuple(int(x) for x in e.current_player.cards), for_blueprint=True
+            )
+            probs = cfg.policies[c].strategy(state, bias=c)
+            idx = sample_index(rng, probs)
+            # settle_winners=False: the terminal is valued per-combo below, so the
+            # engine's concrete single-hand settlement is skipped (as the vector walk).
+            tokens.append(
+                e.step_in_place(state.legal_actions[idx], settle_winners=False)
+            )
+        accum += e.vector_payout_concrete(traverser_seat)
+        for tok in reversed(tokens):
+            e.undo(tok)
+    return accum / cfg.n_rollouts

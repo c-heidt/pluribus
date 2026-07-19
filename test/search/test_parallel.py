@@ -171,9 +171,11 @@ def _node_state(pk, legal, actor, *, regret=None, strat=None, frozen=None):
 
 
 def _regret_tables_equal(a: SolverState, b: SolverState) -> bool:
-    if set(a.regret) != set(b.regret):
+    # The MCCFR regime is traverser-vectorized → writes ``vregret`` (per public_key),
+    # not the scalar ``regret`` dict.
+    if set(a.vregret) != set(b.vregret):
         return False
-    return all(np.array_equal(a.regret[k], b.regret[k]) for k in a.regret)
+    return all(np.array_equal(a.vregret[k], b.vregret[k]) for k in a.vregret)
 
 
 _FORK = "fork" in mp.get_all_start_methods()
@@ -321,7 +323,7 @@ class TestParallelSolve:
     def test_parallel_reproducible_per_seed_and_workers(self):
         a = self._run(workers=3)
         b = self._run(workers=3)
-        assert set(a.state.regret) == set(b.state.regret)
+        assert set(a.state.vregret) == set(b.state.vregret)
         assert _regret_tables_equal(a.state, b.state)
 
     def test_parallel_differs_from_serial(self):
@@ -366,7 +368,7 @@ class TestParallelSolve:
         assert prob.shape == (len(legal),)
         np.testing.assert_allclose(prob.sum(), 1.0, atol=1e-5)
         assert (prob >= 0).all()
-        assert len(res.state.regret) > 0
+        assert len(res.state.vregret) > 0
 
     def test_vector_regime_parallel_runs(self):
         # The vector regime parallelizes like MCCFR (§6.7 row 11): W replicas each
@@ -411,5 +413,5 @@ class TestParallelSolve:
         ctx2 = _ctx(env2, seed=1)
         again = solve(env2, ctx2, _cfg(iters=30, workers=2), warm_start=first.state)
         assert (pk, hr) in again.state.frozen
-        assert len(again.state.regret) > 0
+        assert len(again.state.vregret) > 0
         assert again.iterations_run == 2 * 30

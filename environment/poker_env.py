@@ -2459,6 +2459,84 @@ class PokerEnv:
             valid, combo_cards, opp_reach, sign * gain, removal
         )
 
+    def vector_payout_concrete(self, seat: int) -> "np.ndarray":
+        """Per-combo chip delta to ``seat`` at a terminal with **concrete** opponents.
+
+        The external-sampling twin of :meth:`vector_payout`: every *other* seat
+        holds a single sampled hand (a point mass, not a range), so the only
+        per-combo variation is ``seat``'s own hand.  Returns a value per hole
+        combo (aligned to :attr:`combo_cards`) for ``seat``, holding every other
+        seat's dealt cards fixed — the traverser-vectorized MCCFR terminal.
+
+        Agrees to the chip with :attr:`payout` built on the concrete env for each
+        individual combo (holding the other seats and board fixed); ``0`` on
+        combos ``seat`` cannot hold given the board and the other seats' dealt
+        cards (card removal).  Multiway and side pots are handled by the shared
+        :func:`_settle_traverser` (same ``Pot.compute_utility`` as
+        ``compute_winners``).
+
+        Raises
+        ------
+        ValueError
+            If called on a non-terminal node.
+        """
+        if self._terminal_contributions is None:
+            raise ValueError(
+                "vector_payout_concrete is only defined at a terminal node."
+            )
+        n = len(self.players)
+        tc = self._terminal_contributions
+        contribution = float(tc[seat])
+        combo_cards = self.combo_cards
+        n_combos = combo_cards.shape[0]
+        community = list(self.community_cards)
+
+        # Feasibility: ``seat``'s combo must share no card with the board or any
+        # OTHER seat's dealt hole (every seat carries concrete sampled cards under
+        # external sampling).  Impossible combos return 0.
+        excluded = set(int(c) for c in community)
+        for s in range(n):
+            if s != seat:
+                excluded.update(int(c) for c in self.players[s]._cards)
+        excl = np.fromiter(excluded, dtype=combo_cards.dtype, count=len(excluded))
+        feasible = ~(
+            np.isin(combo_cards[:, 0], excl) | np.isin(combo_cards[:, 1], excl)
+        )
+
+        # (i) ``seat`` folded → forfeits its contribution regardless of hand.
+        if not self.players[seat].is_active:
+            return np.where(feasible, -contribution, 0.0)
+
+        # Rank ``seat``'s every combo on the completed board once; each opponent
+        # ranks to a scalar.  Build ``rank_mat`` (n_combos, n_active) column-
+        # aligned to ``active``, infeasible seat combos parked at the sentinel
+        # (they lose every pot; masked to 0 below regardless).
+        active = [self.players[s] for s in range(n) if self.players[s].is_active]
+        trav_ranks, _ = range_showdown.rank_combos_on_board(combo_cards, community)
+        trav_ranks = trav_ranks.copy()
+        trav_ranks[~feasible] = range_showdown._SENTINEL_RANK
+        opp_hands = [
+            [int(c) for c in p._cards] + community
+            for p in active if p.player_i != seat
+        ]
+        opp_ranks = (
+            default_evaluator.evaluate_batch(np.asarray(opp_hands, dtype=np.int64))
+            if opp_hands else np.empty(0, dtype=np.int64)
+        )
+        rank_mat = np.empty((n_combos, len(active)), dtype=np.int64)
+        oi = 0
+        for a, p in enumerate(active):
+            if p.player_i == seat:
+                rank_mat[:, a] = trav_ranks
+            else:
+                rank_mat[:, a] = opp_ranks[oi]
+                oi += 1
+
+        won = _settle_traverser(active, self.players, tc, rank_mat, n_combos, n, seat)
+        cfv = won - contribution
+        cfv[~feasible] = 0.0
+        return cfv
+
     @property
     def deck_size(self) -> int:
         """Total cards in the deck (including dealt cards)."""
@@ -2753,3 +2831,71 @@ try:
             return [float(acc[i]) for i in range(n)]
 except ImportError:
     pass
+
+
+# --------------------------------------------------------------------------- #
+# Traverser-vectorized settlement (search Phase 0).  The per-combo twin of
+# ``_settle_runout``: instead of summing ``Pot.compute_utility`` over board
+# completions (concrete hands, one board per scenario), it keeps the ``count``
+# axis = the traverser's hole combos (one board, concrete opponents, the
+# traverser's hand swept over its range) and returns just the traverser seat's
+# chips won per combo.  Same side-pot peel + vectorized "clean" fast path +
+# scalar ``compute_utility`` tie / fold-only-pot fallback → bit-exact with the
+# concrete ``compute_winners`` for every scenario.  Consumed by
+# ``PokerEnv.vector_payout_concrete``.
+# --------------------------------------------------------------------------- #
+def _settle_traverser(active_players, all_players, pot_chips, rank_mat, count, n,
+                      traverser_pi):
+    """Chips won by seat ``traverser_pi`` in each of ``count`` scenarios.
+
+    ``rank_mat`` is ``(count, n_active)`` column-aligned to ``active_players``:
+    the traverser's column varies with its combo, every opponent column is that
+    seat's fixed concrete rank.  Returns a ``(count,)`` float64 of chips won by
+    the traverser (the caller nets its contribution).
+    """
+    scratch = Pot(n)
+    scratch._chips = list(pot_chips)
+    won = np.zeros(count, dtype=np.float64)
+
+    def _score_scalar(indices):
+        for ci in indices:
+            groups = collections.defaultdict(list)
+            for a, p in enumerate(active_players):
+                groups[int(rank_mat[ci, a])].append(p)
+            ranked = [groups[r] for r in sorted(groups)]
+            winnings = scratch.compute_utility(all_players, ranked)
+            won[ci] = winnings[traverser_pi]
+
+    specs = []
+    degenerate = False
+    for sp in scratch.side_pots:
+        cols = np.fromiter(
+            (a for a, p in enumerate(active_players) if p.player_i in sp),
+            dtype=np.intp,
+        )
+        if cols.size == 0:
+            degenerate = True
+            break
+        glob = np.fromiter(
+            (active_players[a].player_i for a in cols),
+            dtype=np.intp,
+            count=cols.size,
+        )
+        specs.append((cols, float(sum(sp.values())), glob))
+
+    if degenerate:
+        _score_scalar(range(count))
+        return won
+
+    clean = np.ones(count, dtype=bool)
+    per_pot = []
+    for cols, total, glob in specs:
+        sub = rank_mat[:, cols]                       # (count, |cols|)
+        best = sub.min(axis=1)
+        clean &= (sub == best[:, None]).sum(axis=1) == 1
+        per_pot.append((glob[sub.argmin(axis=1)], total))
+    if clean.any():
+        for glob_win, total in per_pot:
+            won[clean] += total * (glob_win[clean] == traverser_pi)
+    _score_scalar(np.flatnonzero(~clean).tolist())
+    return won
