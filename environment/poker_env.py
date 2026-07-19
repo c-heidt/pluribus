@@ -39,7 +39,7 @@ from environment.chance import Deck
 from environment.evaluator import default_evaluator
 from environment.player import Player
 from environment.pot import Pot
-from environment.utils import enumerate_combos
+from environment.utils import enumerate_combos, make_deck_arr
 
 
 @dataclass(frozen=True)
@@ -1678,6 +1678,101 @@ class PokerEnv:
         new.deck.replace_drawn(tuple(old_union), new_union)
         new.deck.shuffle_undealt()
         return new
+
+    def reseat_private_cards(
+        self, holes: "Sequence[Tuple[int, int]]", rng=None, full_deck=None
+    ) -> None:
+        """Re-deal every seat's holes on **this** env in place — no deepcopy.
+
+        The single-copy search loop reuses one env across CFR iterations instead
+        of :meth:`with_hole_cards`-deepcopying per iteration.  Because the engine
+        cannot tolerate a duplicate card anywhere (even a folded seat's), a hole
+        replacement must be **atomic over all seats *and* the deck**: this sets
+        every seat's holes and rebuilds the deck as a single permutation — the
+        public board (:attr:`community_cards`) frozen, the private holes set to
+        ``holes``, and the undealt region ``= full deck − board − holes``,
+        shuffled, so no hole card can leak into a future board deal.
+
+        The deck is laid out to match :meth:`Deck.board_runout` (the accessor the
+        compiled ``FastState`` reads): private cards fill ``[0:_board_start)``,
+        the frozen board follows, then the shuffled remainder.  ``rng`` (a
+        per-search :class:`numpy.random.Generator`) drives the shuffle so parallel
+        replicas stay independent and the draw is reproducible from the search
+        seed; it falls back to the global RNG only when ``None``.
+
+        Unlike :meth:`with_hole_cards` this **mutates** ``self`` and returns
+        ``None``; the caller restores the env afterwards if it must stay pristine.
+        The betting state (pot / chips / history / stage / ``community_cards``) is
+        **not** touched — the search walk's make/undo balance restores it to the
+        root between iterations — so this rebuilds only the cards + deal cursor.
+        Validation matches :meth:`with_hole_cards`.
+        """
+        n = self.n_players
+        if len(holes) != n:
+            raise ValueError(
+                f"reseat_private_cards: expected {n} hole tuples (one per "
+                f"seat), got {len(holes)}."
+            )
+        flat: List[int] = []
+        for seat, h in enumerate(holes):
+            c0, c1 = int(h[0]), int(h[1])
+            if c0 == c1:
+                raise ValueError(
+                    f"reseat_private_cards: seat {seat}'s hole must contain "
+                    f"distinct cards, got ({c0}, {c1})."
+                )
+            flat.append(c0)
+            flat.append(c1)
+        if len(set(flat)) != len(flat):
+            raise ValueError(
+                f"reseat_private_cards: holes must be pairwise disjoint across "
+                f"seats; got duplicates in {flat}."
+            )
+        board = [int(c) for c in self.community_cards]
+        overlap = set(flat) & set(board)
+        if overlap:
+            raise ValueError(
+                f"reseat_private_cards: cards {sorted(overlap)} overlap the "
+                f"community board."
+            )
+        deck = self.deck
+        bs = deck._board_start
+        if bs != len(flat):
+            raise ValueError(
+                f"reseat_private_cards: deck board-start {bs} does not match "
+                f"{len(flat)} private cards (env not dealt?)."
+            )
+        # Undealt = full deck − board − holes, from the canonical full deck (rank
+        # bounds — ground truth, not the possibly-permuted live ``_cards`` — so a
+        # prior corruption can't silently shrink the complement).  The caller may
+        # pass a cached ``full_deck`` array (the search loop reuses one per solve)
+        # to skip rebuilding it every iteration.  The Python list-comp with a set
+        # is measured ~2x faster than ``np.isin`` at deck sizes (≤52), which has
+        # constant overhead that never amortises here.
+        full = full_deck if full_deck is not None else make_deck_arr(
+            self._low_card_rank, self._high_card_rank
+        )
+        exclude = set(flat) | set(board)
+        undealt = np.array(
+            [int(c) for c in full if int(c) not in exclude], dtype=full.dtype
+        )
+        # Permutation guard: private + board + undealt must partition the deck
+        # exactly (the "env breaks on duplicates" invariant, machine-checked).
+        if len(flat) + len(board) + len(undealt) != len(full):
+            raise ValueError(
+                "reseat_private_cards: card partition is not a permutation "
+                f"({len(flat)}+{len(board)}+{len(undealt)} != {len(full)})."
+            )
+        (rng if rng is not None else np.random).shuffle(undealt)
+        # Rebuild ``[private | board | undealt]`` — the layout Deck.board_runout
+        # reads (board at ``[bs:bs+5]`` = frozen board + the runout peek), and
+        # reset the cursor to "board dealt, ready for the next street".
+        deck._cards[:bs] = flat
+        deck._cards[bs:bs + len(board)] = board
+        deck._cards[bs + len(board):] = undealt
+        deck._idx = bs + len(board)
+        for seat, h in enumerate(holes):
+            self.players[seat]._cards = (int(h[0]), int(h[1]))
 
     # ------------------------------------------------------------------
     # Properties

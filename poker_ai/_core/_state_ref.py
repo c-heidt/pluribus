@@ -146,7 +146,7 @@ class FastStateRef:
         clusters from the env's ``card_info_lut``, so both start field-identical.
         """
         n = env.n_players
-        board = tuple(int(c) for c in env.deck._cards[2 * n: 2 * n + 5])
+        board = tuple(int(c) for c in env.deck.board_runout(5))
         hole = [tuple(p._cards) for p in env.players]
         # Precompute clusters for every (seat, round) decision node the same way
         # PokerEnv._compute_info_set does: LUT[stage][sorted(hole)+sorted(board_prefix)].

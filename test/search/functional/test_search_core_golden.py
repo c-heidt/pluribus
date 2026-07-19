@@ -52,7 +52,13 @@ _RNG_SEED = 7
 _N_ITERS = 50
 
 # Frozen fingerprints — see the module docstring for when and how to regenerate.
-GOLDEN_DIGEST_MCCFR = "a1f716d14b9a7d431384cc397ee80e7d3b0bb24187af1c0b397d48a9c560d91f"
+# MCCFR regenerated 2026-07-18: the regime now walks ``root_env`` in place (reseat
+# per iteration) instead of deepcopying it, and samples the per-iteration board from
+# a dedicated child RNG rather than the global ``np.random`` — so the board-sampling
+# stream differs from the prior build (the CFR maths is unchanged: proven byte-
+# identical to the old ``with_hole_cards`` walk at a board-frozen river root, and the
+# equilibrium oracle still converges).
+GOLDEN_DIGEST_MCCFR = "7133099998a84778e3d4f1157d86b2a883fdf160e7f3c55c0f26da9f9eb5cd0c"
 GOLDEN_DIGEST_VECTOR = "7e6e3da6534d92c5e9a808a48b9da06054558cbb4a7ee8727fab0efa23113db2"
 
 

@@ -258,8 +258,9 @@ cdef class FastState:
             for k in range(n):
                 s.player_i_lut[si][k] = <int>perm[k]
 
-        # Hole cards + board (deck[2n:2n+5], line-independent).
-        board = [int(c) for c in env.deck._cards[2 * n: 2 * n + 5]]
+        # Hole cards + board (the 5-card runout, read via the deck's layout
+        # accessor rather than a hand-rolled 2n offset; line-independent).
+        board = [int(c) for c in env.deck.board_runout(5)]
         for k in range(5):
             s.board[k] = <int>board[k]
         holes = [[int(c) for c in p._cards] for p in env.players]

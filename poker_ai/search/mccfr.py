@@ -24,6 +24,7 @@ from typing import Dict, Tuple
 
 import numpy as np
 
+from environment.utils import make_deck_arr
 from poker_ai.blueprint.tree_utils import sample_index
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.leaf import continuation_value
@@ -115,6 +116,37 @@ class _MCCFRSolver:
             cdf = np.cumsum(w)
             cdf /= cdf[-1]
             self._cdf[s] = cdf
+        # Single-copy walk: the traversal reseat-mutates ``root_env`` in place per
+        # iteration (§6.5) instead of deepcopying it, so snapshot its pristine
+        # card-state now — before any walk — to rewind afterwards, honouring
+        # solve()'s "never mutates root_env" contract and keeping warm re-search /
+        # downstream reads correct.  Only the cards + deal cursor change (reseat);
+        # the betting state is restored by the walk's own make/undo balance.
+        self._pristine_holes = [tuple(int(c) for c in p._cards) for p in root_env.players]
+        self._pristine_cards = root_env.deck._cards.copy()
+        self._pristine_idx = int(root_env.deck._idx)
+        # Canonical full deck, built once and reused by every reseat so the
+        # per-iteration re-hole never rebuilds it (it is invariant for the solve).
+        self._full_deck = make_deck_arr(
+            root_env._low_card_rank, root_env._high_card_rank
+        )
+        # Dedicated board-shuffle RNG.  reseat re-randomises the undealt deck each
+        # iteration, but that draw must NOT come from ``self.rng`` — that stream
+        # drives hole + action sampling, and polluting it with per-iteration board
+        # shuffles desyncs the traversal and wrecks convergence.  The old
+        # per-iteration ``with_hole_cards`` shuffled on the *global* ``np.random``
+        # (a separate stream) for exactly this reason; we keep the separation but
+        # derive an independent child from ``self.rng``'s seed sequence so parallel
+        # replicas stay decorrelated (each replica's ``rng`` is its own seeded
+        # substream), rather than sharing fork-inherited global state.  Spawn from
+        # the seed sequence so ``self.rng`` itself is NOT advanced — the sampling
+        # stream (hole + action draws) must stay bit-identical to a board-free
+        # baseline, or the traversal desyncs.
+        try:
+            _board_seed = self.rng.bit_generator._seed_seq.spawn(1)[0]
+            self._board_rng = np.random.default_rng(_board_seed)
+        except AttributeError:  # generator without an exposed seed sequence
+            self._board_rng = np.random.default_rng(int(self.rng.integers(0, 2 ** 63 - 1)))
         self._iter = 0
 
     # ------------------------------------------------------------------
@@ -124,7 +156,14 @@ class _MCCFRSolver:
     def iterate(self) -> None:
         holes = self._sample_root_holes()
         holes_list = [holes[s] for s in range(self.n_players)]
-        env = self.root_env.with_hole_cards(holes_list)
+        # In-place re-hole of the single walk env (no per-iteration deepcopy):
+        # atomically resets every seat's holes + the deck as one permutation,
+        # board frozen (§6.5).  ``self.rng`` (not global) drives the board shuffle
+        # so parallel replicas stay independent.  The prior iteration's walk left
+        # the betting state root-restored (make/undo balance); reseat rebuilds only
+        # the cards, so ``root_env`` is a valid fresh sampled root again.
+        env = self.root_env
+        env.reseat_private_cards(holes_list, rng=self._board_rng, full_deck=self._full_deck)
         i = self._live_seats[self._iter % len(self._live_seats)]
         self._iter += 1
         # Regret pass: explore the traverser's actions, sample opponents/chance;
@@ -136,6 +175,23 @@ class _MCCFRSolver:
         # blueprint/strategy.py:update_strategy.  The regret pass leaves ``env``
         # restored (make/undo), so it is reused here.
         self._update_strategy(env, i, holes)
+
+    def restore_root(self) -> None:
+        """Rewind ``root_env`` to its pristine card-state after the in-place walk.
+
+        The traversal reseat-mutates ``root_env`` (holes + deck order + cursor)
+        rather than deepcopying it, so ``solve()`` calls this once the loop ends to
+        leave ``root_env`` byte-identical — the documented "never mutates root_env"
+        contract that warm re-search and any downstream reader rely on.  The
+        betting state is already root-restored by the walk's make/undo balance, so
+        only the cards + deal cursor are rewound here.  Idempotent; a no-op if the
+        solve ran zero iterations (root_env never reseated).
+        """
+        deck = self.root_env.deck
+        deck._cards[:] = self._pristine_cards
+        deck._idx = self._pristine_idx
+        for p, h in zip(self.root_env.players, self._pristine_holes):
+            p._cards = h
 
     # ------------------------------------------------------------------
     # Joint root sampling (§6.5 step 1)

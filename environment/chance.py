@@ -31,12 +31,19 @@ class Deck:
         Undealt portion of the deck as a 1-D int32 array.
     """
 
-    __slots__ = ("_cards", "_idx")
+    __slots__ = ("_cards", "_idx", "_board_start")
 
     def __init__(self, low_rank: int = 2, high_rank: int = 14):
         self._cards: np.ndarray = make_deck_arr(low_rank, high_rank)
         np.random.shuffle(self._cards)
         self._idx: int = 0
+        # Position in ``_cards`` where the community (board) region begins —
+        # set once when the private hole cards finish dealing (they occupy
+        # ``[0:_board_start)``, so ``_board_start == 2 * n_players``).  The board
+        # occupies ``[_board_start : _board_start + 5)``; :meth:`board_runout`
+        # reads it without any caller re-deriving the ``2 * n`` offset.  Fixed for
+        # the hand (private dealing happens once), so make/undo leaves it alone.
+        self._board_start: int = 0
 
     def deal_private_cards(self, players) -> None:
         """Deal 2 hole cards to each player in standard 2-pass dealing order.
@@ -53,6 +60,8 @@ class Deck:
             for player in players:
                 player._cards += (int(self._cards[self._idx]),)
                 self._idx += 1
+        # Private cards now fill ``[0:_idx)``; the board region starts here.
+        self._board_start = self._idx
 
     def deal_community(self, n: int) -> tuple:
         """Deal n community cards.
@@ -88,6 +97,21 @@ class Deck:
     def remaining(self) -> np.ndarray:
         """Return the undealt portion of the deck as a numpy array."""
         return self._cards[self._idx:]
+
+    def board_runout(self, board_len: int = 5) -> np.ndarray:
+        """The ``board_len`` cards that form this hand's final board, in order.
+
+        The community region sits at ``[_board_start : _board_start + board_len)``
+        immediately after the private cards, so this returns the board cards
+        already dealt **plus** the next undealt cards that will complete the
+        runout (turn/river peek), given the current deck order.  This is the
+        single accessor for the board layout: readers (the compiled ``FastState``
+        and its reference twin) call it instead of slicing ``_cards`` with a
+        hand-rolled ``2 * n`` offset, and any writer that rebuilds the deck must
+        produce a layout consistent with it (private cards, then the board, then
+        the rest).  ``_board_start`` is set by :meth:`deal_private_cards`.
+        """
+        return self._cards[self._board_start: self._board_start + board_len]
 
     def replace_drawn(
         self,

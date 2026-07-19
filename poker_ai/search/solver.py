@@ -209,6 +209,12 @@ def solve(
             solver = _MCCFRSolver(root_env, state, ctx, cfg, ctx.rng)
         start = time.perf_counter()
         iterations, stop_reason = run_loop(solver, state, cfg)
+        # The MCCFR regime walks ``root_env`` in place (reseat per iteration) rather
+        # than deepcopying it, so rewind it to pristine — solve() must not mutate
+        # ``root_env`` (warm re-search reuses it).  The vector regime walks via
+        # make/undo balance (or a separate FastState) and already leaves it clean.
+        if regime != "vector":
+            solver.restore_root()
         wall = time.perf_counter() - start
         stats = state.stats_snapshot()
 
