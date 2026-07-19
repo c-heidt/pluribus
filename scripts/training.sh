@@ -6,6 +6,13 @@
 #
 #   # Biased blueprint warm-started from a finished base run:
 #   sbatch --export=ALL,WORKSPACE=/path/to/ws,BIAS=fold,WARM_START=/path/to/base training.sh
+# Propagate the submission environment directly instead of letting SLURM fall
+# back to login-shell retrieval (`--get-user-env`), which times out against
+# GetEnvTimeout on an overloaded login node and yields
+# "(user env retrieval failed requeued held)".  Belt-and-suspenders: the CLI
+# `--export=ALL,WORKSPACE=...` still wins over this, and a `SBATCH_EXPORT=NONE`
+# env var can override this directive — see the note in the header comment.
+#SBATCH --export=ALL
 #SBATCH --job-name=pluribus-train
 #SBATCH --output=logs/training-%j.out
 #SBATCH --error=logs/training-%j_error.out
