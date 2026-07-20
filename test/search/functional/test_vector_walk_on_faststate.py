@@ -26,7 +26,7 @@ if _core.CORE_AVAILABLE:
     from poker_ai.search.vector import _VectorSolver
 
     from test.search import core_diff
-    from test.search.test_solver import _ctx, _late_env
+    from test.search._helpers import _ctx, _late_env
 
 
 def _cfg(leaf):

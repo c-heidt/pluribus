@@ -203,7 +203,6 @@ def continuation_value_vector(
     profile: Mapping[int, BiasClass],
     ctx: SubgameContext,
     traverser_seat: int,
-    runout_cache: dict | None = None,
 ) -> np.ndarray:
     """Per-traverser-combo continuation value of a fixed profile (§6.4, vectorized).
 
@@ -218,12 +217,10 @@ def continuation_value_vector(
 
     Returns ``(n_combos,)`` float64: entry ``c`` is the mean chip delta to
     ``traverser_seat`` holding combo ``c`` (``0`` on combos it cannot hold given
-    the board and the other seats' cards).  ``runout_cache`` is accepted for
-    signature parity with :func:`continuation_value` but unused: v1 scores a
-    decision-free all-in on its single force-dealt board (variance absorbed across
-    iterations), not the per-combo exact board-average — a bounded later refinement.
+    the board and the other seats' cards).  v1 scores a decision-free all-in on its
+    single force-dealt board (variance absorbed across iterations), not the
+    per-combo exact board-average — a bounded later refinement.
     """
-    del runout_cache  # v1: single-board settlement (see docstring)
     cfg = ctx.leaf
     rng = ctx.rng
     n_combos = frontier_env.n_combos

@@ -158,13 +158,15 @@ def _cfg(*, iters=40, discount=20, workers=1) -> SolverConfig:
     )
 
 
-def _node_state(pk, legal, actor, *, regret=None, strat=None, frozen=None):
+def _node_state(pk, legal, actor, *, regret=None, strat=None, frozen=None, n_rows=10):
+    # Build a combo-keyed vector node (the storage both regimes now write) so the
+    # merge semantics are exercised on ``vregret``/``vstrat``.
     st = SolverState.empty()
-    st.ensure_node(pk, legal, actor)
+    st.ensure_vnode(pk, legal, actor, n_rows, "combo")
     for row, vec in (regret or {}).items():
-        st.add_regret((pk, row), np.array(vec, dtype=float))
+        st.vregret[pk][row] = np.array(vec, dtype=float)
     for row, vec in (strat or {}).items():
-        st.add_strat((pk, row), np.array(vec, dtype=float))
+        st.vstrat[pk][row] = np.array(vec, dtype=float)
     for row, vec in (frozen or {}).items():
         st.frozen[(pk, row)] = np.array(vec, dtype=float)
     return st
@@ -196,10 +198,10 @@ class TestAccumulate:
             regret={7: [0, 1, 1], 8: [2, 2, 2]}, strat={8: [0, 1, 0]},
         )
         m = SolverState.accumulate([a, b])
-        np.testing.assert_allclose(m.regret[(pk, 7)], [1, 3, 4])
-        np.testing.assert_allclose(m.regret[(pk, 8)], [2, 2, 2])   # only b saw row 8
-        np.testing.assert_allclose(m.strat_sum[(pk, 7)], [1, 0, 0])
-        np.testing.assert_allclose(m.strat_sum[(pk, 8)], [0, 1, 0])
+        np.testing.assert_allclose(m.vregret[pk][7], [1, 3, 4])
+        np.testing.assert_allclose(m.vregret[pk][8], [2, 2, 2])   # only b saw row 8
+        np.testing.assert_allclose(m.vstrat[pk][7], [1, 0, 0])
+        np.testing.assert_allclose(m.vstrat[pk][8], [0, 1, 0])
         assert m.legal_at[pk] == ("f", "c", "r")
         assert m.actor_at[pk] == 0
 
@@ -208,8 +210,8 @@ class TestAccumulate:
         pk = ("flop", ())
         a = _node_state(pk, ("f", "c"), 0, regret={7: [1.0, 1.0]})
         m = SolverState.accumulate([a])
-        m.regret[(pk, 7)] += 5.0
-        np.testing.assert_allclose(a.regret[(pk, 7)], [1.0, 1.0])
+        m.vregret[pk][7] += 5.0
+        np.testing.assert_allclose(a.vregret[pk][7], [1.0, 1.0])
 
     def test_sums_vector_tables(self):
         pk = ("turn", ())
@@ -230,7 +232,7 @@ class TestAccumulate:
         r1 = _node_state(pk, ("f", "c", "r"), 0, regret={7: [11, 12, 13]})  # base + [1,2,3]
         r2 = _node_state(pk, ("f", "c", "r"), 0, regret={7: [10, 15, 10]})  # base + [0,5,0]
         m = SolverState.accumulate([r1, r2], baseline=base)
-        np.testing.assert_allclose(m.regret[(pk, 7)], [11, 17, 13])  # 10 + [1,2,3] + [0,5,0]
+        np.testing.assert_allclose(m.vregret[pk][7], [11, 17, 13])  # 10 + [1,2,3] + [0,5,0]
 
     def test_baseline_new_node_summed_without_double_count(self):
         # A node only the replicas discovered (not in baseline) is a pure sum.
@@ -239,8 +241,8 @@ class TestAccumulate:
         r1 = _node_state(pk, ("f", "c"), 0, regret={7: [5, 4], 8: [1, 1]})
         r2 = _node_state(pk, ("f", "c"), 0, regret={7: [4, 6], 8: [2, 2]})
         m = SolverState.accumulate([r1, r2], baseline=base)
-        np.testing.assert_allclose(m.regret[(pk, 7)], [5, 6])   # 4 + [1,0] + [0,2]
-        np.testing.assert_allclose(m.regret[(pk, 8)], [3, 3])   # pure sum (no baseline)
+        np.testing.assert_allclose(m.vregret[pk][7], [5, 6])   # 4 + [1,0] + [0,2]
+        np.testing.assert_allclose(m.vregret[pk][8], [3, 3])   # pure sum (no baseline)
 
     def test_carries_baseline_frozen(self):
         pk = ("flop", ())
@@ -254,7 +256,7 @@ class TestAccumulate:
         a = _node_state(pk, ("f", "c"), 0, regret={7: [1, 2]})
         b = _node_state(pk, ("f", "c"), 0, regret={7: [3, 4]})
         m = SolverState.accumulate([a, b])
-        np.testing.assert_allclose(m.regret[(pk, 7)], [4, 6])
+        np.testing.assert_allclose(m.vregret[pk][7], [4, 6])
         assert m.frozen == {}
 
 

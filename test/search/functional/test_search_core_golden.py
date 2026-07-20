@@ -44,7 +44,7 @@ import pytest
 from poker_ai.search.solver import solve
 from poker_ai.search.solver_state import SolverConfig
 
-from test.search.test_solver import _ctx, _preflop_env, _late_env
+from test.search._helpers import _ctx, _preflop_env, _late_env
 
 # Fixed seeds for the two reference solves (fixture deal seed / ctx.rng seed).
 _ENV_SEED = 0

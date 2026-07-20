@@ -108,8 +108,8 @@ def _leaf_mode(regime: str, ctx: SubgameContext, cfg: SolverConfig) -> str:
     The vector regime values leaves over the full range (``'exact_range'``).  MCCFR
     scores decision-free all-in terminals either by the exact board-average
     (``'decision_free'``) or the paper's single sampled runout (``'sampled_runout'``)
-    — mirroring :attr:`_MCCFRSolver._use_equity`, which forces sampling on a preflop
-    root regardless of the flag (a 5-card runout blows past the exact path).
+    — the exact path is forced off on a preflop root (``street_at_root == 0``)
+    regardless of the flag, because a 5-card runout blows past the exact path.
     """
     if regime == "vector":
         return "exact_range"

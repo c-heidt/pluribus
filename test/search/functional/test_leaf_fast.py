@@ -38,7 +38,7 @@ if _core.CORE_AVAILABLE:
     from poker_ai.search.leaf import LeafConfig, continuation_value
     from poker_ai.search.leaf_fast import continuation_value_fast, _policy_state
     from poker_ai.search.mccfr import _BIAS_CLASSES
-    from test.search.test_solver import UniformPolicy
+    from test.search._helpers import UniformPolicy
 
     _cystate.configure(_STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND)
     FastState = _cystate.FastState

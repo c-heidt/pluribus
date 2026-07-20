@@ -49,54 +49,26 @@ Storage — root street lossless, future streets clustered (§6.5):
 
 from __future__ import annotations
 
-import itertools
 from typing import Dict, Optional, Tuple
 
 import numpy as np
 
-from information_abstraction.lookup import clusters_for_board
+from poker_ai.search.cluster_maps import ClusterMapper
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.solver_state import SolverConfig, SolverState
+from poker_ai.search.vform import (
+    _regret_match_matrix_py,
+    freeze_combo,
+    node_sigma,
+    regret_match_matrix,
+    traverser_update,
+)
 
-# Street index -> LUT street key, for the future-street cluster lookups.
-_STREET_NAME = {0: "pre_flop", 1: "flop", 2: "turn", 3: "river"}
-
-
-def _regret_match_matrix(regret: np.ndarray) -> np.ndarray:
-    """Row-wise regret matching over the **last** axis of a regret tensor.
-
-    Vectorised counterpart of
-    :func:`poker_ai.blueprint.tree_utils.calculate_strategy_from_row`: each row's
-    strategy is proportional to its positive cumulative regret, falling back to
-    uniform over the ``width`` actions when a row has no positive regret.
-
-    Action ``width`` is always the last axis, so this serves both a
-    root-street ``(n_combos, width)`` node and a future-street
-    ``(n_clusters, width)`` node (§6.5) without reshaping.
-    """
-    pos = np.maximum(regret, 0.0)
-    total = pos.sum(axis=-1, keepdims=True)
-    width = regret.shape[-1]
-    safe = np.where(total > 0.0, total, 1.0)
-    return np.where(total > 0.0, pos / safe, 1.0 / width)
-
-
-# Compiled-core wiring (Phase 1): when built AND enabled
-# (``PLURIBUS_CORE_KERNELS`` includes ``regret_match_matrix``), swap the batched
-# regret-matcher for its byte-identical Cython kernel.  ``_walk`` calls it as the
-# module global ``_regret_match_matrix``, so the rebind is transparent; the
-# pure-Python reference is kept as ``_regret_match_matrix_py`` (the oracle).
-_regret_match_matrix_py = _regret_match_matrix
-try:
-    from poker_ai._core import CORE_AVAILABLE as _CORE_AVAILABLE
-    from poker_ai._core.flags import kernel_enabled as _kernel_enabled
-
-    if _CORE_AVAILABLE and _kernel_enabled("regret_match_matrix"):
-        from poker_ai._core._regret import (
-            calculate_strategy_matrix as _regret_match_matrix,
-        )
-except ImportError:
-    pass
+# The vector-form CFR kernel is shared with the MCCFR walk (:mod:`vform`).  It is
+# re-exported here (``_regret_match_matrix`` / ``_regret_match_matrix_py``) for the
+# compiled-kernel byte-parity tests and any caller that historically imported it
+# from this module.
+_regret_match_matrix = regret_match_matrix
 
 
 class _VectorSolver:
@@ -166,90 +138,20 @@ class _VectorSolver:
         self._my_combo: Optional[int] = root_env.combo_index.get(my)
         self._my_seat = ctx.my_seat
 
-        # Future streets (§6.5): each is stored per LUT cluster.  ``street ==
-        # street_at_root`` is lossless (combo rows); deeper streets fold the
-        # sampled runout into the cluster id, so no explicit river axis is needed.
+        # Future streets (§6.5): the per-LUT-cluster storage machinery — the
+        # deterministic per-street cluster universes, the per-iteration dense
+        # combo→cluster rows / board feasibility / scatter plans — is shared with the
+        # MCCFR walk via :class:`ClusterMapper`.  ``street == street_at_root`` is
+        # lossless (combo rows); deeper streets fold the sampled runout into the
+        # cluster id, so there is no explicit river axis.
         self._street_at_root = ctx.street_at_root
-        self._future = list(range(self._street_at_root + 1, 4))
-        self._n_completion = len(self._future)          # 0 (river) / 1 (turn) / 2 (flop)
-
-        self._combo_cards = np.asarray(root_env.combo_cards, dtype=np.int64)
-        self._lut = root_env.card_info_lut
-        self._root_comm = [int(c) for c in root_env.community_cards]
-        if self._n_completion:
-            avail = sorted(
-                set(int(c) for c in np.unique(self._combo_cards)) - set(self._root_comm)
-            )
-            self._avail = np.array(avail, dtype=np.int64)
-            # Deterministic per-street cluster universes (union over every
-            # candidate completion) → identical local row layout across parallel
-            # replicas, so ``SolverState.accumulate`` sums aligned rows.
-            self._universe = self._build_universes()
-        else:
-            self._avail = np.empty(0, dtype=np.int64)
-            self._universe = {}
-
-        # Per-iteration cluster maps + scatter plans (filled in :meth:`iterate`).
+        self._cmaps = ClusterMapper(
+            root_env.card_info_lut, root_env.combo_cards,
+            root_env.community_cards, self._street_at_root,
+        )
+        self._n_completion = self._cmaps.n_completion   # 0 (river) / 1 (turn) / 2 (flop)
+        # The sampled board runout for the current iteration (filled in :meth:`iterate`).
         self._completion: Tuple[int, ...] = ()
-        self._cluster_of: Dict[int, np.ndarray] = {}    # street -> (n_combos,) dense row, -1 infeasible
-        self._feas: Dict[int, np.ndarray] = {}          # street -> (n_combos,) 0/1 board-feasibility
-        self._scatter: Dict[int, Tuple] = {}            # street -> (sorted_combos, seg_starts, seg_cluster)
-        self._feas_full: Optional[np.ndarray] = None    # feasibility for the full completion
-
-    def _build_universes(self) -> Dict[int, np.ndarray]:
-        """Sorted unique LUT cluster ids reachable at each future street.
-
-        For street ``s`` the board is the root community plus the first
-        ``s - street_at_root`` completion cards; the universe unions the clusters
-        over **every** candidate completion of that depth, so the dense local row
-        index (a ``searchsorted`` into this array) is fixed for the whole search
-        and identical across replicas.  Bucket-count-agnostic: it reads only the
-        ids the LUT actually produces here, never a cluster total.
-        """
-        universe: Dict[int, np.ndarray] = {}
-        avail = self._avail.tolist()
-        for s in self._future:
-            name = _STREET_NAME[s]
-            depth = s - self._street_at_root
-            ids: set = set()
-            for comp in itertools.combinations(avail, depth):
-                board = np.array(self._root_comm + list(comp), dtype=np.int64)
-                raw = clusters_for_board(self._lut[name], self._combo_cards, board)
-                ids.update(int(x) for x in np.unique(raw[raw >= 0]))
-            universe[s] = np.array(sorted(ids), dtype=np.int64)
-        return universe
-
-    def _refresh_cluster_maps(self, completion: Tuple[int, ...]) -> None:
-        """Per-iteration: dense cluster row + feasibility + scatter plan per street.
-
-        ``completion`` is the sampled runout (turn[, river]); at street ``s`` the
-        board carries its first ``s - street_at_root`` cards.  The scatter plan
-        pre-sorts the feasible combos by cluster row so a node's regret/strategy
-        update is a ``reduceat`` segment-sum rather than an ``np.add.at``.
-        """
-        for s in self._future:
-            name = _STREET_NAME[s]
-            depth = s - self._street_at_root
-            board = np.array(self._root_comm + list(completion[:depth]), dtype=np.int64)
-            raw = clusters_for_board(self._lut[name], self._combo_cards, board)
-            valid = raw >= 0
-            dense = np.full(self._n_combos, -1, dtype=np.int64)
-            dense[valid] = np.searchsorted(self._universe[s], raw[valid])
-            self._cluster_of[s] = dense
-            self._feas[s] = valid.astype(np.float64)
-            fcombos = np.flatnonzero(valid)
-            fclusters = dense[fcombos]
-            order = np.argsort(fclusters, kind="stable")
-            sorted_combos = fcombos[order]
-            sorted_clusters = fclusters[order]
-            seg_starts = np.concatenate(
-                ([0], np.flatnonzero(np.diff(sorted_clusters)) + 1)
-            ).astype(np.intp)
-            seg_cluster = sorted_clusters[seg_starts]
-            self._scatter[s] = (sorted_combos, seg_starts, seg_cluster)
-        # Full-completion feasibility (deepest future street) — used to mask the
-        # opponent reach at a showdown that completes the whole board at once.
-        self._feas_full = self._feas[self._future[-1]]
 
     # ------------------------------------------------------------------
     # One iteration (§6.5 vector regime)
@@ -262,13 +164,12 @@ class _VectorSolver:
         # available deck gives the uniform chance measure over ordered runouts.
         if self._n_completion:
             idx = self.rng.choice(
-                len(self._avail), size=self._n_completion, replace=False
+                len(self._cmaps.avail), size=self._n_completion, replace=False
             )
-            self._completion = tuple(int(self._avail[i]) for i in idx)
-            self._refresh_cluster_maps(self._completion)
+            self._completion = tuple(int(self._cmaps.avail[i]) for i in idx)
+            self._cmaps.refresh(self._completion)
         else:
             self._completion = ()
-            self._feas_full = None
         s0, s1 = self._seats
         # Alternating updates: one full tree pass per traverser.  ``_walk_env`` is
         # the compiled FastState adapter under PLURIBUS_SEARCH_CORE (else the
@@ -285,8 +186,8 @@ class _VectorSolver:
 
         Reach vectors are always ``(n_combos,)``.  The node's row space is set by
         its street: the root street is lossless (row == ``combo_index``); a future
-        street is clustered (``self._cluster_of[street]`` maps each combo to its
-        dense cluster row).  For a clustered node the per-combo strategy is a
+        street is clustered (``self._cmaps.cluster_of(street)`` maps each combo to
+        its dense cluster row).  For a clustered node the per-combo strategy is a
         gather of the cluster rows, and the per-combo regret/strategy deltas are
         scattered (segment-summed) back into the cluster rows.
         """
@@ -298,27 +199,15 @@ class _VectorSolver:
         if is_root:
             n_rows, row_space, cof = self._n_combos, "combo", None
         else:
-            cof = self._cluster_of[street]
-            n_rows, row_space = len(self._universe[street]), "cluster"
-        self.state.ensure_vnode(pk, legal, actor, n_rows, row_space)
-        regret = self.state.vregret[pk]                 # (n_rows, width)
-        strat = self.state.vstrat[pk]
-        sigma_rows = _regret_match_matrix(regret)       # (n_rows, width)
-        # Per-combo strategy: identity for a root node, a cluster gather otherwise
-        # (infeasible combos map to row 0 — harmless, their reach is zeroed below).
-        sigma = sigma_rows if is_root else sigma_rows[np.where(cof >= 0, cof, 0)]
-
-        # Freezing (§5): the bot's pinned actual-hand row is substituted at every
-        # visit to the bot's node.  Frozen rows are only ever set on the bot's
-        # current (root-street) decisions, so this fires on combo nodes only.
-        apply_frozen = (
-            is_root
-            and actor == self._my_seat
-            and self._my_combo is not None
-            and (pk, self._my_combo) in self.state.frozen
+            cof = self._cmaps.cluster_of(street)
+            n_rows, row_space = self._cmaps.n_rows(street), "cluster"
+        # Shared vector-form preamble + freezing (§6.5, §5 — see :mod:`vform`).
+        sigma, regret, strat = node_sigma(
+            self.state, pk, legal, actor, is_root, n_rows, row_space, cof
         )
-        if apply_frozen:
-            sigma[self._my_combo] = self.state.frozen[(pk, self._my_combo)]
+        frozen_combo = freeze_combo(
+            self.state, pk, sigma, is_root, actor, self._my_seat, self._my_combo
+        )
 
         if actor != p:
             # Opponent node: expand all actions, fold opp mixing into pi_o, and
@@ -339,38 +228,14 @@ class _VectorSolver:
             token = env.step_in_place(action, settle_winners=False)
             child_vs[a_idx] = self._child(env, p, pi_p * sigma[:, a_idx], pi_o, street)
             env.undo(token)
-        cv = np.moveaxis(child_vs, 0, -1)             # (n_combos, width)
-        v = (sigma * cv).sum(axis=-1)                 # (n_combos,)
-        delta = cv - v[:, None]                       # regret: v_a - v
-        strat_delta = pi_p[:, None] * sigma           # strat-sum: own reach * sigma
-        if apply_frozen:
-            # The pinned actual-hand row neither accrues regret nor strategy (here
-            # ``actor == p``, so this fires only when the bot traverses itself).
-            delta[self._my_combo] = 0.0
-            strat_delta[self._my_combo] = 0.0
-        if is_root:
-            regret += delta                           # in-place: writes the store
-            strat += strat_delta
-        else:
-            # All combos in a cluster share one row (§6.5), so the row update is
-            # the sum of their per-combo deltas — a presorted segment-sum.
-            self._scatter_add(regret, delta, street)
-            self._scatter_add(strat, strat_delta, street)
-        return v
-
-    def _scatter_add(self, table: np.ndarray, per_combo: np.ndarray, street: int) -> None:
-        """Segment-sum the feasible combos' rows of ``per_combo`` into ``table``.
-
-        The combo→cluster map is fixed for the whole iteration, so the sort +
-        segment boundaries are precomputed once (``_refresh_cluster_maps``) and a
-        ``reduceat`` does the grouping — cheaper than ``np.add.at`` on every node.
-        ``seg_cluster`` holds each segment's distinct cluster row, so the final
-        fancy-index add has no duplicate targets.
-        """
-        sorted_combos, seg_starts, seg_cluster = self._scatter[street]
-        grouped = per_combo[sorted_combos]            # (n_feasible, width)
-        seg_sums = np.add.reduceat(grouped, seg_starts, axis=0)
-        table[seg_cluster] += seg_sums
+        # All combos in a cluster share one row (§6.5), so a future-street update is
+        # a presorted segment-sum; a root node adds combo rows directly.
+        scatter = None if is_root else (
+            lambda t, pc: self._cmaps.scatter_add(t, pc, street)
+        )
+        return traverser_update(
+            regret, strat, sigma, child_vs, pi_p, frozen_combo, scatter
+        )
 
     def _child(self, env, p: int, pi_p: np.ndarray, pi_o: np.ndarray,
                parent_street: int) -> np.ndarray:
@@ -385,7 +250,8 @@ class _VectorSolver:
                 # that reached the terminal *before* the chance nodes were walked
                 # still excludes combos holding a completion card (mirrors the
                 # per-crossing masking below).  No-op for a river root.
-                reach = pi_o if self._feas_full is None else pi_o * self._feas_full
+                reach = (pi_o if self._cmaps.feas_full is None
+                         else pi_o * self._cmaps.feas_full)
                 return env.vector_payout(p, opp, reach, runout=runout)
             # Fold: pi_o is already masked to the fold's street by the crossings
             # below; vector_payout's fold path selects the board it saw via
@@ -397,7 +263,7 @@ class _VectorSolver:
             # by the new street's board feasibility, so a combo holding the freshly
             # dealt completion card carries no reach below it.  No 1/R — chance
             # sampling already gives the expectation.
-            feas = self._feas[env.betting_round]
+            feas = self._cmaps.feas(env.betting_round)
             return self._walk(env, p, pi_p * feas, pi_o * feas)
 
         return self._walk(env, p, pi_p, pi_o)

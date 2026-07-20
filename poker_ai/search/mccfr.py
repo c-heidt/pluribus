@@ -1,20 +1,22 @@
-"""External-sampling Linear MCCFR regime for the subgame solver (§6.5).
+"""Traverser-vectorized external-sampling Linear MCCFR regime (§6.5).
 
 The MCCFR regime is the *large / early* path — round 1, all of round 2, and any
-large multiway later subgame.  Per traversal it samples **one** card-disjoint
-hole assignment from the joint belief (so inter-seat card removal is reflected in
-the draw), then runs an external-sampling CFR pass on the make/undo env: the
-**traverser explores all of its actions**, every opponent **samples one** action
-from its regret-matched strategy, and chance (the board deal) is the engine's own
-one-outcome-per-round draw.  Depth-limit leaves are the §6.4 continuation
-meta-game, solved as an ordinary action; terminals score with ``env.payout`` (or
-``runout_equity`` at a decision-free all-in).  Regret accrues only on the
-traverser's rows, which are variable-width (per-node legal set), keyed
-``(public_key, hand_row)`` in the shared :class:`SolverState`.
+large multiway later subgame.  The traverser's private hand is solved in **vector
+form**: one walk updates every combo's row at once (killing the per-row
+starvation the scalar external-sampling walk suffered), while opponents still
+**sample one** action from their single sampled hole's regret-matched row (keeping
+multiway tractable) and chance is the engine's frozen per-iteration board runout.
+Regret and average strategy fold into a single pass — ``pi_p`` is exact because the
+traverser's actions are expanded — writing the shared ``vregret``/``vstrat``
+matrices (keyed by ``public_key``; combo rows on the root street, LUT-cluster rows
+on future streets) that the vector regime and :class:`SearchPolicy` also read.
 
-This mirrors :func:`poker_ai.blueprint.cfr._traverse` but with variable-width
-rows, the belief-sampled root, the meta-game action, and freezing.  CFR-P pruning
-is omitted (it never engages in a short search, §6.5).
+Depth-limit leaves are the §6.4 continuation meta-game, valued per-combo by
+:func:`poker_ai.search.leaf.continuation_value_vector`; terminals settle against
+the concrete sampled opponents via :meth:`PokerEnv.vector_payout_concrete`.  This
+mirrors :meth:`poker_ai.search.vector._VectorSolver._walk`, specialized to sampled
+(rather than range-expanded) opponents.  CFR-P pruning is omitted (it never
+engages in a short search, §6.5).
 """
 
 from __future__ import annotations
@@ -28,27 +30,17 @@ from environment.utils import make_deck_arr
 from poker_ai.blueprint.tree_utils import sample_index
 from poker_ai.search.cluster_maps import ClusterMapper
 from poker_ai.search.context import SubgameContext
-from poker_ai.search.leaf import continuation_value, continuation_value_vector
+from poker_ai.search.leaf import continuation_value_vector
 from poker_ai.search.policy import BiasClass
-from poker_ai.search.solver_state import Key, SolverConfig, SolverState, _hand_row
-from poker_ai.search.vector import _regret_match_matrix
+from poker_ai.search.solver_state import SolverConfig, SolverState
+from poker_ai.search.vform import (
+    freeze_combo,
+    node_sigma,
+    regret_match_matrix,
+    traverser_update,
+)
 
 logger = logging.getLogger(__name__)
-
-# Search Cython core (Phase 4b): under ``PLURIBUS_SEARCH_CORE=1`` swap the leaf
-# rollout (the ~74% MCCFR cost) for the FastState-driven rollout, which builds the
-# leaf env once and make/undo-walks it per rollout, settling terminals in-core.
-# ``_leaf_value`` calls the module global ``continuation_value`` so the rebind is
-# transparent; the pure-Python reference is retained (and used as the fallback the
-# fast path delegates to for unrepresentable frontiers).  Equilibrium-gated.
-_continuation_value_py = continuation_value
-try:
-    from poker_ai._core.flags import search_core_enabled as _search_core_enabled
-
-    if _search_core_enabled():
-        from poker_ai.search.leaf_fast import continuation_value_fast as continuation_value
-except ImportError:
-    pass
 
 # The four §4 continuation strategies, in the canonical meta-action order.
 _BIAS_CLASSES: Tuple[BiasClass, ...] = ("none", "fold", "call", "raise")
@@ -72,19 +64,6 @@ class _MCCFRSolver:
         self.n_players = root_env.n_players
         self._combo_cards = root_env.combo_cards
         self._my_hole = tuple(sorted(int(c) for c in ctx.my_hole))
-
-        # Decision-free runout equity is exact and cheap once a flop is out (<=2
-        # cards to come), but a *preflop* (round-1) all-in is a 5-card runout that
-        # blows past runout_equity's enumeration cap and falls back to sampling
-        # thousands of boards *per terminal, per iteration*.  For a preflop root we
-        # therefore score all-in terminals by the env's single sampled board
-        # (env.payout) regardless of the flag — far cheaper, and the per-terminal
-        # variance is absorbed across iterations.  (continuation_value keeps the
-        # flag: its rollouts only reach all-ins on the flop or later, where the
-        # exact path is cheap.)
-        self._use_equity = (
-            bool(cfg.leaf.use_decision_free_equity) and ctx.street_at_root != 0
-        )
 
         self._live_seats = sorted(ctx.ranges.keys())
         all_seats = set(ctx.ranges) | set(ctx.folded_ranges)
@@ -357,82 +336,6 @@ class _MCCFRSolver:
         return choice
 
     # ------------------------------------------------------------------
-    # Recursion (§6.5 steps 2-4)
-    # ------------------------------------------------------------------
-
-    def _traverse(self, env, i: int, holes: Dict[int, Tuple[int, int]]) -> float:
-        verdict = self.ctx.depth_limit.classify(env)
-        if verdict == "terminal":
-            return self._terminal_value(env, i)
-        if verdict == "leaf":
-            return self._meta_game(env, i, holes)
-
-        actor = env.player_i
-        legal = tuple(a for a in env.legal_actions if a is not None)
-        pk = env.public_key
-        key = (pk, _hand_row(env, holes[actor], self.ctx.street_at_root))
-        self.state.ensure_node(pk, legal, actor)
-        sig = self._node_sigma(key, actor, holes)
-
-        if actor != i:
-            # External sampling: one opponent action from its current strategy.
-            a_idx = sample_index(self.rng, sig)
-            token = env.step_in_place(legal[a_idx])
-            value = self._traverse(env, i, holes)
-            env.undo(token)
-            return value
-
-        # Traverser: explore every action.
-        va = np.empty(len(legal), dtype=np.float64)
-        for a_idx, action in enumerate(legal):
-            token = env.step_in_place(action)
-            va[a_idx] = self._traverse(env, i, holes)
-            env.undo(token)
-        node_v = float(np.dot(sig, va))
-        if not self._is_frozen(key, actor, holes):
-            self.state.add_regret(key, va - node_v)
-        return node_v
-
-    def _update_strategy(self, env, i: int, holes: Dict[int, Tuple[int, int]]) -> None:
-        """Average-strategy pass: one sampled playthrough, accumulating ``i``'s rows.
-
-        Mirrors :func:`poker_ai.blueprint.strategy.update_strategy`.  Every node
-        samples a single action (a single playthrough, not a branching tree); when
-        the actor is the traverser ``i`` its current strategy is accumulated into
-        ``strat_sum`` (unless the row is frozen).  Because ``i``'s own actions are
-        **sampled** here, visits to ``i``'s infosets carry the π_i reach weight,
-        which is exactly what makes the normalised ``strat_sum`` the correct
-        average strategy.  The regret pass must therefore **not** accumulate it —
-        there ``i`` explores all actions, which would mis-weight by the opponent
-        reach.  (Accumulating the full ``sig`` rather than a unit count of the
-        sampled action is the same in expectation, with lower variance.)
-        """
-        verdict = self.ctx.depth_limit.classify(env)
-        if verdict == "terminal":
-            return
-        if verdict == "leaf":
-            # Continuation meta-game: accumulate ``i``'s meta-row, then stop — the
-            # continuation below the leaf is not part of the search tree.
-            if env.players[i].is_active:
-                key, sig = self._meta_node(env, holes, i, env.public_key)
-                if not self._is_frozen(key, i, holes):
-                    self.state.add_strat(key, self._frozen_or(sig, key, i, holes))
-            return
-
-        actor = env.player_i
-        legal = tuple(a for a in env.legal_actions if a is not None)
-        pk = env.public_key
-        key = (pk, _hand_row(env, holes[actor], self.ctx.street_at_root))
-        self.state.ensure_node(pk, legal, actor)
-        sig = self._node_sigma(key, actor, holes)
-        if actor == i and not self._is_frozen(key, actor, holes):
-            self.state.add_strat(key, sig)
-        a_idx = sample_index(self.rng, sig)
-        token = env.step_in_place(legal[a_idx])
-        self._update_strategy(env, i, holes)
-        env.undo(token)
-
-    # ------------------------------------------------------------------
     # Traverser-vectorized walk (§6.5 — leaf-free turn/river subgames)
     # ------------------------------------------------------------------
 
@@ -489,25 +392,13 @@ class _MCCFRSolver:
         else:
             cof = self._cmaps.cluster_of(street)
             n_rows, row_space = self._cmaps.n_rows(street), "cluster"
-        self.state.ensure_vnode(pk, legal, actor, n_rows, row_space)
-        regret = self.state.vregret[pk]                 # (n_rows, width)
-        strat = self.state.vstrat[pk]
-        sigma_rows = _regret_match_matrix(regret)       # (n_rows, width)
-        # Per-combo strategy: identity for a root node, a cluster gather otherwise
-        # (infeasible combos map to row 0 — harmless, their reach is zeroed).
-        sigma = sigma_rows if is_root else sigma_rows[np.where(cof >= 0, cof, 0)]
-
-        # Freezing (§5): substitute the bot's pinned actual-hand row at every visit
-        # to the bot's (root-street) node — for whichever seat is acting, so a
-        # sampled opponent that IS the frozen bot also plays the pinned strategy.
-        apply_frozen = (
-            is_root
-            and actor == self._my_seat
-            and self._my_combo is not None
-            and (pk, self._my_combo) in self.state.frozen
+        # Shared vector-form preamble + freezing (§6.5, §5 — see :mod:`vform`).
+        sigma, regret, strat = node_sigma(
+            self.state, pk, legal, actor, is_root, n_rows, row_space, cof
         )
-        if apply_frozen:
-            sigma[self._my_combo] = self.state.frozen[(pk, self._my_combo)]
+        frozen_combo = freeze_combo(
+            self.state, pk, sigma, is_root, actor, self._my_seat, self._my_combo
+        )
 
         if actor != p:
             # Opponent node: sample one action from its single sampled hole's row
@@ -525,20 +416,14 @@ class _MCCFRSolver:
             token = env.step_in_place(action, settle_winners=False)
             child_vs[a_idx] = self._vchild(env, p, pi_p * sigma[:, a_idx], holes, street)
             env.undo(token)
-        cv = np.moveaxis(child_vs, 0, -1)             # (n_combos, width)
-        v = (sigma * cv).sum(axis=-1)                 # (n_combos,)
-        delta = cv - v[:, None]                       # regret: v_a - v
-        strat_delta = pi_p[:, None] * sigma           # strat-sum: own reach * sigma
-        if apply_frozen:
-            delta[self._my_combo] = 0.0
-            strat_delta[self._my_combo] = 0.0
-        if is_root:
-            regret += delta                           # in-place: writes the store
-            strat += strat_delta
-        else:
-            self._cmaps.scatter_add(regret, delta, street)
-            self._cmaps.scatter_add(strat, strat_delta, street)
-        return v
+        # All combos in a cluster share one row (§6.5), so a future-street update is
+        # a presorted segment-sum; a root node adds combo rows directly.
+        scatter = None if is_root else (
+            lambda t, pc: self._cmaps.scatter_add(t, pc, street)
+        )
+        return traverser_update(
+            regret, strat, sigma, child_vs, pi_p, frozen_combo, scatter
+        )
 
     def _vchild(self, env, p: int, pi_p: np.ndarray,
                 holes: Dict[int, Tuple[int, int]], parent_street: int) -> np.ndarray:
@@ -591,7 +476,7 @@ class _MCCFRSolver:
         self.state.ensure_vnode(meta_pk, _BIAS_CLASSES, p, self._n_combos, "combo")
         regret = self.state.vregret[meta_pk]              # (n_combos, 4)
         strat = self.state.vstrat[meta_pk]
-        sigma = _regret_match_matrix(regret)              # (n_combos, 4)
+        sigma = regret_match_matrix(regret)              # (n_combos, 4)
         child_vs = np.empty((len(_BIAS_CLASSES), self._n_combos), dtype=np.float64)
         for b, bias in enumerate(_BIAS_CLASSES):
             profile = dict(sampled)
@@ -610,7 +495,7 @@ class _MCCFRSolver:
         """Sample one bias index for ``seat`` from its single sampled hole's meta-row."""
         meta_pk = (pk_base, "META", seat)
         self.state.ensure_vnode(meta_pk, _BIAS_CLASSES, seat, self._n_combos, "combo")
-        sigma = _regret_match_matrix(self.state.vregret[meta_pk])
+        sigma = regret_match_matrix(self.state.vregret[meta_pk])
         opp_ci = self._combo_index[tuple(sorted(holes[seat]))]
         return sample_index(self.rng, sigma[opp_ci])
 
@@ -630,9 +515,7 @@ class _MCCFRSolver:
         ck = (pk_base, traverser, holes_key, tuple(sorted(profile.items())))
         val = self.state.leaf_value_cache.get(ck)
         if val is None:
-            val = continuation_value_vector(
-                env, profile, self.ctx, traverser, runout_cache=self.state.runout_cache
-            )
+            val = continuation_value_vector(env, profile, self.ctx, traverser)
             self.state.leaf_value_cache[ck] = val
         return val
 
@@ -645,112 +528,3 @@ class _MCCFRSolver:
         barr = np.fromiter((int(c) for c in board), dtype=cc.dtype, count=len(board))
         return ~(np.isin(cc[:, 0], barr) | np.isin(cc[:, 1], barr))
 
-    def _terminal_value(self, env, i: int) -> float:
-        if self._use_equity and env.is_decision_free:
-            # Search-lifetime runout memo (§6.4.2): the same all-in reached from
-            # many lines/iterations integrates once.  Key on the all-seat holes
-            # plus the exact pre-runout snapshot, built exactly as the leaf
-            # rollouts do (``leaf.py``) so the two call sites share entries.
-            holes_key = tuple(
-                tuple(int(c) for c in env.players[s].cards)
-                for s in range(self.n_players)
-            )
-            key = (holes_key, env.runout_key)
-            eq = self.state.runout_cache.get(key)
-            if eq is None:
-                eq = env.runout_equity(rng=self.rng)
-                self.state.runout_cache[key] = eq
-            self.state.term_runout += 1
-            return float(eq[i])
-        self.state.term_payout += 1
-        return float(env.payout[i])
-
-    def _leaf_value(self, env, profile: Dict[int, BiasClass], pk_base) -> np.ndarray:
-        """Continuation value at this leaf, memoised search-wide (§6.4.1).
-
-        For a fixed ``(leaf public_key, all-seat holes, profile)`` the value is
-        invariant across CFR iterations — only the meta-game's weighting over
-        profiles changes — so the ``n_rollouts`` estimate is computed once per
-        key and reused.  The estimate stored is the **first** draw (subsequent
-        visits consume no ``ctx.rng``); the search stays deterministic per seed.
-        The shared ``runout_cache`` is threaded so a leaf's four bias profiles
-        share their decision-free runout integrations.
-        """
-        holes_key = tuple(
-            tuple(int(c) for c in env.players[s].cards)
-            for s in range(self.n_players)
-        )
-        ck = (pk_base, holes_key, tuple(sorted(profile.items())))
-        val = self.state.leaf_value_cache.get(ck)
-        if val is None:
-            val = continuation_value(
-                env, profile, self.ctx, runout_cache=self.state.runout_cache
-            )
-            self.state.leaf_value_cache[ck] = val
-        return val
-
-    # ------------------------------------------------------------------
-    # Continuation meta-game leaf (§6.5 step 4)
-    # ------------------------------------------------------------------
-
-    def _meta_game(self, env, i: int, holes: Dict[int, Tuple[int, int]]) -> float:
-        """Value to ``i`` of the depth-limit continuation meta-game.
-
-        Each active seat picks one of the four §4 bias classes as an ordinary
-        action.  The traverser explores all four; every other active seat's
-        choice is sampled from its current meta-strategy.  A fully-chosen profile
-        is scored by :func:`continuation_value`.  Meta-rows are keyed
-        ``((public_key, "META", seat), hand_row)`` so no other seat's choice
-        leaks into the row (infoset-consistent simultaneous choice).
-        """
-        pk_base = env.public_key
-        active = [s for s in range(self.n_players) if env.players[s].is_active]
-
-        # Sample the non-traverser active seats' biases once.
-        sampled: Dict[int, BiasClass] = {}
-        for s in active:
-            if s == i:
-                continue
-            _, sig = self._meta_node(env, holes, s, pk_base)
-            b = sample_index(self.rng, sig)
-            sampled[s] = _BIAS_CLASSES[b]
-
-        if i not in active:
-            # Traverser cannot act here; score the sampled profile as-is.
-            return float(self._leaf_value(env, dict(sampled), pk_base)[i])
-
-        key, sig = self._meta_node(env, holes, i, pk_base)
-        sig = self._frozen_or(sig, key, i, holes)
-        va = np.empty(len(_BIAS_CLASSES), dtype=np.float64)
-        for b, bias in enumerate(_BIAS_CLASSES):
-            profile = dict(sampled)
-            profile[i] = bias
-            va[b] = float(self._leaf_value(env, profile, pk_base)[i])
-        node_v = float(np.dot(sig, va))
-        if not self._is_frozen(key, i, holes):
-            self.state.add_regret(key, va - node_v)
-        return node_v
-
-    def _meta_node(self, env, holes, seat: int, pk_base) -> Tuple[Key, np.ndarray]:
-        meta_pk = (pk_base, "META", seat)
-        key = (meta_pk, _hand_row(env, holes[seat], self.ctx.street_at_root))
-        self.state.ensure_node(meta_pk, _BIAS_CLASSES, seat)
-        return key, self.state.sigma(key)
-
-    # ------------------------------------------------------------------
-    # Freezing (§5) — only when the sampled hole is the bot's actual hole.
-    # ------------------------------------------------------------------
-
-    def _is_actual_bot(self, seat: int, holes: Dict[int, Tuple[int, int]]) -> bool:
-        return seat == self.ctx.my_seat and tuple(sorted(holes[seat])) == self._my_hole
-
-    def _is_frozen(self, key: Key, seat: int, holes: Dict[int, Tuple[int, int]]) -> bool:
-        return self._is_actual_bot(seat, holes) and key in self.state.frozen
-
-    def _frozen_or(self, sig: np.ndarray, key: Key, seat: int, holes) -> np.ndarray:
-        if self._is_frozen(key, seat, holes):
-            return self.state.frozen[key]
-        return sig
-
-    def _node_sigma(self, key: Key, actor: int, holes) -> np.ndarray:
-        return self._frozen_or(self.state.sigma(key), key, actor, holes)

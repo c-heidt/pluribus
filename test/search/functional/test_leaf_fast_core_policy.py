@@ -45,7 +45,7 @@ if _core.CORE_AVAILABLE:
     from poker_ai.search.policy import BlueprintPolicy
     from poker_ai.tables.cfr_tables import CFRTables
     from poker_ai.tables.index import lmdb_map_size_for_players
-    from test.search.test_solver import UniformPolicy
+    from test.search._helpers import UniformPolicy
 
     _cystate.configure(_STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND)
     FastState = _cystate.FastState

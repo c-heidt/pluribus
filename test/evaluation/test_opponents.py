@@ -14,7 +14,7 @@ from evaluation.opponents import (
     BlueprintOpponent,
     assign_seats,
 )
-from test.search.test_solver import UniformPolicy
+from test.search._helpers import UniformPolicy
 
 
 def _env(n_players=2, low=11, high=14):

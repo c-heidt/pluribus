@@ -30,7 +30,7 @@ from poker_ai.search.agent import SearchAgent
 from poker_ai.search.leaf import LeafConfig
 from poker_ai.search.solver import SolverConfig
 from test.evaluation.test_runner import _stub_session
-from test.search.test_solver import UniformPolicy, _flop_env, _policies
+from test.search._helpers import UniformPolicy, _flop_env, _policies
 
 
 class _NonUniformPolicy(UniformPolicy):

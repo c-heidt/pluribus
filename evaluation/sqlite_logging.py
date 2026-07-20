@@ -116,8 +116,6 @@ CREATE TABLE IF NOT EXISTS decisions (
     unique_pubkeys  INTEGER,
     cache_hits      INTEGER,
     cache_misses    INTEGER,
-    term_runout     INTEGER,
-    term_payout     INTEGER,
     action_played   TEXT,
     action_dist     TEXT,
     exploitability  REAL,
@@ -263,8 +261,6 @@ class DecisionRow:
     unique_pubkeys: Optional[int] = None
     cache_hits: Optional[int] = None
     cache_misses: Optional[int] = None
-    term_runout: Optional[int] = None            # decision-free runout_equity evals
-    term_payout: Optional[int] = None            # env.payout (fold/showdown) evals
     action_played: Optional[str] = None
     action_dist: Optional[str] = None            # JSON: root action distribution
     exploitability: Optional[float] = None
@@ -369,10 +365,11 @@ class ExperimentLog:
         if "condition" not in have:       # v2 → v3
             con.execute("ALTER TABLE games ADD COLUMN condition TEXT")
         dhave = {r[1] for r in con.execute("PRAGMA table_info(decisions)")}
-        if "term_runout" not in dhave:    # v3 → v4: per-terminal evaluator mix
-            con.execute("ALTER TABLE decisions ADD COLUMN term_runout INTEGER")
-            con.execute("ALTER TABLE decisions ADD COLUMN term_payout INTEGER")
-        if "blueprint_weight" not in dhave:  # v4 → v5: blueprint-prior shrinkage
+        # (A retired v3 → v4 migration added ``term_runout``/``term_payout`` — a
+        # per-terminal scalar-evaluator mix that the vectorized walk no longer
+        # produces; the columns are gone from the DDL and left untouched where an
+        # older DB already has them, since ``asdict``-driven inserts simply skip them.)
+        if "blueprint_weight" not in dhave:  # blueprint-prior shrinkage (§8)
             con.execute("ALTER TABLE decisions ADD COLUMN blueprint_weight REAL")
         # Indexes last — after the ALTERs, so an index on a freshly-migrated column
         # (idx_games_condition) has its column to reference.

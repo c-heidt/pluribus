@@ -21,8 +21,6 @@ tests that construct ``_MCCFRSolver`` directly, bypassing the regime router.)
 """
 
 import collections
-import copy
-from typing import Dict
 
 import numpy as np
 import pytest
@@ -31,11 +29,10 @@ from environment.player import Player
 from environment.poker_env import PokerEnv
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.leaf import LeafConfig
-from poker_ai.search.mccfr import _MCCFRSolver, _BIAS_CLASSES
-from poker_ai.search.policy import Policy, SearchPolicy
+from poker_ai.search.mccfr import _MCCFRSolver
+from poker_ai.search.policy import SearchPolicy
 from environment.range_showdown import reach_after_removal
 from poker_ai.search.solver import solve, SolverConfig, SolverState, _select_regime
-from poker_ai.search.solver_state import _hand_row
 from poker_ai.search.vector import _VectorSolver, _regret_match_matrix
 
 
@@ -43,94 +40,16 @@ from poker_ai.search.vector import _VectorSolver, _regret_match_matrix
 # Helpers
 # --------------------------------------------------------------------------- #
 
-class UniformPolicy(Policy):
-    """Uniform over the legal actions (a self-contained leaf fleet stand-in)."""
-
-    def strategy(self, state, bias="none"):
-        n = len(state.legal_actions)
-        return np.full(n, 1.0 / n, dtype=np.float32) if n else np.array([], np.float32)
-
-
-def _policies():
-    return {c: UniformPolicy() for c in _BIAS_CLASSES}
-
-
-def _stub_lut(env: PokerEnv) -> None:
-    env.card_info_lut = collections.defaultdict(
-        lambda: collections.defaultdict(lambda: 0)
-    )
-
-
-def _flop_env(low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
-    """Heads-up env advanced to the flop over a small deck (exact runouts)."""
-    np.random.seed(seed)
-    env = PokerEnv(
-        players=[Player(i, s) for i, s in enumerate(stacks)],
-        low_card_rank=low,
-        high_card_rank=high,
-    )
-    _stub_lut(env)
-    guard = 0
-    while env.betting_round < 1 and not env.is_terminal and guard < 20:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
-        guard += 1
-    return env
-
-
-def _preflop_env(low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
-    """Heads-up small-deck env at the preflop root (``street_at_root == 0``).
-
-    The MCCFR isolation fixture: ``_select_regime`` routes a heads-up preflop
-    subgame to MCCFR, and heads-up play extends to showdown, so a ``solve`` walks
-    the full betting tree to real small-deck showdowns.  (Since the router now
-    sends a heads-up *flop* subgame to the vector regime, the MCCFR integration /
-    convergence tests root at the preflop instead — one street earlier, same
-    "walk to showdown, no continuation meta-game" property.)
-    """
-    np.random.seed(seed)
-    env = PokerEnv(
-        players=[Player(i, s) for i, s in enumerate(stacks)],
-        low_card_rank=low,
-        high_card_rank=high,
-    )
-    _stub_lut(env)
-    return env
-
-
-def _advance_to(env: PokerEnv, target_round: int) -> PokerEnv:
-    """Walk a heads-up env (calls/checks only) to ``target_round``."""
-    guard = 0
-    while env.betting_round < target_round and not env.is_terminal and guard < 60:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
-        guard += 1
-    return env
-
-
-def _late_env(target_round, low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
-    """Heads-up small-deck env advanced to ``target_round`` (2=turn, 3=river)."""
-    np.random.seed(seed)
-    env = PokerEnv(
-        players=[Player(i, s) for i, s in enumerate(stacks)],
-        low_card_rank=low,
-        high_card_rank=high,
-    )
-    _stub_lut(env)
-    return _advance_to(env, target_round)
-
-
-def _ctx(env, *, n_rollouts=2, seed=0, ranges=None, folded=None) -> SubgameContext:
-    if ranges is None:
-        ranges = {s: np.ones(env.n_combos, np.float32) / env.n_combos for s in range(2)}
-    leaf = LeafConfig(policies=_policies(), n_rollouts=n_rollouts)
-    return SubgameContext.from_runtime(
-        env=env,
-        my_seat=0,
-        my_hole=tuple(int(c) for c in env.players[0].cards),
-        ranges=ranges,
-        folded_ranges=folded or {},
-        leaf=leaf,
-        rng=np.random.default_rng(seed),
-    )
+from test.search._helpers import (  # noqa: E402  (shared test builders)
+    UniformPolicy,
+    _advance_to,
+    _ctx,
+    _flop_env,
+    _late_env,
+    _policies,
+    _preflop_env,
+    _stub_lut,
+)
 
 
 def _cfg(env_ctx, *, iters=60, discount=20) -> SolverConfig:
@@ -192,40 +111,10 @@ class TestSolverState:
         key = (pk, 7)
         np.testing.assert_allclose(st.sigma(key), [1 / 3, 1 / 3, 1 / 3], atol=1e-6)
 
-    def test_regret_matching(self):
-        st, pk = self._node()
-        key = (pk, 7)
-        st.add_regret(key, np.array([0.0, 3.0, 1.0]))
-        np.testing.assert_allclose(st.sigma(key), [0.0, 0.75, 0.25], atol=1e-6)
-
-    def test_average_sigma_normalises(self):
-        st, pk = self._node()
-        key = (pk, 7)
-        assert st.average_sigma(key) is None
-        st.add_strat(key, np.array([1.0, 0.0, 0.0]))
-        st.add_strat(key, np.array([0.0, 1.0, 1.0]))
-        np.testing.assert_allclose(st.average_sigma(key), [1 / 3, 1 / 3, 1 / 3], atol=1e-6)
-
-    def test_discount_scales_both_tables(self):
-        st, pk = self._node()
-        key = (pk, 7)
-        st.add_regret(key, np.array([2.0, 4.0, 6.0]))
-        st.add_strat(key, np.array([1.0, 2.0, 3.0]))
-        st.discount(0.5)
-        np.testing.assert_allclose(st.regret[key], [1.0, 2.0, 3.0])
-        np.testing.assert_allclose(st.strat_sum[key], [0.5, 1.0, 1.5])
-
-    def test_widening_preserves_columns(self):
-        # A re-search injects a 4th action; old regrets keep their place, the new
-        # column is zero-initialised.
-        st, pk = self._node(("fold", "call", "raise"))
-        key = (pk, 7)
-        st.add_regret(key, np.array([1.0, 2.0, 3.0]))
-        st.add_strat(key, np.array([4.0, 5.0, 6.0]))
-        st.ensure_node(pk, ("fold", "call", "raise", "all_in"), actor=0)
-        np.testing.assert_allclose(st.regret[key], [1.0, 2.0, 3.0, 0.0])
-        np.testing.assert_allclose(st.strat_sum[key], [4.0, 5.0, 6.0, 0.0])
-        assert st.width(pk) == 4
+    # Regret-matching, average normalisation, discount, and column-widening on the
+    # matrix storage are covered by TestVectorRegime (test_state_reads_matrix_rows,
+    # test_ensure_vnode_allocates_and_discount_scales,
+    # test_vnode_widening_grows_columns_preserving_values).
 
     def test_widening_grows_frozen_rows(self):
         st, pk = self._node(("fold", "call"))
@@ -306,83 +195,6 @@ class TestJointSampler:
 
 
 # --------------------------------------------------------------------------- #
-# Freezing gate
-# --------------------------------------------------------------------------- #
-
-class TestFreezing:
-
-    def _solver(self):
-        env = _flop_env(seed=6)
-        ctx = _ctx(env)
-        return _MCCFRSolver(env, SolverState.empty(), ctx, _cfg(ctx), ctx.rng), env, ctx
-
-    def test_frozen_only_when_sampled_hand_is_actual(self):
-        solver, env, ctx = self._solver()
-        my = ctx.my_hole
-        other = next(
-            tuple(env.combo_cards[j]) for j in range(env.n_combos)
-            if tuple(sorted(int(c) for c in env.combo_cards[j])) != tuple(sorted(my))
-        )
-        key = (("flop", ()), 0)
-        solver.state.frozen[key] = np.array([1.0, 0.0])
-        # bot seat, actual hand → frozen
-        assert solver._is_frozen(key, ctx.my_seat, {ctx.my_seat: my})
-        # bot seat, different hand in (possibly) same cluster → NOT frozen
-        assert not solver._is_frozen(key, ctx.my_seat, {ctx.my_seat: tuple(int(c) for c in other)})
-        # non-bot seat → never frozen
-        assert not solver._is_frozen(key, 1, {1: my})
-
-    def test_frozen_sigma_is_returned_verbatim(self):
-        solver, env, ctx = self._solver()
-        key = (("flop", ()), 0)
-        solver.state.legal_at[("flop", ())] = ("fold", "call")
-        pinned = np.array([0.9, 0.1])
-        solver.state.frozen[key] = pinned
-        out = solver._frozen_or(np.array([0.5, 0.5]), key, ctx.my_seat, {ctx.my_seat: ctx.my_hole})
-        np.testing.assert_array_equal(out, pinned)
-
-
-# --------------------------------------------------------------------------- #
-# Regret / strategy pass separation (the blueprint's two-pass structure)
-# --------------------------------------------------------------------------- #
-
-class TestPassSeparation:
-    """The average strategy must be accumulated ONLY by the separate sampled
-    strategy pass (`_update_strategy`), where the traverser's own actions are
-    *sampled* (π_i-reach weighted) — never inside the regret pass, where the
-    traverser *explores* all actions (which would mis-weight by opponent reach).
-    Mirrors blueprint `cfr.py` (regret only) vs `strategy.py` (`update_strategy`)."""
-
-    def _solver(self, seed=5):
-        env = _flop_env(seed=seed)
-        ctx = _ctx(env, seed=1)
-        solver = _MCCFRSolver(env, SolverState.empty(), ctx, _cfg(ctx), ctx.rng)
-        holes = solver._sample_root_holes()
-        return solver, env, holes
-
-    def test_regret_pass_does_not_touch_strategy(self):
-        solver, env, holes = self._solver()
-        hl = [holes[s] for s in range(2)]
-        # Traverse as the seat that actually acts at the flop root — heads-up
-        # that is the big blind (seat 1), who leads post-flop — so the traverser
-        # is guaranteed a decision node in the sampled line.
-        root_actor = env.player_i
-        solver._traverse(env.with_hole_cards(hl), root_actor, holes)
-        assert solver.state.regret, "regret pass should populate regret"
-        assert not solver.state.strat_sum, "regret pass must NOT populate strat_sum"
-
-    def test_strategy_pass_accumulates_strategy(self):
-        solver, env, holes = self._solver()
-        hl = [holes[s] for s in range(2)]
-        root_actor = env.player_i
-        solver._update_strategy(env.with_hole_cards(hl), root_actor, holes)
-        assert solver.state.strat_sum, "strategy pass should populate strat_sum"
-        # only the traverser's own rows are accumulated in its own pass
-        for (pk, _hr) in solver.state.strat_sum:
-            assert solver.state.actor_at[pk] == root_actor
-
-
-# --------------------------------------------------------------------------- #
 # solve() integration
 # --------------------------------------------------------------------------- #
 
@@ -414,21 +226,21 @@ class TestSolveIntegration:
             return solve(env, ctx, _cfg(ctx, iters=30))
 
         r1, r2 = run(), run()
-        assert set(r1.state.regret) == set(r2.state.regret)
-        for k in r1.state.regret:
-            np.testing.assert_allclose(r1.state.regret[k], r2.state.regret[k])
+        assert set(r1.state.vregret) == set(r2.state.vregret)
+        for k in r1.state.vregret:
+            np.testing.assert_allclose(r1.state.vregret[k], r2.state.vregret[k])
 
     def test_warm_start_reuses_state(self):
         env = _preflop_env(seed=9)
         ctx = _ctx(env, seed=2)
         first = solve(env, ctx, _cfg(ctx, iters=20))
-        keys_before = set(first.state.regret)
+        keys_before = set(first.state.vregret)
         # re-search the same root with the carried state
         env2 = _preflop_env(seed=9)
         ctx2 = _ctx(env2, seed=3)
         second = solve(env2, ctx2, _cfg(ctx2, iters=20), warm_start=first.state)
         assert second.state is first.state                 # reused in place
-        assert keys_before <= set(second.state.regret)     # rows preserved/extended
+        assert keys_before <= set(second.state.vregret)    # rows preserved/extended
 
     def test_warm_start_resets_per_search_counters(self):
         # Regression: the walk/cache tallies live on the reused SolverState, so a
@@ -471,7 +283,7 @@ class TestSearchPolicy:
     def _state(self, legal=("fold", "call", "raise")):
         st = SolverState.empty()
         pk = ("flop", ())
-        st.ensure_node(pk, legal, actor=0)
+        st.ensure_vnode(pk, legal, actor=0, n_rows=6, row_space="combo")
         return st, pk
 
     def test_unseen_node_is_uniform(self):
@@ -482,7 +294,7 @@ class TestSearchPolicy:
 
     def test_play_reads_regret_matched(self):
         st, pk = self._state()
-        st.add_regret((pk, 5), np.array([0.0, 3.0, 1.0]))
+        st.vregret[pk][5] = np.array([0.0, 3.0, 1.0])
         sp = SearchPolicy(st, use_average=False)
         np.testing.assert_allclose(
             sp.strategy_for(pk, 5, ("fold", "call", "raise")), [0.0, 0.75, 0.25], atol=1e-6
@@ -490,7 +302,7 @@ class TestSearchPolicy:
 
     def test_average_reads_strat_sum(self):
         st, pk = self._state()
-        st.add_strat((pk, 5), np.array([2.0, 1.0, 1.0]))
+        st.vstrat[pk][5] = np.array([2.0, 1.0, 1.0])
         sp = SearchPolicy(st, use_average=True)
         np.testing.assert_allclose(
             sp.strategy_for(pk, 5, ("fold", "call", "raise")), [0.5, 0.25, 0.25], atol=1e-6
@@ -498,7 +310,7 @@ class TestSearchPolicy:
 
     def test_alignment_remaps_to_caller_order(self):
         st, pk = self._state(("fold", "call", "raise"))
-        st.add_regret((pk, 5), np.array([0.0, 3.0, 1.0]))
+        st.vregret[pk][5] = np.array([0.0, 3.0, 1.0])
         sp = SearchPolicy(st, use_average=False)
         # caller lists actions in a different order
         out = sp.strategy_for(pk, 5, ("raise", "fold", "call"))
@@ -506,7 +318,7 @@ class TestSearchPolicy:
 
     def test_overlay_action_absent_from_row_gets_zero_mass(self):
         st, pk = self._state(("fold", "call", "raise"))
-        st.add_regret((pk, 5), np.array([0.0, 3.0, 1.0]))
+        st.vregret[pk][5] = np.array([0.0, 3.0, 1.0])
         sp = SearchPolicy(st, use_average=False)
         # an injected off-tree action the row has no column for → 0, renormalised
         out = sp.strategy_for(pk, 5, ("fold", "call", "raise", "raise:0.5"))
@@ -520,7 +332,7 @@ class TestSearchPolicy:
         np.testing.assert_allclose(play, [0.2, 0.5, 0.3], atol=1e-6)
         # the average policy ignores frozen (belief uses accumulated strategy)
         avg = SearchPolicy(st, use_average=True).strategy_for(pk, 5, ("fold", "call", "raise"))
-        np.testing.assert_allclose(avg, [1 / 3, 1 / 3, 1 / 3], atol=1e-6)  # no strat_sum → uniform
+        np.testing.assert_allclose(avg, [1 / 3, 1 / 3, 1 / 3], atol=1e-6)  # no vstrat mass → uniform
 
 
 # --------------------------------------------------------------------------- #
@@ -533,16 +345,17 @@ class TestConvergence:
     def _root_range_average(state, root_pk: tuple, width: int) -> np.ndarray:
         """Range-aggregated average strategy at the root node.
 
-        Sums ``strat_sum`` over every hand row at the root public node and
+        Sums the ``vstrat`` matrix over every combo row at the root public node and
         normalises.  Unlike a single hand row — which is only updated on the rare
         traversals that sample exactly that hole — this aggregate accumulates on
-        **every** traversal where the root actor traverses, so it is the
-        low-variance quantity that actually converges under external sampling.
+        **every** traversal where the root actor traverses (the vectorized walk
+        trains all combos at once), so it is the low-variance quantity that actually
+        converges under external sampling.
         """
-        agg = np.zeros(width, dtype=np.float64)
-        for (pk, _hr), row in state.strat_sum.items():
-            if pk == root_pk:
-                agg += row
+        mat = state.vstrat.get(root_pk)
+        if mat is None:
+            return np.full(width, 1.0 / width)
+        agg = mat.sum(axis=0)
         total = agg.sum()
         return agg / total if total > 0 else np.full(width, 1.0 / width)
 
@@ -658,10 +471,10 @@ class TestVectorRegime:
         sv1 = _VectorSolver(env, SolverState.empty(), ctx, cfg, ctx.rng)
         for sv in (sv0, sv1):
             if sv._n_completion:
-                comp = tuple(int(sv._avail[i]) for i in
-                             sv.rng.choice(len(sv._avail), sv._n_completion, replace=False))
+                comp = tuple(int(sv._cmaps.avail[i]) for i in
+                             sv.rng.choice(len(sv._cmaps.avail), sv._n_completion, replace=False))
                 sv._completion = comp
-                sv._refresh_cluster_maps(comp)
+                sv._cmaps.refresh(comp)
         v0 = sv0._walk(env, s0, r0, r1)
         v1 = sv1._walk(env, s1, r1, r0)
         big = abs(float(r0 @ v0)) + abs(float(r1 @ v1)) + 1.0
@@ -729,7 +542,7 @@ class TestVectorRegime:
 
         monkeypatch.setattr(rs, "rank_combos_on_board", spy)
         solver = _VectorSolver(env, SolverState.empty(), ctx, _cfg(ctx, iters=1), ctx.rng)
-        n_candidate = len(solver._avail)
+        n_candidate = len(solver._cmaps.avail)
         for _ in range(40):
             solver.iterate()
         # Ranking happens only at showdown terminals, on the sampled runout's
@@ -805,23 +618,25 @@ class TestVectorRegime:
         ctx = _ctx(env)
         sv = _VectorSolver(env, SolverState.empty(), ctx, _cfg(ctx, iters=1), ctx.rng)
         assert sv._n_completion == 1
-        river = int(sv._avail[0])
-        sv._refresh_cluster_maps((river,))
+        river = int(sv._cmaps.avail[0])
+        sv._cmaps.refresh((river,))
         cc = env.combo_cards
         holds_river = (cc[:, 0] == river) | (cc[:, 1] == river)
         assert holds_river.any(), "fixture must contain combos holding the river card"
-        s = sv._future[0]
+        s = sv._street_at_root + 1                       # the sole future street
         # Combos holding the river are impossible below the chance node → masked.
-        assert np.all(sv._feas[s][holds_river] == 0.0)
-        assert np.all(sv._cluster_of[s][holds_river] == -1)
+        assert np.all(sv._cmaps.feas(s)[holds_river] == 0.0)
+        assert np.all(sv._cmaps.cluster_of(s)[holds_river] == -1)
         # Feasibility == full-board compatibility (root board + the river card);
         # every feasible combo gets a valid dense cluster row within the node.
-        full_board = np.array(sv._root_comm + [river], dtype=np.int64)
+        full_board = np.array(
+            [int(c) for c in env.community_cards] + [river], dtype=np.int64
+        )
         compatible = ~(np.isin(cc[:, 0], full_board) | np.isin(cc[:, 1], full_board))
         assert compatible.any()
-        np.testing.assert_array_equal(sv._feas[s] > 0, compatible)
-        assert np.all(sv._cluster_of[s][compatible] >= 0)
-        assert sv._cluster_of[s][compatible].max() < len(sv._universe[s])
+        np.testing.assert_array_equal(sv._cmaps.feas(s) > 0, compatible)
+        assert np.all(sv._cmaps.cluster_of(s)[compatible] >= 0)
+        assert sv._cmaps.cluster_of(s)[compatible].max() < sv._cmaps.n_rows(s)
 
     def test_unequal_allin_stake_is_matched_not_max(self):
         # Heads-up unequal stacks: a short stack calls all-in for less against a
@@ -950,13 +765,13 @@ class TestSearchLifetimeCaches:
         keys = []
         original = mod.continuation_value_vector
 
-        def wrapper(env, profile, ctx, traverser_seat, runout_cache=None):
+        def wrapper(env, profile, ctx, traverser_seat):
             n = env.n_players
             hk = tuple(tuple(int(c) for c in env.players[s].cards)
                        for s in range(n) if s != traverser_seat)
             keys.append((env.public_key, traverser_seat, hk,
                          tuple(sorted(profile.items()))))
-            return original(env, profile, ctx, traverser_seat, runout_cache=runout_cache)
+            return original(env, profile, ctx, traverser_seat)
 
         monkeypatch.setattr(mod, "continuation_value_vector", wrapper)
         return keys
@@ -1000,36 +815,3 @@ class TestSearchLifetimeCaches:
             np.testing.assert_allclose(r1.state.vregret[k], r2.state.vregret[k])
         # The caches themselves reproduce key-for-key under a fixed seed.
         assert set(r1.state.leaf_value_cache) == set(r2.state.leaf_value_cache)
-
-    def test_forced_runout_terminal_memoises_once(self, monkeypatch):
-        # The MCCFR forced-runout terminal integrates a given all-in once and
-        # reuses it across seats / revisits via SolverState.runout_cache.
-        env = _flop_env(seed=10)
-        ctx = _ctx(env, seed=0)
-        state = SolverState.empty()
-        solver = _MCCFRSolver(env, state, ctx, _cfg(ctx), ctx.rng)
-        term = copy.deepcopy(env)
-        guard = 0
-        while not term.is_terminal and guard < 12:
-            legal = [a for a in term.legal_actions if a is not None]
-            term.step_in_place("all_in" if "all_in" in legal else legal[0])
-            guard += 1
-        if not (term.is_decision_free and solver._use_equity):
-            pytest.skip("flop line did not reach a decision-free runout")
-        ref = copy.deepcopy(term).runout_equity()  # before patching the counter
-
-        calls = {"n": 0}
-        original = PokerEnv.runout_equity
-
-        def spy(self, *a, **k):
-            calls["n"] += 1
-            return original(self, *a, **k)
-
-        monkeypatch.setattr(PokerEnv, "runout_equity", spy)
-        v0 = solver._terminal_value(term, 0)
-        v0b = solver._terminal_value(term, 0)  # same key → hit
-        v1 = solver._terminal_value(term, 1)   # other seat, same key → hit
-        assert calls["n"] == 1
-        assert v0b == v0
-        assert abs(v0 - ref[0]) < 1e-9
-        assert abs(v1 - ref[1]) < 1e-9

@@ -26,7 +26,7 @@ from evaluation.runner import (
 from evaluation.sqlite_logging import ExperimentLog
 from poker_ai.search.leaf import LeafConfig
 from poker_ai.search.solver import SolverConfig
-from test.search.test_solver import UniformPolicy, _policies
+from test.search._helpers import UniformPolicy, _policies
 
 
 # --------------------------------------------------------------------------- #

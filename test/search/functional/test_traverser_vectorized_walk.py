@@ -97,10 +97,8 @@ def test_turn_root_takes_vectorized_walk(seed):
     root_pk = env.public_key
     solver, state = _run(env, ctx, iters=40)
     assert solver._cmaps is not None               # turn root ⇒ cluster machinery
-    # The vectorized walk writes the shared vregret/vstrat matrices (not the
-    # scalar regret/strat_sum dicts).
+    # The vectorized walk writes the shared vregret/vstrat matrices.
     assert state.vregret and state.vstrat
-    assert not state.regret and not state.strat_sum
     assert root_pk in state.vregret
 
 

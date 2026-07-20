@@ -47,7 +47,7 @@ from test.search.brute_force_cfr import (
     turn_exploitability,
     turn_game_value,
 )
-from test.search.test_solver import _ctx, _flop_env, _late_env
+from test.search._helpers import _ctx, _flop_env, _late_env
 
 
 # --------------------------------------------------------------------------- #
@@ -319,7 +319,7 @@ def _install_lossless_lut(env):
 def _river_universe(env, sub):
     """Sorted unique river-street cluster ids over the candidate rivers.
 
-    Mirrors ``_VectorSolver._build_universes`` for the river street, so the dense
+    Mirrors ``ClusterMapper`` universe-building for the river street, so the dense
     row a (hole, river) maps to can be recovered from the solved state.
     """
     cc = env.combo_cards
@@ -434,7 +434,7 @@ _FLOP_FUTURE_NAME = {1: "turn", 2: "river"}
 def _flop_universe(env, sub, depth: int):
     """Sorted unique cluster ids at future-street ``depth`` over all runouts.
 
-    Mirrors ``_VectorSolver._build_universes`` for a flop root: the board at
+    Mirrors ``ClusterMapper`` universe-building for a flop root: the board at
     depth ``d`` is the flop plus a ``d``-card completion, and the universe unions
     the clusters over **every** candidate completion of that depth — so the dense
     row a (hole, board) maps to is recoverable from the solved state.

@@ -316,8 +316,6 @@ def _capture_hero_decision(
             unique_pubkeys=int(stats.unique_pubkeys),
             cache_hits=int(stats.cache_hits),
             cache_misses=int(stats.cache_misses),
-            term_runout=int(stats.term_runout),
-            term_payout=int(stats.term_payout),
             action_played=action,
             action_dist=_dist_json(played_legal, played_probs),
             # How much blueprint prior the search read was shrunk toward at this
