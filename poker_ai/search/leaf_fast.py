@@ -1,12 +1,13 @@
-"""FastState-driven leaf continuation-value rollout (search Cython core, Phase 4b).
+"""FastState-driven leaf continuation-value rollout (search Cython core).
 
-Ports the depth-limit leaf rollout (:func:`poker_ai.search.leaf.continuation_value`,
-the ~74% cost of an MCCFR iteration — a per-leaf ``with_hole_cards`` deepcopy plus a
-``PokerEnv`` make/undo/``policy_state_for`` walk per rollout) onto the compiled
-:class:`poker_ai._core._state.FastState` betting engine.  The FastState is built
-**once** per leaf and make/undo-walked per rollout (the per-leaf deepcopy collapses),
-and terminals settle in-core via ``FastState.payout`` / ``FastState.runout_equity``
-(Phase 4a).
+Ports the traverser-vectorized depth-limit leaf rollout
+(:func:`poker_ai.search.leaf.continuation_value_vector`, the dominant cost of an
+MCCFR iteration — a per-leaf deepcopy plus a ``PokerEnv`` make/undo/``policy_state``
+walk per rollout) onto the compiled :class:`poker_ai._core._state.FastState` betting
+engine.  The FastState is built (or cloned from the walk's own engine) **once** per
+leaf and make/undo-walked per rollout (the per-leaf deepcopy collapses), and the
+reached terminal settles **per traverser combo** in-core via
+:meth:`FastState.vector_payout_concrete`.
 
 **Equilibrium-gated, not byte-identical.**  The rollout draws a fresh 5-card board
 per call (the undealt-deck runout), and the core draws its *own* sample rather than
@@ -16,21 +17,23 @@ therefore infeasible: the fast path consumes ``ctx.rng`` for the per-rollout boa
 draw while the Python reference consumes it inside ``deck.shuffle_undealt()``, so the
 two action-sampling streams diverge even under one seed.  Instead the value is gated
 **statistically and componentwise**: (1) the fast rollout is an unbiased estimator of
-the Python rollout's per-seat value (``test_leaf_fast::test_rollout_unbiased_vs_python``
-— grand means agree within the combined standard error); (2) the two scoring building
-blocks it adds are proven exactly — ``runout_equity`` is byte-identical to ``PokerEnv``
-(``test_faststate_runout``), and the drawn-board ``PolicyState`` (clusters via
-:meth:`FastState.refresh_clusters` + info-set/valid-mask via :func:`_policy_state`)
-matches ``PokerEnv.policy_state`` at the frontier **and across turn/river rollout
-nodes** (``test_leaf_fast::test_policy_state_matches_env_across_streets``).  The
-**policy stays a Python callback**; the ``PolicyState`` is rebuilt from FastState per
-decision with clusters recomputed for the drawn board, so a real ``BlueprintPolicy``
-reads a correct info-set — only the in-core policy-fleet read is deferred (Phase 4c
-crux).
+the Python rollout's per-combo value
+(``test_leaf_fast::test_rollout_vector_unbiased_vs_python`` — grand means agree
+within the combined standard error); (2) the per-combo settlement it adds is proven
+exactly — ``FastState.vector_payout_concrete`` is byte-identical to ``PokerEnv``
+(``test_faststate_vector_payout_concrete``), and the drawn-board ``PolicyState``
+(clusters via :meth:`FastState.refresh_clusters` + info-set/valid-mask via
+:func:`_policy_state`) matches ``PokerEnv.policy_state`` at the frontier **and across
+turn/river rollout nodes**
+(``test_leaf_fast::test_policy_state_matches_env_across_streets``).  The **policy
+stays a Python callback** unless the fleet is a cache-backed ``BlueprintPolicy``, in
+which case the info-set read is served in-core (``core_sigma``); either way the
+clusters are recomputed for the drawn board so a real ``BlueprintPolicy`` reads a
+correct info-set.
 
-Falls back to the pure-Python :func:`continuation_value` when the core is unavailable,
-the frontier carries off-tree injections (its byte-code history / overlay actions are
-not representable — the Phase-3 crux-#1 guard), or the frontier is already terminal.
+Falls back to the pure-Python :func:`continuation_value_vector` when the core is
+unavailable, the frontier carries off-tree injections (its byte-code history /
+overlay actions are not representable), or the frontier is already terminal.
 """
 
 from __future__ import annotations
@@ -44,7 +47,7 @@ from environment.action_space import ACTION_TO_IDX, CANONICAL_ACTIONS
 from environment.poker_env import PolicyState
 from poker_ai.blueprint.tree_utils import sample_index
 from poker_ai.search.context import SubgameContext
-from poker_ai.search.leaf import continuation_value
+from poker_ai.search.leaf import continuation_value_vector
 from poker_ai.search.policy import BiasClass, BlueprintPolicy
 
 logger = logging.getLogger(__name__)
@@ -111,20 +114,30 @@ def _policy_state(fs, legal: Tuple[str, ...]) -> PolicyState:
     )
 
 
-def continuation_value_fast(
+def continuation_value_vector_fast(
     frontier_env,
     profile: Mapping[int, BiasClass],
     ctx: SubgameContext,
-    runout_cache: "dict | None" = None,
+    traverser_seat: int,
 ) -> np.ndarray:
-    """FastState leaf rollout; drop-in for :func:`continuation_value` (see module doc).
+    """FastState per-combo leaf rollout; drop-in for
+    :func:`poker_ai.search.leaf.continuation_value_vector` (search Phase 2).
+
+    The rollout action line is driven on the compiled :class:`FastState` (the
+    phantom traverser hole picks the shared line, opponents hold their concrete
+    sampled holes), and the reached terminal is settled **per traverser combo** via
+    :meth:`FastState.vector_payout_concrete`.  Returns ``(n_combos,)``.  This is
+    **equilibrium-gated, not byte-identical** (the board draw consumes ``ctx.rng``
+    differently from the env shuffle), so it is an unbiased estimator of the Python
+    :func:`continuation_value_vector`; the added per-combo settlement is proven
+    exactly (``FastState.vector_payout_concrete`` == ``PokerEnv`` counterpart).
 
     Falls back to the pure-Python reference on any unrepresentable frontier so the
     result is always defined; the compiled path only ever *accelerates*.
     """
     n = frontier_env.n_players
     cfg = ctx.leaf
-    # Fallbacks (crux-#1 overlay guard + defensive): keep the Python path.
+    n_combos = frontier_env.n_combos
     FastState = _core_state()
     if (
         FastState is None
@@ -132,39 +145,39 @@ def continuation_value_fast(
         or cfg.n_rollouts <= 0
         or getattr(frontier_env, "_extra_legal_actions", None)
     ):
-        return continuation_value(frontier_env, profile, ctx, runout_cache)
+        return continuation_value_vector(frontier_env, profile, ctx, traverser_seat)
 
+    # The MCCFR walk may already run on a FastState (``FastMCCFRAdapter``); then the
+    # frontier is that engine and we CLONE it (a private betting copy to draw boards
+    # on) rather than rebuilding from a PokerEnv.  Off a PokerEnv frontier (the walk
+    # ran in Python) we build fresh.  ``frontier_env.community_cards`` returns the
+    # board *prefix* either way, so the undealt pool below is identical.
+    fast_frontier = getattr(frontier_env, "_fast", None)
     try:
-        fs = FastState.from_poker_env(frontier_env)
+        fs = fast_frontier.clone() if fast_frontier is not None \
+            else FastState.from_poker_env(frontier_env)
     except Exception:
         # Off-tree byte-code history not representable — use the Python rollout.
-        return continuation_value(frontier_env, profile, ctx, runout_cache)
+        return continuation_value_vector(frontier_env, profile, ctx, traverser_seat)
 
     rng = ctx.rng
-    use_equity = cfg.use_decision_free_equity
     lut = frontier_env.card_info_lut
+    combo_cards = frontier_env.combo_cards
 
     prefix = [int(c) for c in frontier_env.community_cards]
     k = 5 - len(prefix)
-    holes = [
-        tuple(int(c) for c in frontier_env.players[i].cards) for i in range(n)
-    ]
-    holes_key = tuple(holes)
     used = set(prefix)
-    for h in holes:
-        used.update(h)
-    full_deck = [int(c) for c in np.unique(frontier_env.combo_cards)]
+    for i in range(n):
+        used.update(int(c) for c in frontier_env.players[i].cards)
+    full_deck = [int(c) for c in np.unique(combo_cards)]
     undealt = np.array([c for c in full_deck if c not in used], dtype=np.int64)
 
-    # Phase 4c: serve the blueprint policy read in-core (skip the per-decision
-    # PolicyState build + Python ``strategy``) when the fleet is a cache-backed
-    # BlueprintPolicy; else ``None`` → the Python callback below.  ``legal`` is
-    # canonical-only here (overlay frontiers already fell back above), so the
-    # canonical→legal map is a clean gather.
+    # Phase 4c in-core blueprint read (skips the per-decision PolicyState build +
+    # Python ``strategy``) when the fleet is a cache-backed BlueprintPolicy; else
+    # ``None`` → the Python callback below.
     core_policy = _resolve_core_policy(cfg.policies, profile)
 
-    cache = runout_cache if runout_cache is not None else {}
-    accum = np.zeros(n, dtype=np.float64)
+    accum = np.zeros(n_combos, dtype=np.float64)
     try:
         for _r in range(cfg.n_rollouts):
             completion = (
@@ -178,8 +191,8 @@ def continuation_value_fast(
                 seat = fs.player_i
                 if seat not in profile:
                     raise ValueError(
-                        f"continuation_value_fast: profile is missing acting seat "
-                        f"{seat}; it must cover every seat that can act."
+                        f"continuation_value_vector_fast: profile is missing acting "
+                        f"seat {seat}; it must cover every seat that can act."
                     )
                 legal = [a for a in fs.legal_actions() if a is not None]
                 bias = profile[seat]
@@ -195,27 +208,14 @@ def continuation_value_fast(
                     )
                 idx = sample_index(rng, probs)
                 tokens.append(fs.step_in_place(legal[idx]))
-            if use_equity and fs.is_decision_free:
-                key = (holes_key, fs.runout_key)
-                eq = cache.get(key)
-                if eq is None:
-                    eq = fs.runout_equity(rng=rng)
-                    cache[key] = eq
-                for i in range(n):
-                    accum[i] += eq[i]
-            else:
-                pay = fs.payout()
-                for i in range(n):
-                    accum[i] += float(pay[i])
+            accum += fs.vector_payout_concrete(traverser_seat, combo_cards)
             for tok in reversed(tokens):
                 fs.undo(tok)
     except Exception:
-        # Never let an unexpected core-path error break a search — fall back and
-        # surface it (visible, not silent) so it can be fixed rather than masked.
         logger.warning(
-            "continuation_value_fast fell back to the Python rollout after an "
-            "unexpected error", exc_info=True,
+            "continuation_value_vector_fast fell back to the Python rollout after "
+            "an unexpected error", exc_info=True,
         )
-        return continuation_value(frontier_env, profile, ctx, runout_cache)
+        return continuation_value_vector(frontier_env, profile, ctx, traverser_seat)
 
     return accum / cfg.n_rollouts

@@ -114,6 +114,105 @@ class FastEnvAdapter:
         )
 
 
+class _McSeatView:
+    """``env.players[s]`` stand-in for the MCCFR walk: live ``is_active`` + the
+    seat's concrete ``cards`` (both read straight off the FastState each access, so
+    make/undo and per-iteration reseat are always reflected)."""
+
+    __slots__ = ("_fast", "_seat")
+
+    def __init__(self, fast, seat: int) -> None:
+        self._fast = fast
+        self._seat = seat
+
+    @property
+    def is_active(self) -> bool:
+        return bool(self._fast.is_seat_active(self._seat))
+
+    @property
+    def cards(self):
+        return self._fast.hole_cards(self._seat)
+
+
+class FastMCCFRAdapter:
+    """``PokerEnv``-shaped facade over a :class:`FastState` for the MCCFR walk.
+
+    Richer than :class:`FastEnvAdapter` (the vector regime is leaf-free and settles
+    range-vs-range): the traverser-vectorized MCCFR walk also reads per-seat holes,
+    the board *prefix* (``community_cards``), the shared ``combo_cards`` / LUT, and
+    settles concretely (:meth:`FastState.vector_payout_concrete`) — and its
+    depth-limit leaf needs a frontier it can clone and draw boards on.  Every member
+    is a thin delegate to the compiled engine (or a threaded solver constant), so the
+    unchanged Python ``_vwalk`` / ``_vchild`` / ``_vmeta_game`` run on it; the leaf
+    (:func:`poker_ai.search.leaf_fast.continuation_value_vector_fast`) detects the
+    exposed ``_fast`` and clones it rather than rebuilding from a ``PokerEnv``.
+    """
+
+    __slots__ = ("_fast", "combo_cards", "n_combos", "card_info_lut", "_players")
+
+    def __init__(self, fast, combo_cards, card_info_lut) -> None:
+        self._fast = fast
+        self.combo_cards = combo_cards
+        self.n_combos = int(combo_cards.shape[0])
+        self.card_info_lut = card_info_lut
+        self._players = [_McSeatView(fast, s) for s in range(fast.n_players)]
+
+    # --- read-only public-state surface (byte-identical to PokerEnv) ---
+    @property
+    def player_i(self) -> int:
+        return self._fast.player_i
+
+    @property
+    def legal_actions(self):
+        return self._fast.legal_actions()
+
+    @property
+    def public_key(self):
+        return self._fast.public_key
+
+    @property
+    def betting_round(self) -> int:
+        return self._fast.betting_round
+
+    @property
+    def is_terminal(self) -> bool:
+        return self._fast.is_terminal
+
+    @property
+    def n_raises_this_round(self) -> int:
+        return self._fast.n_raises_this_round
+
+    @property
+    def n_players(self) -> int:
+        return self._fast.n_players
+
+    @property
+    def n_players_started_round(self) -> int:
+        return self._fast.n_players_started_round
+
+    @property
+    def terminal_board_len(self) -> Optional[int]:
+        return self._fast.terminal_board_len
+
+    @property
+    def community_cards(self):
+        return self._fast.community_cards()
+
+    @property
+    def players(self) -> List[_McSeatView]:
+        return self._players
+
+    # --- make/undo + concrete terminal settlement ---
+    def step_in_place(self, action: str, settle_winners: bool = True):
+        return self._fast.step_in_place(action)
+
+    def undo(self, token) -> None:
+        self._fast.undo(token)
+
+    def vector_payout_concrete(self, seat: int):
+        return self._fast.vector_payout_concrete(seat, self.combo_cards)
+
+
 def build_fast_walk_env(root_env):
     """Return a :class:`FastEnvAdapter` over ``root_env``, or ``None`` to fall back.
 
@@ -145,5 +244,39 @@ def build_fast_walk_env(root_env):
             )
         fast = _cystate.FastState.from_poker_env(root_env)
         return FastEnvAdapter(fast, root_env.combo_cards)
+    except Exception:
+        return None
+
+
+def build_fast_mccfr_env(root_env):
+    """Return a :class:`FastMCCFRAdapter` over ``root_env``, or ``None`` to fall back.
+
+    Called **per MCCFR iteration**: the traverser-vectorized walk re-holes the root
+    each traversal (in-place ``reseat_private_cards`` on the ``PokerEnv``), so the
+    ``FastState`` is rebuilt from the freshly-reseated ``root_env`` (a cheap O(n)
+    copy) rather than mutated.  Falls back (→ the ``PokerEnv`` walk) on the same
+    conditions as :func:`build_fast_walk_env` — core unavailable, off-tree overlay,
+    or construction failure; never raises.
+    """
+    overlay = getattr(root_env, "_extra_legal_actions", None)
+    if overlay:
+        return None
+    try:
+        from poker_ai._core import CORE_AVAILABLE
+        if not CORE_AVAILABLE:
+            return None
+        from poker_ai._core import _state as _cystate
+        if not _cystate.is_configured():
+            from environment.poker_env import (
+                _ACTION_BYTE,
+                _STAGE_ID,
+                RAISE_SIZES_BY_STAGE,
+                MAX_RAISES_PER_ROUND,
+            )
+            _cystate.configure(
+                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND
+            )
+        fast = _cystate.FastState.from_poker_env(root_env)
+        return FastMCCFRAdapter(fast, root_env.combo_cards, root_env.card_info_lut)
     except Exception:
         return None

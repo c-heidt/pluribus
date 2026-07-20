@@ -2899,3 +2899,33 @@ def _settle_traverser(active_players, all_players, pot_chips, rank_mat, count, n
             won[clean] += total * (glob_win[clean] == traverser_pi)
     _score_scalar(np.flatnonzero(~clean).tolist())
     return won
+
+
+_settle_traverser_py = _settle_traverser
+
+try:
+    from poker_ai._core import CORE_AVAILABLE as _CORE_AVAILABLE
+    from poker_ai._core.flags import kernel_enabled as _kernel_enabled
+
+    if _CORE_AVAILABLE and _kernel_enabled("settle_concrete"):
+        from poker_ai._core._runout import settle_traverser as _core_settle_traverser
+
+        def _settle_traverser(active_players, all_players, pot_chips, rank_mat,
+                              count, n, traverser_pi):
+            """Cython-backed per-combo traverser settlement (flag ``settle_concrete``).
+
+            Marshals the plain-integer inputs the kernel wants — per-``player_i``
+            ``order`` and the active columns' global seats — and returns the
+            traverser's chips won per scenario as float64 (integer-valued, matching
+            the pure-Python ``_settle_traverser`` accumulator).
+            """
+            order = [0] * n
+            for p in all_players:
+                order[p.player_i] = p.order
+            active_glob = [p.player_i for p in active_players]
+            out = _core_settle_traverser(
+                rank_mat, list(pot_chips), order, active_glob, traverser_pi, n
+            )
+            return np.asarray(out, dtype=np.float64)
+except ImportError:
+    pass

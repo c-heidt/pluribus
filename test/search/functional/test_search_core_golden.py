@@ -84,17 +84,36 @@ def _solve_mccfr():
     future streets), so the MCCFR golden trace roots at the preflop instead — one
     street earlier, still ``_select_regime`` → MCCFR, and heads-up play extends to
     real showdowns, exercising the full external-sampling walk.
+
+    The digest anchors the **pure-Python** MCCFR path, so pin the Python leaf +
+    PokerEnv walk here: the ambient ``PLURIBUS_SEARCH_CORE`` import-rebinds the leaf
+    to the compiled rollout and enables the FastState walk, and while the walk is
+    byte-identical, the FastState *leaf* is equilibrium-gated (its board draw
+    diverges the RNG stream), so an un-pinned solve under the flag would not match
+    the frozen digest.  The compiled paths have their own gates (walk byte-identity
+    in ``test_mccfr_walk_on_faststate``; leaf unbiasedness in ``test_leaf_fast``).
     """
-    env = _preflop_env(seed=_ENV_SEED)
-    assert env.betting_round == 0 and not env.is_terminal
-    ctx = _ctx(env, seed=_RNG_SEED)
-    cfg = SolverConfig(
-        leaf=ctx.leaf, max_iterations=_N_ITERS, max_wall_seconds=60.0,
-        discount_interval=20, workers=1,
-    )
-    res = solve(env, ctx, cfg)
-    assert res.regime == "mccfr", res.regime
-    return res.state
+    import poker_ai.search.mccfr as _mccfr
+    from poker_ai.search.leaf import continuation_value_vector as _py_leaf
+
+    saved_leaf = _mccfr.continuation_value_vector
+    saved_build = _mccfr.build_fast_mccfr_env
+    _mccfr.continuation_value_vector = _py_leaf         # pin the Python leaf
+    _mccfr.build_fast_mccfr_env = lambda env: None      # force the PokerEnv walk
+    try:
+        env = _preflop_env(seed=_ENV_SEED)
+        assert env.betting_round == 0 and not env.is_terminal
+        ctx = _ctx(env, seed=_RNG_SEED)
+        cfg = SolverConfig(
+            leaf=ctx.leaf, max_iterations=_N_ITERS, max_wall_seconds=60.0,
+            discount_interval=20, workers=1,
+        )
+        res = solve(env, ctx, cfg)
+        assert res.regime == "mccfr", res.regime
+        return res.state
+    finally:
+        _mccfr.continuation_value_vector = saved_leaf
+        _mccfr.build_fast_mccfr_env = saved_build
 
 
 def _solve_vector():

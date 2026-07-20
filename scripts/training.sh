@@ -112,30 +112,23 @@ export PLURIBUS_CHUNK_SIZE=${PLURIBUS_CHUNK_SIZE:-4000000}
 # accordingly (chunk tables need the rest of RAM).
 export PLURIBUS_INDEX_CACHE=${PLURIBUS_INDEX_CACHE:-1}
 export PLURIBUS_INDEX_CAPACITY=${PLURIBUS_INDEX_CAPACITY:-"67108864,268435456,268435456,268435456"}
-# Compiled Cython core for the CFR hot loop.  1 = every worker drives its
-# traversals through poker_ai._core (byte-verified, fallback-retaining); set 0
-# to force the pure-Python path (e.g. the A/B baseline arm).  REQUIRES the shm
-# index cache above (pure-shm reads, no LMDB fallback) — already default-on —
-# and the extension to be BUILT on this node (preflight check below).
+# Compiled Cython core for CFR training — the SINGLE operator switch.  1 = every
+# worker drives its traversals through poker_ai._core (the compiled walk) AND every
+# byte-identical kernel the training hot path uses — ``evaluator`` + ``settlement``
+# fire at each showdown terminal (FastState.payout() calls back into them); the
+# rest (``info_set``/``regret_match``/``index_hash``) are bypassed in-core and the
+# search-only ones never fire here, so lighting them costs nothing.  Byte-verified
+# (the golden trace digest is unchanged with kernels on) and fallback-retaining;
+# set 0 to force the pure-Python A/B baseline arm.  REQUIRES the shm index cache
+# above (pure-shm reads, no LMDB fallback) — already default-on — and the extension
+# to be BUILT on this node (preflight below).
 export PLURIBUS_CFR_CORE=${PLURIBUS_CFR_CORE:-1}
-# Per-node compiled kernels.  Comma-separated names, or ``all``.  These gate
-# INDEPENDENTLY of PLURIBUS_CFR_CORE above and default to "" (= every kernel OFF,
-# pure-Python reference) when unset — so leaving this unset silently gave up the
-# kernels even with the core on.
-#
-# They are NOT redundant with PLURIBUS_CFR_CORE.  The core owns the *walk*, but
-# FastState.payout() is deliberately a separate value layer that calls back into
-# the Python ``default_evaluator.evaluate`` + ``Pot.compute_utility`` — so the
-# ``evaluator`` and ``settlement`` kernels stay live on the training hot path at
-# every showdown terminal.  The rest (``info_set``/``regret_match``/``index_hash``)
-# are bypassed in-core and the search-only ones (``showdown``/``runout``/
-# ``regret_match_matrix``) never fire here; enabling them costs nothing.
-#
-# Every kernel is a byte-identical drop-in: the golden trace digest is unchanged
-# between PLURIBUS_CORE_KERNELS="" and "all" (verified), so ``all`` is a pure
-# throughput win.  Set "" to force the pure-Python A/B baseline arm.  Requires the
-# extension to be BUILT (same preflight as the core below).
-export PLURIBUS_CORE_KERNELS=${PLURIBUS_CORE_KERNELS:-all}
+# Developer override — normally UNSET.  A comma-separated kernel allow-list (or
+# ``all``) that A/B's individual kernels against their pure-Python oracles in
+# isolation; when set it WINS over PLURIBUS_CFR_CORE for the per-kernel gates (the
+# walk still follows PLURIBUS_CFR_CORE).  Leave unset in production — the master
+# switch above already lights every kernel.
+export PLURIBUS_CORE_KERNELS=${PLURIBUS_CORE_KERNELS:-}
 # Deferred-durability allocation.  1 = the shm index cache assigns info-set row
 # numbers under its own lightweight lock and LMDB is written in bulk only at
 # checkpoints — taking the LMDB single-writer mutex off the allocation hot path
@@ -178,7 +171,7 @@ fi
 # flag being set proves nothing; assert the rebind actually happened.  Checked
 # for the two kernels that are live on the training hot path (FastState.payout
 # calls both at every showdown terminal); the others are bypassed in-core.
-if [ -n "$PLURIBUS_CORE_KERNELS" ]; then
+if [ "$PLURIBUS_CFR_CORE" = "1" ] || [ -n "$PLURIBUS_CORE_KERNELS" ]; then
   if ! python - <<'PY'
 import sys
 import poker_ai  # FIRST — mirror the console-script entry order exactly.  The
@@ -199,10 +192,10 @@ print("Compiled kernels live on the hot path: %s"
       % (", ".join(k for k, ok in live.items() if ok) or "(none — pure Python)"))
 PY
   then
-    echo "ERROR: PLURIBUS_CORE_KERNELS=$PLURIBUS_CORE_KERNELS but a requested kernel" >&2
-    echo "       silently fell back to pure Python (extension missing or stale)." >&2
+    echo "ERROR: the training core is on but a compiled kernel silently fell back" >&2
+    echo "       to pure Python (extension missing or stale)." >&2
     echo "       Rebuild on this node:  python setup.py build_ext --inplace" >&2
-    echo "       (or set PLURIBUS_CORE_KERNELS= to run the pure-Python path)." >&2
+    echo "       (or set PLURIBUS_CFR_CORE=0 to run the pure-Python path)." >&2
     exit 1
   fi
 fi
@@ -350,8 +343,8 @@ echo "  - Warm start:                  ${WARM_START:-(none)}"
 echo "  - CPUs:                        $SLURM_CPUS_PER_TASK"
 echo "  - PLURIBUS_CFR_BATCH_SIZE:     $PLURIBUS_CFR_BATCH_SIZE"
 echo "  - PLURIBUS_STRATEGY_PER_JOB:   ${PLURIBUS_STRATEGY_PER_JOB:-1}"
-echo "  - PLURIBUS_CFR_CORE:           $PLURIBUS_CFR_CORE"
-echo "  - PLURIBUS_CORE_KERNELS:       ${PLURIBUS_CORE_KERNELS:-(none — pure Python)}"
+echo "  - PLURIBUS_CFR_CORE:           $PLURIBUS_CFR_CORE  (1 = walk + all kernels)"
+echo "  - Kernel override (dev):       ${PLURIBUS_CORE_KERNELS:-(none — master switch drives all)}"
 echo "  - PLURIBUS_DEFERRED_ALLOC:     $PLURIBUS_DEFERRED_ALLOC"
 echo "  - PLURIBUS_INDEX_CACHE:        $PLURIBUS_INDEX_CACHE"
 echo "  - PLURIBUS_INDEX_CAPACITY:     $PLURIBUS_INDEX_CAPACITY"

@@ -30,6 +30,7 @@ from environment.utils import make_deck_arr
 from poker_ai.blueprint.tree_utils import sample_index
 from poker_ai.search.cluster_maps import ClusterMapper
 from poker_ai.search.context import SubgameContext
+from poker_ai.search.fast_env import build_fast_mccfr_env
 from poker_ai.search.leaf import continuation_value_vector
 from poker_ai.search.policy import BiasClass
 from poker_ai.search.solver_state import SolverConfig, SolverState
@@ -39,6 +40,24 @@ from poker_ai.search.vform import (
     regret_match_matrix,
     traverser_update,
 )
+
+# Search Cython core (Phase 2): when built AND ``PLURIBUS_SEARCH_CORE=1``, the
+# depth-limit leaf rollout runs on the compiled ``FastState`` engine, settling each
+# terminal per-combo via ``FastState.vector_payout_concrete``.  Rebinds the module
+# global the walk resolves at call time (``_vleaf_value``), so the swap is
+# transparent; falls back to the pure-Python ``continuation_value_vector`` when the
+# core is unavailable or the flag is off.  Equilibrium-gated (not byte-identical):
+# the rollout board draw consumes ``ctx.rng`` differently from the env shuffle.
+try:
+    from poker_ai._core import CORE_AVAILABLE as _CORE_AVAILABLE
+    from poker_ai._core.flags import search_core_enabled as _search_core_enabled
+
+    if _CORE_AVAILABLE and _search_core_enabled():
+        from poker_ai.search.leaf_fast import (
+            continuation_value_vector_fast as continuation_value_vector,
+        )
+except ImportError:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +188,30 @@ class _MCCFRSolver:
             else ClusterMapper(root_env.card_info_lut, root_env.combo_cards,
                                root_env.community_cards, street)
         )
+        # Search Cython core (Phase 3): when enabled and the search is overlay-free,
+        # the walk runs on the compiled FastState engine (make/undo + concrete
+        # settlement in-core, leaf rollout via the cloned frontier).  The walk
+        # re-holes the root every iteration, so the FastState is rebuilt per
+        # traversal (:meth:`_make_walk_env`); a build that returns ``None`` falls
+        # back to the PokerEnv walk for that iteration.  Equilibrium-gated, not
+        # byte-identical (the FastState leaf's board draw diverges the RNG stream).
+        self._use_core = False
+        try:
+            from poker_ai._core import CORE_AVAILABLE
+            from poker_ai._core.flags import search_core_enabled
+            self._use_core = bool(CORE_AVAILABLE and search_core_enabled())
+        except ImportError:
+            pass
         self._iter = 0
+
+    def _make_walk_env(self, env):
+        """The env the walk traverses this iteration: a fresh FastState adapter over
+        the just-reseated root under the search core, else the ``PokerEnv`` itself."""
+        if self._use_core:
+            fast = build_fast_mccfr_env(env)
+            if fast is not None:
+                return fast
+        return env
 
     # ------------------------------------------------------------------
     # One traversal
@@ -192,8 +234,9 @@ class _MCCFRSolver:
         env = self.root_env
         env.reseat_private_cards(holes_list, rng=self._board_rng, full_deck=self._full_deck)
         # Single vectorized walk: regret + average strategy in one pass over the
-        # traverser's whole range (opponents/chance still sampled).
-        self._vectorized_iterate(env, i, holes)
+        # traverser's whole range (opponents/chance still sampled).  Under the search
+        # core the walk runs on a FastState adapter built from the reseated root.
+        self._vectorized_iterate(self._make_walk_env(env), i, holes)
 
     def restore_root(self) -> None:
         """Rewind ``root_env`` to its pristine card-state after the in-place walk.
@@ -354,8 +397,9 @@ class _MCCFRSolver:
             # root community), folded into the future-street cluster ids exactly
             # as the vector regime folds its sampled completion.  Only turn/river
             # roots reach future streets; leaf-containing roots (cmaps is None) cut
-            # to a leaf first.
-            runout = env.deck.board_runout(5)
+            # to a leaf first.  Read the runout off the PokerEnv root (``env`` here
+            # may be the deck-less FastState adapter) — reseat already froze it.
+            runout = self.root_env.deck.board_runout(5)
             completion = tuple(int(c) for c in runout[self._root_len:])
             self._cmaps.refresh(completion)
         # Traverser root reach: its board-masked range, additionally masked to

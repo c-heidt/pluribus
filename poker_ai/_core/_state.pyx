@@ -317,6 +317,53 @@ cdef class FastState:
                 s._push_hist_code(si, s._resolve_code(table, token))
         return s
 
+    def clone(self):
+        """Return an independent deep copy of this betting state (search Phase 3).
+
+        Copies every config + mutable betting field + resolved history into a fresh
+        ``FastState`` with its **own empty make/undo stack**, so a leaf rollout (or a
+        parallel branch) can make/undo-walk the copy without disturbing this one.
+        The clone shares no mutable state with ``self``.  Used by the MCCFR walk to
+        hand the depth-limit leaf a private frontier it can draw boards on and
+        walk to terminals independently of the parent traversal.
+        """
+        cdef FastState c = FastState.__new__(FastState)
+        cdef int i, j, s
+        c.n_players = self.n_players
+        c.small_blind = self.small_blind
+        c.big_blind = self.big_blind
+        c._low_card_rank = self._low_card_rank
+        c._high_card_rank = self._high_card_rank
+        c.betting_stage = self.betting_stage
+        c.player_i_index = self.player_i_index
+        c.n_raises = self.n_raises
+        c.n_actions = self.n_actions
+        c.skip_counter = self.skip_counter
+        c.last_raise_amount = self.last_raise_amount
+        c.n_players_started_round = self.n_players_started_round
+        c._terminal_board_len = self._terminal_board_len
+        for i in range(6):
+            for j in range(MAX_PLAYERS):
+                c.player_i_lut[i][j] = self.player_i_lut[i][j]
+        for s in range(MAX_PLAYERS):
+            c.hole[s][0] = self.hole[s][0]
+            c.hole[s][1] = self.hole[s][1]
+            c.order[s] = self.order[s]
+            c.n_chips[s] = self.n_chips[s]
+            c.n_bet_chips[s] = self.n_bet_chips[s]
+            c.is_active[s] = self.is_active[s]
+            c.pot_chips[s] = self.pot_chips[s]
+            for j in range(N_DECISION_STAGES):
+                c.clusters[s][j] = self.clusters[s][j]
+                c.has_cluster[s][j] = self.has_cluster[s][j]
+        for i in range(5):
+            c.board[i] = self.board[i]
+        for i in range(N_DECISION_STAGES):
+            c.hist_n[i] = self.hist_n[i]
+            for j in range(self.hist_n[i]):
+                c.hist[i][j] = self.hist[i][j]
+        return c
+
     def set_board(self, board):
         """Overwrite the 5-card board (Phase 4b leaf rollout).
 
@@ -397,6 +444,23 @@ cdef class FastState:
     @property
     def betting_round(self):
         return self.betting_stage
+
+    def hole_cards(self, int seat):
+        """The two concrete hole cards dealt to ``seat`` (search Phase 3 adapter)."""
+        return (self.hole[seat][0], self.hole[seat][1])
+
+    def community_cards(self):
+        """Board cards public at the current street — the prefix of the 5-card board.
+
+        ``_BOARD_LEN[betting_stage]`` gives the public count (0 pre-flop, 3 flop,
+        4 turn, 5 river/terminal), so this equals ``PokerEnv.community_cards`` at
+        every node — the MCCFR adapter reads it for the leaf frontier prefix and
+        card-removal masks, and it returns the full five at a terminal (as the
+        concrete settlement expects).
+        """
+        cdef int blen = _BOARD_LEN[self.betting_stage]
+        cdef int k
+        return [self.board[k] for k in range(blen)]
 
     # ------------------------------------------------------------------
     # Search public-state surface (Phase 3) — mirrors PokerEnv exactly so the
@@ -975,6 +1039,93 @@ cdef class FastState:
         return range_showdown.fold_cfv(
             valid, combo_cards, opp_reach, sign * gain, removal
         )
+
+    def vector_payout_concrete(self, int traverser_seat, combo_cards):
+        """Per-combo chip delta to ``traverser_seat`` at a terminal with **concrete**
+        opponents — byte-identical to ``PokerEnv.vector_payout_concrete`` (search
+        Phase 2).
+
+        The traverser-vectorized MCCFR terminal / leaf settlement moved in-core: the
+        caller supplies the shared ``combo_cards``; everything else reads FastState
+        fields (per-seat holes, the complete board, contributions, active mask, bet
+        order — the engine owns them).  Every *other* seat holds a single concrete
+        sampled hand, so only the traverser's own hand varies per combo.  Returns a
+        ``(n_combos,)`` float64 chip delta (``0`` on combos the traverser cannot hold
+        given the board + other seats' cards).  Settles via the module-level
+        ``_settle_traverser`` (core-backed under the ``settle_concrete`` flag), so the
+        method is byte-identical to the env by construction — only the field source
+        differs.  The board is complete (5 cards) at every terminal a leaf rollout or
+        MCCFR walk reaches.
+        """
+        import numpy as np
+        from environment import range_showdown
+        from environment.evaluator import default_evaluator
+        from environment.poker_env import _settle_traverser
+        from environment.player import Player
+
+        if not self.is_terminal:
+            raise ValueError(
+                "vector_payout_concrete is only defined at a terminal node."
+            )
+        n = self.n_players
+        seat = traverser_seat
+        contribution = float(self.pot_chips[seat])
+        n_combos = combo_cards.shape[0]
+        community = [self.board[k] for k in range(5)]
+
+        # Feasibility: the traverser's combo shares no card with the board or any
+        # OTHER seat's concrete hole.  Impossible combos return 0.
+        excluded = set(community)
+        for s in range(n):
+            if s != seat:
+                excluded.add(self.hole[s][0])
+                excluded.add(self.hole[s][1])
+        excl = np.fromiter(excluded, dtype=combo_cards.dtype, count=len(excluded))
+        feasible = ~(
+            np.isin(combo_cards[:, 0], excl) | np.isin(combo_cards[:, 1], excl)
+        )
+
+        # (i) traverser folded → forfeits its contribution regardless of hand.
+        if self.is_active[seat] == 0:
+            return np.where(feasible, -contribution, 0.0)
+
+        # Rank the traverser's combos once; each opponent ranks to a scalar.  Build
+        # ``rank_mat`` (n_combos, n_active) column-aligned to the active seats.
+        active_seats = [s for s in range(n) if self.is_active[s] != 0]
+        trav_ranks, _ = range_showdown.rank_combos_on_board(combo_cards, community)
+        trav_ranks = trav_ranks.copy()
+        trav_ranks[~feasible] = range_showdown._SENTINEL_RANK
+        opp_hands = [
+            [self.hole[s][0], self.hole[s][1]] + community
+            for s in active_seats if s != seat
+        ]
+        opp_ranks = (
+            default_evaluator.evaluate_batch(np.asarray(opp_hands, dtype=np.int64))
+            if opp_hands else np.empty(0, dtype=np.int64)
+        )
+        rank_mat = np.empty((n_combos, len(active_seats)), dtype=np.int64)
+        oi = 0
+        for a, s in enumerate(active_seats):
+            if s == seat:
+                rank_mat[:, a] = trav_ranks
+            else:
+                rank_mat[:, a] = opp_ranks[oi]
+                oi += 1
+
+        # Player stubs carry the plain ``order`` / ``player_i`` the settlement wants
+        # (as ``payout`` builds them); ``_settle_traverser`` marshals ints from these.
+        stub = [Player(s) for s in range(n)]
+        for s in range(n):
+            stub[s].order = self.order[s]
+            stub[s].is_active = self.is_active[s] != 0
+        active_players = [stub[s] for s in active_seats]
+        pot_chips = [self.pot_chips[s] for s in range(n)]
+        won = _settle_traverser(
+            active_players, stub, pot_chips, rank_mat, n_combos, n, seat
+        )
+        cfv = won - contribution
+        cfv[~feasible] = 0.0
+        return cfv
 
     # ------------------------------------------------------------------
     # Decision-free all-in runout (Phase 4a) — the shared terminal the MCCFR

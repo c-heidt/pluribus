@@ -16,6 +16,9 @@ Kernel                       Pure-Python oracle (source of truth)
 ``_index.pyx``               ``poker_ai.tables.index`` hash + ``ShmIndexCache``
 ``_eval.pyx``                ``environment.evaluator`` (_five/_six/_seven)
 ``_settle.pyx``              ``environment.pot.Pot.compute_utility``
+``_showdown.pyx``            ``environment.range_showdown`` CFV kernels
+``_runout.pyx``              ``environment.poker_env`` ``_settle_runout`` (all-in
+                             board-average) + ``_settle_traverser`` (per-combo)
 ``_probe.pyx``               memoryview-seam build probe (Phase 0)
 ===========================  ==================================================
 
@@ -25,10 +28,11 @@ pure-Python reference as the source of truth, so a build without a C toolchain
 :data:`CORE_AVAILABLE` reports whether the extension compiled and imported;
 callers gate on it and fall back to Python when it is ``False``.
 
-Each kernel is opt-in per :mod:`poker_ai._core.flags` (the
-``PLURIBUS_CORE_KERNELS`` env var); Phase 1 wires them behind that flag as
-byte-identical drop-ins, and Phase 3 adds the top-level ``PLURIBUS_CFR_CORE``
-in-core traversal.
+The compiled core is driven by **one master switch per pipeline** —
+``PLURIBUS_SEARCH_CORE`` (real-time search) and ``PLURIBUS_CFR_CORE`` (blueprint
+training) — each of which lights the compiled walk *and* every byte-identical
+kernel that pipeline uses (see :mod:`poker_ai._core.flags`).
+``PLURIBUS_CORE_KERNELS`` is a developer-only per-kernel override for parity A/B.
 """
 
 # Re-exported (when built) so callers use ``poker_ai._core.core_build_ok()``

@@ -40,8 +40,10 @@ if _core.CORE_AVAILABLE:
     )
     from poker_ai._core import _state as _cystate
     from poker_ai.search.context import SubgameContext
-    from poker_ai.search.leaf import LeafConfig, continuation_value
-    from poker_ai.search.leaf_fast import _resolve_core_policy, continuation_value_fast
+    from poker_ai.search.leaf import LeafConfig, continuation_value_vector
+    from poker_ai.search.leaf_fast import (
+        _resolve_core_policy, continuation_value_vector_fast,
+    )
     from poker_ai.search.policy import BlueprintPolicy
     from poker_ai.tables.cfr_tables import CFRTables
     from poker_ai.tables.index import lmdb_map_size_for_players
@@ -193,16 +195,18 @@ def _ctx(env, policy, n_rollouts, seed):
 
 
 def test_rollout_in_core_policy_unbiased_vs_python(tmp_path):
-    """End-to-end: with a cache-backed BlueprintPolicy fleet the fast rollout takes
-    the IN-CORE policy path and stays an unbiased estimator of the Python-callback
-    rollout using the SAME blueprint.  They differ only in the (same-distribution)
-    board draw + rng and in core_sigma-vs-strategy (proven <1e-6), so the per-seat
-    grand means must agree within Monte-Carlo error.  Confirms the full integration
-    (in-core read + fallback + bias + remap + runout scoring) end to end.
+    """End-to-end: with a cache-backed BlueprintPolicy fleet the fast per-combo
+    rollout takes the IN-CORE policy path and stays an unbiased estimator of the
+    Python-callback rollout using the SAME blueprint.  They differ only in the
+    (same-distribution) board draw + rng and in core_sigma-vs-strategy (proven
+    <1e-6), so the per-combo grand means must agree within Monte-Carlo error.
+    Confirms the full integration (in-core read + fallback + bias + remap + per-combo
+    settlement) end to end.
     """
     env = _flop_frontier(7)
     active = [s for s in range(env.n_players) if env.players[s].is_active]
     profile = {s: "none" for s in active}
+    traverser = active[0]
 
     # Populate the deterministic reference line's keys so some decisions HIT a
     # non-uniform blueprint (others miss → uniform); correctness holds either way.
@@ -227,19 +231,18 @@ def test_rollout_in_core_policy_unbiased_vs_python(tmp_path):
             vals = []
             for b in range(B):
                 ctx = _ctx(env, policy, R, seed=base_seed * 100 + b)
-                fn = continuation_value_fast if fast else continuation_value
-                vals.append(fn(copy.deepcopy(env), profile, ctx, runout_cache={}))
-            arr = np.array(vals)
+                fn = continuation_value_vector_fast if fast else continuation_value_vector
+                vals.append(fn(copy.deepcopy(env), profile, ctx, traverser))
+            arr = np.array(vals)                       # (B, n_combos)
             return arr.mean(0), arr.std(0, ddof=1) / np.sqrt(B)
 
         m_fast, se_fast = estimate(True, 1)
         m_py, se_py = estimate(False, 2)
         sem = np.sqrt(se_fast ** 2 + se_py ** 2)
         gap = np.abs(m_fast - m_py)
-        assert abs(float(m_fast.sum())) < 1e-6 and abs(float(m_py.sum())) < 1e-6
         assert np.all(gap < 4.0 * sem + 0.5), (
-            f"in-core-policy rollout biased vs python: gap={np.round(gap,3)} "
-            f"sem={np.round(sem,3)} fast={np.round(m_fast,2)} py={np.round(m_py,2)}")
+            f"in-core-policy rollout biased vs python: max gap={float(gap.max()):.3f} "
+            f"at combo {int(gap.argmax())} (sem there={float(sem[gap.argmax()]):.3f})")
     finally:
         tables.close()
 
