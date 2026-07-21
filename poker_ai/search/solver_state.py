@@ -80,6 +80,44 @@ class SolverConfig:
     # in the empirical bimodal gap between noise and genuine mass.  ``0.0`` disables
     # the shrinkage (pure search rows, the pre-shrinkage behaviour).
     blueprint_prior_kappa: float = 5.0
+    # Structural iteration budget (§6.5) — the *primary* stop.  A real subgame is far
+    # too large for any single sampled replica to reach a tight equilibrium online, so
+    # there is **no online convergence test**; instead the per-subgame iteration count
+    # is derived from the subgame's *structure*, which is machine-independent (unlike a
+    # wall cap) and known up front.  ``poker_ai.search.budget.iteration_budget`` reads
+    # these; ``max_iterations`` is the absolute safety ceiling and ``max_wall_seconds``
+    # a loose backstop.  **Off by default** so a flat ``max_iterations`` is honoured
+    # verbatim (every existing test / pinned digest that sets an explicit iteration
+    # count is unchanged); production turns it on in ``build_blueprint_session``.
+    auto_budget: bool = False
+    # Vector regime (heads-up flop/turn/river): **full-width**, so iterations-to-
+    # converge is driven by tree *depth* (streets left to resolve), not the infoset
+    # count — a per-stage constant ``(flop, turn, river)``.  The 200-buckets/street
+    # infoset counts (~746k flop / ~89k turn / ~26k river) only bound the per-iteration
+    # wall (flop ≈ 1500 it × 746k rows ≈ tens of s/replica — the paper's 1–33 s).
+    vector_budget_by_street: tuple = (1500, 1000, 500)  # (flop, turn, river)
+    # MCCFR regime (multiway, or heads-up pre-flop): **sampled**, and only the HOT PATH
+    # needs to converge — rarely-reached infosets fall back to the blueprint via the
+    # ``blueprint_prior_kappa`` shrinkage — so the budget is a **GLOBAL** (pooled-over-
+    # all-W-replicas) iteration count, split among the replicas: per-replica =
+    # ``ceil(global / workers)``.  More workers ⇒ **shorter wall at ~constant total
+    # work**, because the merged average pools every replica's samples so what matters
+    # is bounding the *total* sampled work — unlike the full-width vector regime, whose
+    # replicas each need the whole per-replica learning horizon (so vector stays a
+    # per-replica constant, not divided).  The global budget grows ~linearly with the
+    # live-player count (bigger hot path); clamped to ``[min, max]``.  **UNCALIBRATED
+    # at multiway scale** (no multiway blueprint yet) — see
+    # ``project_search_stopping_criterion``.
+    mccfr_global_per_player: int = 3000
+    mccfr_global_min: int = 6000
+    mccfr_global_max: int = 30000
+    # Per-replica **learning floor**: every replica runs at least this many iterations,
+    # so it learns properly even when the global budget divided by a large ``workers``
+    # would otherwise leave it starved (an under-learned replica pollutes the merged
+    # average).  Effectively raises the global budget to ``mccfr_min_per_replica ×
+    # workers`` once the plain division would fall below the floor — "a little higher
+    # for more workers".  Wall keeps shrinking with W down to this floor, then flattens.
+    mccfr_min_per_replica: int = 750
 
 
 class _CountingCache:

@@ -110,11 +110,14 @@ def run_loop(solver, state: SolverState, cfg: SolverConfig) -> Tuple[int, str]:
     This *is* the orchestrator's serial loop (Linear-CFR discount on the
     ``discount_interval`` cadence, stop on ``max_iterations`` **or**
     ``max_wall_seconds``); :func:`solve` and every replica share it so the
-    single-worker path stays bit-for-bit identical.  ``stop_reason`` is which of
-    the two budget caps ended the loop (eval doc §6 ``decisions.stop_reason``):
-    ``'wall_cap'`` if the wall-clock check broke early, else ``'iteration_cap'``
-    (the loop ran the full ``max_iterations``, including the degenerate 0-iteration
-    case).
+    single-worker path stays bit-for-bit identical.  The binding ``max_iterations``
+    is the **structural iteration budget** :func:`solve` computed for this subgame
+    (:mod:`poker_ai.search.budget`) — a real subgame is too large for any single
+    replica to reach a tight equilibrium online, so the stop is a machine-independent
+    per-subgame iteration count, not an online convergence test.  ``stop_reason`` is
+    which cap ended the loop (eval doc §6 ``decisions.stop_reason``): ``'wall_cap'``
+    if the wall-clock backstop broke early, else ``'iteration_cap'`` (the loop ran the
+    full budget, including the degenerate 0-iteration case).
     """
     start = time.perf_counter()
     delta = cfg.discount_interval

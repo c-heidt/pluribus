@@ -111,7 +111,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     iterations      INTEGER,
     wall_seconds    REAL,
     iters_per_sec   REAL,
-    stop_reason     TEXT,
+    stop_reason     TEXT,      -- 'iteration_cap' | 'wall_cap'
     node_count      INTEGER,
     unique_pubkeys  INTEGER,
     cache_hits      INTEGER,

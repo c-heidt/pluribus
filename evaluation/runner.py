@@ -871,7 +871,7 @@ def build_blueprint_session(
     n_rollouts: int = 20,
     use_decision_free_equity: bool = True,
     max_iterations: int = 5_000,
-    max_wall_seconds: float = 10.0,
+    max_wall_seconds: float = 60.0,
     discount_interval: int = 100,
     workers: Optional[int] = None,
     bias_multiplier: float = 5.0,
@@ -935,8 +935,12 @@ def build_blueprint_session(
         n_rollouts=n_rollouts,
         use_decision_free_equity=use_decision_free_equity,
     )
+    # ``auto_budget=True`` makes each search run the structural per-subgame iteration
+    # budget (:mod:`poker_ai.search.budget`) instead of a flat count; ``max_iterations``
+    # is then the absolute ceiling and ``max_wall_seconds`` a loose backstop.
     solver_cfg = SolverConfig(
         leaf=leaf,
+        auto_budget=True,
         max_iterations=max_iterations,
         max_wall_seconds=max_wall_seconds,
         discount_interval=discount_interval,

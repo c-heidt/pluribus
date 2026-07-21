@@ -15,12 +15,14 @@ SolverState, SearchResult``.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from poker_ai.search.budget import iteration_budget
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.mccfr import _MCCFRSolver
 from poker_ai.search.parallel import (
@@ -68,7 +70,9 @@ class SearchResult:
         (MCCFR) or ``'exact_range'`` (vector).  Together ``(regime, leaf_mode)`` is
         the "solver approach" the evaluation groups on (eval doc §6, §8).
     stop_reason : str
-        Which budget cap ended the search: ``'iteration_cap'`` or ``'wall_cap'``.
+        Which cap ended the search: ``'iteration_cap'`` (ran the full structural
+        iteration budget — the normal case) or ``'wall_cap'`` (the wall backstop
+        broke early).
     stats : SearchStats
         Walk/cache instrumentation counters (node/tree size, cache hit/miss),
         snapshotted for the ``decisions`` grain (eval doc §9.1).
@@ -178,6 +182,14 @@ def solve(
     """
     regime = _select_regime(ctx)
     workers = resolve_workers(getattr(cfg, "workers", 1))
+    # Structural iteration budget (§6.5): replace ``max_iterations`` with the
+    # per-replica count derived from the subgame's structure — vector = per-stage
+    # constant (each full-width replica needs the whole learning horizon); MCCFR = a
+    # global pooled budget split across the ``workers`` replicas (per-replica =
+    # ceil(global/workers), so more workers shorten the wall at ~constant total work).
+    # The primary, machine-independent stop; the original ``max_iterations`` stays the
+    # absolute per-replica ceiling.  ``auto_budget=False`` leaves it untouched.
+    cfg = dataclasses.replace(cfg, max_iterations=iteration_budget(ctx, cfg, workers))
     # Both regimes parallelize the same way (§6.7 row 11): W independent replicas,
     # merged once.  The vector regime is chance-sampled (one river per iteration),
     # so its replicas draw independent river substreams and summing their regrets
