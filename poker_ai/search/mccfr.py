@@ -35,6 +35,7 @@ from poker_ai.search.leaf import continuation_value_vector
 from poker_ai.search.policy import BiasClass
 from poker_ai.search.solver_state import SolverConfig, SolverState
 from poker_ai.search.vform import (
+    apply_model_clamp,
     freeze_combo,
     node_sigma,
     regret_match_matrix,
@@ -439,6 +440,11 @@ class _MCCFRSolver:
         # Shared vector-form preamble + freezing (§6.5, §5 — see :mod:`vform`).
         sigma, regret, strat = node_sigma(
             self.state, pk, legal, actor, is_root, n_rows, row_space, cof
+        )
+        # Opponent-model clamp (opponent_modeling §5.2) — no-op without models.
+        # Before `freeze_combo` so the bot's pinned actual-hand row always wins.
+        sigma = apply_model_clamp(
+            sigma, self.ctx, self.state, env, pk, actor, len(legal), self._combo_cards
         )
         frozen_combo = freeze_combo(
             self.state, pk, sigma, is_root, actor, self._my_seat, self._my_combo

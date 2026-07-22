@@ -58,6 +58,7 @@ from poker_ai.search.context import SubgameContext
 from poker_ai.search.solver_state import SolverConfig, SolverState
 from poker_ai.search.vform import (
     _regret_match_matrix_py,
+    apply_model_clamp,
     freeze_combo,
     node_sigma,
     regret_match_matrix,
@@ -118,6 +119,7 @@ class _VectorSolver:
             )
         self._seats: Tuple[int, int] = (live[0], live[1])
         self._n_combos = int(root_env.combo_cards.shape[0])
+        self._combo_cards = root_env.combo_cards   # (n_combos, 2), for the model clamp
 
         # Per-seat board-masked reach (float64 copies of the §6.2 ranges).
         bc = np.asarray(ctx.board_compatible, dtype=np.float64)
@@ -204,6 +206,11 @@ class _VectorSolver:
         # Shared vector-form preamble + freezing (§6.5, §5 — see :mod:`vform`).
         sigma, regret, strat = node_sigma(
             self.state, pk, legal, actor, is_root, n_rows, row_space, cof
+        )
+        # Opponent-model clamp (opponent_modeling §5.2) — no-op without models.
+        # Before `freeze_combo` so the bot's pinned actual-hand row always wins.
+        sigma = apply_model_clamp(
+            sigma, self.ctx, self.state, env, pk, actor, len(legal), self._combo_cards
         )
         frozen_combo = freeze_combo(
             self.state, pk, sigma, is_root, actor, self._my_seat, self._my_combo

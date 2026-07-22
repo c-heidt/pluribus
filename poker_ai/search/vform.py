@@ -75,6 +75,68 @@ def node_sigma(state, pk, legal, actor, is_root, n_rows, row_space, cof):
     return sigma, regret, strat
 
 
+def _model_rows(model, env, width, combo_cards):
+    """Build ``(σ̂, c)`` for every combo at the current node — the cached payload.
+
+    One :meth:`~environment.poker_env.PokerEnv.policy_state_for` query per combo,
+    reusing the combo-independent public fields so the per-combo sweep does not
+    re-derive ``legal_actions`` / ``valid_mask`` each time.  ``policy_state_for``
+    reads no seat's actual cards, so this is leak-free: the rows depend only on
+    public state plus the hypothetical hole.
+
+    The :class:`~poker_ai.modeling.model.OpponentModel` contract already returns a
+    row aligned with ``state.legal_actions`` and renormalized with overlay
+    (off-tree) actions at zero mass, so the row drops in as-is.
+    """
+    public = env.policy_public_fields()
+    n = int(combo_cards.shape[0])
+    m_sigma = np.zeros((n, width), dtype=np.float64)
+    conf = np.zeros((n, 1), dtype=np.float64)
+    for ci in range(n):
+        st = env.policy_state_for(combo_cards[ci], public=public)
+        row = np.asarray(model.strategy(st), dtype=np.float64)
+        m_sigma[ci, : row.shape[0]] = row[:width]
+        conf[ci, 0] = float(model.confidence(st))
+    return m_sigma, conf
+
+
+def apply_model_clamp(sigma, ctx, state, env, pk, actor, width, combo_cards):
+    """Blend a modeled seat's realized strategy toward its model — (A-mix), doc §5.2.
+
+    ``σ̃ = c·σ̂ + (1 − c)·x`` per combo, where ``x`` is the seat's regret-matched free
+    strategy (``sigma`` as produced by :func:`node_sigma`).  This is Data Biased
+    Response (Johanson & Bowling 2009) transplanted into the depth-limited solver:
+    where confidence is high the bot best-responds to the model, where it is zero the
+    seat degenerates to the baseline's adversarial player.
+
+    Applies in **both regimes** — MCCFR and vector share this seam, and both consume
+    the returned matrix identically (MCCFR samples one combo's row, the vector regime
+    reach-weights every combo), so no regime-specific blend logic is needed.
+
+    Realized-vs-free semantics: the *realized* ``σ̃`` is returned, so the caller's
+    child reach-weighting, ``strat_sum`` accrual and regret baseline all use the
+    mixture, while the accumulated regrets it regret-matches next iteration remain
+    the free component ``x``. That is exactly the restricted-response treatment.
+
+    **Baseline equivalence:** with no models (or none for ``actor``) this returns
+    ``sigma`` unchanged, before touching the cache or allocating anything — so an
+    unmodeled solve is bit-for-bit the pre-change solver in both regimes.
+    """
+    models = getattr(ctx, "models", None)
+    if not models:
+        return sigma
+    model = models.get(actor)
+    if model is None:
+        return sigma
+    key = (actor, pk)
+    entry = state.model_sigma_cache.get(key)
+    if entry is None:
+        entry = _model_rows(model, env, width, combo_cards)
+        state.model_sigma_cache[key] = entry
+    m_sigma, conf = entry
+    return conf * m_sigma + (1.0 - conf) * sigma
+
+
 def freeze_combo(state, pk, sigma, is_root, actor, my_seat, my_combo):
     """Substitute the bot's pinned actual-hand row into ``sigma`` in place (§5).
 

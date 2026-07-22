@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Dict, Mapping, Tuple
+from typing import TYPE_CHECKING, Dict, Mapping, Optional, Tuple
 
 import numpy as np
 from typing_extensions import Literal
@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     # importable in the meantime; downstream code passes any object
     # whose duck-typed interface matches what leaf.py will expose.
     from poker_ai.search.leaf import LeafConfig
+    from poker_ai.modeling.model import OpponentModel
 
 
 DepthVerdict = Literal["internal", "leaf", "terminal"]
@@ -139,6 +140,11 @@ class SubgameContext:
     depth_limit: DepthLimit
     leaf: "LeafConfig"
     rng: np.random.Generator
+    #: seat → opponent model (opponent_modeling §5.1).  **Empty by default**, and an
+    #: empty mapping activates no code path in the solver — the clamp early-outs, so
+    #: an unmodeled solve is bit-for-bit the baseline (condition B0 needs no separate
+    #: code path).  See :func:`poker_ai.search.vform.apply_model_clamp`.
+    models: Mapping[int, "OpponentModel"] = MappingProxyType({})
 
     @classmethod
     def from_runtime(
@@ -150,6 +156,7 @@ class SubgameContext:
         folded_ranges: Dict[int, Range],
         leaf: "LeafConfig",
         rng: np.random.Generator,
+        models: Optional[Mapping[int, "OpponentModel"]] = None,
     ) -> "SubgameContext":
         """Build a context for a search rooted at ``env``.
 
@@ -179,6 +186,7 @@ class SubgameContext:
             depth_limit=DepthLimit(env.betting_round, env.n_players_started_round),
             leaf=leaf,
             rng=rng,
+            models=MappingProxyType(dict(models)) if models else MappingProxyType({}),
         )
 
 

@@ -244,6 +244,14 @@ class SolverState:
     # profile)`` — one ``(n_combos,)`` vector per key spans every traverser combo
     # (§6.4.1).
     leaf_value_cache: _CountingCache = field(default_factory=_CountingCache)
+    # Opponent-model rows for the solver clamp (opponent_modeling §5.3), keyed by
+    # ``(seat, public_key)`` → ``(σ̂ (n_combos, width), c (n_combos, 1))``, aligned to
+    # the node's legal set at insert time.  The model is frozen for the search's
+    # lifetime, so warm-started re-searches within a hand reuse it; the cache dies
+    # with the ``SolverState`` at hand end.  **Untouched when ``ctx.models`` is empty**
+    # — the clamp early-outs before any lookup, so an unmodeled solve neither reads
+    # nor writes it (keeping the baseline bit-for-bit and its counters at zero).
+    model_sigma_cache: _CountingCache = field(default_factory=_CountingCache)
     # Walk instrumentation (eval doc §9.1) — cumulative over the search; the
     # legal-action cache (``legal_at``) is a plain dict, so its hit/miss and the
     # node-visit tally are counted explicitly in :meth:`ensure_node` rather than by

@@ -63,12 +63,13 @@ is untouched. That is what makes the baseline a controlled comparison
   confidence `c_j`. **Provider (as built):** synthetic — ground truth ± a controlled,
   optionally scheduled error, for the design doc's §6.2 sweeps. *(A second, learned-online
   provider was built then removed — see the scope note at top.)*
-- The (A-mix) clamp in the **MCCFR regime**, behind a per-search mapping that
-  is empty by default — an empty mapping is bit-for-bit the baseline solve
-  (condition B0 needs no separate code path).
-- The two shared integration points of design doc §5: belief-tracking
-  likelihood `σ̂_j` for modeled seats, and model-derived leaf continuation
-  policies for modeled seats.
+- The (A-mix) clamp in **both regimes — MCCFR *and* vector** (2026-07-22
+  decision: **A ships fully, both regimes, before Part II**), behind a per-search
+  mapping that is empty by default — an empty mapping is bit-for-bit the baseline
+  solve **in each regime** (condition B0 needs no separate code path).
+- The **one** shared integration point A needs from design doc §5: belief-tracking
+  likelihood `σ̂_j` for modeled seats. *(The model-derived **leaf** continuation is
+  **deferred for safety** — see §5.4 and the Non-Goals — so A does not build it.)*
 - Conditions B0 (no models), B1 (`c ≡ 1`, naive best response), and A
   (`p_max` grid) runnable from the evaluation runner
   ([evaluation.md](evaluation.md) §10.1) at matched budgets.
@@ -82,9 +83,21 @@ is untouched. That is what makes the baseline a controlled comparison
   swap is the only Part I component B-HU depends on.
 - **No safety guarantees.** CW-RR has none by construction; safety is an
   empirical claim measured by the design doc's §6.1 proxy.
-- **No vector-regime clamp in v1.** Modeled subgames force the MCCFR regime
-  (`force_mccfr_when_modeled`, §6.6) until the matrix blend lands (§9 step 7);
-  design doc §5 integration point 4 records the budget consequence.
+- **Model-derived leaf continuations are deferred (safety).** Exploitation is
+  confined to the *searched* subtree **by design**: past the depth limit every seat
+  rolls out under the **blueprint**, not the model. The leaf is where the model
+  extrapolates furthest and no CFR below it can correct a wrong assumption, so
+  keeping it blueprint bounds model-error exposure to the searched horizon. This is
+  an intentional conservative default (**not** a bug / not "silently truncated"),
+  and a future exploit-vs-safety knob measurable on the **strong-clean** condition.
+  See §5.4. *(Note: the vector regime never had a policy leaf anyway — it settles
+  terminals with exact-range `vector_payout` — so this deferral only spares the
+  MCCFR leaf.)*
+- ~~**No vector-regime clamp in v1.**~~ **SUPERSEDED (2026-07-22):** A clamps
+  **both** regimes, so `force_mccfr_when_modeled` is **not** introduced — regime
+  selection stays identical to vanilla. This also removes the MCCFR-vs-vector
+  solution-quality confound that forcing would have injected into the HU A-vs-B0
+  comparison. The vector matrix blend is §6.7 / §9 step **A5**.
 - ~~**Learned model over a coarser abstraction, not the blueprint's.**~~ **REMOVED**
   (scope note at top). The online `BayesOpponentModel` keyed counts on coarse behavioral
   buckets (§3, §4.4) so a ~10k-game budget could saturate confidence; the blueprint's
@@ -109,8 +122,8 @@ is untouched. That is what makes the baseline a controlled comparison
 | Count attribution | **(REMOVED — no counts without the learned model.)** **Soft counts** at the round-boundary belief replay: an observed action credits each coarse bucket `k(cluster, ctx)` — collapsed to the action's class — proportionally to the tracker's pre-action belief mass over clusters (§6.3) |
 | Model freeze cadence | Per hand: the search and belief updates read a hand-start snapshot; observations buffer and commit at hand end (breaks the count↔belief feedback loop within a hand) |
 | Belief likelihood | Modeled seats: `σ̂_j` (the model, **not** the mixture — beliefs estimate actual behavior, the mixture is the solver's hedge); bot's own range and unmodeled seats: unchanged baseline (last-search average / blueprint) |
-| Leaf continuations | Modeled seat: 4 variants derived from `σ̂_j` (same ×5-reweight machinery); bot and unmodeled seats: blueprint variants, unchanged |
-| Regime coverage | v1: MCCFR only, `force_mccfr_when_modeled = True`; v2: vector-regime matrix blend (§6.7) |
+| Leaf continuations | **DEFERRED (safety, 2026-07-22).** All seats roll out under the **blueprint** past the depth limit; exploitation is confined to the searched subtree. The modeled-leaf design (4 variants derived from `σ̂_j`) is kept as a future knob (§5.4). |
+| Regime coverage | **v1 (A): BOTH regimes** — MCCFR `_node_sigma` blend + vector `node_sigma` matrix blend (§6.7). No `force_mccfr_when_modeled`; regime selection identical to vanilla. |
 | Identity | Models keyed by a caller-supplied stable `opponent_id` (evaluation: the seat's `agent_label` + seat index); persistence via `ModelStore.save/load` (npz) |
 | Conditions | B0 = empty model mapping (identical baseline path) · B1 = synthetic model, `c ≡ 1` · A = models + `(p_max, τ)` |
 
@@ -189,7 +202,10 @@ learned model's postflop underperformance (the bucket-average discards per-state
 the blueprint keeps), which is why the learned path was dropped in favor of injected
 model quality.
 
-## 5. The solver clamp (MCCFR regime)
+## 5. The solver clamp (both regimes)
+
+> §5.1–5.3 specify the **MCCFR** clamp; §5.5 the **vector** clamp (§6.7). Both are
+> now v1 (A ships both regimes). §5.4 (leaf) is **deferred for safety**.
 
 ### 5.1 Plumbing (`context.py`)
 
@@ -253,21 +269,30 @@ renormalized). Warm-started re-searches within a hand reuse it (the model is
 per-hand frozen); the cache dies with the `SolverState` at hand end. Cache
 counters ride the existing `_CountingCache` stats plumbing.
 
-### 5.4 Leaf continuations (`leaf.py`)
+### 5.4 Leaf continuations (`leaf.py`) — DEFERRED FOR SAFETY (2026-07-22)
 
-`LeafConfig` gains
+**Not built in A.** Exploitation is deliberately confined to the searched
+subtree: past the depth limit **every seat rolls out under the blueprint**
+(`cfg.policies`), exactly as vanilla. The truncation the earlier draft called a
+bug ("silently truncated at the depth limit") is **re-decided as an intentional
+safety property** — the leaf is where the model extrapolates furthest and there
+is no CFR below it to correct a wrong assumption, so a bad model in the leaf
+would deviate hero into strength with nothing to catch it. Keeping the leaf
+blueprint bounds model-error exposure to the horizon the solver actually
+resolved. (This only affects the **MCCFR** leaf; the vector regime has no policy
+leaf — it settles terminals via exact-range `vector_payout`.)
 
-```python
-seat_policies: Mapping[int, Mapping[BiasClass, Policy]] = MappingProxyType({})
-```
+Bonus: the leaf code path is unchanged from vanilla, so it is byte-identical for
+free — one fewer surface for the empty-models gate to cover.
 
-and `continuation_value` resolves each acting seat's policy as
-`cfg.seat_policies.get(seat, cfg.policies)[profile[seat]]` — modeled seats
-roll out under `ModelPolicy` variants, everyone else under the blueprint
-variants, unchanged. The leaf-value cache key already contains the profile
-and holes; `seat_policies` is search-static, so no key change is needed.
-Without this, exploitation is silently truncated at the depth limit (design
-doc §5, integration point 2).
+**Future knob (not scheduled).** Modeled leaf continuations are the lever that
+trades safety for deeper exploitation, and its value is exactly what the
+**strong-clean** eval condition prices. When resumed, the design is: `LeafConfig`
+gains `seat_policies: Mapping[int, Mapping[BiasClass, Policy]]`, and
+`continuation_value` resolves each acting seat as
+`cfg.seat_policies.get(seat, cfg.policies)[profile[seat]]` (modeled seats →
+`ModelPolicy` variants). The leaf-value cache key already carries profile+holes
+and `seat_policies` is search-static, so no key change is needed.
 
 ## 6. Agent integration (`agent.py`) and regime gating
 
@@ -303,12 +328,14 @@ belief-likelihood swap is unchanged — `σ̂` is now supplied by `SyntheticOppo
   `commit_hand` path; the boundary belief replay still updates ranges, it just no longer
   emits counts.
 
-### 6.4 Regime gating (`solver.py`)
+### 6.4 Regime gating (`solver.py`) — NO GATE (2026-07-22)
 
-`_select_regime` gains the v1 gate: `ctx.models` non-empty ⇒ MCCFR,
-regardless of size/street (`force_mccfr_when_modeled`, `SolverConfig`
-field). Logged per solve so matched-budget analyses can slice on it. Removed
-when §6.7 lands.
+**`_select_regime` is unchanged from vanilla.** Because A clamps **both**
+regimes (§5.2 MCCFR, §6.7 vector), there is no `force_mccfr_when_modeled` gate:
+a modeled subgame takes exactly the regime it would take vanilla (HU
+flop/turn/river → vector, else MCCFR). This removes the MCCFR-vs-vector
+solution-quality confound that forcing would have injected into the paired
+A-vs-B0 comparison. Log `regime` per solve as today.
 
 ### 6.5 What does not change
 
@@ -317,30 +344,41 @@ inject/re-search machinery, the dual budget, final-iterate play for the bot,
 `SearchPolicy` readers. CW-RR is deliberately confined to *what the opponent
 seats play inside the solve* plus the two §5-doc integration points.
 
-### 6.6 Interim cost note
+### 6.6 Interim cost note — OBSOLETE (2026-07-22)
 
-Forcing MCCFR on modeled late/heads-up subgames trades the vector regime's
-exactness for generality; at matched wall-clock this is a real handicap for
-conditions A/B1 relative to B0 in exactly those subgames, and it is *the
-baseline's* regimes that define B0. Report the fraction of solves gated, and
-prioritize §6.7 if it is material. **In 4-handed play this is milder than it
-reads:** the vector regime only applies once a subgame is heads-up (turn/river),
-so with three opponents most subgames are already multiway/MCCFR in the
-baseline — the gated fraction is small, and §6.7 is a lower priority than the
-heads-up framing implies. Measure it before investing.
+Superseded: there is no MCCFR-forcing, so there is no matched-wall handicap on
+HU subgames and nothing to report a "gated fraction" for. §6.7 is now v1, not a
+lower-priority follow-up.
 
-### 6.7 Vector-regime blend (v2)
+### 6.7 Vector-regime clamp (v1, step A5) — the matrix blend
 
-The vector seam is one line-cluster in
-[`_walk`](../poker_ai/search/vector.py): after
-`sigma = _regret_match_matrix(regret)`, an acting modeled seat blends
-matrices — `Σ̃ = C ⊙ Σ̂ + (1 − C) ⊙ Σ` with `Σ̂ : (n_combos, width)` the
-model rows (expanded cluster→combo, cached per `public_key` on first visit,
-like `legal_at`) and `C : (n_combos, 1)` the per-combo confidence. Regret
-and strat-sum updates are already written against the produced `sigma`, so
-they inherit the blend unchanged. The turn subgame's river-conditioned 3-D
-nodes need `Σ̂` per `(combo, river)` — build lazily per sampled river slice
-to avoid a `(n_combos, n_rivers, width)` precompute.
+The seam is `node_sigma(...)` in [`_walk`](../poker_ai/search/vector.py) (the
+matrix analog of MCCFR's `_node_sigma`, and — like it — pure Python/numpy above
+the compiled core). After the regret-matched `sigma`, an acting modeled seat
+blends matrices: `Σ̃ = C ⊙ Σ̂ + (1 − C) ⊙ Σ`, with
+
+- **`Σ̂ : (n_combos, width)`** — the model rows. The model is keyed by the coarse
+  (street, tier, ctx); build `Σ̂` by a **per-combo gather** (map every combo in the
+  range → its model row → assemble the matrix), a ClusterMapper/vform-style
+  scatter-gather. Cached per `public_key` on first visit, aligned to
+  `legal_at[public_key]` (overlay/off-tree columns zero-mass, renormalized), like
+  MCCFR's `model_sigma_cache`.
+- **`C : (n_combos, 1)`** — the per-combo confidence (schedules must expose a
+  full-width `c`, not just the scalar/per-infoset form).
+
+**Realized-vs-free semantics (match MCCFR §5.2):** the *realized* `Σ̃` drives child
+reach-weighting and `strat_sum`; regret still accrues on the **free** regret-matched
+component against values under the mixture. Verify the vform Linear-CFR update does
+this (regret/strat updates are written against the produced `sigma`, so they inherit
+`Σ̃` unchanged — confirm that is the intended free-vs-realized split, not a shortcut).
+
+**Byte-identity (the hard gate):** empty models / `C = 0` must leave
+`GOLDEN_DIGEST_VECTOR` **untouched under `PLURIBUS_SEARCH_CORE` both on and off** —
+the blend is a clean early-out that must not perturb numpy op order. This is a
+second regression gate distinct from (and harder than) the scalar MCCFR one.
+
+The turn subgame's river-conditioned 3-D nodes need `Σ̂` per `(combo, river)` — build
+lazily per sampled river slice to avoid a `(n_combos, n_rivers, width)` precompute.
 
 ## 7. Evaluation integration ([evaluation.md](evaluation.md))
 
@@ -407,12 +445,17 @@ to avoid a `(n_combos, n_rivers, width)` precompute.
 
 Unit-first (fast, no functional pipeline in the iteration loop):
 
-1. **Baseline equivalence (the load-bearing test):** empty `models` ⇒
-   bitwise-identical `SolverState` to the pre-change solver on a seeded
-   small-deck solve, and `ctx.models` absent from every hot path branch.
-2. **Blend math:** `c = 0` returns the regret-matched σ exactly; `c = 1`
-   returns the model row; overlay-injected actions get zero model mass and
-   renormalize; frozen bot rows never blend.
+1. **Baseline equivalence (the load-bearing test) — TWO gates, both regimes:**
+   empty `models` ⇒ bitwise-identical `SolverState` to the pre-change solver, and
+   `ctx.models` absent from every hot path branch. Gate the **MCCFR** golden *and*
+   the **vector** golden (`GOLDEN_DIGEST_VECTOR`), each with `PLURIBUS_SEARCH_CORE`
+   **on and off**. The vector gate is the harder one (the blend must be a clean
+   `C = 0` early-out that never perturbs numpy op order).
+2. **Blend math (both regimes):** `c = 0` returns the regret-matched σ exactly;
+   `c = 1` returns the model row/matrix; overlay-injected actions get zero model
+   mass and renormalize; frozen bot rows never blend. Vector: the per-combo gather
+   assembles `Σ̂` aligned to `legal_at`, and the realized-`Σ̃`/free-regret split
+   matches MCCFR.
 3. **Tiers & counts:** *(tiers, §4.4)* rolled-back equity is monotone across a
    hand-built toy centroid set, every cluster maps to a tier in `[0, n)`, and
    equal-frequency bins are balanced on the real `data/20cards_exact`
@@ -427,37 +470,60 @@ Unit-first (fast, no functional pipeline in the iteration loop):
    per-seat resolution.
 5. **Determinism:** seeded solve with models is reproducible; the
    `model_sigma_cache` stores first-draw rows only.
-6. **Functional (slow-marked, not in the iteration loop):** 3-seat
-   small-deck game, one heavily fold-biased opponent, exact synthetic model:
-   condition A's search EV against that table ≥ B0's, and B1 ≥ A at zero
-   model error; with a maximally wrong model, A's EV degrades gracefully
-   toward B0 as `p_max` shrinks.
+6. **Functional (slow-marked) — this is the `e = 0` CEILING GATE, run before the
+   full sweep:** 3-seat small-deck game, one heavily fold-biased opponent, exact
+   synthetic model (`e = 0`): condition A's search EV against that table ≥ B0's
+   (exploitation now comes from **above the depth limit only**, since the leaf is
+   blueprint — the gain is smaller but must still be positive). With a maximally
+   wrong model, A's EV degrades gracefully toward B0 as `p_max` shrinks. **If A
+   cannot beat B0 with a perfect model here, stop — the exploitation math is the
+   problem, before building the agent/eval.** *(B1 ≥ A is a Part II check, deferred
+   with B.)*
 
 ## 9. Implementation Steps
 
-Each step lands green before the next starts; steps 1–5 are the v1 critical
-path, 6–7 are follow-ups.
+**Restructured 2026-07-22: implement Approach A (DBR) FULLY — both regimes — before
+Part II (B).** Each step lands green before the next; the leaf model (old step 3)
+is **dropped for safety** (§5.4). Every step keeps vanilla Pluribus **byte-identical**
+under empty models (§8.1, both goldens, core on/off).
 
-1. `poker_ai/modeling/` package: `OpponentModel`, `SyntheticOpponentModel`,
-   `schedules.py` (error/confidence shaping), `ModelPolicy` + unit tests (§8.2–4).
-   *(The learned pieces — `tiers.py`, `counts.py`, `BayesOpponentModel`, `ModelStore` —
-   were built then **removed**; see the scope note at top.)*
-2. `SubgameContext.models` + the `_node_sigma` blend + `model_sigma_cache`
-   + the baseline-equivalence regression (§8.1) and blend tests.
-3. `LeafConfig.seat_policies` + leaf resolution + tests.
-4. Agent wiring: snapshots, per-seat belief likelihood,
-   `force_mccfr_when_modeled` gate + determinism tests. *(Soft-count buffering removed
-   with the learned model.)*
-5. Evaluation: `Pr_shuffle` opponent label, conditions vanilla/B0/A (+optional
-   B1) in the runner, **cross-condition CRN** (built per
-   [evaluation.md](evaluation.md) §9 step 10 — `max_hands` + shared
-   `run_seed`/`deck_seed` + `condition`; can land first, independent of steps
-   1–4), paired-difference AIVAT reporting, coverage-restricted slicing, schema
-   additions, the functional sanity test (§8.6).
-6. ~~`BayesOpponentModel` online learner + showdown hard counts~~ — **REMOVED** (scope
-   note at top); the "how good must the model be" question is answered by the §6.2
-   synthetic error sweep instead of a learning curve.
-7. Vector-regime blend (§6.7); retire the regime gate.
+- **A1 — model package *(DONE)*.** `poker_ai/modeling/`: `OpponentModel`,
+  `SyntheticOpponentModel`, `schedules.py` (error/confidence shaping, incl. a
+  full-width per-combo `c` for A5), `ModelPolicy` + unit tests (§8.2–4). *(Learned
+  pieces `tiers.py`/`counts.py`/`BayesOpponentModel`/`ModelStore` were built then
+  removed — scope note at top.)*
+- **A2 — MCCFR clamp.** `SubgameContext.models` plumbing + `from_runtime` threading
+  + the `_node_sigma` blend + `model_sigma_cache` + overlay zero-mass/renorm. Gate:
+  MCCFR baseline-equivalence (§8.1, core on/off) + blend math (§8.2).
+- **A4 — belief-likelihood swap** *(no dependency on A2/A3/A5 — can land in parallel).*
+  `RangeTracker` likelihood for modeled seats switches blueprint → `σ̂_j` (the model,
+  not the mixture — §6.3). **Invariant:** the tracker and the solver read the **same
+  per-hand frozen model snapshot**, so hero infers the opponent's range under the
+  strategy it best-responds to. Shared with Part II (B's only Part I dependency).
+- **A5 — vector clamp (§6.7), the high-risk item — de-risk right after A2.** The
+  `node_sigma` matrix blend + per-combo model gather (cluster→combo, cached per
+  `public_key`) + per-combo confidence + realized-`Σ̃`/free-regret semantics. Gate:
+  **vector** baseline-equivalence (`GOLDEN_DIGEST_VECTOR`, core on/off) + matrix blend
+  math. A6/A7 can't be validated in HU without this, so it precedes the agent.
+- **A6 — DBR agent.** Per-hand model snapshot feeding **both** the tracker (A4) and
+  the solver (A2/A5); **multi-opponent** `seat → model` map (one model per live
+  opponent); hero's own seat never blends (`_is_actual_bot`); **regime selection
+  unchanged** (no `force_mccfr_when_modeled`); leaf stays blueprint (§5.4).
+  Determinism tests (§8.5).
+- **A7 — evaluation wiring.** `Pr_shuffle` opponent label; conditions
+  **vanilla / B0 (`models={}`) / A** (+ optional B1) in the runner; **cross-condition
+  CRN** (`max_hands` + shared `run_seed`/`deck_seed` + `condition`; can land first,
+  independent of A2–A6); **paired-difference AIVAT** with the blueprint control
+  variate (confirm it stays unbiased when hero plays the modeled strategy);
+  `modeled_decision`/`opponent_models`/`condition` schema; **coverage-restricted
+  slicing** (score only decisions where the model applied); the §8.6 functional as
+  the `e = 0` ceiling gate **before** the sweep.
+
+*Removed:* the online learner (old step 6) — the "how good must the model be"
+question is answered by the §6.2 synthetic error sweep, not a learning curve.
+
+**Then Part II (B)** — §11.3, reusing A4 (belief swap) + the landed settlement +
+the gadget; none of A's mixture/confidence machinery.
 
 ## 10. Risks and Open Questions (Part I)
 
