@@ -96,7 +96,7 @@ def get_legal_actions(state: PokerState) -> List[str]:
 def get_node_strategy(
     tables: CFRTables,
     state: PokerState,
-) -> Tuple[np.ndarray, int, Dict[str, int], np.ndarray]:
+) -> Tuple[np.ndarray, int, Dict[str, int], np.ndarray, bytes]:
     """Compute the current mixed strategy at *state* via regret matching.
 
     Looks up the cumulative regret row for the current information set
@@ -126,21 +126,30 @@ def get_node_strategy(
     regret_row : np.ndarray
         Int32 cumulative regret vector, either the live row from the
         table or a fresh zero vector when the infoset is unseen.
+    info_set : bytes
+        The information-set key used for the lookup.  Returned so
+        callers that write back to the tables at the same node reuse
+        it instead of re-deriving it — :attr:`PokerEnv.info_set`
+        re-encodes the full action history on every read and is
+        one of the hottest per-node costs in a traversal.
     """
     r = state.betting_round
     legal_actions = get_legal_actions(state)
     canonical = CANONICAL_ACTIONS[r]
     legal_set = set(legal_actions)
-    valid_mask = np.array([a in legal_set for a in canonical], dtype=bool)
+    # A plain list (not np.array): ``calculate_strategy_from_row`` iterates it
+    # element-wise, so building an array here only to convert it back is waste.
+    valid_mask = [a in legal_set for a in canonical]
 
-    row = tables.regret[r].get_row_if_exists(state.info_set)
+    info_set = state.info_set
+    row = tables.regret[r].get_row_if_exists(info_set)
     regret_row = (
         row if row is not None
         else np.zeros(MAX_ACTIONS_PER_STREET[r], dtype=np.int32)
     )
     sigma = calculate_strategy_from_row(regret_row, valid_mask)
     a_to_i = ACTION_TO_IDX[r]
-    return sigma, r, a_to_i, regret_row
+    return sigma, r, a_to_i, regret_row, info_set
 
 
 def sample_action(
@@ -183,7 +192,65 @@ def sample_action(
         probs /= prob_sum
     else:
         probs[:] = 1.0 / len(legal_actions)
-    return np.random.choice(legal_actions, p=probs)
+    # Inverse-CDF single draw.  ``np.random.choice`` re-validates ``probs`` and
+    # builds a cumulative distribution on every call — dominant self-time in the
+    # traversal hot loop (profiled ~9%).  For one sample over a short action
+    # list a manual walk with a single ``random()`` draw is ~5-10x cheaper and
+    # draws from the identical distribution.
+    threshold = np.random.random()
+    cumulative = 0.0
+    for i in range(len(legal_actions)):
+        cumulative += probs[i]
+        if threshold < cumulative:
+            return legal_actions[i]
+    return legal_actions[-1]  # float-rounding guard: threshold ~= 1.0
+
+
+def sample_index(rng, weights: np.ndarray) -> int:
+    """Draw one index in ``[0, len(weights))`` proportional to ``weights``.
+
+    A single inverse-CDF draw: one ``rng.random()`` plus a cumulative walk.
+    Equivalent in distribution to
+    ``rng.choice(len(weights), p=weights / weights.sum())`` but avoids
+    :meth:`numpy.random.Generator.choice`'s per-call re-validation and CDF
+    construction, which dominate when repeatedly drawing a *single* index from a
+    short, per-node strategy vector — the subgame-search MCCFR and leaf-rollout
+    hot loops (:mod:`poker_ai.search.mccfr`, :mod:`poker_ai.search.leaf`).  This
+    is the ``rng``-based counterpart of :func:`sample_action`.
+
+    ``weights`` need not be normalised — the draw threshold is scaled by their
+    sum — so callers can pass a raw (possibly float32) strategy vector directly
+    and drop the float64 copy-and-renormalise the ``choice`` path required.
+    When the total mass is non-positive (a degenerate all-zero strategy) the
+    draw falls back to a uniform index, matching the samplers' uniform fallback.
+
+    Parameters
+    ----------
+    rng : numpy.random.Generator
+        Source of randomness.  Consumes exactly one ``rng.random()`` draw on the
+        positive-mass path (or one ``rng.integers`` on the degenerate fallback).
+    weights : np.ndarray
+        Non-negative weights over the candidate indices (need not sum to 1).
+
+    Returns
+    -------
+    int
+        The sampled index.
+    """
+    w = weights.tolist()
+    n = len(w)
+    total = 0.0
+    for x in w:
+        total += x
+    if total <= 0.0:
+        return int(rng.integers(n))
+    threshold = rng.random() * total
+    cumulative = 0.0
+    for i in range(n):
+        cumulative += w[i]
+        if threshold < cumulative:
+            return i
+    return n - 1  # float-rounding guard: threshold ~= total
 
 
 def accumulate_regrets(
@@ -267,18 +334,70 @@ def calculate_strategy_from_row(
         to 1 (or to 0 if no actions are valid, which should not occur
         in a well-formed game state).
     """
-    masked = regret_row.astype(np.float32)
-    if valid_mask is not None:
-        masked[~valid_mask] = 0.0
-    positive = np.maximum(masked, 0.0)
-    total = float(positive.sum())
-    if total > 0.0:
-        return (positive / total).astype(np.float32)
-    result = np.zeros(len(regret_row), dtype=np.float32)
-    if valid_mask is not None:
-        n_valid = int(valid_mask.sum())
-        if n_valid > 0:
-            result[valid_mask] = 1.0 / n_valid
+    # Regret rows are tiny (<= MAX_ACTIONS_PER_STREET, ~8), so the several
+    # whole-array numpy ops this used to do (astype, boolean-mask assign,
+    # maximum, sum, divide) are dominated by numpy's per-call dispatch
+    # overhead — this is one of the hottest per-node costs in a traversal.
+    # A single Python pass over the row-as-list (one C-level ``tolist`` up
+    # front) avoids that overhead and is materially faster at this size.
+    regrets = regret_row.tolist()
+    n = len(regrets)
+    if valid_mask is None:
+        mask = None
+    elif isinstance(valid_mask, list):
+        mask = valid_mask
     else:
-        result[:] = 1.0 / len(regret_row)
-    return result
+        mask = valid_mask.tolist()
+
+    positive = [0.0] * n
+    total = 0.0
+    n_valid = 0
+    for i in range(n):
+        if mask is not None and not mask[i]:
+            continue
+        n_valid += 1
+        r = regrets[i]
+        if r > 0:
+            positive[i] = float(r)
+            total += r
+    if total > 0.0:
+        inv = 1.0 / total
+        for i in range(n):
+            positive[i] *= inv
+        return np.array(positive, dtype=np.float32)
+
+    result = [0.0] * n
+    if mask is not None:
+        if n_valid > 0:
+            p = 1.0 / n_valid
+            for i in range(n):
+                if mask[i]:
+                    result[i] = p
+    else:
+        p = 1.0 / n
+        for i in range(n):
+            result[i] = p
+    return np.array(result, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Optional compiled-core kernel (Phase 1a: regret matching)
+# ---------------------------------------------------------------------------
+# Keep a stable handle on the pure-Python implementation as the byte-exact
+# oracle, then swap the public ``calculate_strategy_from_row`` for the Cython
+# kernel when the extension is built AND enabled (``PLURIBUS_CORE_KERNELS``
+# includes ``regret_match``).  ``get_node_strategy`` looks the name up as a
+# module global at call time, so the swap is transparent to every caller.  The
+# decision is made once at import (no per-call env read on the hot path):
+# production sets the flag before launch; tests that must exercise the core path
+# monkeypatch this module's ``calculate_strategy_from_row`` directly.
+_calculate_strategy_from_row_py = calculate_strategy_from_row
+
+try:
+    from poker_ai._core import CORE_AVAILABLE as _CORE_AVAILABLE
+    from poker_ai._core.flags import kernel_enabled as _kernel_enabled
+
+    if _CORE_AVAILABLE and _kernel_enabled("regret_match"):
+        from poker_ai._core._regret import calculate_strategy_from_row
+except ImportError:
+    pass  # extension / flags unavailable -> keep the pure-Python reference

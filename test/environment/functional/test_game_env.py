@@ -1,8 +1,11 @@
 """Functional tests for poker_ai/environment/poker_env.py.
 
 Covers PokerEnv construction, validation errors, initial state properties,
-apply_action semantics, stage progression, terminal states, and CFR helpers.
+action semantics (step_in_place), stage progression, terminal states, and
+CFR helpers.
 """
+
+import copy
 
 import pytest
 
@@ -19,7 +22,7 @@ def _play_to_terminal(env, max_steps=200):
     steps = 0
     while not env.is_terminal and steps < max_steps:
         action = "call" if "call" in env.legal_actions else env.legal_actions[0]
-        env = env.apply_action(action)
+        env.step_in_place(action)
         steps += 1
     return env
 
@@ -35,9 +38,6 @@ class TestConstruction:
     def test_six_player_game_created(self):
         env = new_game(n_players=6, card_info_lut={})
         assert env.n_players == 6
-
-    def test_n_players_attribute(self, fresh_game):
-        assert fresh_game.n_players == 3
 
     def test_community_cards_empty(self, fresh_game):
         assert fresh_game.community_cards == ()
@@ -149,22 +149,6 @@ class TestInitialState:
     def test_legal_actions_contains_fold(self, fresh_game):
         assert "fold" in fresh_game.legal_actions
 
-    def test_legal_actions_inactive_player(self):
-        env = new_game(n_players=3, card_info_lut={})
-        env.players[env.player_i].fold()
-        env.players[env.player_i]._is_active = False
-        # Access legal_actions from inactive player's perspective directly
-        from environment.player import Player
-        p = Player(99, 0)
-        p._is_active = False
-        # Simulate inactive player: override current player temporarily
-        original_idx = env._player_i_index
-        # Find a folded player
-        for i, p in enumerate(env.players):
-            if not p.is_active:
-                # legal_actions checks current_player
-                break
-
     def test_initial_regret_keys_match_legal_actions(self, fresh_game):
         assert set(fresh_game.initial_regret.keys()) == set(fresh_game.legal_actions)
 
@@ -198,47 +182,22 @@ class TestInitialState:
 
 
 # ---------------------------------------------------------------------------
-# apply_action immutability
-# ---------------------------------------------------------------------------
-
-class TestApplyActionImmutability:
-    def test_returns_new_instance(self, fresh_game):
-        new_env = fresh_game.apply_action("fold")
-        assert new_env is not fresh_game
-
-    def test_original_stage_unchanged(self, fresh_game):
-        stage_before = fresh_game.betting_stage
-        fresh_game.apply_action("fold")
-        assert fresh_game.betting_stage == stage_before
-
-    def test_original_pot_unchanged(self, fresh_game):
-        pot_before = fresh_game.pot_size
-        fresh_game.apply_action("fold")
-        assert fresh_game.pot_size == pot_before
-
-    def test_original_players_unchanged(self, fresh_game):
-        active_before = [p.is_active for p in fresh_game.players]
-        fresh_game.apply_action("fold")
-        assert [p.is_active for p in fresh_game.players] == active_before
-
-
-# ---------------------------------------------------------------------------
 # Action semantics
 # ---------------------------------------------------------------------------
 
 class TestActionSemantics:
     def test_fold_deactivates_current_player(self, fresh_game):
         acting_i = fresh_game.player_i
-        new_env = fresh_game.apply_action("fold")
+        new_env = copy.deepcopy(fresh_game); new_env.step_in_place("fold")
         assert not new_env.players[acting_i].is_active
 
     def test_call_increases_pot(self, fresh_game):
         pot_before = fresh_game.pot_size
-        new_env = fresh_game.apply_action("call")
+        new_env = copy.deepcopy(fresh_game); new_env.step_in_place("call")
         assert new_env.pot_size > pot_before
 
     def test_call_equalizes_bet(self, fresh_game):
-        new_env = fresh_game.apply_action("call")
+        new_env = copy.deepcopy(fresh_game); new_env.step_in_place("call")
         bets = [p.n_bet_chips for p in new_env.players if p.is_active]
         # After a call, the bet should be equal to BB (100)
         assert len(set(bets)) <= 2  # at most caller vs raiser differ
@@ -246,28 +205,28 @@ class TestActionSemantics:
     def test_raise_action_increments_n_raises(self, fresh_game):
         raise_actions = [a for a in fresh_game.legal_actions if a and a.startswith("raise:")]
         if raise_actions:
-            new_env = fresh_game.apply_action(raise_actions[0])
+            new_env = copy.deepcopy(fresh_game); new_env.step_in_place(raise_actions[0])
             assert new_env._n_raises >= 1
 
     def test_all_in_sets_player_all_in(self):
-        env = new_game(n_players=2, card_info_lut={}, initial_chips=100, big_blind=100)
+        # Deep stacks so the shove is non-terminal (opponent still to respond);
+        # otherwise a both-all-in hand settles immediately and the winner's chips
+        # are already redistributed, masking the "actor staked everything" state.
+        env = new_game(n_players=2, card_info_lut={}, initial_chips=10000, big_blind=100)
         if "all_in" in env.legal_actions:
-            new_env = env.apply_action("all_in")
-            # The acting player should now have 0 chips
+            new_env = copy.deepcopy(env); new_env.step_in_place("all_in")
+            # The acting player should now have 0 chips (staked their whole stack)
             acting_i = env.player_i
+            assert not new_env.is_terminal
             assert new_env.players[acting_i].n_chips == 0
 
-    def test_invalid_action_does_not_raise(self, fresh_game):
-        new_env = fresh_game.apply_action("raise:999")  # absurdly large raise
-        assert new_env is not None
-
     def test_action_recorded_in_history(self, fresh_game):
-        new_env = fresh_game.apply_action("fold")
+        new_env = copy.deepcopy(fresh_game); new_env.step_in_place("fold")
         history = dict(new_env._history)
         assert any(len(actions) > 0 for actions in history.values())
 
     def test_is_turn_updated_after_action(self, fresh_game):
-        new_env = fresh_game.apply_action("call")
+        new_env = copy.deepcopy(fresh_game); new_env.step_in_place("call")
         turns = [p.is_turn for p in new_env.players]
         assert turns.count(True) == 1
 
@@ -283,7 +242,7 @@ class TestRaiseCap:
             raise_actions = [a for a in env.legal_actions if a and a.startswith("raise:")]
             if not raise_actions:
                 break
-            env = env.apply_action(raise_actions[0])
+            env.step_in_place(raise_actions[0])
         raise_actions = [a for a in env.legal_actions if a and a.startswith("raise:")]
         assert len(raise_actions) == 0
 
@@ -296,19 +255,19 @@ class TestStageProgression:
     def test_pre_flop_to_flop(self):
         env = new_game(n_players=2, card_info_lut={})
         while env.betting_stage == "pre_flop":
-            env = env.apply_action("call")
+            env.step_in_place("call")
         assert len(env.community_cards) == 3
 
     def test_flop_to_turn(self):
         env = new_game(n_players=2, card_info_lut={})
         while env.betting_stage in ("pre_flop", "flop"):
-            env = env.apply_action("call")
+            env.step_in_place("call")
         assert len(env.community_cards) == 4
 
     def test_turn_to_river(self):
         env = new_game(n_players=2, card_info_lut={})
         while env.betting_stage in ("pre_flop", "flop", "turn"):
-            env = env.apply_action("call")
+            env.step_in_place("call")
         assert len(env.community_cards) == 5
 
     def test_river_to_show_down(self):
@@ -319,7 +278,7 @@ class TestStageProgression:
     def test_community_cards_are_ints(self):
         env = new_game(n_players=2, card_info_lut={})
         while env.betting_stage == "pre_flop":
-            env = env.apply_action("call")
+            env.step_in_place("call")
         for c in env.community_cards:
             assert isinstance(c, int)
 
@@ -334,7 +293,7 @@ class TestStageProgression:
         env = new_game(n_players=2, card_info_lut={})
         hole_cards = {c for p in env.players for c in p.cards}
         while env.betting_stage == "pre_flop":
-            env = env.apply_action("call")
+            env.step_in_place("call")
         for c in env.community_cards:
             assert c not in hole_cards
 
@@ -347,7 +306,7 @@ class TestBettingRoundException:
     def test_betting_round_raises_at_terminal(self):
         env = new_game(n_players=2, card_info_lut={})
         # Force terminal stage by folding
-        env2 = env.apply_action("fold")
+        env2 = copy.deepcopy(env); env2.step_in_place("fold")
         if env2.betting_stage == "terminal":
             with pytest.raises(ValueError):
                 _ = env2.betting_round
@@ -359,11 +318,11 @@ class TestBettingRoundException:
 
 class TestTerminalState:
     def test_fold_two_player_is_terminal(self, two_player_game):
-        new_env = two_player_game.apply_action("fold")
+        new_env = copy.deepcopy(two_player_game); new_env.step_in_place("fold")
         assert new_env.is_terminal
 
     def test_fold_terminal_stage(self, two_player_game):
-        new_env = two_player_game.apply_action("fold")
+        new_env = copy.deepcopy(two_player_game); new_env.step_in_place("fold")
         assert new_env.betting_stage == "terminal"
 
     def test_all_call_three_players_show_down(self, fresh_game):
@@ -389,11 +348,11 @@ class TestInfoSet:
         with pytest.raises(ValueError):
             _ = fresh_game.info_set
 
-    def test_info_set_returns_string_at_terminal(self, two_player_game):
-        env = two_player_game.apply_action("fold")
+    def test_info_set_returns_bytes_at_terminal(self, two_player_game):
+        env = copy.deepcopy(two_player_game); env.step_in_place("fold")
         assert env.is_terminal
         result = env.info_set
-        assert isinstance(result, str)
+        assert isinstance(result, bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -445,12 +404,12 @@ class TestCFRHelpers:
 # ---------------------------------------------------------------------------
 
 class TestDeepCopy:
-    def test_lut_excluded_from_copy(self, fresh_game):
-        import copy
+    def test_lut_shared_by_reference(self, fresh_game):
         fresh_game.card_info_lut = {"pre_flop": {(1, 2): "cluster_A"}}
         copied = copy.deepcopy(fresh_game)
-        # LUT should be {} on the copy, not the original's dict
-        assert copied.card_info_lut == {}
+        # The LUT is read-only and large, so __deepcopy__ shares it by
+        # reference rather than copying or zeroing it.
+        assert copied.card_info_lut is fresh_game.card_info_lut
 
     def test_config_fields_independent(self, fresh_game):
         import copy
@@ -482,11 +441,11 @@ class TestDeepCopy:
 class TestClosestLegalAction:
     def test_oversize_raise_maps_to_valid_action(self, fresh_game):
         # "raise:999" is not in legal_actions; must not raise an exception
-        new_env = fresh_game.apply_action("raise:999")
+        new_env = copy.deepcopy(fresh_game); new_env.step_in_place("raise:999")
         assert new_env is not None
 
     def test_completely_invalid_string_maps_to_valid_action(self, fresh_game):
-        new_env = fresh_game.apply_action("not_a_real_action")
+        new_env = copy.deepcopy(fresh_game); new_env.step_in_place("not_a_real_action")
         assert new_env is not None
         # The resulting env must still be in a valid state
         assert new_env.betting_stage in {
@@ -498,7 +457,7 @@ class TestClosestLegalAction:
         # Fold the current player so the next is inactive in a forced-skip scenario
         # Drive to a point where an inactive player would receive None
         # Simulate by checking that None is accepted for an inactive player
-        env2 = env.apply_action("fold")
+        env2 = copy.deepcopy(env); env2.step_in_place("fold")
         # Continue past the skip; eventually game is terminal or another player acts
         assert env2 is not None
 
@@ -548,6 +507,92 @@ class TestPositionalFlagsAfterConstruction:
         assert sb.n_chips == 10000 - 50
 
 
+class TestAllInBettingContract:
+    """An all-in must not let the engine skip an opponent's response or make a
+    live player act twice — the round-advance twin of the terminal all-in
+    contract enforced by ``_hand_over``.
+    """
+
+    def test_heads_up_over_the_top_all_in_lets_opponent_respond(self):
+        # P0 (SB) raises pre-flop, P1 (BB) shoves over the top.  The street must
+        # NOT advance and the hand must NOT end: P0 still owes a call-or-fold on
+        # the shove (previously the street silently advanced to the flop with
+        # P0's chips uncommitted).
+        env = PokerEnv([Player(0, 10000), Player(1, 10000)],
+                       small_blind=50, big_blind=100)
+        env.step_in_place("raise:1.0")
+        env.step_in_place("all_in")
+        assert env.betting_stage == "pre_flop"
+        assert not env.is_terminal
+        assert env.player_i == 0
+        # Facing the full-stack shove, P0 can only call it off or fold.
+        assert set(a for a in env.legal_actions if a) == {"fold", "all_in"}
+
+    def test_multiway_over_the_top_all_in_lets_live_players_respond(self):
+        # P2 (short) shoves over a flop bet that P0/P1 already matched; the two
+        # live players must still get to respond, not have the hand jump to the
+        # turn with the shove uncalled.
+        env = PokerEnv([Player(0, 10000), Player(1, 10000), Player(2, 450)],
+                       small_blind=50, big_blind=100)
+        for _ in range(3):
+            env.step_in_place("call")          # everyone limps to the flop
+        assert env.betting_stage == "flop"
+        env.step_in_place("raise:1.0")         # P0 opens
+        env.step_in_place("call")              # P1 calls
+        env.step_in_place("all_in")            # P2 shoves over the top
+        assert env.betting_stage == "flop"
+        assert env.current_player.is_active
+        assert not env.current_player.is_all_in
+
+    def test_earlier_street_all_in_does_not_cause_double_action(self):
+        # P2 is all-in from pre-flop; on the flop the two remaining live players
+        # must each act exactly once before the turn.  Previously the already-
+        # all-in P2 was counted in the round's actor total, so the gate that
+        # ends the round never tripped after one lap and P0/P1 were re-polled.
+        env = PokerEnv([Player(0, 10000), Player(1, 10000), Player(2, 200)],
+                       small_blind=50, big_blind=100)
+        env.step_in_place("all_in")            # P2 shoves pre-flop
+        env.step_in_place("call")              # P0 calls
+        env.step_in_place("call")              # P1 calls -> flop
+        assert env.betting_stage == "flop"
+        assert env.players[2].is_all_in
+        actors = []
+        for _ in range(10):                    # bounded so a regression can't hang
+            if env.betting_stage != "flop":
+                break
+            actors.append(env.player_i)
+            env.step_in_place("call")          # check it down
+        assert actors == [0, 1]                # each live player acts once
+
+
+class TestHeadsUpActionOrder:
+    """Heads-up position: the button (seat 0 = SB) acts first pre-flop but LAST
+    post-flop, so the big blind (seat 1) leads post-flop.  For 3+ players the
+    small blind (seat 0) already leads post-flop, so their order is unchanged.
+    """
+
+    def test_preflop_button_acts_first(self):
+        env = new_game(n_players=2, card_info_lut={})
+        assert env.player_i == 0               # SB / button
+
+    def test_postflop_big_blind_acts_first(self):
+        env = new_game(n_players=2, card_info_lut={})
+        env.step_in_place("call")              # SB completes
+        env.step_in_place("call")              # BB checks -> flop
+        assert env.betting_stage == "flop"
+        assert env.player_i == 1               # BB is first to act post-flop
+
+    @pytest.mark.parametrize("street", ["flop", "turn", "river"])
+    def test_heads_up_postflop_lut_is_bb_first(self, street):
+        env = new_game(n_players=2, card_info_lut={})
+        assert env._player_i_lut[street] == [1, 0]
+
+    @pytest.mark.parametrize("n", [3, 4, 6])
+    def test_multiway_postflop_lut_is_seat_order(self, n):
+        env = new_game(n_players=n, card_info_lut={})
+        assert env._player_i_lut["flop"] == list(range(n))
+
+
 # ---------------------------------------------------------------------------
 # Bet reset at stage transitions (Bug 3 regression)
 # ---------------------------------------------------------------------------
@@ -555,7 +600,7 @@ class TestPositionalFlagsAfterConstruction:
 class TestBetResetViaApplyAction:
     def _advance_to_stage(self, env, target_stage):
         while env.betting_stage != target_stage and not env.is_terminal:
-            env = env.apply_action("call")
+            env.step_in_place("call")
         return env
 
     def test_n_bet_chips_zero_at_flop_start(self):
@@ -584,7 +629,7 @@ class TestBetResetViaApplyAction:
         # Raise pre-flop so n_bet_chips > 0
         raise_actions = [a for a in env.legal_actions if a and a.startswith("raise:")]
         if raise_actions:
-            env = env.apply_action(raise_actions[0])
+            env.step_in_place(raise_actions[0])
             assert any(p.n_bet_chips > 0 for p in env.players)
         # Drive to flop and verify reset
         env = self._advance_to_stage(env, "flop")
@@ -615,13 +660,27 @@ class TestBetResetViaApplyAction:
 class TestAllInBoardCompletion:
     def _advance_to_stage(self, env, target_stage):
         while env.betting_stage != target_stage and not env.is_terminal:
-            env = env.apply_action("call")
+            env.step_in_place("call")
+        return env
+
+    def _shove_and_respond(self, env, respond="call"):
+        """Shove all-in, then have the opponent respond (the corrected
+        contract: an all-in is NOT terminal until the opponent calls or folds).
+        Returns the env after the response resolves the hand."""
+        env.step_in_place("all_in")
+        # The fix: the opponent must still get to act on the all-in.
+        assert not env.is_terminal
+        if respond == "call":
+            resp = "all_in" if "all_in" in env.legal_actions else "call"
+        else:
+            resp = "fold"
+        env.step_in_place(resp)
         return env
 
     def test_all_in_preflop_has_5_community_cards(self):
         env = new_game(n_players=2, card_info_lut={})
         assert "all_in" in env.legal_actions
-        env = env.apply_action("all_in")
+        self._shove_and_respond(env)
         assert env.is_terminal
         assert len(env.community_cards) == 5
 
@@ -630,7 +689,7 @@ class TestAllInBoardCompletion:
         env = self._advance_to_stage(env, "flop")
         assert env.betting_stage == "flop"
         assert "all_in" in env.legal_actions
-        env = env.apply_action("all_in")
+        self._shove_and_respond(env)
         assert env.is_terminal
         assert len(env.community_cards) == 5
 
@@ -639,7 +698,7 @@ class TestAllInBoardCompletion:
         env = self._advance_to_stage(env, "turn")
         assert env.betting_stage == "turn"
         assert "all_in" in env.legal_actions
-        env = env.apply_action("all_in")
+        self._shove_and_respond(env)
         assert env.is_terminal
         assert len(env.community_cards) == 5
 
@@ -648,24 +707,65 @@ class TestAllInBoardCompletion:
         env = self._advance_to_stage(env, "river")
         assert env.betting_stage == "river"
         assert "all_in" in env.legal_actions
-        env = env.apply_action("all_in")
+        self._shove_and_respond(env)
         assert env.is_terminal
         assert len(env.community_cards) == 5
 
     def test_fold_terminal_has_5_community_cards(self):
         env = new_game(n_players=2, card_info_lut={})
-        env = env.apply_action("fold")
+        env.step_in_place("fold")
         assert env.is_terminal
         assert len(env.community_cards) == 5
 
     def test_community_cards_unique_after_all_in(self):
         env = new_game(n_players=2, card_info_lut={})
-        env = env.apply_action("all_in")
+        self._shove_and_respond(env)
         assert len(env.community_cards) == len(set(env.community_cards))
 
     def test_community_cards_no_overlap_with_hole_cards(self):
         env = new_game(n_players=2, card_info_lut={})
         hole_cards = {c for p in env.players for c in p.cards}
-        env = env.apply_action("all_in")
+        self._shove_and_respond(env)
         for c in env.community_cards:
             assert c not in hole_cards
+
+
+class TestAllInFacingResponse:
+    """Regression for the corrected all-in contract: an all-in must give the
+    opponent a call/fold decision (it used to auto-terminate the hand)."""
+
+    def test_all_in_is_not_immediately_terminal(self):
+        env = new_game(n_players=2, card_info_lut={})
+        env.step_in_place("all_in")
+        assert not env.is_terminal
+        assert env.player_i == 1  # opponent to act
+        legal = [a for a in env.legal_actions if a is not None]
+        assert "fold" in legal and ("call" in legal or "all_in" in legal)
+
+    def test_facing_all_in_offers_only_call_or_fold(self):
+        # No one can call a raise when the only opponent is all-in, so the
+        # responses are exactly call/all_in and fold — never a raise.
+        env = new_game(n_players=2, card_info_lut={})
+        env.step_in_place("all_in")
+        legal = [a for a in env.legal_actions if a is not None]
+        assert not any(a.startswith("raise:") for a in legal)
+
+    def test_calling_all_in_contests_full_stacks(self):
+        # The core of the fix: a called all-in settles for the full contested
+        # stacks, not just the pre-shove matched pot.
+        env = new_game(n_players=2, card_info_lut={})
+        env.step_in_place("all_in")
+        env.step_in_place("all_in")  # opponent calls the shove
+        assert env.is_terminal
+        payout = dict(env.payout)
+        # One player wins the other's entire 10000 stack (zero-sum).
+        assert sorted(payout.values()) == [-10000, 10000]
+
+    def test_folding_to_all_in_forfeits_only_committed_chips(self):
+        env = new_game(n_players=2, card_info_lut={})
+        env.step_in_place("all_in")   # SB shoves
+        env.step_in_place("fold")     # BB folds
+        assert env.is_terminal
+        payout = dict(env.payout)
+        # BB forfeits only the big blind it had committed.
+        assert payout == {0: 100, 1: -100}

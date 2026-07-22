@@ -211,7 +211,8 @@ class TestStrategyStep:
 
         tables, state = MagicMock(), MagicMock()
         strategy_step(tables, state, i=2)
-        update_strategy_mock.assert_called_once_with(tables, state, 2)
+        # Default (no core, no accumulator) → the legacy direct-write path.
+        update_strategy_mock.assert_called_once_with(tables, state, 2, local_delta=None)
 
 
 # ---------------------------------------------------------------------------

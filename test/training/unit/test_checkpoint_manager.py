@@ -18,6 +18,12 @@ class _FakeTables:
     def __init__(self):
         self.snapshot_calls = 0
         self.flush_index_calls = 0
+        self.persist_index_calls = 0
+
+    def persist_indexes(self):
+        # Deferred-allocation bulk flush; a no-op on the synchronous path.
+        self.persist_index_calls += 1
+        return 0
 
     def snapshot_dirty_chunks(self):
         # Returning [] keeps the (now-stopped) writer's work trivial if
@@ -103,3 +109,87 @@ class TestCheckpointSkipCoalesce:
         assert server._tables.snapshot_calls == 1
         # The inline write produced a real checkpoint directory.
         assert list(mgr._save_path.glob("checkpoint_[0-9]*"))
+
+
+class TestCheckpointRetention:
+    """Every checkpoint is retained as an average-strategy snapshot — the
+    previous generation is no longer deleted.  These tests pin the
+    non-deleting invariant and the unique, monotonic naming that keeps
+    retained generations from colliding when written in the same second.
+    """
+
+    def test_previous_checkpoint_is_not_deleted(self, manager):
+        """A second checkpoint must leave the first on disk (it is a
+        retained snapshot), not roll it over as the old behaviour did."""
+        mgr, server = manager
+
+        mgr.checkpoint(t=1, emergency=True)
+        first = mgr._last_checkpoint_path
+        assert first is not None and first.exists()
+
+        mgr.checkpoint(t=2, emergency=True)
+        second = mgr._last_checkpoint_path
+
+        # Both generations survive; they are distinct directories.
+        assert first != second
+        assert first.exists()
+        assert second.exists()
+        assert len(list(mgr._save_path.glob("checkpoint_[0-9]*"))) == 2
+
+    def test_same_second_names_are_unique_and_monotonic(self, manager, monkeypatch):
+        """Checkpoints written within the same wall-clock second must get
+        distinct, strictly increasing names so the retained dirs neither
+        collide on rename nor confuse the lexical 'latest' resume pick.
+
+        The clock is pinned to a constant so every write reports the same
+        second, deterministically exercising the collision-bump path (the
+        exact scenario that would crash a same-second rename onto a
+        non-empty retained dir)."""
+        import poker_ai.tables.checkpoint as checkpoint_mod
+
+        mgr, server = manager
+        monkeypatch.setattr(checkpoint_mod.time, "time", lambda: 1_700_000_000.0)
+
+        names = []
+        for t in range(3):
+            mgr.checkpoint(t=t, emergency=True)
+            names.append(mgr._last_checkpoint_path.name)
+
+        # Same second for all three, yet all names unique and strictly
+        # increasing (the bump path fired), and creation order == sort order.
+        assert names == ["checkpoint_1700000000",
+                         "checkpoint_1700000001",
+                         "checkpoint_1700000002"]
+        assert len(set(names)) == 3
+        assert names == sorted(names)
+        # Every generation is still on disk (nothing deleted, nothing clobbered).
+        assert len(list(mgr._save_path.glob("checkpoint_[0-9]*"))) == 3
+
+    def test_hardlink_carry_forward_sources_from_latest(self, manager, tmp_path):
+        """Unchanged chunk files carry forward via hardlink from the most
+        recent retained checkpoint, so a new generation is self-contained
+        while sharing inodes with the one before it."""
+        import numpy as np
+
+        mgr, server = manager
+
+        # First generation carries a chunk file.
+        def _one_chunk():
+            server._tables.snapshot_calls += 1
+            return [("regret_0_chunk_000000.npy", np.zeros((2, 3), dtype=np.int32))]
+
+        server._tables.snapshot_dirty_chunks = _one_chunk
+        mgr.checkpoint(t=1, emergency=True)
+        first = mgr._last_checkpoint_path
+        first_chunk = first / "regret_0_chunk_000000.npy"
+        assert first_chunk.exists()
+
+        # Second generation writes no new chunks — the file must appear via
+        # a hardlink to the first (same inode), and both dirs still exist.
+        server._tables.snapshot_dirty_chunks = lambda: []
+        mgr.checkpoint(t=2, emergency=True)
+        second = mgr._last_checkpoint_path
+        second_chunk = second / "regret_0_chunk_000000.npy"
+        assert second_chunk.exists()
+        assert first_chunk.stat().st_ino == second_chunk.stat().st_ino
+        assert first.exists() and second.exists()

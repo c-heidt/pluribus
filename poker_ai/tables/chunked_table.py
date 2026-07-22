@@ -311,6 +311,49 @@ class ChunkedTable:
         finally:
             lock.release()
 
+    def merge_delta_rows(self, items) -> None:
+        """Batch-merge many ``(info_set, delta)`` pairs, one lock per chunk.
+
+        Semantically identical to calling :meth:`merge_delta_row` for each
+        pair, but groups the rows by chunk and acquires each chunk's stripe
+        lock **once** — applying every row for that chunk inside a single
+        critical section — instead of once per info set.  The regret flush
+        (:func:`poker_ai.blueprint.cfr.merge_local_delta`) touches many info
+        sets that map to only a handful of chunks, so this cuts the number of
+        (futex) lock acquisitions from *O(touched info sets)* to *O(distinct
+        chunks touched)* per flush, shrinking both syscall overhead and the
+        window in which workers contend for a chunk.
+
+        Rows are resolved (and allocated) up front, before any stripe lock is
+        taken; each chunk's lock is acquired and released in turn, so no two
+        stripe locks are ever held at once (no deadlock).
+
+        Parameters
+        ----------
+        items : Iterable[Tuple[str, np.ndarray]]
+            ``(info_set, delta)`` pairs.  Each ``delta`` is a 1-D integer
+            array of length ``n_actions`` added to that info set's row (cast
+            to int32 before the add), exactly as in :meth:`merge_delta_row`.
+        """
+        by_chunk = {}
+        locations = self._locate_rows([info_set for info_set, _ in items])
+        for (info_set, delta), (chunk_id, local_row) in zip(items, locations):
+            by_chunk.setdefault(chunk_id, []).append((local_row, delta))
+        for chunk_id, rows in by_chunk.items():
+            lock = self.get_stripe_lock(chunk_id)
+            lock.acquire()
+            try:
+                view = self._store.view(chunk_id)
+                for local_row, delta in rows:
+                    np.add(
+                        view[local_row],
+                        delta.astype(np.int32),
+                        out=view[local_row],
+                    )
+                self._store.mark_dirty(chunk_id)
+            finally:
+                lock.release()
+
     # ------------------------------------------------------------------
     # Stripe locking
     # ------------------------------------------------------------------
@@ -410,3 +453,28 @@ class ChunkedTable:
         chunk_id, local_row = divmod(flat_row, CHUNK_SIZE)
         self._store.ensure_open(chunk_id)
         return chunk_id, local_row
+
+    def _locate_rows(self, info_sets) -> list:
+        """Batched :meth:`_locate_row`: ``(chunk_id, local_row)`` per info set.
+
+        Resolves/allocates every flat row through the index in **one** batched
+        call (:meth:`InfosetIndex.get_or_create_many` — one LMDB write txn for
+        the whole batch instead of one per new info set), then applies the same
+        per-row bookkeeping :meth:`_locate_row` does: bump the per-table
+        allocation counter once by the number of freshly-allocated rows, and
+        ``ensure_open`` each row's chunk (idempotent; opens any chunks a batch of
+        allocations crossed into).  Order-preserving.
+        """
+        results = self._index.get_or_create_many(info_sets)
+        n_new = 0
+        locations = []
+        for flat_row, is_new in results:
+            if is_new:
+                n_new += 1
+            chunk_id, local_row = divmod(flat_row, CHUNK_SIZE)
+            self._store.ensure_open(chunk_id)
+            locations.append((chunk_id, local_row))
+        if n_new:
+            with self._n_allocated.get_lock():
+                self._n_allocated.value += n_new
+        return locations

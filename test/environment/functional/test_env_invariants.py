@@ -15,7 +15,8 @@ fast-path, so ALL terminal states have exactly 5 community cards.
 
 import pytest
 
-from environment.poker_env import new_game
+from environment.player import Player
+from environment.poker_env import PokerEnv, new_game
 
 
 # ---------------------------------------------------------------------------
@@ -23,9 +24,38 @@ from environment.poker_env import new_game
 # ---------------------------------------------------------------------------
 
 def _play_step(env):
-    """Advance one action: prefer call, else first legal action."""
+    """Advance one action in place: prefer call, else first legal action."""
     action = "call" if "call" in env.legal_actions else env.legal_actions[0]
-    return env.apply_action(action)
+    env.step_in_place(action)
+    return env
+
+
+def _raise_step(env):
+    """Advance one action in place: prefer raise:0.5, else fall back to call."""
+    raise_actions = [a for a in env.legal_actions if a and a.startswith("raise:0.5")]
+    if raise_actions:
+        env.step_in_place(raise_actions[0])
+        return env
+    return _play_step(env)
+
+
+def _short_stack_shove_step(env):
+    """Short stacks shove when they can; everyone else checks/calls.
+
+    Putting *every* stack all-in heads-up just fast-paths to terminal (no
+    intermediate betting rounds).  Letting only the short stack shove while the
+    deeper players call keeps a side pot alive across the flop/turn/river, so
+    the bet-reset invariant is exercised with an all-in player still in the
+    hand — the case worth testing."""
+    p = env.current_player
+    legal = env.legal_actions
+    if "all_in" in legal and p.n_chips <= 5 * env.big_blind:
+        env.step_in_place("all_in")
+        return env
+    if "check" in legal:
+        env.step_in_place("check")
+        return env
+    return _play_step(env)
 
 
 def _play_all_calls(env, max_steps=500):
@@ -41,7 +71,7 @@ def _play_fold_first(env, max_steps=500):
     steps = 0
     while not env.is_terminal and steps < max_steps:
         if "fold" in env.legal_actions:
-            env = env.apply_action("fold")
+            env.step_in_place("fold")
         else:
             env = _play_step(env)
         steps += 1
@@ -54,7 +84,7 @@ def _play_all_raises(env, max_steps=500):
     while not env.is_terminal and steps < max_steps:
         raise_actions = [a for a in env.legal_actions if a and a.startswith("raise:0.5")]
         if raise_actions:
-            env = env.apply_action(raise_actions[0])
+            env.step_in_place(raise_actions[0])
         else:
             env = _play_step(env)
         steps += 1
@@ -66,7 +96,7 @@ def _play_all_in_first(env, max_steps=500):
     steps = 0
     while not env.is_terminal and steps < max_steps:
         if "all_in" in env.legal_actions:
-            env = env.apply_action("all_in")
+            env.step_in_place("all_in")
         else:
             env = _play_step(env)
         steps += 1
@@ -107,19 +137,35 @@ class TestChipConservationInvariant:
 # ---------------------------------------------------------------------------
 
 class TestBetResetInvariant:
-    def _assert_bets_reset_at_stage_transitions(self, env):
+    # Only a new *betting* round clears the per-round wagers (``_increment_stage``
+    # zeros ``n_bet_chips``); the transition into show_down/terminal is
+    # settlement, and an all-in fast-path can jump straight there with chips
+    # still staged for the pot — so those transitions are not part of the
+    # invariant.
+    _BETTING_STAGES = frozenset({"pre_flop", "flop", "turn", "river"})
+
+    def _assert_bets_reset_at_stage_transitions(self, env, step_fn=_play_step):
+        # ``step_fn`` chooses the action at each node, so the same invariant can
+        # be exercised under call-down, raises, or all-ins.  The playing and the
+        # checking must be interleaved here (not pre-played) — the assertion
+        # fires at every stage transition, so a raise/all-in line has to drive
+        # the very steps whose resets we verify.
         prev_stage = env.betting_stage
+        transitions = 0
         for _ in range(500):
             if env.is_terminal:
                 break
-            env = _play_step(env)
+            env = step_fn(env)
             if env.betting_stage != prev_stage:
-                for p in env.players:
-                    assert p.n_bet_chips == 0, (
-                        f"{p.name}.n_bet_chips={p.n_bet_chips} "
-                        f"at start of {env.betting_stage}"
-                    )
+                if env.betting_stage in self._BETTING_STAGES:
+                    transitions += 1
+                    for p in env.players:
+                        assert p.n_bet_chips == 0, (
+                            f"{p.name}.n_bet_chips={p.n_bet_chips} "
+                            f"at start of {env.betting_stage}"
+                        )
                 prev_stage = env.betting_stage
+        return transitions
 
     @pytest.mark.parametrize("n_players", [2, 3, 6])
     def test_bet_chips_zero_at_every_stage_start(self, n_players):
@@ -127,17 +173,23 @@ class TestBetResetInvariant:
         self._assert_bets_reset_at_stage_transitions(env)
 
     def test_bet_reset_with_raises(self):
+        # Heads-up raise war: bets grow past the blinds every street, so the
+        # reset at each new betting round is exercised under non-trivial wagers.
         env = new_game(n_players=2, card_info_lut={})
-        self._assert_bets_reset_at_stage_transitions(_play_all_raises(
-            new_game(n_players=2, card_info_lut={}), max_steps=0
-        ))
-        # Run the invariant check on a game played with raises
-        env = new_game(n_players=2, card_info_lut={})
-        self._assert_bets_reset_at_stage_transitions(env)
+        transitions = self._assert_bets_reset_at_stage_transitions(
+            env, step_fn=_raise_step
+        )
+        assert transitions >= 1, "raise line never reached a new betting round"
 
-    def test_bet_reset_with_all_in_strategy(self):
-        env = new_game(n_players=2, card_info_lut={})
-        self._assert_bets_reset_at_stage_transitions(env)
+    def test_bet_reset_with_all_in_side_pot(self):
+        # Short stack (seat 0) shoves pre-flop; the two deeper players call and
+        # keep betting on later streets — a side pot.  The bet-reset invariant
+        # must still hold at every new street with an all-in player in the hand.
+        env = PokerEnv(players=[Player(0, 250), Player(1, 10_000), Player(2, 10_000)])
+        transitions = self._assert_bets_reset_at_stage_transitions(
+            env, step_fn=_short_stack_shove_step
+        )
+        assert transitions >= 1, "side-pot line never reached a new betting round"
 
 
 # ---------------------------------------------------------------------------
@@ -186,9 +238,15 @@ class TestBoardCompletionInvariant:
             env = new_game(n_players=2, card_info_lut={})
             for _ in range(n_calls_before):
                 if not env.is_terminal:
-                    env = env.apply_action("call")
+                    env.step_in_place("call")
             if not env.is_terminal and "all_in" in env.legal_actions:
-                env = env.apply_action("all_in")
+                env.step_in_place("all_in")
+                # Corrected contract: the shove is not terminal until the
+                # opponent responds — call the all-in to reach the showdown.
+                if not env.is_terminal:
+                    env.step_in_place(
+                        "all_in" if "all_in" in env.legal_actions else "call"
+                    )
                 assert env.is_terminal
                 assert len(env.community_cards) == 5, (
                     f"all-in at {target_stage}: expected 5 cards, "
@@ -251,6 +309,24 @@ class TestPayoutIntegrityInvariant:
     def test_payout_zero_sum_three_players(self):
         env = new_game(n_players=3, card_info_lut={})
         env = _play_all_calls(env)
+        assert sum(env.payout.values()) == 0
+
+    def test_payout_nets_per_seat_with_unequal_stacks(self):
+        # Regression for the per-seat-initial payout fix: with UNEQUAL starting
+        # stacks, ``payout`` must net each seat against its OWN start (zero-sum),
+        # not against seat 0's stack.  The old code netted everyone against
+        # ``players[0].n_chips``, giving a non-zero-sum result off equal stacks.
+        starting = [150, 400, 900]
+        env = PokerEnv(
+            players=[Player(i, starting[i]) for i in range(3)],
+            small_blind=25,
+            big_blind=50,
+        )
+        env.card_info_lut = {}
+        env = _play_all_calls(env)
+        assert env.is_terminal
+        for i, player in enumerate(env.players):
+            assert env.payout[i] == player.n_chips - starting[i]
         assert sum(env.payout.values()) == 0
 
 

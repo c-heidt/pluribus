@@ -43,6 +43,7 @@ from typing import Dict, Tuple
 
 import numpy as np
 
+from poker_ai.blueprint.bias import BiasClass
 from poker_ai.blueprint.cfr import cfr, cfrp
 from poker_ai.tables.cfr_tables import CFRTables
 from poker_ai.blueprint.strategy import update_strategy
@@ -80,6 +81,9 @@ def cfr_step(
     prune_threshold: int,
     c: int,
     local_delta: Dict[Tuple[int, str], np.ndarray],
+    bias: BiasClass = "none",
+    bias_magnitude: float = 0.0,
+    core=None,
 ) -> None:
     """Execute one CFR traversal for player *i* with stochastic pruning.
 
@@ -89,6 +93,11 @@ def cfr_step(
     sampling CFR.  The 5% unpruned fallback is what keeps pruned
     actions from being permanently stuck — their regrets still get
     updated on those traversals.
+
+    The pruning coin is drawn identically whether the traversal runs
+    on the Python path or the compiled core, so the cfr/cfrp mix (and
+    the global RNG stream advance) is the same either way; only the
+    recursion body differs.
 
     Regret updates are written into the caller-owned ``local_delta``
     buffer; the caller decides when to flush via
@@ -112,35 +121,72 @@ def cfr_step(
         or below ``c`` are pruned (unless on the river).
     local_delta : dict[tuple[int, str], np.ndarray]
         Caller-owned regret accumulator.
+    bias : BiasClass, optional
+        Action class for biased-blueprint training.  Forwarded to
+        :func:`cfr` / :func:`cfrp`; ``"none"`` (default) selects the
+        legacy unbiased path.
+    bias_magnitude : float, optional
+        Per-occurrence terminal-payoff bonus applied when
+        ``bias != "none"``.
+    core : poker_ai.blueprint.core_runner.CoreDriver, optional
+        When supplied (``PLURIBUS_CFR_CORE=1``), the traversal runs
+        through the compiled Cython core instead of the Python
+        :func:`cfr` / :func:`cfrp` recursion.  The core accumulates
+        into the same ``local_delta`` in place, so the caller's flush
+        path is unchanged.  ``None`` (default) keeps the Python path,
+        which stays the live oracle.
     """
     use_pruning = np.random.uniform() < PRUNE_PROBABILITY
-    if use_pruning and t > prune_threshold:
-        cfrp(tables, state, i, t, c, local_delta)
+    prune_on = use_pruning and t > prune_threshold
+    if core is not None:
+        core.run_cfr(state, i, t, c, prune_on, local_delta)
+        return
+    if prune_on:
+        cfrp(tables, state, i, t, c, local_delta,
+             bias=bias, bias_magnitude=bias_magnitude)
     else:
-        cfr(tables, state, i, t, local_delta)
+        cfr(tables, state, i, t, local_delta,
+            bias=bias, bias_magnitude=bias_magnitude)
 
 
 def strategy_step(
     tables: CFRTables,
     state: PokerState,
     i: int,
+    local_delta: Dict[Tuple[int, str], np.ndarray] = None,
+    core=None,
 ) -> None:
     """Execute one strategy-update traversal for player *i*.
 
-    Thin wrapper around :func:`poker_ai.blueprint.strategy.update_strategy`
-    that keeps the single- and multi-process loops structurally
-    symmetric with :func:`cfr_step`.
+    Wrapper around :func:`poker_ai.blueprint.strategy.update_strategy` that keeps
+    the single- and multi-process loops structurally symmetric with
+    :func:`cfr_step` — same ``core`` / ``local_delta`` dispatch shape.
 
     Parameters
     ----------
     tables : CFRTables
-        Shared tables (only ``tables.strategy`` is written).
+        Shared tables (only ``tables.strategy`` is written, and only when
+        ``local_delta is None``).
     state : PokerState
         Root game state for this traversal.
     i : int
         Traversing player whose average strategy is being updated.
+    local_delta : dict, optional
+        Caller-owned visit-count accumulator keyed by ``(betting_round,
+        info_set)``.  When supplied, the sampled visit counts are written here
+        (to be flushed later via
+        :func:`poker_ai.blueprint.cfr.merge_local_strategy_delta`) instead of
+        directly into the shared ``tables.strategy``.  ``None`` (default) keeps
+        the legacy direct-write behaviour used by the single-process loop.
+    core : poker_ai.blueprint.core_runner.CoreDriver, optional
+        When supplied (``PLURIBUS_CFR_CORE=1``), the playthrough runs through the
+        compiled core, accumulating into ``local_delta`` in place.  ``None``
+        (default) keeps the Python path, which stays the live oracle.
     """
-    update_strategy(tables, state, i)
+    if core is not None:
+        core.run_strategy(state, i, local_delta)
+        return
+    update_strategy(tables, state, i, local_delta=local_delta)
 
 
 # ---------------------------------------------------------------------------

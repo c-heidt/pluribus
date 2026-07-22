@@ -152,6 +152,10 @@ __pycache__/
 # C extensions
 *.so
 
+# Cython-generated C sources for the compiled core (build artifacts; the .pyx
+# is the source of truth). Scoped to poker_ai/_core so no hand-written C is hidden.
+poker_ai/_core/*.c
+
 # Distribution / packaging
 .Python
 /build/
@@ -283,3 +287,6 @@ dmypy.json
 
 # VS Code
 .vscode/**
+
+# Data
+/data/*

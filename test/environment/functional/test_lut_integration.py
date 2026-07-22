@@ -13,6 +13,7 @@ The LUT directory is resolved from the environment variable
 ``PLURIBUS_LUT_PATH`` (default: ``data/20cards_exact``).
 """
 
+import copy
 import pytest
 
 from environment.poker_env import new_game
@@ -30,7 +31,7 @@ def _play_to_terminal(env, max_steps=500):
     steps = 0
     while not env.is_terminal and steps < max_steps:
         action = "call" if "call" in env.legal_actions else env.legal_actions[0]
-        env = env.apply_action(action)
+        env.step_in_place(action)
         steps += 1
     return env
 
@@ -71,44 +72,43 @@ class TestDeckInferenceFromLUT:
 # ---------------------------------------------------------------------------
 
 class TestInfoSetWithLUT:
-    def test_info_set_returns_string_at_preflop(self, lut):
+    def test_info_set_returns_bytes_at_preflop(self, lut):
         env = new_game(n_players=2, card_info_lut=lut)
         result = env.info_set
-        assert isinstance(result, str)
+        assert isinstance(result, bytes)
         assert len(result) > 0
 
-    def test_info_set_contains_cards_cluster_key(self, lut):
-        import json
+    def test_info_set_fields_expose_cluster(self, lut):
+        # The key itself is now opaque compact bytes; the structured
+        # accessor exposes the pre-encoding (cluster, history) fields.
         env = new_game(n_players=2, card_info_lut=lut)
-        parsed = json.loads(env.info_set)
-        assert "cards_cluster" in parsed
+        cluster, history = env.info_set_fields()
+        assert isinstance(cluster, int)
 
-    def test_info_set_contains_history_key(self, lut):
-        import json
+    def test_info_set_fields_expose_history(self, lut):
         env = new_game(n_players=2, card_info_lut=lut)
-        parsed = json.loads(env.info_set)
-        assert "history" in parsed
+        cluster, history = env.info_set_fields()
+        assert isinstance(history, list)
 
     def test_info_set_differs_between_players(self, lut):
         env = new_game(n_players=2, card_info_lut=lut)
         # Player 0 info set
         info_0 = env.info_set
         # Advance to player 1's turn
-        env2 = env.apply_action("call")
+        env2 = copy.deepcopy(env); env2.step_in_place("call")
         if not env2.is_terminal:
             info_1 = env2.info_set
             # Different players hold different hole cards so info sets differ
             assert info_0 != info_1
 
     def test_info_set_at_flop(self, lut):
-        import json
         env = new_game(n_players=2, card_info_lut=lut)
         # Play through pre-flop
         while env.betting_stage == "pre_flop":
-            env = env.apply_action("call")
+            env.step_in_place("call")
         if env.betting_stage == "flop":
-            parsed = json.loads(env.info_set)
-            assert "cards_cluster" in parsed
+            cluster, _ = env.info_set_fields()
+            assert isinstance(cluster, int)
 
     def test_info_set_raises_at_nonterminal_without_lut(self, lut):
         # Strip the LUT after construction to simulate a missing entry
@@ -119,15 +119,15 @@ class TestInfoSetWithLUT:
 
     def test_info_set_all_streets(self, lut):
         """info_set resolves without error for every non-terminal state."""
-        import json
         env = new_game(n_players=2, card_info_lut=lut)
         visited_stages = set()
         steps = 0
         while not env.is_terminal and steps < 200:
             visited_stages.add(env.betting_stage)
-            parsed = json.loads(env.info_set)
-            assert "cards_cluster" in parsed
-            env = env.apply_action("call")
+            assert isinstance(env.info_set, bytes) and len(env.info_set) > 0
+            cluster, _ = env.info_set_fields()
+            assert isinstance(cluster, int)
+            env.step_in_place("call")
             steps += 1
         # Must have passed through at least pre_flop and flop
         assert "pre_flop" in visited_stages

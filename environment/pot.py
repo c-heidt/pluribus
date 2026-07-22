@@ -57,6 +57,14 @@ class Pot:
         """Clear all contributions, zeroing every player's entry."""
         self._chips = [0] * len(self._chips)
 
+    def capture(self) -> list:
+        """Snapshot per-player contributions for make/undo (a copy)."""
+        return list(self._chips)
+
+    def restore(self, snap: list) -> None:
+        """Restore the contributions captured by :meth:`capture`."""
+        self._chips = list(snap)
+
     @property
     def total(self) -> int:
         """Total chips currently in the pot."""
@@ -138,3 +146,40 @@ class Pot:
             payouts[player.player_i] += per_player
         for i in range(remainder):
             payouts[winners[i].player_i] += 1
+
+
+# ---------------------------------------------------------------------------
+# Optional compiled-core settlement (Phase 1e)
+# ---------------------------------------------------------------------------
+# Keep the pure-Python ``compute_utility`` as the byte-exact oracle, then swap it
+# for the Cython kernel when the extension is built AND enabled
+# (``PLURIBUS_CORE_KERNELS`` includes ``settlement``).  The kernel reproduces the
+# side-pot peel + odd-chip remainder exactly (verified by randomized differential
+# fixtures and the golden trace).  The thin wrapper hands the kernel the plain
+# integer inputs it wants — ``pot._chips``, per-``player_i`` ``order``, and the
+# ranked groups as ``player_i`` lists — and rebuilds the ``{player_i: won}`` dict
+# ``compute_winners`` expects.  ``compute_winners`` calls ``self.compute_utility``
+# at hand end, so swapping the class method is transparent.
+_compute_utility_py = Pot.compute_utility
+
+try:
+    from poker_ai._core import CORE_AVAILABLE as _CORE_AVAILABLE
+    from poker_ai._core.flags import kernel_enabled as _kernel_enabled
+
+    if _CORE_AVAILABLE and _kernel_enabled("settlement"):
+        from poker_ai._core._settle import (
+            compute_utility_won as _core_compute_utility_won,
+        )
+
+        def _compute_utility_core(self, players: list, ranked_groups: list) -> dict:
+            """Cython-backed :meth:`Pot.compute_utility` (flag ``settlement``)."""
+            order = [0] * len(self._chips)
+            for p in players:
+                order[p.player_i] = p.order
+            groups_pi = [[p.player_i for p in g] for g in ranked_groups]
+            won = _core_compute_utility_won(self._chips, groups_pi, order)
+            return {p.player_i: won[p.player_i] for p in players}
+
+        Pot.compute_utility = _compute_utility_core
+except ImportError:
+    pass

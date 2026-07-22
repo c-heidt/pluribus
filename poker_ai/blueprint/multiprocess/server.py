@@ -42,6 +42,8 @@ from typing import Dict, Optional, Union
 from poker_ai.tables.checkpoint import CheckpointManager
 from poker_ai.tables.cfr_tables import CFRTables
 from poker_ai.tables.chunk_store import CHUNK_SIZE as _CHUNK_SIZE
+from poker_ai.tables.warm_start import apply_warm_start
+from poker_ai.blueprint.bias import BiasClass
 from poker_ai.blueprint.multiprocess.worker import Worker
 from poker_ai.blueprint.training import (
     DiscountState,
@@ -78,6 +80,32 @@ def _startup_signal_handler(signum: int, frame) -> None:
         "before training begins (no checkpoint needed)"
     )
     sys.exit(143 if signum == signal.SIGTERM else 130)
+
+
+def _read_persisted_index_capacities(save_path) -> Optional[Dict[int, int]]:
+    """Return the index-cache capacities saved in the latest checkpoint, if any.
+
+    Read *before* :class:`CFRTables` is constructed so a resume rebuilds the
+    same-size shm index cache the original run used (see
+    :func:`poker_ai.tables.cfr_tables._cache_capacity`).  Returns ``None`` on a
+    fresh run (no checkpoint) or an older checkpoint without the field.
+    """
+    import joblib
+
+    checkpoints = sorted(Path(save_path).glob("checkpoint_[0-9]*"))
+    for cp in reversed(checkpoints):
+        state_file = cp / "server_state.pkl"
+        if not state_file.exists():
+            continue
+        try:
+            state = joblib.load(state_file)
+        except Exception:
+            continue
+        caps = state.get("index_cache_capacity")
+        if caps:
+            return {int(k): int(v) for k, v in caps.items()}
+        return None
+    return None
 
 
 class WorkerError(RuntimeError):
@@ -119,9 +147,14 @@ class Server:
         sync_interval: int = 10,
         discount_interval: int = 1,
         checkpoint_interval: int = 1,
+        checkpoint_start_cycles: int = 0,
         start_timestep: int = 0,
         n_processes: Optional[int] = None,
         batch_size: Optional[int] = None,
+        strategy_per_job: Optional[int] = None,
+        bias: BiasClass = "none",
+        bias_magnitude: float = 0.0,
+        warm_start: Optional[Union[str, Path]] = None,
     ):
         """Initialise the server and spawn the worker pool.
 
@@ -166,7 +199,18 @@ class Server:
         discount_interval : int, optional
             Period (in sync cycles) between LCFR discount applications.
         checkpoint_interval : int, optional
-            Period (in sync cycles) between checkpoint writes.
+            Period (in sync cycles) between checkpoint writes.  Every
+            checkpoint is retained (never deleted) and serves as a post-flop
+            average-strategy snapshot, so this also sets the snapshot cadence.
+        checkpoint_start_cycles : int, optional
+            Suppress scheduled checkpoints until ``sync_step`` reaches this
+            many cycles (``0`` = checkpoint from the beginning, identical to
+            having no gate).  The first checkpoint fires at the first
+            ``checkpoint_interval`` multiple ``>=`` this value, so setting it
+            equal to a multiple of the interval fires exactly there.  Used as
+            the average-strategy warm-up so the retained snapshots skip the
+            near-random early era.  The end-of-run / SIGTERM checkpoint
+            ignores this gate so an orderly stop is always resumable.
         start_timestep : int, optional
             Initial traversals-per-player counter (``0`` on fresh
             runs).  Overridden on resume by the checkpoint manager.
@@ -187,6 +231,12 @@ class Server:
             pressure at the cost of longer per-job wall time.
             Defaults to the ``PLURIBUS_CFR_BATCH_SIZE`` environment
             variable if set, else ``5``.
+        strategy_per_job : int, optional
+            Pre-flop UPDATE-STRATEGY playthroughs folded into each ``cfr``
+            job (per player, after warm-up).  ``None`` (default) reads the
+            ``PLURIBUS_STRATEGY_PER_JOB`` environment variable, falling back
+            to ``1`` — one pass covers the whole pre-flop opponent tree per
+            deal (full branching).  ``0`` disables the strategy pass entirely.
         """
         # Install a minimal SIGTERM/SIGINT handler immediately so a
         # signal that arrives during the slow startup phases (LUT
@@ -240,6 +290,29 @@ class Server:
             f"{self._workers_per_player * self._batch_size} per player"
         )
 
+        # Number of pre-flop UPDATE-STRATEGY playthroughs folded into each
+        # ``cfr`` job (per player, after warm-up).  The strategy pass is
+        # interleaved with CFR and flushed alongside the regret delta at the
+        # next sync — no separate barrier.  One pass covers the whole pre-flop
+        # opponent tree per deal (full branching), so the default is 1; the old
+        # auto-sizing existed to feed the abandoned post-flop average.
+        if strategy_per_job is None:
+            # Falsy (unset OR the empty string a ``${VAR:-}`` export produces)
+            # → fall through to the default.
+            env_spj = os.environ.get("PLURIBUS_STRATEGY_PER_JOB")
+            strategy_per_job = int(env_spj) if env_spj else 1
+        if strategy_per_job < 0:
+            raise ValueError(
+                f"strategy_per_job must be >= 0, got {strategy_per_job}"
+            )
+        self._strategy_per_job = strategy_per_job
+        log.info(
+            f"strategy_per_job={self._strategy_per_job} "
+            f"(pre-flop UPDATE-STRATEGY, folded into each cfr job after warm-up)"
+        )
+
+        self._bias: BiasClass = bias
+        self._bias_magnitude = float(bias_magnitude)
         self._strategy_interval = strategy_interval
         self._max_runtime_hours = max_runtime_hours
         self._prune_threshold = prune_threshold
@@ -252,11 +325,22 @@ class Server:
         self._sync_interval = sync_interval
         self._discount_interval = discount_interval
         self._checkpoint_interval = checkpoint_interval
+        self._checkpoint_start_cycles = checkpoint_start_cycles
         self._start_t = start_timestep
         self._discount_state = DiscountState(
             duration_cycles=discount_duration_cycles,
             discount_interval=discount_interval,
         )
+        if 0 < checkpoint_start_cycles < discount_duration_cycles:
+            log.warning(
+                "checkpoint_start_cycles=%d is inside the LCFR discount window "
+                "(%d cycles); retained snapshots will include still-discounting "
+                "iterates. Pluribus starts snapshotting after the discount "
+                "window closes — consider raising it above "
+                "discount_duration_cycles.",
+                checkpoint_start_cycles,
+                discount_duration_cycles,
+            )
 
         # Load the LUT once in the parent; workers inherit the
         # deserialised object via fork copy-on-write, avoiding one
@@ -284,6 +368,16 @@ class Server:
             f"LMDB map_size={lmdb_map_size // 1024**3} GiB for {n_players} players"
         )
 
+        # Stage a warm-start checkpoint into the save dir BEFORE
+        # constructing CFRTables so the CheckpointManager finds it on
+        # construction and restores chunks transparently.  No-op when
+        # the save dir already contains a checkpoint (resume wins).
+        if warm_start is not None:
+            apply_warm_start(
+                save_path=self._save_path,
+                warm_start_path=Path(warm_start),
+                expected_n_players=n_players,
+            )
         # Optional node-local LMDB staging.  When PLURIBUS_LMDB_LOCAL_DIR
         # is set the runtime LMDB lives on fast scratch (avoids per-
         # lookup NFS lock-table latency), and CheckpointManager
@@ -305,12 +399,24 @@ class Server:
         self._lmdb_runtime_dir = lmdb_runtime_dir
         self._lmdb_persistent_dir = lmdb_persistent_dir
 
+        # Shared-memory index cache (on by default): serves the per-node
+        # info-set lookup from shm instead of an LMDB read txn.  On resume the
+        # capacity persisted in the checkpoint is reused (so the cache never
+        # shrinks below the original run and overflows); on a fresh run the
+        # size comes from PLURIBUS_INDEX_CAPACITY / existing rows (see
+        # CFRTables).
+        enable_index_cache = os.environ.get("PLURIBUS_INDEX_CACHE", "1") == "1"
+        persisted_caps = _read_persisted_index_capacities(self._save_path)
         self._tables = CFRTables(
             index_path=lmdb_runtime_dir,
             shm_dir=shm_dir,
             lmdb_map_size=lmdb_map_size,
             actions_per_street=MAX_ACTIONS_PER_STREET,
+            enable_index_cache=enable_index_cache,
+            index_capacities=persisted_caps,
         )
+        if enable_index_cache:
+            self._warn_index_cache_budget()
         self._locks: Dict[str, mp.synchronize.Lock] = {}
         self._error_event: mp.Event = mp.Event()  # type: ignore
         self._current_t: int = self._start_t
@@ -341,15 +447,17 @@ class Server:
         Each iteration:
 
         1. Dispatches one ``cfr`` job per player into the worker pool.
+           After warm-up each ``cfr`` job also folds in
+           ``strategy_per_job`` average-strategy playthroughs for the
+           same player, accumulated into the worker's persistent
+           strategy delta.
         2. At sync barriers, drains the queue, broadcasts a ``sync``
-           job so workers flush their accumulated deltas, then
-           re-drains the queue.
-        3. At sync barriers that satisfy the strategy-interval
-           schedule, dispatches one ``update_strategy`` job per
-           player and waits for them all to complete.
-        4. At sync barriers that satisfy the discount schedule,
+           job so workers flush their accumulated regret *and* strategy
+           deltas, then re-drains the queue.  The strategy pass is thus
+           overlapped with CFR and needs no barrier of its own.
+        3. At sync barriers that satisfy the discount schedule,
            applies an LCFR discount to the shared tables.
-        5. At sync barriers that satisfy the checkpoint schedule,
+        4. At sync barriers that satisfy the checkpoint schedule,
            writes a checkpoint via the checkpoint manager.
 
         The loop exits when :attr:`max_runtime_hours` is reached or
@@ -381,10 +489,25 @@ class Server:
                 if sigterm.is_set():
                     break
 
+                # Average-strategy playthroughs are folded into the cfr jobs
+                # (``strat_batch`` per job, per player) so they overlap CFR and
+                # flush with the regret delta at the next sync — no separate
+                # strategy barrier.  Gated to 0 during warm-up by the same
+                # ``should_update_strategy`` predicate the old barriered pass used.
+                strat_batch = (
+                    self._strategy_per_job
+                    if should_update_strategy(
+                        t // self._sync_interval,
+                        self._strategy_interval,
+                        self._update_threshold,
+                    )
+                    else 0
+                )
                 for i in range(self._n_players):
                     for _ in range(self._workers_per_player):
                         self._send_job(
-                            "cfr", t=t, i=i, batch=self._batch_size
+                            "cfr", t=t, i=i, batch=self._batch_size,
+                            strat_batch=strat_batch,
                         )
                 t += step
                 self._current_t = t
@@ -400,19 +523,18 @@ class Server:
 
                     sync_step = t // self._sync_interval
 
-                    if should_update_strategy(
-                        sync_step, self._strategy_interval, self._update_threshold
-                    ):
-                        for i in range(self._n_players):
-                            self._send_job("update_strategy", i=i)
-                        self._join_queue()
-                        if sigterm.is_set():
-                            break
+                    # Strategy updates are no longer a barrier here — they are
+                    # folded into the cfr jobs above (``strat_batch``) and flushed
+                    # with the regret delta by the ``sync`` broadcast, so the pool
+                    # never stalls on a strategy-only phase.
 
                     if should_discount(sync_step, self._discount_interval):
                         self._discount_state.apply(self._tables, sync_step)
 
-                    if should_checkpoint(sync_step, self._checkpoint_interval):
+                    if (
+                        sync_step >= self._checkpoint_start_cycles
+                        and should_checkpoint(sync_step, self._checkpoint_interval)
+                    ):
                         self._checkpoint_manager.checkpoint(t=t)
 
                     now = time.monotonic()
@@ -511,6 +633,37 @@ class Server:
         self._checkpoint_manager.shutdown()
         self._tables.close()
 
+    def _warn_index_cache_budget(self) -> None:
+        """Log the shm index-cache footprint and warn if it is a large share
+        of the node's memory budget.
+
+        The caches plus the chunk mmaps share the node's RAM; an oversized
+        capacity can OOM the run.  This surfaces the footprint at startup —
+        *before* compute is committed — using ``SLURM_MEM_PER_NODE`` (MiB)
+        when available.
+        """
+        total_bytes = self._tables.index_cache_total_bytes()
+        mem_mb = os.environ.get("SLURM_MEM_PER_NODE")
+        if mem_mb:
+            frac = total_bytes / (float(mem_mb) * 1024 ** 2)
+            msg = (
+                f"Index caches use {total_bytes / 1024 ** 3:.2f} GiB "
+                f"({frac:.0%} of the {float(mem_mb) / 1024:.1f} GiB node budget); "
+                f"chunk mmaps need the rest."
+            )
+            if frac > 0.40:
+                log.warning(
+                    "%s — consider lowering PLURIBUS_INDEX_CAPACITY or raising "
+                    "--mem so the chunk tables still fit.", msg
+                )
+            else:
+                log.info(msg)
+        else:
+            log.info(
+                "Index caches use %.2f GiB (set SLURM_MEM_PER_NODE for a "
+                "budget check).", total_bytes / 1024 ** 3
+            )
+
     def _start_workers(self, n_processes: int):
         """Construct and start *n_processes* worker processes.
 
@@ -534,8 +687,16 @@ class Server:
                 save_path=self._save_path,
                 info_set_lut=self._info_set_lut,
                 error_event=self._error_event,
+                bias=self._bias,
+                bias_magnitude=self._bias_magnitude,
             )
             workers.append(worker)
+        # Prewarm the shm index caches from LMDB before the fork so every
+        # worker inherits a warm, consistent cache (the mmap is shared, so
+        # this happens exactly once).  Must precede close_envs() — it reads
+        # each index's LMDB env.  No-op when the cache is disabled.
+        self._tables.prewarm_caches()
+
         # Close every LMDB env in the parent immediately before
         # forking the workers.  python-lmdb (1.3) appears to hold
         # transaction state that survives env.close() / reopen in the
@@ -578,9 +739,12 @@ class Server:
             Flat dict with path-like values converted to absolute
             strings so the checkpoint is portable between CWDs.
         """
+        from environment.poker_env import INFO_SET_ENCODING
+
         t_val = t if t is not None else self._current_t
         config = dict(
             t=t_val,
+            info_set_encoding=INFO_SET_ENCODING,
             strategy_interval=self._strategy_interval,
             max_runtime_hours=self._max_runtime_hours,
             discount_duration_cycles=self._discount_state.duration_cycles,
@@ -595,9 +759,15 @@ class Server:
             sync_interval=self._sync_interval,
             discount_interval=self._discount_interval,
             checkpoint_interval=self._checkpoint_interval,
+            # Not structural — snapshot-cadence gate, safe to change on resume.
+            checkpoint_start_cycles=self._checkpoint_start_cycles,
             start_timestep=self._start_t,
             n_chunks_per_street=self._tables.n_chunks_per_street(),
             chunk_size=_CHUNK_SIZE,
+            # Not structural — persisted so a resume rebuilds the same-size
+            # shm index cache instead of auto-shrinking below this run's
+            # capacity and overflowing as it keeps allocating.
+            index_cache_capacity=self._tables.index_cache_capacities(),
         )
         return {
             k: os.path.abspath(str(v)) if isinstance(v, Path) else v

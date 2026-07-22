@@ -36,7 +36,31 @@ class _FakeTable:
     community_cards = []
 
 
-class MockTerminal:
+class _MakeUndoMock:
+    """Make/undo support for the graph-node mocks.
+
+    The CFR traversal now descends with ``state.step_in_place(action)`` and
+    ascends with ``state.undo(token)`` (mirroring :class:`PokerEnv`).  These
+    mocks model an immutable tree where ``apply_action`` returns a *child
+    node object*, so ``self`` acts as a cursor: ``step_in_place`` makes
+    ``self`` take on the child's class and a copy of its ``__dict__``, and
+    ``undo`` restores the saved identity.  The original node objects are
+    never mutated, so the tree is reusable across the traverser's action
+    loop.
+    """
+
+    def step_in_place(self, action):
+        child = self.apply_action(action)
+        token = (self.__class__, self.__dict__.copy())
+        self.__class__ = child.__class__
+        self.__dict__ = child.__dict__.copy()
+        return token
+
+    def undo(self, token):
+        self.__class__, self.__dict__ = token
+
+
+class MockTerminal(_MakeUndoMock):
     """A terminal game node."""
 
     def __init__(self, payout, n_players=2):
@@ -66,7 +90,7 @@ class MockTerminal:
         raise RuntimeError("terminal")
 
 
-class MockState:
+class MockState(_MakeUndoMock):
     """A non-terminal game node for hand-crafted game trees."""
 
     def __init__(self, player_i, info_set, actions, children, n_players=2):
@@ -322,6 +346,23 @@ class TestLocalDelta:
         root, _ = _make_two_node_game()
         cfr(tmp_tables, root, i=0, t=1, local_delta=None)
         assert tmp_tables.regret[0].get_row_if_exists("root") is not None
+
+    def test_make_undo_leaves_root_unchanged(self, tmp_tables):
+        # The traversal descends with step_in_place and ascends with undo;
+        # after a full cfr() call the root cursor must be fully restored
+        # (no leaked mutation from the in-place walk).
+        root, _ = _make_two_node_game()
+        before = (
+            root.__class__, root.player_i, root.info_set,
+            list(root.legal_actions), root.is_terminal,
+        )
+        np.random.seed(0)
+        cfr(tmp_tables, root, i=0, t=1, local_delta={})
+        after = (
+            root.__class__, root.player_i, root.info_set,
+            list(root.legal_actions), root.is_terminal,
+        )
+        assert before == after
 
     def test_merge_after_cfr_equals_direct_mode(self, tmp_path):
         root, _ = _make_two_node_game()

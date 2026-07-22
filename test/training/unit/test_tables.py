@@ -380,10 +380,25 @@ class TestChunkedTableDiscount:
             cfr_tables.regret[0].get_row(f"disc_is_{k}")[:] = initial
         cfr_tables.apply_discount(0.5)
         for k in range(3):
-            expected = [int(v * 0.5) for v in initial]
+            # Discounting rounds to nearest (rint) rather than
+            # truncating toward zero — truncation would bleed ~0.5 per
+            # entry per application, which zeroes unit-scale strategy
+            # counts.
+            expected = np.rint(np.array(initial, dtype=np.float32) * 0.5)
             np.testing.assert_array_equal(
                 cfr_tables.regret[0].get_row(f"disc_is_{k}"), expected
             )
+
+    def test_small_strategy_counts_survive_mild_discount(self, cfr_tables):
+        """A visit count of 1 must survive a late-window discount factor.
+
+        With truncation, ``int(1 * 0.9) == 0`` erased every count
+        written since the previous discount application; rounding keeps
+        it alive (regression test for the strategy-mass wipe-out).
+        """
+        cfr_tables.strategy[0].get_row("tiny_mass")[:] = 1
+        cfr_tables.apply_discount(0.9)
+        assert np.all(cfr_tables.strategy[0].get_row("tiny_mass") == 1)
 
     def test_regret_floor_applied(self, cfr_tables):
         row = cfr_tables.regret[0].get_row("floor_is_0")
@@ -409,18 +424,26 @@ class TestChunkedTableDiscount:
 
 
 class TestCFRTablesDiscount:
-    def test_scales_both_table_types(self, cfr_tables):
-        """After apply_discount, both regret and strategy tables are scaled."""
-        n = cfr_tables.regret[0].n_actions
+    def test_scales_regret_all_streets_strategy_preflop_only(self, cfr_tables):
+        """Regret is discounted on every street; strategy only on pre-flop.
+
+        The average strategy is tracked pre-flop only, so streets 1-3 strategy
+        tables stay zero during training and discounting them is pure waste —
+        ``apply_discount`` leaves them untouched.
+        """
         for street in range(4):
             cfr_tables.regret[street].get_row("both_test")[:] = 1000
             cfr_tables.strategy[street].get_row("both_test")[:] = 1000
         cfr_tables.apply_discount(0.5)
+        # Regret scaled on every street.
         for street in range(4):
-            r_row = cfr_tables.regret[street].get_row("both_test")
-            s_row = cfr_tables.strategy[street].get_row("both_test")
-            assert np.all(r_row <= 500)
-            assert np.all(s_row <= 500)
+            assert np.all(cfr_tables.regret[street].get_row("both_test") <= 500)
+        # Strategy scaled pre-flop, left unchanged post-flop.
+        assert np.all(cfr_tables.strategy[0].get_row("both_test") <= 500)
+        for street in (1, 2, 3):
+            assert np.all(
+                cfr_tables.strategy[street].get_row("both_test") == 1000
+            )
 
     def test_regret_floor_not_breached(self, cfr_tables):
         """After discounting a value at REGRET_FLOOR, it stays >= REGRET_FLOOR."""
@@ -632,4 +655,50 @@ class TestChunkedTableAllocation:
         table.merge_delta_row("neg_is", delta)
         np.testing.assert_array_equal(
             table.get_row_if_exists("neg_is"), np.full(n_actions, -5, dtype=np.int32)
+        )
+
+    def test_merge_delta_rows_matches_per_row(
+        self, tmp_path, tmp_lmdb, n_actions, table_name
+    ):
+        # Batched merge_delta_rows must be byte-identical to a sequence of
+        # per-row merge_delta_row calls (it exists only to cut lock acquisitions).
+        rng = np.random.default_rng(0)
+        infosets = [f"eq_is_{i}" for i in range(40)]
+        deltas = {
+            s: rng.integers(-1000, 1000, size=n_actions).astype(np.int64)
+            for s in infosets
+        }
+        # Reference table: per-row path.
+        os.makedirs(str(tmp_path / "ref_shm"), exist_ok=True)
+        ref_idx = InfosetIndex(tmp_path / "ref_idx")
+        ref = ChunkedTable(
+            n_actions=n_actions, table_name=table_name + "_ref",
+            index=ref_idx, shm_dir=str(tmp_path / "ref_shm"),
+        )
+        try:
+            for s in infosets:
+                ref.merge_delta_row(s, deltas[s])
+            # Batched table.
+            os.makedirs(str(tmp_path / "bat_shm"), exist_ok=True)
+            bat = ChunkedTable(
+                n_actions=n_actions, table_name=table_name + "_bat",
+                index=tmp_lmdb, shm_dir=str(tmp_path / "bat_shm"),
+            )
+            try:
+                bat.merge_delta_rows([(s, deltas[s]) for s in infosets])
+                for s in infosets:
+                    np.testing.assert_array_equal(
+                        bat.get_row(s), ref.get_row(s)
+                    )
+            finally:
+                bat.close(); bat.unlink_all()
+        finally:
+            ref.close(); ref.unlink_all(); ref_idx.close()
+
+    def test_merge_delta_rows_accumulates_duplicates(self, table, n_actions):
+        # Two entries for the same info set in one batch add twice.
+        delta = np.full(n_actions, 4, dtype=np.int64)
+        table.merge_delta_rows([("dup_is", delta), ("dup_is", delta)])
+        np.testing.assert_array_equal(
+            table.get_row_if_exists("dup_is"), np.full(n_actions, 8, dtype=np.int32)
         )

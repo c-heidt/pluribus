@@ -67,6 +67,41 @@ def lex_rank(combo: Tuple[int, ...], n: int) -> int:
     return rank
 
 
+def _comb_table(n: int, k_max: int) -> np.ndarray:
+    """``C[a, r] == comb(a, r)`` for ``a in [0, n]``, ``r in [0, k_max]``.
+
+    The vectorised counterpart of the ``comb`` calls inside :func:`lex_rank`.
+    Depends only on the deck size, so callers hoist it (see
+    :meth:`MemmapLookup._indexer`) rather than rebuilding it per lookup — that
+    hoist is most of the speedup over the scalar path.
+    """
+    C = np.zeros((n + 1, k_max + 1), dtype=np.int64)
+    for a in range(n + 1):
+        for r in range(k_max + 1):
+            C[a, r] = comb(a, r)
+    return C
+
+
+def _lex_rank_vec(combos: np.ndarray, n: int, C: np.ndarray) -> np.ndarray:
+    """Lexicographic ranks of many k-combinations at once.
+
+    Vectorised :func:`lex_rank`: ``combos`` is ``(m, k)`` int64 with strictly
+    ascending rows drawn from ``{0, ..., n-1}``; returns ``(m,)`` 0-based ranks.
+    Loops over the ``k`` axis (k <= 5 here), not over ``m``, and reads the
+    binomials out of the precomputed ``C`` table.  Bit-exact with the scalar
+    function by construction: same identity, same integer arithmetic, no floats.
+    """
+    m, k = combos.shape
+    rank = np.zeros(m, dtype=np.int64)
+    prev = np.full(m, -1, dtype=np.int64)
+    for i in range(k):
+        start = prev + 1
+        remaining = k - i
+        rank += C[n - start, remaining] - C[n - combos[:, i], remaining]
+        prev = combos[:, i]
+    return rank
+
+
 log = logging.getLogger("information_abstraction.lookup")
 
 
@@ -188,6 +223,98 @@ class MemmapLookup:
         public_rank = lex_rank(p_reindexed, n_remaining)
         return hole_rank * comb(n_remaining, k_public) + public_rank
 
+    def _indexer(self):
+        """Deck-derived tables for the vectorised row index, built once.
+
+        All three depend only on ``card_to_idx`` / ``n_cards``, so they are
+        hoisted out of the per-lookup path and memoised on the instance.
+        Rebuilt after unpickling (``__getstate__`` drops them), like ``_mm``.
+        """
+        idx = getattr(self, "_idx_cache", None)
+        if idx is None:
+            keys = np.fromiter(self._card_to_idx.keys(), dtype=np.int64)
+            vals = np.fromiter(self._card_to_idx.values(), dtype=np.int64)
+            order = np.argsort(keys)
+            idx = (keys[order], vals[order], _comb_table(self._n_cards, 5))
+            self._idx_cache = idx
+        return idx
+
+    def _to_deck_idx(self, cards: np.ndarray) -> np.ndarray:
+        """Map eval-card integers to 0-based deck indices (vectorised)."""
+        keys_sorted, vals_sorted, _ = self._indexer()
+        return vals_sorted[np.searchsorted(keys_sorted, cards)]
+
+    def clusters_for_board(
+        self,
+        combo_cards: np.ndarray,
+        board: "np.ndarray",
+        valid_mask: "Optional[np.ndarray]" = None,
+    ) -> np.ndarray:
+        """Cluster id for **every** combo against one fixed ``board``.
+
+        The batched counterpart of ``__getitem__``: one call replaces
+        ``n_combos`` scalar lookups when the board is fixed — which it is for a
+        whole CFR iteration, so the vector search regime hoists this per
+        ``(street, sampled completion)`` instead of paying it per node visit.
+
+        Bit-exact with the scalar path (same combinadic identity, integer-only),
+        but the per-combo Python work — two ``sorted`` calls, a tuple build and
+        two ``lex_rank`` loops over ``math.comb`` — collapses into a handful of
+        numpy ops plus one gather out of the ``uint16`` memmap.
+
+        Parameters
+        ----------
+        combo_cards : numpy.ndarray
+            ``(n_combos, 2)`` hole-card pairs (``PokerEnv.combo_cards``).
+        board : numpy.ndarray
+            The public cards for this street, as eval-card integers.  Its
+            length selects the street's row layout, so it must match the street
+            this lookup was built for.
+        valid_mask : numpy.ndarray, optional
+            ``(n_combos,)`` bool; ``False`` marks combos that cannot be held
+            (they share a card with ``board``).  Those rows have **no** entry on
+            disk — the scalar path raises ``KeyError`` — so they are excluded
+            from the gather and receive ``-1``.  When omitted the conflict mask
+            is derived here.
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(n_combos,)`` int64 cluster ids, ``-1`` on board-conflicting combos.
+        """
+        self._load()
+        _, _, C = self._indexer()
+        cc = np.asarray(combo_cards, dtype=np.int64)
+        board = np.asarray(board, dtype=np.int64)
+        n_combos = cc.shape[0]
+
+        if valid_mask is None:
+            valid_mask = ~(np.isin(cc[:, 0], board) | np.isin(cc[:, 1], board))
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+
+        out = np.full(n_combos, -1, dtype=np.int64)
+        live = cc[valid_mask]
+        if live.shape[0] == 0:
+            return out
+
+        n = self._n_cards
+        k = board.shape[0]
+        # Hole pair -> deck indices, ascending (combo_cards rows are already
+        # sorted by card int, but deck index order is what lex_rank needs).
+        h = np.sort(self._to_deck_idx(live), axis=1)
+        hole_rank = _lex_rank_vec(h, n, C)
+        h0, h1 = h[:, 0:1], h[:, 1:2]
+
+        # Public cards re-indexed into the deck with the hole pair removed —
+        # the hole-dependent layout the on-disk rows use (see _get_row_index).
+        p = np.sort(self._to_deck_idx(board[None, :]).reshape(1, k), axis=1)
+        pr = p - (h0 < p).astype(np.int64) - (h1 < p).astype(np.int64)
+        public_rank = _lex_rank_vec(pr, n - 2, C)
+
+        rows = hole_rank * C[n - 2, k] + public_rank
+        out[valid_mask] = self._mm[rows].astype(np.int64)
+        return out
+
     def prewarm(self) -> int:
         """Pull ``cluster_ids.dat`` into the OS page cache via a sequential read.
 
@@ -243,10 +370,72 @@ class MemmapLookup:
         """
         state = self.__dict__.copy()
         state["_mm"] = None
+        state.pop("_idx_cache", None)  # deck-derived; rebuilt lazily (see _indexer)
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
+
+
+# ---------------------------------------------------------------------------
+# Batched street lookup — works on any LUT layout
+# ---------------------------------------------------------------------------
+
+def clusters_for_board(
+    lut_entry: Any,
+    combo_cards: np.ndarray,
+    board: "np.ndarray",
+    valid_mask: "Optional[np.ndarray]" = None,
+) -> np.ndarray:
+    """Cluster id for every combo against one fixed ``board``, for any LUT entry.
+
+    Dispatches on the street's storage: :class:`MemmapLookup` takes the
+    vectorised combinadic path; a plain ``dict`` street (pre-flop, and any LUT
+    built small enough to stay a dict) falls back to a scalar sweep.  Callers
+    therefore need not know how a given LUT was built — which matters because
+    the shipped 20-card test LUT and a production 52-card LUT differ in both
+    layout and bucket count.
+
+    **No cluster/bucket count is consulted anywhere.**  Cluster ids are returned
+    as the LUT produced them; sizing a table over them is the caller's job (the
+    search regime remaps to a dense local index over the ids actually reachable
+    in its subgame, so it works identically on a 50- or 200-bucket LUT).
+
+    Parameters
+    ----------
+    lut_entry : MemmapLookup or dict
+        One street of a loaded :data:`InfoSetLut` (e.g. ``lut["turn"]``).
+    combo_cards : numpy.ndarray
+        ``(n_combos, 2)`` hole-card pairs (``PokerEnv.combo_cards``).
+    board : numpy.ndarray
+        Public cards for this street as eval-card integers; length must match
+        the street ``lut_entry`` was built for.
+    valid_mask : numpy.ndarray, optional
+        ``(n_combos,)`` bool; ``False`` marks board-conflicting combos, which
+        have no entry on disk and receive ``-1``.  Derived here when omitted.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(n_combos,)`` int64 cluster ids, ``-1`` on board-conflicting combos.
+    """
+    cc = np.asarray(combo_cards, dtype=np.int64)
+    board = np.asarray(board, dtype=np.int64)
+    if valid_mask is None:
+        valid_mask = ~(np.isin(cc[:, 0], board) | np.isin(cc[:, 1], board))
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+
+    if isinstance(lut_entry, MemmapLookup):
+        return lut_entry.clusters_for_board(cc, board, valid_mask)
+
+    # Plain-dict street: the key is sorted(hole) + sorted(board), matching
+    # PokerEnv.cluster_for.  Cheap — a dict street is small by construction.
+    key_board = sorted(int(c) for c in board)
+    out = np.full(cc.shape[0], -1, dtype=np.int64)
+    for i in np.flatnonzero(valid_mask):
+        hole = sorted((int(cc[i, 0]), int(cc[i, 1])))
+        out[i] = int(lut_entry[tuple(hole + key_board)])
+    return out
 
 
 # ---------------------------------------------------------------------------

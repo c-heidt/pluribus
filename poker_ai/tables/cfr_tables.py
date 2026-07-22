@@ -30,6 +30,7 @@ shared-memory mmaps, and LMDB environments.
 
 import logging
 import math
+import os
 import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -39,9 +40,69 @@ import numpy as np
 from poker_ai.tables.chunk_store import CHUNK_SIZE
 from poker_ai.tables.index import InfosetIndex
 from poker_ai.tables.chunked_table import ChunkedTable
+from poker_ai.tables.shm_index_cache import (
+    DEFAULT_LOAD_FACTOR,
+    ShmIndexCache,
+    capacity_for,
+    next_pow2,
+)
 from utils.io import atomic_numpy_save
 
 log = logging.getLogger("poker_ai.tables.cfr_tables")
+
+# Fallback per-street cache capacities when the shm index cache is enabled
+# without an explicit size and there are no existing rows to size from (e.g.
+# a small fresh run).  The real large run sets PLURIBUS_INDEX_CAPACITY.
+_DEFAULT_CACHE_CAPACITY: Dict[int, int] = {0: 2 ** 22, 1: 2 ** 23, 2: 2 ** 23, 3: 2 ** 23}
+
+
+def _parse_capacities_env() -> Optional[Dict[int, int]]:
+    """Parse ``PLURIBUS_INDEX_CAPACITY`` (``"pf,flop,turn,river"``) → dict."""
+    raw = os.environ.get("PLURIBUS_INDEX_CAPACITY")
+    if not raw:
+        return None
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if len(parts) != 4:
+        raise ValueError(
+            f"PLURIBUS_INDEX_CAPACITY must be 4 comma-separated ints "
+            f"(pre_flop,flop,turn,river), got {raw!r}"
+        )
+    return {r: int(parts[r]) for r in range(4)}
+
+
+def _cache_capacity(
+    street: int,
+    n_allocated: int,
+    capacities: Optional[Dict[int, int]],
+    load_factor: float,
+    headroom: float,
+) -> int:
+    """Power-of-two cache capacity for a street.
+
+    Two regimes, chosen so a **resume never shrinks the cache below what the
+    original run used** (which would overflow as the resumed run keeps
+    allocating):
+
+    - **Explicit capacity** (``capacities[street]`` — the env
+      ``PLURIBUS_INDEX_CAPACITY`` on a fresh run, or the capacity persisted in
+      the checkpoint on resume): honour it as the saturation target.  Only
+      bump it if it cannot even hold the rows already present (a safety floor,
+      no headroom multiplier — existing rows ``<=`` saturation by definition).
+    - **No explicit capacity**: auto-size from existing rows grown by
+      ``headroom``, floored at a modest default so a small resumed run keeps at
+      least the fresh run's default capacity.
+    """
+    if capacities and capacities.get(street):
+        cap = next_pow2(int(capacities[street]))
+        if n_allocated > 0:
+            cap = max(cap, capacity_for(n_allocated, load_factor))
+        return cap
+    base = (
+        capacity_for(int(math.ceil(n_allocated * headroom)), load_factor)
+        if n_allocated > 0
+        else 0
+    )
+    return max(base, _DEFAULT_CACHE_CAPACITY[street])
 
 REGRET_FLOOR: np.int32 = np.int32(-310_000_000)
 """Per-action regret floor.
@@ -78,6 +139,8 @@ class CFRTables:
         shm_dir: str = "/dev/shm",
         lmdb_map_size: Optional[int] = None,
         actions_per_street: Optional[Dict[int, int]] = None,
+        enable_index_cache: bool = False,
+        index_capacities: Optional[Dict[int, int]] = None,
     ) -> None:
         """Open (or create) the four indexes and the eight tables.
 
@@ -98,15 +161,46 @@ class CFRTables:
             Mandatory mapping from street index to number of abstract
             actions.  Supplied by
             :data:`environment.action_space.MAX_ACTIONS_PER_STREET`.
+        enable_index_cache : bool, optional
+            Build a per-street :class:`ShmIndexCache` in front of each LMDB
+            index so hot-path ``get`` reads never open an LMDB transaction.
+            Off by default (standalone indexes and unit tests keep the
+            LMDB-only path).  Must be constructed in the parent before workers
+            fork; call :meth:`prewarm_caches` before the fork.
+        index_capacities : dict[int, int], optional
+            Per-street cache slot counts (fresh-run sizing).  When ``None`` and
+            the cache is enabled, ``PLURIBUS_INDEX_CAPACITY`` is consulted; on
+            resume the size is derived from the existing row count regardless.
         """
         if actions_per_street is None:
             raise ValueError("actions_per_street is required")
 
+        # Deferred-durability allocation (PLURIBUS_DEFERRED_ALLOC): the shm cache
+        # assigns rows under its lightweight lock and LMDB is written in bulk at
+        # checkpoints (:meth:`persist_indexes`), taking the LMDB writer mutex off
+        # the allocation hot path.  Requires the cache — a no-op otherwise.
+        self._deferred_alloc: bool = (
+            enable_index_cache
+            and os.environ.get("PLURIBUS_DEFERRED_ALLOC", "0") == "1"
+        )
+
         base = Path(index_path)
         self._indexes: Dict[int, InfosetIndex] = {
-            r: InfosetIndex(base / f"street_{r}", map_size=lmdb_map_size)
+            r: InfosetIndex(
+                base / f"street_{r}",
+                map_size=lmdb_map_size,
+                deferred=self._deferred_alloc,
+            )
             for r in range(4)
         }
+
+        # Optional shm read caches (parent-side; inherited by forked workers).
+        # Sized after the indexes exist so a resume/warm-start can auto-size
+        # from each street's existing row count.
+        self._index_caches: Optional[Dict[int, ShmIndexCache]] = None
+        if enable_index_cache:
+            self._build_index_caches(shm_dir, index_capacities)
+
         self.regret: Dict[int, ChunkedTable] = {
             r: ChunkedTable(
                 n_actions=actions_per_street[r],
@@ -125,6 +219,95 @@ class CFRTables:
             )
             for r in range(4)
         }
+
+    # ------------------------------------------------------------------
+    # Shared-memory index cache
+    # ------------------------------------------------------------------
+
+    def _build_index_caches(
+        self, shm_dir: str, index_capacities: Optional[Dict[int, int]]
+    ) -> None:
+        """Create and attach a per-street :class:`ShmIndexCache`."""
+        capacities = index_capacities or _parse_capacities_env()
+        load_factor = float(
+            os.environ.get("PLURIBUS_INDEX_LOAD_FACTOR", DEFAULT_LOAD_FACTOR)
+        )
+        headroom = float(os.environ.get("PLURIBUS_INDEX_GROWTH_HEADROOM", 1.3))
+        caches: Dict[int, ShmIndexCache] = {}
+        total_bytes = 0
+        for r in range(4):
+            cap = _cache_capacity(
+                r, self._indexes[r].n_allocated_rows, capacities, load_factor, headroom
+            )
+            cache = ShmIndexCache(
+                name=f"pluribus_index_cache_{r}",
+                capacity=cap,
+                shm_dir=shm_dir,
+                load_factor=load_factor,
+            )
+            self._indexes[r].set_cache(cache)
+            caches[r] = cache
+            total_bytes += cache.n_bytes
+        self._index_caches = caches
+        # The capacities actually used — persisted in the checkpoint so a
+        # resume rebuilds the same-size cache instead of auto-shrinking.
+        self._index_cache_capacities = {r: c.capacity for r, c in caches.items()}
+        log.info(
+            "Index caches enabled: capacities=%s, total %.2f GiB in %s",
+            self._index_cache_capacities,
+            total_bytes / 1024 ** 3,
+            shm_dir,
+        )
+
+    def prewarm_caches(self) -> None:
+        """Populate every index cache from its LMDB (parent, before fork).
+
+        No-op when the cache is disabled.  Must run after any resume /
+        warm-start restore (so LMDB holds the rows to load) and before the
+        worker pool forks (so children inherit a warm, consistent cache).
+        """
+        if self._index_caches is None:
+            return
+        for r in range(4):
+            n = self._indexes[r].prewarm_cache()
+            if n:
+                log.info("Street %d: prewarmed %d index-cache entries", r, n)
+
+    def index_cache_total_bytes(self) -> int:
+        """Total resident bytes across all index caches (0 if disabled)."""
+        if self._index_caches is None:
+            return 0
+        return sum(c.n_bytes for c in self._index_caches.values())
+
+    def index_cache_capacities(self) -> Optional[Dict[int, int]]:
+        """Per-street cache capacities in use, or ``None`` when disabled.
+
+        Persisted in ``server_state.pkl`` so a resume rebuilds the same-size
+        cache (see :func:`_cache_capacity`).
+        """
+        if self._index_caches is None:
+            return None
+        return dict(self._index_cache_capacities)
+
+    # ------------------------------------------------------------------
+    # Process-fork safety
+    # ------------------------------------------------------------------
+
+    def reopen_after_fork(self) -> None:
+        """Reopen every per-street LMDB index in the current (forked) process.
+
+        The four :class:`InfosetIndex` LMDB environments are **not** safe to share
+        across a ``fork`` — a child that reuses the parent's inherited reader-lock
+        slot trips ``mdb_txn_renew: MDB_BAD_RSLOT`` on its first read
+        (:meth:`InfosetIndex.reopen_after_fork`).  A forked worker that will *read*
+        these tables (e.g. a parallel search replica querying a blueprint at a
+        depth-limit leaf) must call this once, before its first lookup.  The chunk
+        stores are read-only ``/dev/shm`` mmaps shared copy-on-write, so only the
+        indexes need reopening; both table families reference the same index object
+        per street, so reopening the index fixes their reads too.
+        """
+        for index in self._indexes.values():
+            index.reopen_after_fork()
 
     # ------------------------------------------------------------------
     # Checkpoint I/O
@@ -254,14 +437,17 @@ class CFRTables:
         Returns
         -------
         bool
-            ``True`` iff every expected ``regret_{r}_chunk_*.npy`` and
-            ``strategy_{r}_chunk_*.npy`` file is present.
+            ``True`` iff every expected ``regret_{r}_chunk_*.npy`` file is
+            present.  Strategy chunks are intentionally NOT required: the
+            average strategy is tracked pre-flop only, so streets 1-3 never
+            write strategy chunks during training and street 0 has none before
+            the warm-up.  :meth:`restore_chunks` zero-fills any missing strategy
+            chunk, so a regret-complete checkpoint is a valid resume point.
         """
         for r in range(4):
             for chunk_id in range(n_chunks.get(r, 0)):
-                for prefix in (f"regret_{r}", f"strategy_{r}"):
-                    if not (dir_path / f"{prefix}_chunk_{chunk_id:06d}.npy").exists():
-                        return False
+                if not (dir_path / f"regret_{r}_chunk_{chunk_id:06d}.npy").exists():
+                    return False
         return True
 
     def restore_chunks(self, dir_path: Path, n_chunks: Dict[int, int]) -> None:
@@ -294,8 +480,12 @@ class CFRTables:
                         chunk_id, np.load(strategy_path)
                     )
                 else:
-                    log.warning(
-                        "Strategy chunk missing: %s — zero-initialised",
+                    # Expected under pre-flop-only average-strategy tracking:
+                    # streets 1-3 never write strategy chunks and street 0 has
+                    # none before the warm-up.  Zero-init and move on (debug,
+                    # not warning — this is the normal steady state).
+                    log.debug(
+                        "Strategy chunk absent: %s — zero-initialised",
                         strategy_path,
                     )
 
@@ -317,7 +507,10 @@ class CFRTables:
         multiplication to prevent int32 underflow and to keep pruned
         actions recoverable.  Strategy entries are non-negative visit
         counts, so no floor is applied to them — clamping them would
-        bias the distribution.
+        bias the distribution.  Only street 0 (pre-flop) strategy is
+        discounted: the average strategy is tracked pre-flop only, so the
+        streets 1-3 strategy tables are always zero and discounting them
+        would be pure waste.
 
         The method reads the shared mmaps directly, which is safe
         **only when every worker is idle** (i.e. immediately after a
@@ -344,17 +537,30 @@ class CFRTables:
                     n_entries - chunk_id * CHUNK_SIZE, CHUNK_SIZE
                 )
 
-                # Regret: discount + floor clamp.
+                # Regret: discount + floor clamp.  ``rint`` (round half to
+                # even) rather than a plain int cast: the cast truncates
+                # toward zero, which systematically bleeds ~0.5 per entry
+                # per application — negligible for chip-scale regrets but
+                # fatal for the unit-scale strategy counts below, so both
+                # use the same unbiased rounding.
                 rview = self.regret[r].store.view(chunk_id)[:valid_rows]
-                rresult = (rview.astype(np.float32) * factor32).astype(np.int32)
+                rresult = np.rint(rview.astype(np.float32) * factor32).astype(np.int32)
                 np.maximum(rresult, REGRET_FLOOR, out=rresult)
                 rview[:] = rresult
                 self.regret[r].store.mark_dirty(chunk_id)
 
-                # Strategy: discount only (non-negative visit counts).
-                sview = self.strategy[r].store.view(chunk_id)[:valid_rows]
-                sview[:] = (sview.astype(np.float32) * factor32).astype(np.int32)
-                self.strategy[r].store.mark_dirty(chunk_id)
+                # Strategy: pre-flop (street 0) only — post-flop strategy is
+                # never accumulated online, so those tables stay zero and
+                # discounting them is wasted work.  Discount only (non-negative
+                # visit counts); rint (not truncation) keeps a count of 1 alive
+                # under the mild late-window factors instead of zeroing the
+                # strategy mass accumulated inside the discount window.
+                if r == 0:
+                    sview = self.strategy[r].store.view(chunk_id)[:valid_rows]
+                    sview[:] = np.rint(
+                        sview.astype(np.float32) * factor32
+                    ).astype(np.int32)
+                    self.strategy[r].store.mark_dirty(chunk_id)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -421,6 +627,19 @@ class CFRTables:
         for idx in self._indexes.values():
             idx.reopen_after_fork()
 
+    def persist_indexes(self) -> int:
+        """Bulk-flush deferred-allocation rows into LMDB (no-op if not deferred).
+
+        In deferred-allocation mode the shm cache is the live row authority and
+        LMDB lags; this writes every row allocated since the last flush into LMDB
+        in one transaction per street so the on-disk index is consistent with the
+        chunk snapshot taken at the same checkpoint (both cover ``[0,
+        occupancy)``).  Must run under the sync barrier (no worker allocating),
+        before :meth:`flush_indexes` and ``snapshot_dirty_chunks``.  Returns the
+        total number of rows persisted across all streets.
+        """
+        return sum(idx.bulk_persist() for idx in self._indexes.values())
+
     def flush_indexes(self) -> None:
         """Flush every LMDB index to disk.
 
@@ -443,3 +662,7 @@ class CFRTables:
             self.regret[r].unlink_all()
             self.strategy[r].unlink_all()
             self._indexes[r].close()
+        if self._index_caches is not None:
+            for cache in self._index_caches.values():
+                cache.close()
+                cache.unlink()

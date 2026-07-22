@@ -11,7 +11,7 @@ import collections
 import logging
 from typing import TYPE_CHECKING
 
-from environment.evaluator import Evaluator
+from environment.evaluator import default_evaluator as _evaluator
 
 if TYPE_CHECKING:
     from environment.poker_env import PokerEnv
@@ -19,10 +19,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Module-level singleton: immutable after init, NEVER deep-copied.
-# ---------------------------------------------------------------------------
-_evaluator: Evaluator = Evaluator()
+# The shared evaluator now lives in :mod:`environment.evaluator` as
+# ``default_evaluator`` (imported above as ``_evaluator`` for backward
+# compatibility).  Hosting it at the leaf evaluator layer keeps the
+# range-showdown settlement free of any dependency on this module.
 
 
 # ---------------------------------------------------------------------------
@@ -73,32 +73,6 @@ def rotate_blinds(env: PokerEnv) -> None:
     env.players.append(env.players.pop(0))
 
 
-def advance_stage(env: PokerEnv) -> None:
-    """Deal community cards for the next betting stage.
-
-    Called at the end of a betting round to transition the board
-    state. Also resets ``n_bet_chips`` on every player so
-    bet-equality checks start fresh for the new round.
-
-    Parameters
-    ----------
-    env : PokerEnv
-        The game environment. ``env._betting_stage`` determines how
-        many cards to deal (3 for pre_flop→flop, 1 for subsequent
-        transitions).
-    """
-    stage = env._betting_stage
-    if stage == "pre_flop":
-        env.community_cards += env.deck.deal_community(3)
-    elif stage == "flop":
-        env.community_cards += env.deck.deal_community(1)
-    elif stage == "turn":
-        env.community_cards += env.deck.deal_community(1)
-    # "river" → "show_down" needs no deal
-    for player in env.players:
-        player.n_bet_chips = 0
-
-
 def rank_players_by_best_hand(env: PokerEnv) -> list:
     """Rank active players by hand strength.
 
@@ -142,6 +116,10 @@ def compute_winners(env: PokerEnv) -> None:
     """
     ranked = rank_players_by_best_hand(env)
     payouts = env.pot.compute_utility(env.players, ranked)
+    # Snapshot the per-seat contributions *before* the pot is reset, so the
+    # terminal's matched/contested stake stays available to the payout evaluators
+    # (the smaller of two heads-up contributions is the winner-takes amount).
+    env._terminal_contributions = tuple(env.pot.capture())
     env.pot.reset()
     for player in env.players:
         player.add_chips(payouts[player.player_i])
@@ -190,7 +168,17 @@ def n_players_with_moves(env: PokerEnv) -> int:
 
 
 def more_betting_needed(env: PokerEnv) -> bool:
-    """Return True if active non-all-in players have unequal bets.
+    """Return True if any live player has not yet matched the largest bet.
+
+    "Live" means active (not folded) and not all-in — a player who still has a
+    betting decision.  The comparison is against the maximum bet among **all**
+    active players, *including all-in players*: an all-in raise over the top of
+    the current bet leaves the live players owing a call/fold decision, so more
+    betting is still needed even though the live players' bets are equal *to
+    each other*.  Comparing live bets only to each other (the previous
+    behaviour) silently treated an unmatched over-the-top all-in as "betting
+    complete" and advanced the street without giving the opponents a chance to
+    respond — the round-advance twin of the ``_hand_over`` all-in contract.
 
     Parameters
     ----------
@@ -200,12 +188,14 @@ def more_betting_needed(env: PokerEnv) -> bool:
     Returns
     -------
     bool
-        ``True`` if at least two active non-all-in players have
-        contributed different amounts this round; ``False`` otherwise.
+        ``True`` if at least one active non-all-in player has bet less than the
+        largest amount committed by any active player this round; ``False``
+        otherwise (every live player has matched the top bet, or no live player
+        remains).
     """
-    active_bets = [
-        p.n_bet_chips for p in env.players if p.is_active and not p.is_all_in
-    ]
-    if len(active_bets) <= 1:
+    active = [p for p in env.players if p.is_active]
+    live = [p for p in active if not p.is_all_in]
+    if not live:
         return False
-    return not all(b == active_bets[0] for b in active_bets)
+    max_bet = max(p.n_bet_chips for p in active)
+    return any(p.n_bet_chips < max_bet for p in live)

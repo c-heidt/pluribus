@@ -35,6 +35,7 @@ from typing import Callable, Dict, Optional, Tuple
 import numpy as np
 
 from poker_ai.tables.cfr_tables import CFRTables
+from poker_ai.blueprint.bias import BiasClass, is_biased
 from poker_ai.blueprint.tree_utils import (
     accumulate_regrets,
     get_legal_actions,
@@ -84,8 +85,50 @@ def merge_local_delta(
         info_set)``.  Values are int64 delta arrays (positive or
         negative) produced by :func:`cfr` / :func:`cfrp`.
     """
+    # Group by betting round (each round has its own regret table), then flush
+    # each round's rows in one batched call.  ``merge_delta_rows`` acquires each
+    # chunk's stripe lock once per flush instead of once per info set — the same
+    # writes, far fewer lock acquisitions under concurrent workers.
+    by_round: Dict[int, list] = {}
     for (r, info_set), delta in local_delta.items():
-        tables.regret[r].merge_delta_row(info_set, delta)
+        by_round.setdefault(r, []).append((info_set, delta))
+    for r, items in by_round.items():
+        tables.regret[r].merge_delta_rows(items)
+
+
+def merge_local_strategy_delta(
+    tables: CFRTables,
+    local_strategy_delta: Dict[Tuple[int, str], np.ndarray],
+) -> None:
+    """Flush a local average-strategy accumulator into the shared strategy tables.
+
+    The strategy-table counterpart of :func:`merge_local_delta`: walks the
+    per-infoset visit-count deltas accumulated by one or more strategy-sampling
+    playthroughs (:func:`poker_ai.blueprint.strategy.update_strategy` with a
+    ``local_delta``, or the compiled core's ``strategy_rng``) and adds each into
+    the corresponding row of ``tables.strategy[betting_round]``.  Batched +Δ into
+    ``tables.strategy[r]`` is arithmetically identical to the sequence of
+    per-node ``update_row(info_set, action, 1)`` calls the barriered strategy pass
+    used to make — the same final counts — but folds all of a worker's
+    accumulated increments into one stripe-locked ``merge_delta_rows`` per chunk
+    at the sync barrier instead of taking a stripe lock per visit.
+
+    After this call the caller is expected to clear or discard
+    ``local_strategy_delta``; this function does not do so itself.
+
+    Parameters
+    ----------
+    tables : CFRTables
+        Shared regret and strategy tables.
+    local_strategy_delta : dict[tuple[int, str], np.ndarray]
+        Per-infoset visit-count increments keyed by ``(betting_round,
+        info_set)``.  Values are non-negative int64 delta arrays.
+    """
+    by_round: Dict[int, list] = {}
+    for (r, info_set), delta in local_strategy_delta.items():
+        by_round.setdefault(r, []).append((info_set, delta))
+    for r, items in by_round.items():
+        tables.strategy[r].merge_delta_rows(items)
 
 
 def cfr(
@@ -94,6 +137,8 @@ def cfr(
     i: int,
     t: int,
     local_delta: Optional[Dict[Tuple[int, str], np.ndarray]] = None,
+    bias: BiasClass = "none",
+    bias_magnitude: float = 0.0,
 ) -> float:
     """Run one CFR traversal from *state* for player *i*.
 
@@ -123,6 +168,14 @@ def cfr(
         flush into the shared tables.  When ``None`` a temporary
         accumulator is created and merged immediately before the
         function returns.
+    bias : BiasClass, optional
+        Action class for biased-blueprint training.  ``"none"``
+        (default) runs the standard unbiased traversal with byte-
+        identical behaviour to the legacy code path.  Any other value
+        adds ``bias_magnitude`` to the terminal payoff for every
+        action of that class taken on the path to the terminal.
+    bias_magnitude : float, optional
+        Per-occurrence bonus applied when ``bias != "none"``.
 
     Returns
     -------
@@ -134,7 +187,12 @@ def cfr(
     if _own_delta:
         local_delta = {}
     try:
-        return _traverse(tables, state, i, t, local_delta, _EXPLORE_ALL)
+        if bias == "none":
+            return _traverse(tables, state, i, t, local_delta, _EXPLORE_ALL)
+        return _traverse_biased(
+            tables, state, i, t, local_delta, _EXPLORE_ALL,
+            bias=bias, bias_magnitude=bias_magnitude, bias_count=0,
+        )
     finally:
         if _own_delta:
             merge_local_delta(tables, local_delta)
@@ -147,6 +205,8 @@ def cfrp(
     t: int,
     c: int,
     local_delta: Optional[Dict[Tuple[int, str], np.ndarray]] = None,
+    bias: BiasClass = "none",
+    bias_magnitude: float = 0.0,
 ) -> float:
     """Run one CFR-P traversal from *state* for player *i*.
 
@@ -175,6 +235,10 @@ def cfrp(
         below the floor effectively disables pruning.
     local_delta : dict, optional
         Caller-owned regret accumulator.  See :func:`cfr` for details.
+    bias : BiasClass, optional
+        Action class for biased-blueprint training.  See :func:`cfr`.
+    bias_magnitude : float, optional
+        Per-occurrence bonus applied when ``bias != "none"``.
 
     Returns
     -------
@@ -197,7 +261,12 @@ def cfrp(
         return int(regret_row[a_to_i[action]]) > c
 
     try:
-        return _traverse(tables, state, i, t, local_delta, _prune)
+        if bias == "none":
+            return _traverse(tables, state, i, t, local_delta, _prune)
+        return _traverse_biased(
+            tables, state, i, t, local_delta, _prune,
+            bias=bias, bias_magnitude=bias_magnitude, bias_count=0,
+        )
     finally:
         if _own_delta:
             merge_local_delta(tables, local_delta)
@@ -266,7 +335,7 @@ def _traverse(
     if not legal_actions:
         return float(state.payout[i])
 
-    sigma, r, a_to_i, regret_row = get_node_strategy(tables, state)
+    sigma, r, a_to_i, regret_row, info_set = get_node_strategy(tables, state)
 
     if state.player_i == i:
         # Traversing player: iterate over explore_fn-filtered actions.
@@ -277,21 +346,22 @@ def _traverse(
                 continue
             if _debug:
                 log.debug("ACTION TRAVERSED FOR REGRET: ph %s ACTION: %s", state.player_i, action)
-            new_state = state.apply_action(action)
-            voa[action] = _traverse(tables, new_state, i, t, local_delta, explore_fn)
+            token = state.step_in_place(action)
+            voa[action] = _traverse(tables, state, i, t, local_delta, explore_fn)
+            state.undo(token)
             if _debug:
                 log.debug("Got EV for %s: %s", action, voa[action])
             vo += sigma[a_to_i[action]] * voa[action]
             if _debug:
                 log.debug(
                     "Added to Node EV for ACTION: %s INFOSET: %s\nSTRATEGY: %s: %s",
-                    action, state.info_set,
+                    action, info_set,
                     sigma[a_to_i[action]], sigma[a_to_i[action]] * voa[action],
                 )
         if _debug:
-            log.debug("Updated EV at %s: %s", state.info_set, vo)
+            log.debug("Updated EV at %s: %s", info_set, vo)
         # Only explored actions (those in voa) receive regret updates.
-        accumulate_regrets(local_delta, r, state.info_set, voa, vo, a_to_i)
+        accumulate_regrets(local_delta, r, info_set, voa, vo, a_to_i)
         return vo
     else:
         # Opponent node: external sampling — descend one sampled branch.
@@ -301,4 +371,80 @@ def _traverse(
                 "EXTERNAL SAMPLE: opponent ph %s sampled ACTION: %s",
                 state.player_i, action,
             )
-        return _traverse(tables, state.apply_action(action), i, t, local_delta, explore_fn)
+        token = state.step_in_place(action)
+        value = _traverse(tables, state, i, t, local_delta, explore_fn)
+        state.undo(token)
+        return value
+
+
+def _traverse_biased(
+    tables: CFRTables,
+    state: PokerState,
+    i: int,
+    t: int,
+    local_delta: Dict[Tuple[int, str], np.ndarray],
+    explore_fn: ExploreFn,
+    bias: BiasClass,
+    bias_magnitude: float,
+    bias_count: int,
+) -> float:
+    """Recursive CFR traversal with a per-trajectory bias bonus.
+
+    Mirrors :func:`_traverse` exactly but threads two extra pieces of
+    state through the recursion:
+
+    - ``bias`` and ``bias_magnitude`` are run-wide constants describing
+      the configured biased action class and the per-occurrence bonus.
+    - ``bias_count`` is the number of biased actions taken on the path
+      from the original root to *state*.  Passed by value (Python int
+      is immutable) so each recursive branch sees an independent
+      lineage; the traversing-player loop, in particular, must not
+      share a counter across the actions it explores.
+
+    The bonus ``bias_magnitude * bias_count`` is added at every
+    terminal short-circuit (paid out player and inactive-player
+    paths).  Regret updates therefore see a payoff that already
+    encodes the trajectory's bias contribution, which in turn shifts
+    the equilibrium toward the biased class and adapts the rest of
+    the tree to that tendency.
+    """
+    _debug = log.isEnabledFor(logging.DEBUG)
+
+    terminal_value = is_terminal(state, i)
+    if terminal_value is not None:
+        return terminal_value + bias_magnitude * bias_count
+
+    legal_actions = get_legal_actions(state)
+    if not legal_actions:
+        return float(state.payout[i]) + bias_magnitude * bias_count
+
+    sigma, r, a_to_i, regret_row, info_set = get_node_strategy(tables, state)
+
+    if state.player_i == i:
+        vo = 0.0
+        voa: Dict[str, float] = {}
+        for action in legal_actions:
+            if not explore_fn(action, regret_row, a_to_i, state):
+                continue
+            if _debug:
+                log.debug("ACTION TRAVERSED FOR REGRET: ph %s ACTION: %s", state.player_i, action)
+            new_count = bias_count + 1 if is_biased(action, bias) else bias_count
+            token = state.step_in_place(action)
+            voa[action] = _traverse_biased(
+                tables, state, i, t, local_delta, explore_fn,
+                bias, bias_magnitude, new_count,
+            )
+            state.undo(token)
+            vo += sigma[a_to_i[action]] * voa[action]
+        accumulate_regrets(local_delta, r, info_set, voa, vo, a_to_i)
+        return vo
+    else:
+        action = sample_action(legal_actions, sigma, a_to_i)
+        new_count = bias_count + 1 if is_biased(action, bias) else bias_count
+        token = state.step_in_place(action)
+        value = _traverse_biased(
+            tables, state, i, t, local_delta, explore_fn,
+            bias, bias_magnitude, new_count,
+        )
+        state.undo(token)
+        return value

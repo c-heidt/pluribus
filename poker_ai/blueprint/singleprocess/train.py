@@ -18,13 +18,19 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 
 from environment.action_space import MAX_ACTIONS_PER_STREET
+from poker_ai.blueprint.bias import BiasClass
 from poker_ai.blueprint.cfr import merge_local_delta
+from poker_ai.blueprint.core_runner import CoreDriver, core_enabled
 from poker_ai.tables.cfr_tables import CFRTables
+from poker_ai.tables.warm_start import (
+    apply_warm_start_to_tables,
+    stage_warm_start_lmdb,
+)
 from poker_ai.blueprint.training import (
     DiscountState,
     at_sync_barrier,
@@ -75,6 +81,10 @@ def simple_search(
     update_threshold: int,
     sync_interval: int,
     discount_interval: int,
+    bias: BiasClass = "none",
+    bias_magnitude: float = 0.0,
+    warm_start: Optional[Union[str, Path]] = None,
+    strategy_per_job: Optional[int] = None,
 ):
     """Run a single-process CFR training loop for *n_iterations* iterations.
 
@@ -125,21 +135,66 @@ def simple_search(
         cycle-based parameter.
     discount_interval : int
         Period (in sync cycles) between LCFR discount applications.
+    strategy_per_job : int, optional
+        Pre-flop UPDATE-STRATEGY playthroughs per player per strategy-update
+        firing — the same knob as the multi-process server's
+        ``strategy_per_job``.  Defaults to the ``PLURIBUS_STRATEGY_PER_JOB``
+        environment variable if set, else ``1`` (one pass covers the whole
+        pre-flop opponent tree per deal via full branching).
     """
+    import os
+
     from poker_ai.tables.index import lmdb_map_size_for_players
     from information_abstraction import load_info_set_lut
 
     _LOG_INTERVAL_SECS = 60.0
 
+    if strategy_per_job is None:
+        env_spj = os.environ.get("PLURIBUS_STRATEGY_PER_JOB")
+        strategy_per_job = int(env_spj) if env_spj else 1
+    if strategy_per_job < 1:
+        raise ValueError(
+            f"strategy_per_job must be >= 1, got {strategy_per_job}"
+        )
+
     seed(42)
     shm_dir = save_path / "shm"
     shm_dir.mkdir(parents=True, exist_ok=True)
+    warm_start_staged = False
+    if warm_start is not None:
+        warm_start_staged = stage_warm_start_lmdb(
+            save_path=save_path,
+            warm_start_path=Path(warm_start),
+            expected_n_players=n_players,
+        )
+    enable_index_cache = os.environ.get("PLURIBUS_INDEX_CACHE", "1") == "1"
     tables = CFRTables(
         index_path=save_path / "lmdb_index",
         shm_dir=str(shm_dir),
         lmdb_map_size=lmdb_map_size_for_players(n_players),
         actions_per_street=MAX_ACTIONS_PER_STREET,
+        enable_index_cache=enable_index_cache,
     )
+    # Only restore chunks when we actually staged the LMDB this run —
+    # otherwise the loaded chunks would belong to the warm-start's
+    # info-set mapping but the tables would be reading the existing
+    # destination LMDB's mapping, silently mis-routing every row.
+    if warm_start is not None and warm_start_staged:
+        apply_warm_start_to_tables(
+            tables=tables,
+            warm_start_path=Path(warm_start),
+            expected_n_players=n_players,
+        )
+    # Prewarm the shm index caches from LMDB now that any warm-start /
+    # resume mapping is in place (single process → no fork to precede).
+    tables.prewarm_caches()
+    # Optional compiled-core CFR (PLURIBUS_CFR_CORE=1).  Built after the
+    # caches are warm so the pure-shm read path sees a complete mirror;
+    # falls back to the Python path (core stays None) when unset or biased.
+    core = None
+    if core_enabled(bias):
+        core = CoreDriver(tables)
+        log.info("PLURIBUS_CFR_CORE=1 — driving CFR through the compiled core")
     discount_state = DiscountState(
         duration_cycles=discount_duration_cycles,
         discount_interval=discount_interval,
@@ -154,7 +209,10 @@ def simple_search(
         for i in range(n_players):
             state: PokerState = new_game(n_players, card_info_lut)
             local_delta: Dict[Tuple[int, str], np.ndarray] = {}
-            cfr_step(tables, state, i, t, prune_threshold, c, local_delta)
+            cfr_step(
+                tables, state, i, t, prune_threshold, c, local_delta,
+                bias=bias, bias_magnitude=bias_magnitude, core=core,
+            )
             merge_local_delta(tables, local_delta)
 
         if at_sync_barrier(t, sync_interval):
@@ -162,8 +220,9 @@ def simple_search(
 
             if should_update_strategy(sync_step, strategy_interval, update_threshold):
                 for i in range(n_players):
-                    state = new_game(n_players, card_info_lut)
-                    strategy_step(tables, state, i)
+                    for _ in range(strategy_per_job):
+                        state = new_game(n_players, card_info_lut)
+                        strategy_step(tables, state, i)
 
             if should_discount(sync_step, discount_interval):
                 discount_state.apply(tables, sync_step)
@@ -183,3 +242,8 @@ def simple_search(
                     f"({iters_per_sec:.1f} iter/s)"
                 )
                 _last_log_time = now
+
+    # In deferred-allocation mode the shm cache is the live row authority and
+    # LMDB lags; make the on-disk index current so a reopen / warm-start (and the
+    # golden-trace regression) sees every allocated row.  No-op otherwise.
+    tables.persist_indexes()

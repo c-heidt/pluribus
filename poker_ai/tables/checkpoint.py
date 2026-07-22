@@ -206,6 +206,13 @@ class CheckpointManager:
                 f"({self._lmdb_runtime_dir} → {self._lmdb_persistent_dir})"
             )
         self._last_checkpoint_path: Optional[Path] = None
+        # Wall-clock seconds used to name the most recent checkpoint dir.
+        # Checkpoints are now retained (never deleted), so two writes in the
+        # same second would collide on ``checkpoint_<seconds>`` and the rename
+        # onto a non-empty dir would fail.  We force the naming counter to
+        # strictly increase so every retained generation gets a unique,
+        # lexically-ordered name (resume picks the lexically-greatest one).
+        self._last_final_seconds: Optional[int] = None
         self._sigterm_event: threading.Event = threading.Event()
 
         signal.signal(signal.SIGTERM, self._handle_sigterm)
@@ -296,6 +303,11 @@ class CheckpointManager:
             self._server.flush_all_workers()
 
         # Phase 1 — snapshot under the barrier.  Cheap: memcpy + LMDB sync.
+        # In deferred-allocation mode, first bulk-write the rows the shm cache
+        # has allocated since the last checkpoint into LMDB, so the on-disk index
+        # matches the chunk snapshot taken immediately after (both cover
+        # [0, occupancy)).  No-op when deferred allocation is off.
+        self._server._tables.persist_indexes()
         buffers = self._server._tables.snapshot_dirty_chunks()
         self._server._tables.flush_indexes()
         state_dict = self._server.to_dict(t=t)
@@ -414,7 +426,13 @@ class CheckpointManager:
                 self._mirror_lmdb_to_persistent()
                 lmdb_ms = (time.monotonic() - lmdb_start) * 1000.0
 
-            final_path = self._save_path / f"checkpoint_{int(time.time())}"
+            seconds = int(time.time())
+            if self._last_final_seconds is not None and seconds <= self._last_final_seconds:
+                # Same-second (or clock-skew) collision: bump past the last
+                # name so retained generations stay unique and monotonic.
+                seconds = self._last_final_seconds + 1
+            self._last_final_seconds = seconds
+            final_path = self._save_path / f"checkpoint_{seconds}"
             tmp_path.rename(final_path)
             tmp_path_to_cleanup = None
         except Exception:
@@ -425,9 +443,13 @@ class CheckpointManager:
             if tmp_path_to_cleanup is not None and tmp_path_to_cleanup.exists():
                 shutil.rmtree(tmp_path_to_cleanup, ignore_errors=True)
 
-        if self._last_checkpoint_path and self._last_checkpoint_path.exists():
-            shutil.rmtree(self._last_checkpoint_path)
-            log.info(f"Deleted previous checkpoint: {self._last_checkpoint_path}")
+        # Every checkpoint is retained as a training snapshot for offline
+        # average-strategy reconstruction — the previous generation is NOT
+        # deleted.  ``_last_checkpoint_path`` still tracks the newest one so
+        # the hardlink carry-forward above sources unchanged chunks from it
+        # (chunks unchanged since the last checkpoint share an inode across
+        # retained generations, so the on-disk cost is only the dirty chunks
+        # each time).
         self._last_checkpoint_path = final_path
 
         writeback_ms = (time.monotonic() - write_start) * 1000.0
@@ -547,6 +569,7 @@ class CheckpointManager:
         "prune_threshold",
         "c",
         "chunk_size",
+        "info_set_encoding",
     )
     """Hyperparameters whose values must match between the saved state
     and the current :class:`Server` for a resume to be safe.  Changing
@@ -581,6 +604,9 @@ class CheckpointManager:
             if key == "chunk_size":
                 from poker_ai.tables.chunk_store import CHUNK_SIZE
                 return CHUNK_SIZE
+            if key == "info_set_encoding":
+                from environment.poker_env import INFO_SET_ENCODING
+                return INFO_SET_ENCODING
             return getattr(self._server, "_" + key)
 
         mismatches = []
