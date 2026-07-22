@@ -93,7 +93,11 @@ def _model_rows(model, env, width, combo_cards):
     m_sigma = np.zeros((n, width), dtype=np.float64)
     conf = np.zeros((n, 1), dtype=np.float64)
     for ci in range(n):
-        st = env.policy_state_for(combo_cards[ci], public=public)
+        # ``for_blueprint=True`` canonicalises an off-tree history exactly as the
+        # blueprint reads and the belief-likelihood swap (§6.3) do, so the model is
+        # queried at one and the same info-set key in all three places — required
+        # for the clamp and the beliefs to describe the *same* opponent.
+        st = env.policy_state_for(combo_cards[ci], for_blueprint=True, public=public)
         row = np.asarray(model.strategy(st), dtype=np.float64)
         m_sigma[ci, : row.shape[0]] = row[:width]
         conf[ci, 0] = float(model.confidence(st))

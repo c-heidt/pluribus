@@ -182,11 +182,14 @@ def test_model_rows_zero_fill_overlay_columns():
     class _FakeState:
         legal_actions = ("fold", "call", "raise:1.0")
 
+    seen = {}
+
     class _FakeEnv:
         def policy_public_fields(self):
             return None
 
-        def policy_state_for(self, combo, public=None):
+        def policy_state_for(self, combo, for_blueprint=False, public=None):
+            seen["for_blueprint"] = for_blueprint
             return _FakeState()
 
     n, width = 3, 5          # node has 5 legal actions; model knows only 3
@@ -197,3 +200,6 @@ def test_model_rows_zero_fill_overlay_columns():
     assert np.all(m[:, 3:] == 0.0)                       # overlay columns: no mass
     np.testing.assert_allclose(m[:, :3], np.tile([0.5, 0.25, 0.25], (n, 1)))
     np.testing.assert_allclose(c, 0.7)
+    # The clamp canonicalises the history exactly as the blueprint read and the
+    # §6.3 belief swap do, so all three query one and the same info-set key.
+    assert seen["for_blueprint"] is True

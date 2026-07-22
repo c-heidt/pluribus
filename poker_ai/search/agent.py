@@ -27,7 +27,8 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Callable, Dict, List, Mapping, Optional, Tuple
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Callable, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -36,6 +37,9 @@ from poker_ai.search.context import SubgameContext
 from poker_ai.search.policy import BiasClass, Policy
 from poker_ai.search.ranges import RangeTracker
 from poker_ai.search.solver import SearchResult, SolverConfig, solve
+
+if TYPE_CHECKING:
+    from poker_ai.modeling.model import OpponentModel
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +78,7 @@ class SearchAgent:
         round1_offtree_threshold: float = 0.25,
         round1_max_players: int = 4,
         offtree_threshold: float = 0.25,
+        models: Optional[Mapping[int, "OpponentModel"]] = None,
     ) -> None:
         # --- session-static ---
         self._leaf_policies = leaf_policies     # the four §4 variants (== cfg.leaf.policies)
@@ -87,8 +92,18 @@ class SearchAgent:
         # canonical branch) instead of triggering a warm re-search — bounding
         # re-search frequency at a negligible exploitability cost (§7).
         self._offtree_threshold = float(offtree_threshold)
+        # Opponent models, seat → model (opponent_modeling §6.3).  Session-static
+        # source; ``on_hand_start`` freezes a per-hand snapshot into ``self._models``.
+        # ``None``/empty ⇒ every model code path is inert and the agent is exactly
+        # the baseline (condition B0).
+        self._models_source: Mapping[int, "OpponentModel"] = models or {}
 
         # --- per-hand (initialised in on_hand_start) ---
+        #: The hand-start model snapshot.  **The invariant of §6.3:** the belief
+        #: tracker's likelihood and the solver's clamp read the *same* frozen
+        #: mapping, so the bot infers an opponent's range under the very strategy
+        #: it then best-responds to.  Never contains the bot's own seat.
+        self._models: Mapping[int, "OpponentModel"] = MappingProxyType({})
         self.my_seat: int = -1
         self.my_hole: Tuple[int, int] = (-1, -1)
         self.tracker: Optional[RangeTracker] = None
@@ -113,6 +128,13 @@ class SearchAgent:
         self.my_hole = tuple(sorted(int(c) for c in env.players[my_seat].cards))
         live = [i for i in range(env.n_players) if env.players[i].is_active]
         self.tracker = RangeTracker(env, self.my_seat, self.my_hole, live)
+        # Freeze the per-hand model snapshot (§6.3 invariant — one mapping feeds
+        # both the belief likelihood and the solver clamp for the whole hand).
+        # The bot's own seat is dropped defensively: hero is never modeled, and
+        # `apply_model_clamp` must never blend hero's rows.
+        self._models = MappingProxyType(
+            {int(s): m for s, m in self._models_source.items() if int(s) != self.my_seat}
+        )
         self.pending_actions = []
         self.last_search = None
         self._ctx = None
@@ -336,7 +358,7 @@ class SearchAgent:
         to the folded set, yielding the post-fold posterior for card removal.
         """
         for seat, env_before, action in self.pending_actions:
-            sigma = self._make_sigma_for_combo(env_before)
+            sigma = self._make_sigma_for_combo(env_before, seat)
             self.tracker.on_action(seat, env_before, action, sigma)
             if action == "fold":
                 self.tracker.on_seat_folded(seat)
@@ -358,6 +380,9 @@ class SearchAgent:
             self.tracker.folded_snapshot(),
             self._cfg.leaf,
             self._rng,
+            # The SAME hand-start snapshot the belief likelihood used (§6.3
+            # invariant): infer the opponent's range under the strategy we clamp to.
+            models=self._models,
         )
         try:
             self.last_search = solve(root_env, self._ctx, self._cfg)
@@ -370,7 +395,7 @@ class SearchAgent:
         self._searched_this_round = True
 
     def _make_sigma_for_combo(
-        self, env_before: PokerEnv
+        self, env_before: PokerEnv, seat: Optional[int] = None
     ) -> Callable[[int], np.ndarray]:
         """Closure mapping a combo row ``h`` → its action distribution at ``env_before``.
 
@@ -378,7 +403,35 @@ class SearchAgent:
         the hypothetical hole ``env_before.combo_cards[h]`` — the contract
         :meth:`RangeTracker.on_action` requires.  ``ranges.py`` never imports
         ``policy.py``; the agent owns this bridge.
+
+        **Per-seat (opponent_modeling §6.3, the belief-likelihood swap).**  When
+        ``seat`` has a model in the hand-start snapshot, the likelihood is the model
+        ``σ̂`` — *not* the solver's mixture ``σ̃``: beliefs estimate what the opponent
+        **actually does**, while the mixture is only the solver's hedge.  This is
+        design-doc §5 integration point 1 — reach beliefs and behavioral models
+        agree, so the bot infers a modeled opponent's range under the same strategy
+        it best-responds to.  Unmodeled seats and the bot's own range keep the
+        baseline path below (last search's average, else the blueprint) unchanged.
         """
+        model = self._models.get(int(seat)) if seat is not None else None
+        if model is not None:
+            combo_cards = env_before.combo_cards
+            # Combo-independent fields computed once (this sweep runs per combo).
+            public = env_before.policy_public_fields()
+
+            def sigma_model(h: int) -> np.ndarray:
+                # ``for_blueprint=True`` matches the blueprint path below and the
+                # solver clamp, so an off-tree history canonicalises identically in
+                # all three — the model is queried at one and the same info-set key.
+                state = env_before.policy_state_for(
+                    tuple(int(c) for c in combo_cards[h]),
+                    for_blueprint=True,
+                    public=public,
+                )
+                return np.asarray(model.strategy(state), dtype=np.float64)
+
+            return sigma_model
+
         if self._searched_this_round and self.last_search is not None:
             pk = self._solved_public_key(env_before)
             legal = [a for a in env_before.legal_actions if a is not None]
