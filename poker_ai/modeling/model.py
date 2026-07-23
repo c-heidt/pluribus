@@ -134,6 +134,21 @@ class SyntheticOpponentModel(OpponentModel):
         c = self._confidence(state) if callable(self._confidence) else self._confidence
         return float(min(self._p_max, max(0.0, float(c))))
 
+    def reopen_after_fork(self) -> None:
+        """Reopen the wrapped policy's LMDB env after a ``fork`` (parallel replicas).
+
+        The solver clamp queries ``σ̂`` *inside* each forked replica, and the wrapped
+        policy is usually blueprint-backed.  LMDB's reader-lock table is a
+        process-shared mmap, so an inherited env handle must be reopened or the first
+        read trips ``MDB_BAD_RSLOT`` in child *and* parent — the recurring pitfall
+        :func:`poker_ai.search.parallel._reopen_leaf_fleet_lmdb` exists to repair.
+        Delegates to the wrapped policy; a no-op for in-memory policies that expose
+        no such hook.
+        """
+        reopen = getattr(self._policy, "reopen_after_fork", None)
+        if reopen is not None:
+            reopen()
+
     def _perturb(self, sigma: np.ndarray, info_set: bytes, error: float) -> np.ndarray:
         """Seeded ℓ1 perturbation toward a random point on the base's support.
 

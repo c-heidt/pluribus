@@ -210,7 +210,8 @@ class _VectorSolver:
         # Opponent-model clamp (opponent_modeling §5.2) — no-op without models.
         # Before `freeze_combo` so the bot's pinned actual-hand row always wins.
         sigma = apply_model_clamp(
-            sigma, self.ctx, self.state, env, pk, actor, len(legal), self._combo_cards
+            sigma, self.ctx, self.state, env, pk, actor, len(legal),
+            self._combo_cards, cof, n_rows, is_root,
         )
         frozen_combo = freeze_combo(
             self.state, pk, sigma, is_root, actor, self._my_seat, self._my_combo

@@ -211,13 +211,28 @@ def _reopen_leaf_fleet_lmdb(ctx: SubgameContext) -> None:
     Policies without an LMDB backend (the in-memory ``UniformPolicy`` in tests, a
     ``SearchPolicy``) expose no ``reopen_after_fork`` and are skipped; the four §4
     bias variants share one blueprint object, so it is reopened once (deduped by id).
+
+    **Covers ``ctx.models`` too** (opponent_modeling §5.1): a modeled seat's ``σ̂`` is
+    typically a *blueprint-backed* policy, and the clamp queries it inside the walk —
+    i.e. inside the forked replica.  An opponent model left out of this sweep would
+    trip the very same ``MDB_BAD_RSLOT`` on its first query, in child and parent
+    alike.  The dedup set is shared, so a blueprint reached through both the leaf
+    fleet and a model is still reopened exactly once.
     """
     seen: set = set()
-    for policy in ctx.leaf.policies.values():
-        reopen = getattr(policy, "reopen_after_fork", None)
-        if reopen is not None and id(policy) not in seen:
-            seen.add(id(policy))
+
+    def _reopen(obj) -> None:
+        if obj is None or id(obj) in seen:
+            return
+        reopen = getattr(obj, "reopen_after_fork", None)
+        if reopen is not None:
+            seen.add(id(obj))
             reopen()
+
+    for policy in ctx.leaf.policies.values():
+        _reopen(policy)
+    for model in getattr(ctx, "models", {}).values():
+        _reopen(model)
 
 
 def _run_replica(payload: Tuple[int, np.random.SeedSequence, int]):

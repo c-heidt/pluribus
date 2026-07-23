@@ -118,69 +118,181 @@ def _sigma(n_combos=4, width=3):
 
 def test_no_models_returns_sigma_object_unchanged():
     sigma = _sigma()
-    out = apply_model_clamp(sigma, _Ctx({}), _State(), None, "pk", 1, 3, None)
+    out = apply_model_clamp(sigma, _Ctx({}), _State(), None, "pk", 1, 3, None, None, 4, True)
     assert out is sigma          # identity, not just equality — no allocation
 
 
 def test_unmodeled_actor_returns_sigma_unchanged():
     sigma = _sigma()
     ctx = _Ctx({0: _FixedModel()})
-    out = apply_model_clamp(sigma, ctx, _State(), None, "pk", 1, 3, None)
+    out = apply_model_clamp(sigma, ctx, _State(), None, "pk", 1, 3, None, None, 4, True)
     assert out is sigma          # seat 1 has no model
+
+
+
+
+def _entry(n_rows, width):
+    return (np.zeros((n_rows, width)), np.zeros((n_rows, 1)),
+            np.zeros(n_rows, dtype=bool))
+
+
+def _stub_fill(monkeypatch, m_row, c_val, counter=None):
+    """Replace the row builder with one that fills every row with a fixed value."""
+    import poker_ai.search.vform as vform
+
+    def fake(entry, model, env, width, combo_cards, cof, is_root):
+        if counter is not None:
+            counter.append(1)
+        m_rows, c_rows, filled = entry
+        m_rows[:] = m_row
+        c_rows[:] = c_val
+        filled[:] = True
+
+    monkeypatch.setattr(vform, "_fill_model_rows", fake)
 
 
 @pytest.mark.parametrize("c", [0.0, 0.25, 0.5, 1.0])
 def test_blend_interpolates_between_free_and_model(c, monkeypatch):
     """``σ̃ = c·σ̂ + (1−c)·x`` exactly; c=0 ⇒ free strategy, c=1 ⇒ model row."""
-    import poker_ai.search.vform as vform
-
     sigma = _sigma()
     n, width = sigma.shape
-    model_row = np.zeros((n, width)); model_row[:, 0] = 1.0     # point mass, action 0
-    monkeypatch.setattr(vform, "_model_rows",
-                        lambda *a, **k: (model_row, np.full((n, 1), c)))
+    model_row = np.zeros(width); model_row[0] = 1.0       # point mass, action 0
+    _stub_fill(monkeypatch, model_row, c)
 
     ctx = _Ctx({1: _FixedModel(c=c)})
-    out = apply_model_clamp(sigma, ctx, _State(), None, "pk", 1, width, None)
+    out = apply_model_clamp(sigma, ctx, _State(), None, "pk", 1, width, None,
+                            None, n, True)
 
-    np.testing.assert_allclose(out, c * model_row + (1.0 - c) * sigma)
-    np.testing.assert_allclose(out.sum(axis=1), 1.0)           # still a distribution
+    expected = c * np.tile(model_row, (n, 1)) + (1.0 - c) * sigma
+    np.testing.assert_allclose(out, expected)
+    np.testing.assert_allclose(out.sum(axis=1), 1.0)      # still a distribution
     if c == 0.0:
-        np.testing.assert_array_equal(out, sigma)
+        np.testing.assert_allclose(out, sigma)
     if c == 1.0:
-        np.testing.assert_array_equal(out, model_row)
+        np.testing.assert_allclose(out, np.tile(model_row, (n, 1)))
 
 
-def test_model_rows_are_cached_per_seat_and_node(monkeypatch):
-    """One build per ``(seat, public_key)``; revisits hit the cache."""
-    import poker_ai.search.vform as vform
-
+def test_entry_is_cached_per_seat_and_node(monkeypatch):
+    """One cache entry per ``(seat, public_key)``; revisits hit it."""
     sigma = _sigma()
     n, width = sigma.shape
     calls = []
-    monkeypatch.setattr(vform, "_model_rows", lambda *a, **k: (
-        calls.append(1), (np.zeros((n, width)), np.zeros((n, 1))))[1])
+    _stub_fill(monkeypatch, np.zeros(width), 0.0, counter=calls)
 
     ctx, state = _Ctx({1: _FixedModel()}), _State()
     for _ in range(3):
-        apply_model_clamp(sigma, ctx, state, None, "pk", 1, width, None)
-    apply_model_clamp(sigma, ctx, state, None, "other_pk", 1, width, None)
+        apply_model_clamp(sigma, ctx, state, None, "pk", 1, width, None, None, n, True)
+    apply_model_clamp(sigma, ctx, state, None, "other_pk", 1, width, None, None, n, True)
 
-    # 4 queries over 2 distinct keys ⇒ 2 builds (misses) + 2 revisits (hits).
-    assert len(calls) == 2                    # one build per distinct public key
+    # 4 queries over 2 distinct keys ⇒ 2 entry allocations + 2 revisits.
     assert state.model_sigma_cache.misses == 2
     assert state.model_sigma_cache.hits == 2
     assert len(state.model_sigma_cache) == 2
 
 
+# --------------------------------------------------------------------------- #
+# 3. Row-space correctness — the board-staleness regression
+# --------------------------------------------------------------------------- #
+
+class _InfoSetModel:
+    """Row depends on the queried info-set, so a stale row is detectable."""
+
+    def __init__(self):
+        self.seen = []
+
+    def strategy(self, state):
+        self.seen.append(bytes(state.info_set))
+        n = len(state.legal_actions)
+        r = np.zeros(n, dtype=np.float64)
+        r[hash(bytes(state.info_set)) % n] = 1.0
+        return r
+
+    def confidence(self, state):
+        return 1.0
+
+
+def test_rows_are_filled_per_cluster_and_gathered_with_the_live_board():
+    """``_fill_model_rows`` builds ONE row per cluster row and only for rows the
+    current board reaches; a later board fills the rows it newly exposes.
+
+    This is the board-staleness regression: ``public_key`` carries no board, and
+    both regimes re-sample the completion every iteration, so caching *combo*-space
+    rows under ``(seat, public_key)`` would reuse the first board's rows forever.
+    """
+    from poker_ai.search.vform import _fill_model_rows
+
+    class _FakeState:
+        legal_actions = ("fold", "call")
+
+        def __init__(self, tag):
+            self.info_set = tag
+
+    class _FakeEnv:
+        def policy_public_fields(self):
+            return None
+
+        def policy_state_for(self, combo, for_blueprint=False, public=None):
+            return _FakeState(bytes(np.asarray(combo).tobytes()))
+
+    n_rows, width = 4, 2
+    combo_cards = np.arange(12, dtype=np.int64).reshape(6, 2)
+    model = _InfoSetModel()
+    entry = _fill_model_rows_entry = _entry(n_rows, width)
+
+    # Board A reaches cluster rows {0, 1} only.
+    cof_a = np.array([0, 0, 1, 1, -1, -1])
+    _fill_model_rows(entry, model, _FakeEnv(), width, combo_cards, cof_a, False)
+    assert list(entry[2]) == [True, True, False, False]
+    assert len(model.seen) == 2, "one query per cluster row, not per combo"
+
+    # Board B reaches {1, 2, 3}: row 1 is reused, rows 2/3 are newly built.
+    cof_b = np.array([1, 1, 2, 2, 3, 3])
+    _fill_model_rows(entry, model, _FakeEnv(), width, combo_cards, cof_b, False)
+    assert list(entry[2]) == [True, True, True, True]
+    assert len(model.seen) == 4, "row 1 rebuilt (should have been reused)"
+
+
+def test_confidence_is_clamped_into_the_unit_interval():
+    """A third-party model returning c outside [0,1] would push the mixture off
+    the simplex; the builder clamps it."""
+    from poker_ai.search.vform import _fill_model_rows
+
+    class _FakeState:
+        legal_actions = ("fold", "call")
+        info_set = b"k"
+
+    class _FakeEnv:
+        def policy_public_fields(self):
+            return None
+
+        def policy_state_for(self, combo, for_blueprint=False, public=None):
+            return _FakeState()
+
+    class _WildModel:
+        def __init__(self, c):
+            self._c = c
+
+        def strategy(self, state):
+            return np.array([1.0, 0.0])
+
+        def confidence(self, state):
+            return self._c
+
+    for c, want in ((-2.0, 0.0), (5.0, 1.0), (0.3, 0.3)):
+        entry = _entry(2, 2)
+        _fill_model_rows(entry, _WildModel(c), _FakeEnv(), 2,
+                         np.zeros((2, 2), dtype=np.int64), None, True)
+        np.testing.assert_allclose(entry[1], want)
+
+
 def test_model_rows_zero_fill_overlay_columns():
-    """A model row narrower than the node's legal width (an overlay/off-tree action
-    was injected) is zero-filled by ``_model_rows``, so the blend can never invent
-    mass on an injected size."""
-    from poker_ai.search.vform import _model_rows
+    """A model row narrower than the node's legal width (an off-tree action was
+    injected) is zero-filled, so the blend can never invent mass on it."""
+    from poker_ai.search.vform import _fill_model_rows
 
     class _FakeState:
         legal_actions = ("fold", "call", "raise:1.0")
+        info_set = b"k"
 
     seen = {}
 
@@ -193,13 +305,63 @@ def test_model_rows_zero_fill_overlay_columns():
             return _FakeState()
 
     n, width = 3, 5          # node has 5 legal actions; model knows only 3
-    m, c = _model_rows(_FixedModel(row=[0.5, 0.25, 0.25], c=0.7),
-                       _FakeEnv(), width, np.zeros((n, 2), dtype=int))
+    entry = _entry(n, width)
+    _fill_model_rows(entry, _FixedModel(row=[0.5, 0.25, 0.25], c=0.7),
+                     _FakeEnv(), width, np.zeros((n, 2), dtype=np.int64), None, True)
+    m, c = entry[0], entry[1]
 
-    assert m.shape == (n, width) and c.shape == (n, 1)
     assert np.all(m[:, 3:] == 0.0)                       # overlay columns: no mass
     np.testing.assert_allclose(m[:, :3], np.tile([0.5, 0.25, 0.25], (n, 1)))
     np.testing.assert_allclose(c, 0.7)
     # The clamp canonicalises the history exactly as the blueprint read and the
     # §6.3 belief swap do, so all three query one and the same info-set key.
     assert seen["for_blueprint"] is True
+
+
+# --------------------------------------------------------------------------- #
+# 4. Fork safety — models must be in the LMDB reopen sweep
+# --------------------------------------------------------------------------- #
+
+def test_models_are_reopened_after_fork():
+    """``ctx.models`` rides the same post-fork LMDB repair as the leaf fleet.
+
+    A modeled seat's σ̂ is typically blueprint-backed and is queried *inside* the
+    forked replica, so omitting it would trip ``MDB_BAD_RSLOT`` on first query.
+    """
+    from poker_ai.search.parallel import _reopen_leaf_fleet_lmdb
+
+    class _Reopenable:
+        def __init__(self): self.n = 0
+        def reopen_after_fork(self): self.n += 1
+
+    leaf_pol, model_pol, shared = _Reopenable(), _Reopenable(), _Reopenable()
+
+    class _Leaf:
+        policies = {"none": leaf_pol, "fold": shared}
+
+    class _Ctx2:
+        leaf = _Leaf()
+        models = {1: model_pol, 2: shared}      # `shared` reachable both ways
+
+    _reopen_leaf_fleet_lmdb(_Ctx2())
+    assert leaf_pol.n == 1
+    assert model_pol.n == 1, "opponent model was not reopened after fork"
+    assert shared.n == 1, "shared blueprint reopened more than once"
+
+
+def test_synthetic_model_delegates_reopen_to_its_policy():
+    from poker_ai.modeling.model import SyntheticOpponentModel
+
+    class _Pol:
+        def __init__(self): self.n = 0
+        def reopen_after_fork(self): self.n += 1
+        def strategy(self, state, bias="none"): return np.array([1.0])
+
+    pol = _Pol()
+    SyntheticOpponentModel(pol).reopen_after_fork()
+    assert pol.n == 1
+
+    # In-memory policies expose no hook — must be a silent no-op, not a crash.
+    class _Bare:
+        def strategy(self, state, bias="none"): return np.array([1.0])
+    SyntheticOpponentModel(_Bare()).reopen_after_fork()

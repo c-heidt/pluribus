@@ -75,36 +75,62 @@ def node_sigma(state, pk, legal, actor, is_root, n_rows, row_space, cof):
     return sigma, regret, strat
 
 
-def _model_rows(model, env, width, combo_cards):
-    """Build ``(σ̂, c)`` for every combo at the current node — the cached payload.
+def _fill_model_rows(entry, model, env, width, combo_cards, cof, is_root):
+    """Lazily build any model rows the *current* board references.
 
-    One :meth:`~environment.poker_env.PokerEnv.policy_state_for` query per combo,
-    reusing the combo-independent public fields so the per-combo sweep does not
-    re-derive ``legal_actions`` / ``valid_mask`` each time.  ``policy_state_for``
-    reads no seat's actual cards, so this is leak-free: the rows depend only on
-    public state plus the hypothetical hole.
+    **Rows, not combos — and this is load-bearing.**  ``public_key`` encodes only
+    ``(stage, action history)``; it carries **no board**.  Both regimes re-sample the
+    completion every iteration (``ClusterMapper.refresh`` / ``reseat_private_cards``),
+    so a cache of *combo*-space model rows keyed by ``public_key`` would be built on
+    one board and silently reused on every later one.
 
-    The :class:`~poker_ai.modeling.model.OpponentModel` contract already returns a
-    row aligned with ``state.legal_actions`` and renormalized with overlay
-    (off-tree) actions at zero mass, so the row drops in as-is.
+    The row space is safe where combo space is not: ``n_rows`` comes from
+    ``ClusterMapper._universe`` (built once over *all* completions) and ``refresh``
+    searchsorts into it, so dense **row r ↔ a fixed LUT cluster** on every board —
+    exactly why the regret tables survive across iterations.  And because
+    ``info_set = (cluster, history)``, every combo in a cluster has the *same*
+    info-set, hence the same ``σ̂``/``c``.  So one query per row is both exact and
+    board-stable, and the caller gathers it with the current iteration's ``cof``.
+
+    Only rows reachable on this board are filled (others are never gathered), so the
+    entry fills in incrementally as later iterations expose new completions.
+
+    ``policy_state_for`` reads no seat's actual cards, so this is leak-free.
+    ``for_blueprint=True`` canonicalises an off-tree history exactly as the blueprint
+    reads and the belief-likelihood swap (§6.3) do, so the clamp and the beliefs
+    describe one and the same opponent at one and the same info-set key.
     """
+    m_rows, c_rows, filled = entry
+    if is_root:
+        # Root street is lossless: row r *is* combo r, and the root board is fixed.
+        need = np.flatnonzero(~filled)
+        rep = need
+    else:
+        cand = np.flatnonzero(cof >= 0)
+        r_of = cof[cand]
+        fresh = ~filled[r_of]
+        cand, r_of = cand[fresh], r_of[fresh]
+        if cand.size == 0:
+            return
+        # One representative combo per not-yet-built row (any combo in the cluster
+        # yields the same info-set, so the choice is immaterial).
+        _, first = np.unique(r_of, return_index=True)
+        need, rep = r_of[first], cand[first]
+    if need.size == 0:
+        return
     public = env.policy_public_fields()
-    n = int(combo_cards.shape[0])
-    m_sigma = np.zeros((n, width), dtype=np.float64)
-    conf = np.zeros((n, 1), dtype=np.float64)
-    for ci in range(n):
-        # ``for_blueprint=True`` canonicalises an off-tree history exactly as the
-        # blueprint reads and the belief-likelihood swap (§6.3) do, so the model is
-        # queried at one and the same info-set key in all three places — required
-        # for the clamp and the beliefs to describe the *same* opponent.
+    for r, ci in zip(need, rep):
         st = env.policy_state_for(combo_cards[ci], for_blueprint=True, public=public)
         row = np.asarray(model.strategy(st), dtype=np.float64)
-        m_sigma[ci, : row.shape[0]] = row[:width]
-        conf[ci, 0] = float(model.confidence(st))
-    return m_sigma, conf
+        m_rows[r, : min(row.shape[0], width)] = row[:width]
+        # Clamp defensively: a third-party model returning c outside [0, 1] would
+        # push the mixture off the simplex (negative mass on the free component).
+        c_rows[r, 0] = min(1.0, max(0.0, float(model.confidence(st))))
+        filled[r] = True
 
 
-def apply_model_clamp(sigma, ctx, state, env, pk, actor, width, combo_cards):
+def apply_model_clamp(sigma, ctx, state, env, pk, actor, width, combo_cards,
+                      cof, n_rows, is_root):
     """Blend a modeled seat's realized strategy toward its model — (A-mix), doc §5.2.
 
     ``σ̃ = c·σ̂ + (1 − c)·x`` per combo, where ``x`` is the seat's regret-matched free
@@ -135,9 +161,19 @@ def apply_model_clamp(sigma, ctx, state, env, pk, actor, width, combo_cards):
     key = (actor, pk)
     entry = state.model_sigma_cache.get(key)
     if entry is None:
-        entry = _model_rows(model, env, width, combo_cards)
+        entry = (np.zeros((n_rows, width), dtype=np.float64),
+                 np.zeros((n_rows, 1), dtype=np.float64),
+                 np.zeros(n_rows, dtype=bool))
         state.model_sigma_cache[key] = entry
-    m_sigma, conf = entry
+    _fill_model_rows(entry, model, env, width, combo_cards, cof, is_root)
+    m_rows, c_rows, _ = entry
+    if is_root:
+        m_sigma, conf = m_rows, c_rows
+    else:
+        # Gather with THIS iteration's cluster map (infeasible combos → row 0;
+        # harmless, their reach is zeroed upstream — same convention as node_sigma).
+        idx = np.where(cof >= 0, cof, 0)
+        m_sigma, conf = m_rows[idx], c_rows[idx]
     return conf * m_sigma + (1.0 - conf) * sigma
 
 
