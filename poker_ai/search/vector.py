@@ -104,6 +104,9 @@ class _VectorSolver:
         self._walk_env = root_env
         try:
             from poker_ai._core.flags import search_core_enabled
+            # Modeled solves run on the core too: the clamp keys the model by
+            # *cluster* (``policy_state_for_cluster``), which both engines serve
+            # identically, so condition A is not handicapped against B0 by engine.
             if search_core_enabled():
                 from poker_ai.search.fast_env import build_fast_walk_env
                 fast_env = build_fast_walk_env(root_env)
@@ -199,19 +202,21 @@ class _VectorSolver:
         pk = env.public_key
         is_root = street == self._street_at_root
         if is_root:
-            n_rows, row_space, cof = self._n_combos, "combo", None
+            n_rows, row_space, cof, gof = self._n_combos, "combo", None, None
         else:
             cof = self._cmaps.cluster_of(street)
+            gof = self._cmaps.gather_of(street)      # hoisted gather index
             n_rows, row_space = self._cmaps.n_rows(street), "cluster"
         # Shared vector-form preamble + freezing (§6.5, §5 — see :mod:`vform`).
         sigma, regret, strat = node_sigma(
-            self.state, pk, legal, actor, is_root, n_rows, row_space, cof
+            self.state, pk, legal, actor, is_root, n_rows, row_space, cof, gof
         )
         # Opponent-model clamp (opponent_modeling §5.2) — no-op without models.
         # Before `freeze_combo` so the bot's pinned actual-hand row always wins.
         sigma = apply_model_clamp(
             sigma, self.ctx, self.state, env, pk, actor, len(legal),
-            self._combo_cards, cof, n_rows, is_root,
+            self._combo_cards, cof, n_rows, is_root, gof,
+            self._cmaps, street,
         )
         frozen_combo = freeze_combo(
             self.state, pk, sigma, is_root, actor, self._my_seat, self._my_combo

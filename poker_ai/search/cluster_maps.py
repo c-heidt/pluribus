@@ -67,6 +67,8 @@ class ClusterMapper:
             self._universe = {}
         # Per-iteration maps (filled by :meth:`refresh`).
         self._cluster_of: Dict[int, np.ndarray] = {}    # street -> (n_combos,) dense row, -1 infeasible
+        self._gather_of: Dict[int, np.ndarray] = {}     # street -> cluster_of clamped to >=0 (gather index)
+        self._root_cluster: Optional[np.ndarray] = None  # lazy; see root_cluster_of
         self._feas: Dict[int, np.ndarray] = {}          # street -> (n_combos,) 0/1 board-feasibility
         self._scatter: Dict[int, Tuple] = {}            # street -> (sorted_combos, seg_starts, seg_cluster)
         self._feas_full: Optional[np.ndarray] = None
@@ -114,6 +116,15 @@ class ClusterMapper:
             dense = np.full(self._n_combos, -1, dtype=np.int64)
             dense[valid] = np.searchsorted(self._universe[s], raw[valid])
             self._cluster_of[s] = dense
+            # Gather index for the cluster→combo strategy expansion: `dense` with
+            # infeasible combos (-1) folded to row 0.  Consumers used to rebuild
+            # `np.where(cof >= 0, cof, 0)` at EVERY node of EVERY iteration, but it
+            # is a pure function of `dense`, which only changes here (once per
+            # iteration per street).  Hoisting it removes one allocation plus one
+            # O(n_combos) pass per node — in BOTH regimes, modeled or not.  Row 0 is
+            # harmless for infeasible combos: their reach is zeroed upstream (same
+            # convention the old inline expression relied on).
+            self._gather_of[s] = np.where(dense >= 0, dense, 0)
             self._feas[s] = valid.astype(np.float64)
             fcombos = np.flatnonzero(valid)
             fclusters = dense[fcombos]
@@ -132,6 +143,52 @@ class ClusterMapper:
     def cluster_of(self, street: int) -> np.ndarray:
         """``(n_combos,)`` dense cluster row per combo at ``street`` (-1 infeasible)."""
         return self._cluster_of[street]
+
+    def root_cluster_of(self) -> np.ndarray:
+        """``(n_combos,)`` LUT cluster id per combo at the **root** street.
+
+        The root board is fixed for the whole search, so this is computed once,
+        lazily (a search that never asks — every vanilla solve — pays nothing).
+
+        Why it exists: the root street's *row* space is lossless (row == combo), but
+        the **info-set** is still ``(cluster, history)``, so combos sharing a root
+        cluster share an info-set and therefore share any per-info-set quantity
+        (a model row, a blueprint row).  Callers use this to collapse an
+        n_combos-wide policy sweep to one query per distinct cluster.
+        """
+        if self._root_cluster is None:
+            name = _STREET_NAME[self._street_at_root]
+            board = np.array(self._root_comm, dtype=np.int64)
+            self._root_cluster = clusters_for_board(
+                self._lut[name], self._combo_cards, board
+            )
+        return self._root_cluster
+
+    def universe(self, street: int) -> np.ndarray:
+        """``(n_rows,)`` **raw LUT cluster id** per dense row at ``street``.
+
+        The inverse of the ``searchsorted`` in :meth:`refresh`: row ``r`` at this
+        street is LUT cluster ``universe(street)[r]``.  Static for the whole search
+        (the universe is built once over every candidate completion), so unlike
+        :meth:`cluster_of` it does not change per board.
+
+        Needed wherever a *row* has to be turned back into something card-keyed —
+        specifically the opponent-model clamp, which keys the model by info-set
+        ``(cluster, history)``.  The dense row index is a local relabelling and is
+        **not** the cluster; using it as one would query the model at the wrong
+        info-set.
+        """
+        return self._universe[street]
+
+    def gather_of(self, street: int) -> np.ndarray:
+        """:meth:`cluster_of` with infeasible combos folded to row 0.
+
+        The index for expanding a ``(n_rows, width)`` cluster table to per-combo
+        rows.  Precomputed in :meth:`refresh` (it changes only with the board), so
+        the hot walk gathers with it directly instead of rebuilding
+        ``np.where(cof >= 0, cof, 0)`` at every node.
+        """
+        return self._gather_of[street]
 
     def feas(self, street: int) -> np.ndarray:
         """``(n_combos,)`` 0/1 board feasibility per combo at ``street``."""

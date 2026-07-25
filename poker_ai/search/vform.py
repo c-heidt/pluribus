@@ -56,13 +56,63 @@ except ImportError:
     pass
 
 
-def node_sigma(state, pk, legal, actor, is_root, n_rows, row_space, cof):
+def clamp_sigma(sigma, m_rows, c_rows, gof):
+    """In-place ``σ ← σ + c·(σ̂ − σ)`` (the A-mix blend); returns ``sigma``.
+
+    Pure-Python reference for the ``_clamp`` kernel (P2).  Uses ``c·σ̂ + (1−c)·σ``
+    verbatim: the cheaper ``σ + c·(σ̂ − σ)`` is NOT exact at ``c = 1``, and
+    condition **B1 is ``c ≡ 1``**.  In-place is safe: ``sigma`` is always a fresh
+    array from the caller (``regret_match_matrix`` at a root node, a fancy-index
+    copy at a clustered one).
+    """
+    if gof is None:
+        m, c = m_rows, c_rows
+    else:
+        m, c = m_rows[gof], c_rows[gof]
+    np.multiply(sigma, 1.0 - c, out=sigma)
+    sigma += c * m
+    return sigma
+
+
+_clamp_sigma_py = clamp_sigma
+try:
+    from poker_ai._core import CORE_AVAILABLE as _CORE_AVAILABLE2
+    from poker_ai._core.flags import kernel_enabled as _kernel_enabled2
+
+    if _CORE_AVAILABLE2 and _kernel_enabled2("clamp_sigma"):
+        from poker_ai._core._clamp import clamp_sigma as _clamp_sigma_core
+
+        def clamp_sigma(sigma, m_rows, c_rows, gof):          # noqa: F811
+            """Compiled fused gather+blend, with a guarded fallback.
+
+            The kernel needs C-contiguous float64 blocks and an int64 gather; any
+            other layout (a test stub, an unusual dtype) falls back to the oracle
+            rather than silently mis-typing.
+            """
+            if (sigma.dtype == np.float64 and sigma.flags.c_contiguous
+                    and m_rows.dtype == np.float64 and m_rows.flags.c_contiguous
+                    and c_rows.dtype == np.float64 and c_rows.flags.c_contiguous
+                    and (gof is None
+                         or (gof.dtype == np.int64 and gof.flags.c_contiguous))):
+                return _clamp_sigma_core(sigma, m_rows, c_rows, gof)
+            return _clamp_sigma_py(sigma, m_rows, c_rows, gof)
+except ImportError:
+    pass
+
+
+def node_sigma(state, pk, legal, actor, is_root, n_rows, row_space, cof, gof=None):
     """Register the node and build its per-combo strategy matrix.
 
     Ensures the ``(n_rows, width)`` ``vregret``/``vstrat`` matrices exist, regret-
     matches the regret matrix, and gathers each combo's row: identity for a
     root-street node, a cluster gather (``cof`` maps combo→dense cluster row, ``-1``
     on infeasible combos → row 0, harmless since their reach is zeroed) otherwise.
+
+    ``gof`` is the precomputed gather index (:meth:`ClusterMapper.gather_of`) — the
+    same thing as ``np.where(cof >= 0, cof, 0)`` but built once per board in
+    ``refresh`` rather than rebuilt at every node of every iteration.  It is passed
+    by both regimes on the hot path; the ``None`` fallback recomputes it so callers
+    with only ``cof`` (tests, older call sites) stay correct.
 
     Returns ``(sigma, regret, strat)`` where ``sigma`` is ``(n_combos, width)`` and
     ``regret``/``strat`` are the node's stored ``(n_rows, width)`` matrices.
@@ -71,11 +121,37 @@ def node_sigma(state, pk, legal, actor, is_root, n_rows, row_space, cof):
     regret = state.vregret[pk]
     strat = state.vstrat[pk]
     sigma_rows = regret_match_matrix(regret)
-    sigma = sigma_rows if is_root else sigma_rows[np.where(cof >= 0, cof, 0)]
-    return sigma, regret, strat
+    if is_root:
+        return sigma_rows, regret, strat
+    if gof is None:
+        gof = np.where(cof >= 0, cof, 0)
+    return sigma_rows[gof], regret, strat
 
 
-def _fill_model_rows(entry, model, env, width, combo_cards, cof, is_root):
+def _policy_state(env, cluster, combo_cards, ci, public):
+    """The :class:`PolicyState` to query the model at — cluster-keyed where possible.
+
+    The clamp needs the info-set a *hypothetical* holding would produce.  That is
+    ``(cluster, history)``, so the cluster is the only card-dependent input — and
+    both walk engines can build the state from it
+    (:meth:`~environment.poker_env.PokerEnv.policy_state_for_cluster` /
+    :meth:`FastEnvAdapter.policy_state_for_cluster`).  Keying by cluster is what
+    lets a **modeled solve run on the compiled core**: the old combo-keyed
+    ``policy_state_for`` is a ``PokerEnv`` method the ``FastState`` adapters have no
+    way to serve, and reaching for it under the core raised ``AttributeError`` —
+    which ``SearchAgent._solve_and_store`` swallowed into a silent blueprint
+    fallback (zero exploitation, reported as A ≈ B0).
+
+    Falls back to the combo-keyed query when no cluster map is available (a
+    hand-built env in a test); that path is ``PokerEnv``-only, as it always was.
+    """
+    if cluster is not None and cluster >= 0:
+        return env.policy_state_for_cluster(int(cluster), public=public)
+    return env.policy_state_for(combo_cards[ci], for_blueprint=True, public=public)
+
+
+def _fill_model_rows(entry, model, env, width, combo_cards, cof, is_root,
+                     row_cluster=None):
     """Lazily build any model rows the *current* board references.
 
     **Rows, not combos — and this is load-bearing.**  ``public_key`` encodes only
@@ -95,16 +171,59 @@ def _fill_model_rows(entry, model, env, width, combo_cards, cof, is_root):
     Only rows reachable on this board are filled (others are never gathered), so the
     entry fills in incrementally as later iterations expose new completions.
 
-    ``policy_state_for`` reads no seat's actual cards, so this is leak-free.
-    ``for_blueprint=True`` canonicalises an off-tree history exactly as the blueprint
-    reads and the belief-likelihood swap (§6.3) do, so the clamp and the beliefs
-    describe one and the same opponent at one and the same info-set key.
+    ``row_cluster`` maps **row → raw LUT cluster id**: at the root street rows are
+    combos, so it is ``ClusterMapper.root_cluster_of()``; at a clustered street it is
+    ``ClusterMapper.universe(street)``, the inverse of ``refresh``'s ``searchsorted``.
+    It is what the model is keyed by (see :func:`_policy_state`) — the dense row index
+    is a local relabelling and must never be used as a cluster.
+
+    Neither query reads any seat's actual cards, so this is leak-free.  The history is
+    canonicalised exactly as the blueprint reads and the belief-likelihood swap (§6.3)
+    do, so the clamp and the beliefs describe one and the same opponent at one and the
+    same info-set key.
     """
     m_rows, c_rows, filled = entry
     if is_root:
-        # Root street is lossless: row r *is* combo r, and the root board is fixed.
-        need = np.flatnonzero(~filled)
-        rep = need
+        # Root street rows are lossless (row == combo), but the INFO-SET is still
+        # ``(cluster, history)`` — so combos sharing a root cluster share σ̂ exactly.
+        # Query once per distinct cluster and broadcast, instead of once per combo
+        # (190 → ~25-45 on the 20-card LUT; ~n_combos/n_buckets at production).
+        unf = np.flatnonzero(~filled)
+        if unf.size == 0:
+            return
+        if row_cluster is None:
+            need, rep, groups = unf, unf, None       # no cluster map: per-combo
+        else:
+            # Board-infeasible combos (cluster -1) share a card with the board, so
+            # they have no info-set to query.  Drop them: their ``m_rows``/``c_rows``
+            # stay zero, and the clamp skips ``c == 0`` — result-neutral anyway, since
+            # their reach is zeroed upstream so their rows never reach a regret or a
+            # value.  Left *unfilled* (not marked filled with a blank row) so ``filled``
+            # keeps meaning "has a real model row", which the row↔cluster test relies
+            # on; the re-filter each iteration is a handful of ops over the infeasible
+            # tail.  (The old combo-keyed query fed the LUT a conflicting hole and used
+            # whatever came back — harmless for the same reach reason, but by accident.)
+            vals = row_cluster[unf]
+            feasible = vals >= 0
+            if not feasible.all():
+                unf, vals = unf[feasible], vals[feasible]
+                if unf.size == 0:
+                    return
+            uniq, first = np.unique(vals, return_index=True)
+            need, rep = unf[first], unf[first]
+            groups = [unf[vals == u] for u in uniq]  # rows sharing each info-set
+        public = env.policy_public_fields()
+        for k, (r, ci) in enumerate(zip(need, rep)):
+            cl = None if row_cluster is None else row_cluster[r]
+            st = _policy_state(env, cl, combo_cards, ci, public)
+            row = np.asarray(model.strategy(st), dtype=np.float64)
+            conf = min(1.0, max(0.0, float(model.confidence(st))))
+            tgt = groups[k] if groups is not None else (r,)
+            m_rows[np.asarray(tgt)[:, None],
+                   np.arange(min(row.shape[0], width))] = row[:width]
+            c_rows[np.asarray(tgt), 0] = conf
+            filled[np.asarray(tgt)] = True
+        return
     else:
         cand = np.flatnonzero(cof >= 0)
         r_of = cof[cand]
@@ -120,7 +239,8 @@ def _fill_model_rows(entry, model, env, width, combo_cards, cof, is_root):
         return
     public = env.policy_public_fields()
     for r, ci in zip(need, rep):
-        st = env.policy_state_for(combo_cards[ci], for_blueprint=True, public=public)
+        cl = None if row_cluster is None else row_cluster[r]
+        st = _policy_state(env, cl, combo_cards, ci, public)
         row = np.asarray(model.strategy(st), dtype=np.float64)
         m_rows[r, : min(row.shape[0], width)] = row[:width]
         # Clamp defensively: a third-party model returning c outside [0, 1] would
@@ -130,7 +250,8 @@ def _fill_model_rows(entry, model, env, width, combo_cards, cof, is_root):
 
 
 def apply_model_clamp(sigma, ctx, state, env, pk, actor, width, combo_cards,
-                      cof, n_rows, is_root):
+                      cof, n_rows, is_root, gof=None, cmaps=None, street=None,
+                      root_cluster=None):
     """Blend a modeled seat's realized strategy toward its model — (A-mix), doc §5.2.
 
     ``σ̃ = c·σ̂ + (1 − c)·x`` per combo, where ``x`` is the seat's regret-matched free
@@ -155,6 +276,12 @@ def apply_model_clamp(sigma, ctx, state, env, pk, actor, width, combo_cards,
     models = getattr(ctx, "models", None)
     if not models:
         return sigma
+    # The bot is never modeled.  ``SearchAgent`` already drops ``my_seat`` from its
+    # per-hand snapshot, but guard here too so the invariant holds however the ctx
+    # was built (a hand-assembled ctx in a test or a future caller): blending hero's
+    # own rows would have it best-respond to a model *of itself*.
+    if actor == getattr(ctx, "my_seat", None):
+        return sigma
     model = models.get(actor)
     if model is None:
         return sigma
@@ -165,16 +292,29 @@ def apply_model_clamp(sigma, ctx, state, env, pk, actor, width, combo_cards,
                  np.zeros((n_rows, 1), dtype=np.float64),
                  np.zeros(n_rows, dtype=bool))
         state.model_sigma_cache[key] = entry
-    _fill_model_rows(entry, model, env, width, combo_cards, cof, is_root)
-    m_rows, c_rows, _ = entry
+    # Resolve the row → LUT-cluster map LAZILY — only now, after the no-models
+    # early-out.  Evaluating it eagerly at the call site made every *vanilla* node
+    # pay for it (and crashed at a pre-flop root, where ``_cmaps`` is ``None``).
+    #
+    # Root street: rows are combos, so this is the per-combo root cluster.  The
+    # caller may supply it directly (``root_cluster``) for the MCCFR pre-flop /
+    # multiway-flop roots, where ``_cmaps`` is deliberately ``None`` because the
+    # walk never crosses a future street.
+    # Clustered street: row r *is* a cluster, recovered from the static universe.
     if is_root:
-        m_sigma, conf = m_rows, c_rows
+        row_cluster = root_cluster
+        if row_cluster is None and cmaps is not None:
+            row_cluster = cmaps.root_cluster_of()
     else:
-        # Gather with THIS iteration's cluster map (infeasible combos → row 0;
-        # harmless, their reach is zeroed upstream — same convention as node_sigma).
-        idx = np.where(cof >= 0, cof, 0)
-        m_sigma, conf = m_rows[idx], c_rows[idx]
-    return conf * m_sigma + (1.0 - conf) * sigma
+        row_cluster = None if cmaps is None else cmaps.universe(street)
+    _fill_model_rows(entry, model, env, width, combo_cards, cof, is_root,
+                     row_cluster)
+    m_rows, c_rows, _ = entry
+    # Fused gather+blend, in place (P2).  Infeasible combos gather row 0 —
+    # harmless, their reach is zeroed upstream (same convention as node_sigma).
+    idx = None if is_root else (gof if gof is not None
+                                else np.where(cof >= 0, cof, 0))
+    return clamp_sigma(sigma, m_rows, c_rows, idx)
 
 
 def freeze_combo(state, pk, sigma, is_root, actor, my_seat, my_combo):

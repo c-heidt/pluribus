@@ -380,6 +380,25 @@ second regression gate distinct from (and harder than) the scalar MCCFR one.
 The turn subgame's river-conditioned 3-D nodes need `Σ̂` per `(combo, river)` — build
 lazily per sampled river slice to avoid a `(n_combos, n_rivers, width)` precompute.
 
+**Keying the model: by cluster, not by combo (P1b).** `Σ̂` is queried at the info-set
+the holding would produce, and `info_set = (cluster, canonicalised history)` — so the
+cluster is the *only* card-dependent input. The clamp therefore keys the model by
+cluster (`policy_state_for_cluster`), which buys two things at once:
+
+- **Deduplication.** Combos sharing a cluster share `σ̂` and `c` exactly, so one query
+  covers the whole group (river root: 2280 → 156 queries).
+- **Both walk engines serve it.** The combo-keyed `PokerEnv.policy_state_for` has no
+  `FastState` equivalent — its `info_set` is for the *seated* hand — so a modeled solve
+  used to be forced off the Cython core. Given the cluster, `FastState.info_set_for`
+  builds the identical key, so **condition A runs on the same engine as B0**. The
+  `ClusterMapper` already computes every combo's cluster, so nothing new is derived;
+  note that the *dense row index* is a local relabelling and is **not** the cluster
+  (`ClusterMapper.universe(street)` inverts it).
+
+Gated in `test/search/test_model_infoset_seam.py`: combo-keyed ≡ cluster-keyed on
+`PokerEnv`, `FastState` ≡ `PokerEnv` per cluster at every node, and — the headline —
+a modeled solve is byte-identical with the core on and off.
+
 ## 7. Evaluation integration ([evaluation.md](evaluation.md))
 
 - **Conditions & budget.** Three headline approaches, **10k hands each**

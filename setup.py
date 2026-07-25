@@ -62,11 +62,18 @@ def get_ext_modules() -> list:
     extensions = []
     for path in sorted(glob.glob("poker_ai/_core/*.pyx")):
         module = path[: -len(".pyx")].replace(os.sep, ".")
+        # ``_clamp`` asserts BYTE-identity against a numpy oracle, so the compiler
+        # must not contract ``a*b + c*d`` into an FMA — FMA keeps a wider
+        # intermediate and rounds differently from numpy's separate multiply and
+        # add, which would break the parity gate.  Scoped to this module so no
+        # other kernel's codegen (or its pinned golden digest) changes.
+        extra = ["-ffp-contract=off"] if module.endswith("._clamp") else []
         extensions.append(
             setuptools.Extension(
                 name=module,
                 sources=[path],
                 include_dirs=[np.get_include(), core_dir],
+                extra_compile_args=extra,
             )
         )
     if not extensions:

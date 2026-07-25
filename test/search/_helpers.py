@@ -37,6 +37,64 @@ def _stub_lut(env: PokerEnv) -> None:
     )
 
 
+# --------------------------------------------------------------------------- #
+# Real-LUT (multi-cluster) fixture
+# --------------------------------------------------------------------------- #
+# ``_stub_lut`` maps every hand to cluster 0, so every future street collapses to
+# ``n_rows == 1``.  That makes a whole bug class INVISIBLE: anything that depends on
+# the cluster→dense-row mapping (``ClusterMapper._universe`` / ``cof``) is trivially
+# correct when there is only one row.  A board-stale model-row cache, for instance,
+# passed the entire stub-LUT suite unchanged.
+#
+# ``data/20cards_exact`` is a real 20-card LUT (ranks 10-14, 190 combos) with 25
+# preflop / 50 flop / 50 turn / 45 river clusters, giving ~24-37 dense rows at future
+# streets.  Use it for anything cluster-row dependent.
+
+import functools
+import os
+from pathlib import Path
+
+
+@functools.lru_cache(maxsize=1)
+def _real_lut():
+    """The real 20-card ``card_info_lut``, loaded once per session.
+
+    Resolves the same way ``test/conftest.py`` does (``PLURIBUS_LUT_PATH``, else
+    ``data/20cards_exact``).  Tests that call this must carry
+    ``@pytest.mark.requires_lut`` so the root conftest skips them when the LUT is
+    absent rather than erroring here.
+    """
+    import joblib
+    import pytest
+    root = Path(__file__).parent.parent.parent
+    lut_dir = Path(os.environ.get("PLURIBUS_LUT_PATH", str(root / "data" / "20cards_exact")))
+    path = lut_dir / "card_info_lut.joblib"
+    if not path.exists():
+        pytest.skip(f"LUT not found at {path}")
+    return joblib.load(str(path))
+
+
+def _real_lut_env(target_round: int, stacks=(10000, 10000), seed=0) -> PokerEnv:
+    """Heads-up 20-card env at ``target_round`` under the REAL LUT.
+
+    Unlike :func:`_stub_lut`, future streets have many distinct clusters, so
+    ``ClusterMapper.n_rows`` is >> 1 and the cluster→row path is exercised for real
+    (flop root: 24 turn / 37 river rows; turn root: 29 river rows).
+    """
+    from environment.poker_env import new_game
+    np.random.seed(seed)
+    env = new_game(2, card_info_lut=_real_lut(), initial_chips=stacks[0])
+    guard = 0
+    while env.betting_round < target_round and not env.is_terminal and guard < 60:
+        legal = [a for a in env.legal_actions if a is not None]
+        env.step_in_place("call" if "call" in legal else legal[0])
+        guard += 1
+    assert env.betting_round == target_round, (
+        f"could not reach round {target_round} (got {env.betting_round})"
+    )
+    return env
+
+
 def _flop_env(low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
     """Heads-up env advanced to the flop over a small deck (exact runouts)."""
     np.random.seed(seed)

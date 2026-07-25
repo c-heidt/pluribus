@@ -21,6 +21,71 @@ from __future__ import annotations
 
 from typing import List, Optional
 
+import numpy as np
+
+
+class _PolicyStateMixin:
+    """Cluster-keyed :class:`PolicyState` construction, shared by both adapters.
+
+    The opponent-model clamp (:func:`poker_ai.search.vform.apply_model_clamp`) has
+    to ask the model what it does at *hypothetical* holdings.  On a ``PokerEnv``
+    that is :meth:`~environment.poker_env.PokerEnv.policy_state_for`, which a
+    ``FastState`` cannot serve — its ``info_set`` is for the seated hand.  But every
+    field of a :class:`PolicyState` except ``info_set`` is public, and ``info_set``
+    is ``(cluster, history)`` with the history public too — so given the cluster
+    (which ``ClusterMapper`` already computes for every combo) the compiled engine
+    can build the state exactly, via ``FastState.info_set_for``.
+
+    That is the whole of what used to force modeled solves off the core.
+    """
+
+    __slots__ = ()
+
+    def policy_public_fields(self):
+        """The combo-independent part of a :class:`PolicyState` (§ ``PokerEnv`` twin).
+
+        Mirrors :meth:`~environment.poker_env.PokerEnv.policy_public_fields`,
+        including the immutable ``valid_mask`` over the street's canonical action
+        set.  Computed here in Python rather than in-core: it is combo-independent,
+        so a per-node sweep pays it once, and it keeps the mask construction in one
+        place (the canonical action set is a ``PokerEnv`` concept).
+        """
+        from environment.poker_env import PokerEnv, PublicPolicyFields
+
+        fast = self._fast
+        rnd = fast.betting_round
+        legal = tuple(a for a in fast.legal_actions() if a is not None)
+        legal_set = set(legal)
+        mask = np.array(
+            [a in legal_set for a in PokerEnv.get_canonical_actions(rnd)], dtype=bool
+        )
+        mask.setflags(write=False)
+        return PublicPolicyFields(
+            player_i=fast.player_i,
+            betting_round=rnd,
+            legal_actions=legal,
+            valid_mask=mask,
+        )
+
+    def policy_state_for_cluster(self, cluster: int, *, public=None):
+        """:class:`PolicyState` for the current actor at ``cluster``.
+
+        Byte-identical to ``PokerEnv.policy_state_for_cluster`` — same info-set
+        bytes, same public fields — which is what keeps a modeled solve's result
+        independent of which engine walked it.
+        """
+        from environment.poker_env import PolicyState
+
+        if public is None:
+            public = self.policy_public_fields()
+        return PolicyState(
+            player_i=public.player_i,
+            betting_round=public.betting_round,
+            info_set=self._fast.info_set_for(int(cluster)),
+            valid_mask=public.valid_mask,
+            legal_actions=public.legal_actions,
+        )
+
 
 class _SeatView:
     """Minimal ``env.players[s]`` stand-in exposing the live ``is_active`` flag.
@@ -41,7 +106,7 @@ class _SeatView:
         return bool(self._fast.is_seat_active(self._seat))
 
 
-class FastEnvAdapter:
+class FastEnvAdapter(_PolicyStateMixin):
     """``PokerEnv``-shaped facade over a :class:`FastState` for the vector walk.
 
     Exposes only the members ``_VectorSolver._walk`` / ``_child`` /
@@ -134,7 +199,7 @@ class _McSeatView:
         return self._fast.hole_cards(self._seat)
 
 
-class FastMCCFRAdapter:
+class FastMCCFRAdapter(_PolicyStateMixin):
     """``PokerEnv``-shaped facade over a :class:`FastState` for the MCCFR walk.
 
     Richer than :class:`FastEnvAdapter` (the vector regime is leaf-free and settles

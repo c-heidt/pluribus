@@ -22,7 +22,7 @@ import pytest
 from poker_ai.search.solver import solve
 from poker_ai.search.vform import apply_model_clamp
 
-from test.search._helpers import _ctx, _late_env, _preflop_env, _policies
+from test.search._helpers import _ctx, _policies, _real_lut_env
 from test.search.test_budget import _cfg
 
 
@@ -76,9 +76,10 @@ def _digest(state):
 # 1. Baseline equivalence — the load-bearing gate, BOTH regimes
 # --------------------------------------------------------------------------- #
 
+@pytest.mark.requires_lut
 @pytest.mark.parametrize("env_fn,regime", [
-    (lambda: _late_env(3), "vector"),     # HU river  → vector
-    (_preflop_env, "mccfr"),              # HU preflop → MCCFR
+    (lambda: _real_lut_env(3), "vector"),     # HU river  → vector
+    (lambda: _real_lut_env(0), "mccfr"),      # HU preflop → MCCFR
 ])
 def test_empty_models_is_bitwise_identical(env_fn, regime):
     """Empty ``ctx.models`` ⇒ byte-identical solver state (vanilla untouched)."""
@@ -95,7 +96,8 @@ def test_empty_models_is_bitwise_identical(env_fn, regime):
     assert run(None) == run({}), f"{regime}: empty models perturbed the solve"
 
 
-@pytest.mark.parametrize("env_fn", [lambda: _late_env(3), _preflop_env])
+@pytest.mark.requires_lut
+@pytest.mark.parametrize("env_fn", [lambda: _real_lut_env(3), lambda: _real_lut_env(0)])
 def test_empty_models_leaves_cache_untouched(env_fn):
     """The clamp early-outs *before* the cache, so an unmodeled solve never
     reads or writes it — counters stay at zero."""
@@ -140,7 +142,7 @@ def _stub_fill(monkeypatch, m_row, c_val, counter=None):
     """Replace the row builder with one that fills every row with a fixed value."""
     import poker_ai.search.vform as vform
 
-    def fake(entry, model, env, width, combo_cards, cof, is_root):
+    def fake(entry, model, env, width, combo_cards, cof, is_root, rcof=None):
         if counter is not None:
             counter.append(1)
         m_rows, c_rows, filled = entry
@@ -160,14 +162,18 @@ def test_blend_interpolates_between_free_and_model(c, monkeypatch):
     _stub_fill(monkeypatch, model_row, c)
 
     ctx = _Ctx({1: _FixedModel(c=c)})
+    # The clamp blends IN PLACE (P2 kernel), so snapshot the free strategy first —
+    # `sigma` is mutated by the call.  Safe in production: every caller's `sigma`
+    # is freshly allocated by `node_sigma` and nobody holds the pre-clamp array.
+    free = sigma.copy()
     out = apply_model_clamp(sigma, ctx, _State(), None, "pk", 1, width, None,
                             None, n, True)
 
-    expected = c * np.tile(model_row, (n, 1)) + (1.0 - c) * sigma
+    expected = c * np.tile(model_row, (n, 1)) + (1.0 - c) * free
     np.testing.assert_allclose(out, expected)
     np.testing.assert_allclose(out.sum(axis=1), 1.0)      # still a distribution
     if c == 0.0:
-        np.testing.assert_allclose(out, sigma)
+        np.testing.assert_allclose(out, free)
     if c == 1.0:
         np.testing.assert_allclose(out, np.tile(model_row, (n, 1)))
 
@@ -365,3 +371,55 @@ def test_synthetic_model_delegates_reopen_to_its_policy():
     class _Bare:
         def strategy(self, state, bias="none"): return np.array([1.0])
     SyntheticOpponentModel(_Bare()).reopen_after_fork()
+
+
+# --------------------------------------------------------------------------- #
+# P2 — the fused clamp kernel must be byte-identical to its Python oracle
+# --------------------------------------------------------------------------- #
+
+def _rand_blend_inputs(rng, n, w, n_rows, clustered):
+    sigma = rng.random((n, w)); sigma /= sigma.sum(1, keepdims=True)
+    m = rng.random((n_rows, w)); m /= m.sum(1, keepdims=True)
+    c = rng.random((n_rows, 1))
+    gof = rng.integers(0, n_rows, size=n).astype(np.int64) if clustered else None
+    return np.ascontiguousarray(sigma), np.ascontiguousarray(m), \
+        np.ascontiguousarray(c), gof
+
+
+@pytest.mark.parametrize("clustered", [False, True])
+def test_clamp_kernel_is_byte_identical_to_the_oracle(clustered):
+    """The compiled fused gather+blend must match ``_clamp_sigma_py`` bit-for-bit."""
+    from poker_ai.search import vform
+    core = pytest.importorskip("poker_ai._core._clamp")
+
+    rng = np.random.default_rng(0)
+    # At a root node rows ARE combos, so n_rows must equal n; only a clustered
+    # node has fewer rows than combos.
+    shapes = ([(190, 3, 37), (64, 5, 12)] if clustered
+              else [(190, 3, 190), (64, 5, 64)])
+    for n, w, n_rows in shapes:
+        for _ in range(20):
+            s, m, c, gof = _rand_blend_inputs(rng, n, w, n_rows, clustered)
+            got = core.clamp_sigma(s.copy(), m, c, gof)
+            want = vform._clamp_sigma_py(s.copy(), m, c, gof)
+            assert got.tobytes() == want.tobytes(), "kernel diverged from oracle"
+
+
+@pytest.mark.parametrize("c_val", [0.0, 1.0])
+def test_clamp_kernel_endpoints_are_exact(c_val):
+    """``c=0`` leaves the free strategy untouched; ``c=1`` returns the model row."""
+    from poker_ai.search.vform import clamp_sigma
+    rng = np.random.default_rng(1)
+    s, m, _, gof = _rand_blend_inputs(rng, 40, 4, 40, False)
+    c = np.full((40, 1), c_val)
+    out = clamp_sigma(s.copy(), m, c, gof)
+    np.testing.assert_array_equal(out, s if c_val == 0.0 else m)
+
+
+def test_clamp_kernel_falls_back_on_odd_layouts():
+    """A non-float64 / non-contiguous input must take the oracle, not mis-type."""
+    from poker_ai.search.vform import clamp_sigma
+    rng = np.random.default_rng(2)
+    s, m, c, _ = _rand_blend_inputs(rng, 8, 3, 8, False)
+    out = clamp_sigma(s.astype(np.float32), m, c, None)   # float32 sigma
+    assert out.shape == s.shape

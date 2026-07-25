@@ -2099,6 +2099,44 @@ class PokerEnv:
             legal_actions=public.legal_actions,
         )
 
+    def policy_state_for_cluster(
+        self,
+        cluster: int,
+        *,
+        public: "Optional[PublicPolicyFields]" = None,
+    ) -> PolicyState:
+        """:class:`PolicyState` for the current actor at a **hypothetical cluster**.
+
+        The cluster-keyed twin of :meth:`policy_state_for`.  Since the info-set is
+        ``(cluster, canonicalised history)`` and the history is public, the actor's
+        hole enters *only* through its LUT cluster — so every combo in a cluster
+        yields the identical :class:`PolicyState`, and a caller that already knows
+        the cluster (from ``ClusterMapper``) can skip the per-combo LUT lookup
+        entirely.  Equivalent to ``policy_state_for(combo, for_blueprint=True)`` for
+        any ``combo`` in ``cluster``.
+
+        Exists so the opponent-model clamp has **one** seam across both walk
+        engines: :class:`~poker_ai._core._state.FastState` cannot serve
+        :meth:`policy_state_for` (its ``info_set`` is for the *seated* hand), but it
+        can serve this — see ``FastState.info_set_for``.  Keeping the ``PokerEnv``
+        path on the same call shape means the two are directly comparable, which is
+        what the parity test asserts.
+
+        Always canonicalises the history (the ``for_blueprint=True`` behaviour); a
+        no-op on on-tree histories.
+        """
+        if public is None:
+            public = self.policy_public_fields()
+        return PolicyState(
+            player_i=public.player_i,
+            betting_round=public.betting_round,
+            info_set=encode_info_set(
+                int(cluster), self._canonicalize_history(self._history)
+            ),
+            valid_mask=public.valid_mask,
+            legal_actions=public.legal_actions,
+        )
+
     @property
     def is_terminal(self) -> bool:
         """True when the hand has ended."""

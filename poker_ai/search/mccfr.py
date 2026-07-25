@@ -27,8 +27,9 @@ from typing import Dict, Tuple
 import numpy as np
 
 from environment.utils import make_deck_arr
+from information_abstraction.lookup import clusters_for_board
 from poker_ai.blueprint.tree_utils import sample_index
-from poker_ai.search.cluster_maps import ClusterMapper
+from poker_ai.search.cluster_maps import _STREET_NAME, ClusterMapper
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.fast_env import build_fast_mccfr_env
 from poker_ai.search.leaf import continuation_value_vector
@@ -59,6 +60,29 @@ try:
         )
 except ImportError:
     pass
+
+
+def _leaf_fn(frontier_env):
+    """The leaf rollout to use for ``frontier_env`` — the walk engine decides.
+
+    The module-global binding above is resolved at **import** time, but whether the
+    walk actually runs on the core is decided per solver (``_use_core``) and per
+    iteration (``build_fast_mccfr_env`` may return ``None``).  When the flag is set
+    after this module is imported, those disagree: the walk hands the leaf a
+    ``FastMCCFRAdapter`` while the global still points at the pure-Python rollout,
+    which reaches for ``PokerEnv``-only members (``with_hole_cards``) and raises —
+    swallowed by ``SearchAgent._solve_and_store`` into a silent blueprint fallback.
+
+    So: a compiled frontier always gets the compiled leaf.  Deliberately one-way —
+    never downgrade a ``PokerEnv`` frontier to the Python rollout when the global
+    selected the fast one, because the two consume ``ctx.rng`` differently and that
+    would move ``GOLDEN_DIGEST_MCCFR``.
+    """
+    if getattr(frontier_env, "_fast", None) is not None:
+        from poker_ai.search.leaf_fast import continuation_value_vector_fast
+        return continuation_value_vector_fast
+    return continuation_value_vector
+
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +220,8 @@ class _MCCFRSolver:
         # traversal (:meth:`_make_walk_env`); a build that returns ``None`` falls
         # back to the PokerEnv walk for that iteration.  Equilibrium-gated, not
         # byte-identical (the FastState leaf's board draw diverges the RNG stream).
+        # Modeled solves run on the core too: the clamp keys the model by *cluster*
+        # (``policy_state_for_cluster``), served identically by both engines.
         self._use_core = False
         try:
             from poker_ai._core import CORE_AVAILABLE
@@ -203,6 +229,22 @@ class _MCCFRSolver:
             self._use_core = bool(CORE_AVAILABLE and search_core_enabled())
         except ImportError:
             pass
+
+        # Root-street LUT cluster per combo, for the opponent-model clamp's info-set
+        # key.  Built only when models are attached, so a vanilla solve pays nothing.
+        # ``_cmaps`` is ``None`` on the leaf-containing roots (pre-flop, multiway
+        # flop) — where every walked node is a root-street node — so the map is
+        # derived straight from the LUT there.
+        self._root_cluster = None
+        if getattr(ctx, "models", None):
+            self._root_cluster = (
+                self._cmaps.root_cluster_of() if self._cmaps is not None
+                else clusters_for_board(
+                    root_env.card_info_lut[_STREET_NAME[street]],
+                    root_env.combo_cards,
+                    np.array(root_env.community_cards, dtype=np.int64),
+                )
+            )
         self._iter = 0
 
     def _make_walk_env(self, env):
@@ -433,19 +475,21 @@ class _MCCFRSolver:
         pk = env.public_key
         is_root = street == self.ctx.street_at_root
         if is_root:
-            n_rows, row_space, cof = self._n_combos, "combo", None
+            n_rows, row_space, cof, gof = self._n_combos, "combo", None, None
         else:
             cof = self._cmaps.cluster_of(street)
+            gof = self._cmaps.gather_of(street)      # hoisted gather index
             n_rows, row_space = self._cmaps.n_rows(street), "cluster"
         # Shared vector-form preamble + freezing (§6.5, §5 — see :mod:`vform`).
         sigma, regret, strat = node_sigma(
-            self.state, pk, legal, actor, is_root, n_rows, row_space, cof
+            self.state, pk, legal, actor, is_root, n_rows, row_space, cof, gof
         )
         # Opponent-model clamp (opponent_modeling §5.2) — no-op without models.
         # Before `freeze_combo` so the bot's pinned actual-hand row always wins.
         sigma = apply_model_clamp(
             sigma, self.ctx, self.state, env, pk, actor, len(legal),
-            self._combo_cards, cof, n_rows, is_root,
+            self._combo_cards, cof, n_rows, is_root, gof,
+            self._cmaps, street, self._root_cluster,
         )
         frozen_combo = freeze_combo(
             self.state, pk, sigma, is_root, actor, self._my_seat, self._my_combo
@@ -566,7 +610,7 @@ class _MCCFRSolver:
         ck = (pk_base, traverser, holes_key, tuple(sorted(profile.items())))
         val = self.state.leaf_value_cache.get(ck)
         if val is None:
-            val = continuation_value_vector(env, profile, self.ctx, traverser)
+            val = _leaf_fn(env)(env, profile, self.ctx, traverser)
             self.state.leaf_value_cache[ck] = val
         return val
 

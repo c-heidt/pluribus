@@ -1,12 +1,20 @@
 """``ModelPolicy`` — a σ̂-backed drop-in Policy for modeled-seat leaf continuations (§4.3).
 
-A modeled seat's depth-limit leaf continuations are "the model, fold-/call-/raise-
+.. note::
+   **Not on the Approach-A path (2026-07-22).**  Model-derived *leaf* continuations are
+   **deferred for safety** (opponent_modeling §5.4): past the depth limit every seat
+   rolls out under the blueprint, so exploitation stays confined to the searched
+   subtree.  ``LeafConfig.seat_policies`` does not exist and nothing constructs a
+   ``ModelPolicy`` today.  This class is kept ready for the future exploit-vs-safety
+   knob, whose value the strong-clean eval condition is designed to price.
+
+A modeled seat's depth-limit leaf continuations would be "the model, fold-/call-/raise-
 biased ×5" (opponent_modeling §5.4).  :class:`ModelPolicy` is a
 :class:`~poker_ai.search.policy.Policy` (same ABC as
 :class:`~poker_ai.search.policy.BlueprintPolicy`) that takes ``σ̂`` from an
 :class:`~poker_ai.modeling.model.OpponentModel` as the base distribution and reuses the
 inherited ``_bias_mask`` / ``_reweight_bias`` for the four continuation variants — so it
-slots into the leaf fleet (``LeafConfig.seat_policies``) with zero new machinery.
+would slot into a per-seat leaf fleet with zero new machinery if the knob is resumed.
 
 ``σ̂`` already arrives aligned to ``state.legal_actions`` with off-tree actions zeroed
 (the :class:`OpponentModel` contract), so the bias reweight is applied directly to that

@@ -21,7 +21,7 @@ import pytest
 
 from poker_ai.search.agent import SearchAgent
 
-from test.search._helpers import _policies, _preflop_env
+from test.search._helpers import _policies, _real_lut_env
 from test.search.test_budget import _cfg
 
 
@@ -57,9 +57,10 @@ def _agent(models=None, seed=0):
 # 1. Baseline untouched
 # --------------------------------------------------------------------------- #
 
+@pytest.mark.requires_lut
 def test_no_models_keeps_the_baseline_closure():
     """Without models the per-seat argument changes nothing — vanilla path."""
-    env = _preflop_env()
+    env = _real_lut_env(0)
     ag = _agent()
     ag.on_hand_start(env, my_seat=0)
 
@@ -69,9 +70,10 @@ def test_no_models_keeps_the_baseline_closure():
         np.testing.assert_array_equal(base(h), per_seat(h))
 
 
+@pytest.mark.requires_lut
 def test_models_default_to_empty_and_agent_is_inert():
     ag = _agent()
-    ag.on_hand_start(_preflop_env(), my_seat=0)
+    ag.on_hand_start(_real_lut_env(0), my_seat=0)
     assert dict(ag._models) == {}
 
 
@@ -79,8 +81,9 @@ def test_models_default_to_empty_and_agent_is_inert():
 # 2/3. Per-seat swap, and it is σ̂ (never the mixture)
 # --------------------------------------------------------------------------- #
 
+@pytest.mark.requires_lut
 def test_modeled_seat_uses_the_model_unmodeled_seat_does_not():
-    env = _preflop_env()
+    env = _real_lut_env(0)
     model = _RecordingModel()
     ag = _agent(models={1: model})
     ag.on_hand_start(env, my_seat=0)
@@ -98,11 +101,12 @@ def test_modeled_seat_uses_the_model_unmodeled_seat_does_not():
     assert len(model.seen) == before, "unmodeled seat queried the model"
 
 
+@pytest.mark.requires_lut
 @pytest.mark.parametrize("c", [0.0, 0.5, 1.0])
 def test_likelihood_is_sigma_hat_not_the_mixture(c):
     """Confidence must not enter the belief likelihood at all (§6.3): the same
     ``σ̂`` comes back regardless of ``c``."""
-    env = _preflop_env()
+    env = _real_lut_env(0)
     rows = []
     for conf in (c, 1.0 - c):
         ag = _agent(models={1: _RecordingModel(c=conf)})
@@ -111,8 +115,9 @@ def test_likelihood_is_sigma_hat_not_the_mixture(c):
     np.testing.assert_array_equal(rows[0], rows[1])
 
 
+@pytest.mark.requires_lut
 def test_likelihood_row_is_a_distribution_aligned_to_legal():
-    env = _preflop_env()
+    env = _real_lut_env(0)
     ag = _agent(models={1: _RecordingModel()})
     ag.on_hand_start(env, my_seat=0)
     legal = [a for a in env.legal_actions if a is not None]
@@ -126,18 +131,20 @@ def test_likelihood_row_is_a_distribution_aligned_to_legal():
 # 4. The §6.3 invariant: one frozen snapshot, hero never modeled
 # --------------------------------------------------------------------------- #
 
+@pytest.mark.requires_lut
 def test_hero_seat_is_dropped_from_the_model_snapshot():
     """Hero is never modeled — the clamp must never blend the bot's own rows."""
     m = _RecordingModel()
     ag = _agent(models={0: m, 1: m})
-    ag.on_hand_start(_preflop_env(), my_seat=0)
+    ag.on_hand_start(_real_lut_env(0), my_seat=0)
     assert set(ag._models) == {1}
 
 
+@pytest.mark.requires_lut
 def test_snapshot_is_frozen_per_hand_and_shared_with_the_solver():
     """The tracker's likelihood and the solver's ctx read the SAME mapping, and a
     later mutation of the caller's dict does not leak into the live hand."""
-    env = _preflop_env()
+    env = _real_lut_env(0)
     src = {1: _RecordingModel()}
     ag = _agent(models=src)
     ag.on_hand_start(env, my_seat=0)
@@ -152,10 +159,11 @@ def test_snapshot_is_frozen_per_hand_and_shared_with_the_solver():
     assert dict(ag._ctx.models) == dict(snap)
 
 
+@pytest.mark.requires_lut
 def test_snapshot_refreshes_on_the_next_hand():
     src = {1: _RecordingModel()}
     ag = _agent(models=src)
-    ag.on_hand_start(_preflop_env(), my_seat=0)
+    ag.on_hand_start(_real_lut_env(0), my_seat=0)
     src[2] = _RecordingModel()
-    ag.on_hand_start(_preflop_env(), my_seat=0)   # new hand → re-freeze
+    ag.on_hand_start(_real_lut_env(0), my_seat=0)   # new hand → re-freeze
     assert set(ag._models) == {1, 2}

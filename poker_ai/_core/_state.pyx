@@ -706,7 +706,35 @@ cdef class FastState:
                 "PokerEnv._compute_info_set; the compiled core must never silently "
                 "fall back to cluster 0." % (seat, rnd)
             )
-        cdef int cluster = self.clusters[seat][rnd]
+        return self._encode_info_set(self.clusters[seat][rnd])
+
+    def info_set_for(self, int cluster):
+        """``info_set`` for a **hypothetical** cluster at the current node.
+
+        The info-set key is ``varint(cluster) ++ history``, and the history is
+        public — so the only card-dependent term is the cluster.  Supplying it
+        explicitly yields the exact key any holding in that LUT cluster would
+        produce, without reseating the state.
+
+        This is what lets the opponent-model clamp
+        (:func:`poker_ai.search.vform.apply_model_clamp`) run on the compiled walk:
+        it must query the model per hypothetical combo, which on a ``PokerEnv``
+        goes through :meth:`~environment.poker_env.PokerEnv.policy_state_for`.
+        Since combos sharing a cluster share an info-set, one call per cluster
+        covers them all.
+
+        No ``has_cluster`` guard: the caller supplies the cluster (from the LUT via
+        ``ClusterMapper``), so the silent-cluster-0 failure :meth:`info_set` guards
+        against cannot arise here.
+
+        Byte-identical to ``PokerEnv.policy_state_for(combo).info_set`` for any
+        combo in ``cluster``, on the canonical histories this engine represents
+        (the adapters are only built when the overlay is empty, so history
+        canonicalisation is a no-op).
+        """
+        return self._encode_info_set(cluster)
+
+    cdef bytes _encode_info_set(self, int cluster):
         # Size bound (never under-allocate → no silent heap overflow): a uLEB128
         # varint is at most 10 bytes for a full uint64, so allow 10 for the
         # cluster and, per stage, 1 stage byte + 10 for varint(count) + the codes.
