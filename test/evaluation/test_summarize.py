@@ -118,40 +118,40 @@ class TestPairedDifference:
     def test_absent_with_fewer_than_two_conditions(self, db):
         log, _ = db
         with log.game():
-            log.log_game(_game(0, condition="B0", deck_seed=1))
+            log.log_game(_game(0, condition="vanilla", deck_seed=1))
         pr = _query_paired(log._con)
         assert pr["available"] is False and pr["n_conditions"] == 1
 
     def test_pairs_on_deck_seed_and_differences(self, db):
         log, _ = db
-        # Same three deals under B0 and A; bb=100 so bb/100 == chips value.
+        # Same three deals under vanilla and DBR; bb=100 so bb/100 == chips value.
         b0 = {100: 0.0, 101: 100.0, 102: 200.0}
         a = {100: 100.0, 101: 100.0, 102: 500.0}
         with log.game():
             for i, (ds, v) in enumerate(b0.items()):
-                log.log_game(_game(i, condition="B0", deck_seed=ds, hero_chips_delta=v))
+                log.log_game(_game(i, condition="vanilla", deck_seed=ds, hero_chips_delta=v))
             for i, (ds, v) in enumerate(a.items()):
-                log.log_game(_game(10 + i, condition="A", deck_seed=ds,
+                log.log_game(_game(10 + i, condition="DBR", deck_seed=ds,
                                    hero_chips_delta=v))
             # A deal only A saw — must be excluded from the paired join.
-            log.log_game(_game(99, condition="A", deck_seed=777, hero_chips_delta=9.0))
+            log.log_game(_game(99, condition="DBR", deck_seed=777, hero_chips_delta=9.0))
         pr = _query_paired(log._con)
-        assert pr["available"] and pr["baseline"] == "B0"
+        assert pr["available"] and pr["baseline"] == "vanilla"
         (cmp,) = pr["comparisons"]
-        assert cmp["treatment"] == "A" and cmp["n_paired"] == 3   # 777 excluded
-        # Δ = [100, 0, 300] → mean 133.33; deck-matched, not (mean(A)-mean(B0)).
+        assert cmp["treatment"] == "DBR" and cmp["n_paired"] == 3   # 777 excluded
+        # Δ = [100, 0, 300] → mean 133.33; deck-matched, not (mean(DBR)-mean(vanilla)).
         assert math.isclose(cmp["mean_delta_bb100"], (100 + 0 + 300) / 3, rel_tol=1e-9)
 
     def test_prefers_aivat_and_bootstrap_present(self, db):
         log, _ = db
         with log.game():
-            log.log_game(_game(0, condition="B0", deck_seed=1,
+            log.log_game(_game(0, condition="vanilla", deck_seed=1,
                                hero_chips_delta=999.0, aivat_value=0.0))
-            log.log_game(_game(1, condition="B0", deck_seed=2,
+            log.log_game(_game(1, condition="vanilla", deck_seed=2,
                                hero_chips_delta=999.0, aivat_value=50.0))
-            log.log_game(_game(2, condition="A", deck_seed=1,
+            log.log_game(_game(2, condition="DBR", deck_seed=1,
                                hero_chips_delta=999.0, aivat_value=80.0))
-            log.log_game(_game(3, condition="A", deck_seed=2,
+            log.log_game(_game(3, condition="DBR", deck_seed=2,
                                hero_chips_delta=999.0, aivat_value=60.0))
         pr = _query_paired(log._con)
         assert pr["used_aivat"] is True            # differences use aivat, not raw

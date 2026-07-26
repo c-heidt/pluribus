@@ -9,7 +9,7 @@ Two gates:
 
 1. **Baseline equivalence (load-bearing, §8.1)** — an empty ``ctx.models`` must be
    *bit-for-bit* the pre-change solver, in **both** regimes.  This is what keeps
-   vanilla Pluribus byte-identical and makes condition B0 "A with no models"
+   vanilla Pluribus byte-identical and makes vanilla Pluribus "DBR with no models"
    by construction, with no separate code path.
 2. **Blend math (§8.2)** — ``c = 0`` returns the regret-matched σ exactly, ``c = 1``
    returns the model row, intermediate ``c`` interpolates, off-tree/overlay actions

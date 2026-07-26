@@ -106,7 +106,7 @@ class _VectorSolver:
             from poker_ai._core.flags import search_core_enabled
             # Modeled solves run on the core too: the clamp keys the model by
             # *cluster* (``policy_state_for_cluster``), which both engines serve
-            # identically, so condition A is not handicapped against B0 by engine.
+            # identically, so DBR is not handicapped against vanilla Pluribus by engine.
             if search_core_enabled():
                 from poker_ai.search.fast_env import build_fast_walk_env
                 fast_env = build_fast_walk_env(root_env)

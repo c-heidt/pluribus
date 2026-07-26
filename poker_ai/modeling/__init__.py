@@ -1,4 +1,4 @@
-"""Opponent modeling package (docs/opponent_modeling.md — Approach A / CW-RR).
+"""Opponent modeling package — DBR (Data-Biased Response; docs call it Approach A / CW-RR).
 
 Pared down to the **synthetic-oracle** path the exploitation eval uses: model quality is
 *injected* as a controlled variable, not learned (see

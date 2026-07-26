@@ -75,9 +75,12 @@ from evaluation.opponents import (
     HERO_LABEL,
     OPPONENT_LABELS,
     BlueprintOpponent,
+    ModelSpec,
     assign_seats,
+    synthetic_models_for,
 )
 from evaluation.range_quality import RangeQualityRecorder
+from poker_ai.modeling.model import OpponentModel
 from evaluation.sqlite_logging import (
     DecisionRow,
     ExperimentLog,
@@ -114,12 +117,30 @@ class EvalConfig:
 
     run_id: str
     run_seed: int = 0
-    # Experiment arm for cross-condition CRN pairing (§10.1): 'vanilla' | 'B0' |
-    # 'A(p_max,tau)' etc.  Logged verbatim onto every ``games`` row so the summary
-    # can group/pair arms; ``None`` for single-arm runs.  Does NOT affect play —
-    # arms are paired by sharing ``run_seed``/``table_policy``/table shape, which
-    # makes ``deck_seed`` match per hand (verified hero-independent, §10.1).
+    # Experiment arm for cross-condition CRN pairing (§10.1): 'vanilla' |
+    # 'DBR(p_max=...)' | 'blueprint_only' etc.  Logged verbatim onto every ``games``
+    # row so the summary can group/pair arms; ``None`` for single-arm runs.  Does NOT
+    # affect play — arms are paired by sharing ``run_seed``/``table_policy``/table
+    # shape, which makes ``deck_seed`` match per hand (verified hero-independent, §10.1).
     condition: Optional[str] = None
+    # --- experiment arm behaviour ---------------------------------------------
+    # ``condition`` above is only the *label*; these two fields are what actually
+    # make an arm behave.  The arms:
+    #   vanilla       : search_enabled=True,  model_spec=None   (vanilla Pluribus —
+    #                   real-time search, NO opponent model; THE baseline)
+    #   DBR           : search_enabled=True,  model_spec=<spec> (Data-Biased Response;
+    #                   naive best response is DBR at p_max=1)
+    #   blueprint_only: search_enabled=False, model_spec=None   (NOT an approach —
+    #                   a no-search pipeline / blueprint-quality test only)
+    # (OX-Search — the heads-up gadget — is a future approach, not yet wired; the
+    # multiplayer OX-Search variant is cancelled.)
+    # Vanilla Pluribus *searches*; only the blueprint-only test skips search.  Kept
+    # independent of ``condition`` so a caller can label freely; the CLI and
+    # :meth:`for_condition` set both together so they never disagree.  Defaults
+    # (search on, no models) are exactly vanilla Pluribus — an existing run is
+    # unchanged.
+    search_enabled: bool = True
+    model_spec: Optional[ModelSpec] = None
     table_policy: str = "all_blueprint"       # all_blueprint | random | fixed
     fixed_seats: Optional[Dict[int, str]] = None   # required for table_policy='fixed'
     time_budget_hours: float = 1.0            # wall-clock budget; 0 → unbounded
@@ -128,7 +149,7 @@ class EvalConfig:
     # every arm of a comparison covers the *same* ``hand_index`` range and pairs
     # cleanly on ``deck_seed``.  Time-budget mode desyncs arms (a search agent
     # completes far fewer hands than a blueprint-only one at equal wall-clock), so
-    # any vanilla/B0/A comparison must use ``max_hands``.  ``None`` → budget-bound.
+    # any vanilla/DBR comparison must use ``max_hands``.  ``None`` → budget-bound.
     max_hands: Optional[int] = None
     n_players: int = 6
     big_blind: int = 100
@@ -152,8 +173,57 @@ class EvalConfig:
     aivat_hole_samples: int = 6
 
     def fingerprint_table_policy(self) -> Dict[str, object]:
-        """The table-composition identity folded into ``config_fingerprint`` (§6)."""
-        return {"policy": self.table_policy, "fixed_seats": self.fixed_seats}
+        """The table-composition + arm identity folded into ``config_fingerprint`` (§6).
+
+        Includes the experiment-arm behaviour (``search_enabled`` + the model spec)
+        so vanilla / A fingerprint as distinct configs — the summary groups raw
+        records by ``config_fingerprint`` and pairs arms by ``condition``, and a
+        modeled arm is genuinely a different config, not a tweak.
+        """
+        return {
+            "policy": self.table_policy,
+            "fixed_seats": self.fixed_seats,
+            "search_enabled": self.search_enabled,
+            "model_spec": (self.model_spec.as_json()
+                           if self.model_spec is not None else None),
+        }
+
+    @classmethod
+    def for_condition(
+        cls,
+        condition: str,
+        *,
+        model_spec: Optional[ModelSpec] = None,
+        **kwargs,
+    ) -> "EvalConfig":
+        """Build a config for an experiment arm, keeping label and behaviour in sync.
+
+        ``condition='vanilla'`` ⇒ vanilla Pluribus: **search, no opponent model** (THE
+        baseline).  ``'blueprint_only'`` ⇒ no search at all — a pipeline / blueprint-
+        quality test, not an approach.  Anything else (a ``DBR`` arm, e.g.
+        ``'DBR(p_max=0.8)'`` — naive best response is DBR at ``p_max=1``) ⇒ search
+        **with** the given ``model_spec`` (required — a modeled arm with no spec is a
+        mistake, not vanilla Pluribus).
+        """
+        low = condition.strip().lower()
+        if low == "vanilla":
+            search_enabled, spec = True, None      # real Pluribus: search, no model
+        elif low == "blueprint_only":
+            search_enabled, spec = False, None     # pipeline test only (no search)
+        else:
+            if model_spec is None:
+                raise ValueError(
+                    f"condition {condition!r} is a modeled (DBR) arm but no "
+                    "model_spec was given ('vanilla' is the model-free search "
+                    "baseline; 'blueprint_only' is the no-search pipeline test)"
+                )
+            search_enabled, spec = True, model_spec
+        return cls(
+            condition=condition,
+            search_enabled=search_enabled,
+            model_spec=spec,
+            **kwargs,
+        )
 
 
 @dataclass
@@ -189,13 +259,47 @@ class EvalSession:
         env.card_info_lut = self.card_info_lut
         return env
 
-    def new_hero(self, rng: np.random.Generator) -> SearchAgent:
-        """A hero :class:`SearchAgent` seeded by ``rng`` (fresh per hand)."""
+    def build_models(
+        self, seat_labels: Mapping[int, str]
+    ) -> Dict[int, "OpponentModel"]:
+        """The hero's ``seat → OpponentModel`` map for this hand (DBR).
+
+        Empty for vanilla (``model_spec is None``) — so the returned hero is
+        the untouched baseline.  For a modeled arm, one exact-or-noisy synthetic
+        model per opponent seat, built from that seat's actual bias label
+        (:func:`synthetic_models_for`) so it models the very bot sitting there.
+
+        Built **per hand** because ``seat_labels`` rotate with ``hero_seat``.  The
+        model wraps the shared blueprint, adds no per-hand RNG of its own (the
+        perturbation is seeded by ``spec.seed`` + seat), and so does not perturb the
+        CRN streams — deck/seat are fixed before this is called (§10.1).
+        """
+        if self.config.model_spec is None:
+            return {}
+        return synthetic_models_for(
+            seat_labels, self.blueprint_policy, self.config.model_spec
+        )
+
+    def new_hero(
+        self,
+        rng: np.random.Generator,
+        models: Optional[Mapping[int, "OpponentModel"]] = None,
+    ) -> SearchAgent:
+        """A hero :class:`SearchAgent` seeded by ``rng`` (fresh per hand).
+
+        ``models`` (from :meth:`build_models`) attaches the opponent models for a
+        DBR hand; ``None``/empty is vanilla Pluribus (search, no model).
+        ``search_enabled`` comes from the config: it is ``True`` for both vanilla and
+        DBR (both search), and only the ``blueprint_only`` pipeline test turns search
+        off.
+        """
         return SearchAgent(
             leaf_policies=self.solver_cfg.leaf.policies,
             blueprint_policy=self.blueprint_policy,
             solver_cfg=self.solver_cfg,
             rng=rng,
+            models=models,
+            search_enabled=self.config.search_enabled,
         )
 
     def new_opponent(self, label: str) -> BlueprintOpponent:
@@ -270,6 +374,30 @@ def _dist_json(actions: List[str], probs) -> str:
     return json.dumps({a: float(p) for a, p in zip(actions, probs)})
 
 
+def _opponent_models_json(
+    cfg: EvalConfig,
+    models: Mapping[int, "OpponentModel"],
+    seat_labels: Mapping[int, str],
+) -> Optional[str]:
+    """Provenance for ``games.opponent_models`` — which seats were modeled + how.
+
+    ``None`` when the hand has no models (vanilla), so the column reads NULL
+    for every baseline row and a non-NULL row is exactly a DBR hand.
+    Otherwise a compact JSON object: the shared model spec plus the per-seat bias
+    the model was built under, keyed by seat.  This is what lets the summary confirm
+    *which* opponents the exploitation slice covers.
+    """
+    if not models:
+        return None
+    return json.dumps(
+        {
+            "spec": cfg.model_spec.as_json() if cfg.model_spec is not None else None,
+            "seats": {str(s): seat_labels.get(s) for s in sorted(models)},
+        },
+        sort_keys=True,
+    )
+
+
 def _capture_hero_decision(
     hero: SearchAgent, env: PokerEnv, action: str
 ) -> DecisionRow:
@@ -321,12 +449,16 @@ def _capture_hero_decision(
             # How much blueprint prior the search read was shrunk toward at this
             # (covered) node — 0.0 when well-trained, →1 when starved (§8).
             blueprint_weight=float(blueprint_weight),
+            # 1 iff a modeled solve produced this play (DBR) — the
+            # coverage flag the summary restricts the exploitation slice to (§9 A7).
+            modeled_decision=1 if hero.has_models else 0,
         )
 
     # Blueprint play — round 1 (no search), or the search-miss / failed-solve
     # fallback (the bot played the blueprint at this node).  ``blueprint_weight``
     # is 1.0 here (a pure-blueprint play), so the column reads uniformly across
-    # both the full fallback and the shrinkage.
+    # both the full fallback and the shrinkage.  ``modeled_decision`` is 0: a
+    # blueprint play consulted no model, even in a DBR hand.
     return DecisionRow(
         betting_stage=stage,
         regime="blueprint",
@@ -338,6 +470,7 @@ def _capture_hero_decision(
         action_played=action,
         action_dist=_dist_json(played_legal, played_probs),
         blueprint_weight=float(blueprint_weight),
+        modeled_decision=0,
     )
 
 
@@ -392,7 +525,7 @@ def play_hand(
     prev_round = env.betting_round
     # HU coverage (opp-modeling doc §11.4): earliest street at which a betting
     # round *began* with exactly two active seats, the hero among them — the
-    # earliest point a B-HU (design doc §4.2b) solve could activate.  Tracked
+    # earliest point a OX-Search-HU (design doc §4.2b) solve could activate.  Tracked
     # for every condition: it is a property of the play trajectory, not of the
     # method under test.
     hu_from_street: Optional[int] = _hu_street(env, hero_seat, prev_round)
@@ -733,7 +866,12 @@ def _play_and_log_one(
             np.random.default_rng(table_ss),
             cfg.fixed_seats,
         )
-        hero = session.new_hero(np.random.default_rng(hero_ss))
+        # Opponent models for this hand (DBR) — keyed by the just-drawn
+        # seat labels, so each seat is modeled under its own bias.  Empty for
+        # vanilla.  Built AFTER seat assignment but adds no RNG draw, so the CRN
+        # invariant above still holds (deck + seating are already fixed).
+        models = session.build_models(seat_labels)
+        hero = session.new_hero(np.random.default_rng(hero_ss), models=models)
         opponents = {
             s: session.new_opponent(lbl)
             for s, lbl in seat_labels.items()
@@ -763,6 +901,7 @@ def _play_and_log_one(
                 GameRow(
                     run_id=cfg.run_id,
                     condition=cfg.condition,
+                    opponent_models=_opponent_models_json(cfg, models, seat_labels),
                     hand_index=hand_index,
                     config_fingerprint=fingerprint,
                     table_label=cfg.table_policy,
@@ -868,11 +1007,9 @@ def build_blueprint_session(
     *,
     blueprint_path: str,
     lut_path: str,
-    n_rollouts: int = 20,
     use_decision_free_equity: bool = True,
     max_iterations: int = 5_000,
     max_wall_seconds: float = 60.0,
-    discount_interval: int = 100,
     workers: Optional[int] = None,
     bias_multiplier: float = 5.0,
     pickle_dir: bool = False,
@@ -930,20 +1067,21 @@ def build_blueprint_session(
         _assert_index_caches_complete(tables)
     blueprint = BlueprintPolicy(tables, bias_multiplier=bias_multiplier)
 
+    # ``n_rollouts`` is NOT set here — it propagates from ``LeafConfig``'s own
+    # default (poker_ai/search/leaf.py), the single source of truth for the leaf
+    # config.  Overriding it here would silently mask that config.
     leaf = LeafConfig(
         policies={c: blueprint for c in _BIAS_CLASSES},
-        n_rollouts=n_rollouts,
         use_decision_free_equity=use_decision_free_equity,
     )
-    # ``auto_budget=True`` makes each search run the structural per-subgame iteration
-    # budget (:mod:`poker_ai.search.budget`) instead of a flat count; ``max_iterations``
-    # is then the absolute ceiling and ``max_wall_seconds`` a loose backstop.
+    # ``discount_interval`` and ``auto_budget`` are NOT set here — they propagate
+    # from ``SolverConfig``'s own defaults (poker_ai/search/solver_state.py), the
+    # single source of truth.  Only the leaf and the genuine run-knobs
+    # (``max_iterations`` / ``max_wall_seconds`` / ``workers``) are supplied.
     solver_cfg = SolverConfig(
         leaf=leaf,
-        auto_budget=True,
         max_iterations=max_iterations,
         max_wall_seconds=max_wall_seconds,
-        discount_interval=discount_interval,
         workers=workers,
     )
     return EvalSession(
@@ -1036,13 +1174,30 @@ def _cli():
         '"5":"bp"}\'.',
     )
     @click.option("--time-budget-hours", default=1.0, type=float, show_default=True)
+    @click.option(
+        "--max-hands",
+        default=None,
+        type=int,
+        help="Paired mode (§10.1): fixed TOTAL hand count; the sole stop criterion "
+        "(ignores --time-budget-hours). REQUIRED for a vanilla/DBR comparison so "
+        "every arm covers the same hand_index range and pairs on deck_seed.",
+    )
     @click.option("--n-players", default=6, type=int, show_default=True)
     @click.option("--big-blind", default=100, type=int, show_default=True)
     @click.option("--small-blind", default=50, type=int, show_default=True)
     @click.option("--starting-stack", default=10_000, type=int, show_default=True)
+    @click.option(
+        "--low-card-rank", default=2, type=int, show_default=True,
+        help="Deck low rank. Use 10 for the 20-card LUT (ranks 10-14).",
+    )
+    @click.option(
+        "--high-card-rank", default=14, type=int, show_default=True,
+        help="Deck high rank (inclusive).",
+    )
     @click.option("--max-iterations", default=5_000, type=int, show_default=True)
     @click.option("--max-wall-seconds", default=10.0, type=float, show_default=True)
-    @click.option("--workers", default=None, type=int, help="Solver replicas (§6.7).")
+    @click.option("--workers", default=None, type=int, help="Solver replicas (§6.7, "
+                  "≤6 on this host).")
     @click.option(
         "--aivat/--no-aivat",
         default=False,
@@ -1057,21 +1212,77 @@ def _cli():
         show_default=True,
         help="Belief hole-draws averaged per AIVAT value-function evaluation.",
     )
+    @click.option(
+        "--condition",
+        default="vanilla",
+        show_default=True,
+        help="Experiment arm: 'vanilla' (vanilla Pluribus — search, no opponent "
+        "model; the baseline), 'blueprint_only' (no search — pipeline / blueprint-"
+        "quality test), or a DBR arm (e.g. 'DBR(p_max=0.8)'; naive best response is "
+        "DBR at p_max=1) which then REQUIRES --model-p-max. Arms sharing "
+        "--run-seed/--table-policy pair on deck_seed in the summary.",
+    )
+    @click.option(
+        "--model-p-max",
+        default=None,
+        type=float,
+        help="Confidence cap for a DBR arm. Presence selects a modeled arm; omit "
+        "for vanilla / blueprint_only. '1.0' with --model-error=0 is naive best "
+        "response (the unsafe EV ceiling).",
+    )
+    @click.option(
+        "--model-error",
+        default=0.0,
+        type=float,
+        show_default=True,
+        help="Target ℓ1 perturbation of each opponent model (0 = exact).",
+    )
+    @click.option(
+        "--model-seed",
+        default=0,
+        type=int,
+        show_default=True,
+        help="Seed for the per-info-set model perturbation (offset per seat).",
+    )
     def run(**opts):
         """Play a time-budgeted evaluation run, logging one transaction per hand."""
         fixed_seats = None
         if opts["fixed_seats"]:
             fixed_seats = {int(k): v for k, v in json.loads(opts["fixed_seats"]).items()}
+        # Experiment arm: a DBR (modeled) arm is signalled by --model-p-max.  Guard
+        # the easy mistake — a modeled-looking --condition with no p_max would
+        # silently run as vanilla Pluribus (search, no model), i.e. a mislabeled
+        # baseline.
+        cond = opts["condition"]
+        model_spec = None
+        if opts["model_p_max"] is not None:
+            model_spec = ModelSpec(
+                p_max=float(opts["model_p_max"]),
+                error=float(opts["model_error"]),
+                seed=int(opts["model_seed"]),
+            )
+        elif cond.strip().lower() not in ("vanilla", "blueprint_only"):
+            raise click.UsageError(
+                f"--condition={cond!r} is a DBR arm but --model-p-max was not "
+                "given ('vanilla' and 'blueprint_only' are the only model-free arms)."
+            )
+        arm = EvalConfig.for_condition(cond, model_spec=model_spec, run_id=opts["run_id"])
         cfg = EvalConfig(
             run_id=opts["run_id"],
+            condition=arm.condition,
+            search_enabled=arm.search_enabled,
+            model_spec=arm.model_spec,
             run_seed=opts["run_seed"],
             table_policy=opts["table_policy"],
             fixed_seats=fixed_seats,
             time_budget_hours=opts["time_budget_hours"],
+            max_hands=opts["max_hands"],
             n_players=opts["n_players"],
             big_blind=opts["big_blind"],
             small_blind=opts["small_blind"],
             starting_stack=opts["starting_stack"],
+            low_card_rank=opts["low_card_rank"],
+            high_card_rank=opts["high_card_rank"],
             sync_interval_hands=opts["sync_interval_hands"],
             sync_interval_minutes=opts["sync_interval_minutes"],
             aivat=opts["aivat"],

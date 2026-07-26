@@ -1,5 +1,5 @@
 # cython: language_level=3
-"""Opponent-model clamp kernel (A-path P2) — fused gather + blend.
+"""Opponent-model clamp kernel (DBR clamp, P2) — fused gather + blend.
 
 The clamp computes a modeled seat's *realized* strategy at every decision node of
 every iteration (opponent_modeling §5.2):
@@ -20,7 +20,7 @@ which copies) at a clustered node.
 
 It evaluates ``c·σ̂ + (1−c)·σ`` verbatim — **not** the cheaper ``σ + c·(σ̂ − σ)``,
 which is *not* exact at ``c = 1`` (``σ + (σ̂ − σ) != σ̂`` in float64).  Condition
-**B1 is ``c ≡ 1``** (naive best response), so an inexact endpoint would quietly
+**naive best response is ``c ≡ 1``**, so an inexact endpoint would quietly
 corrupt a headline eval arm.  Built with ``-ffp-contract=off`` so gcc cannot fuse
 the multiply-add: FMA rounds differently from numpy's separate ops and would break
 byte-identity with the oracle in :mod:`poker_ai.search.vform`.

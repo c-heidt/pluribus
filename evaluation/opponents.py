@@ -19,10 +19,12 @@ Two seams the rest of the design leans on:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
+from poker_ai.modeling.model import OpponentModel, SyntheticOpponentModel
 from poker_ai.search.policy import BiasClass, Policy
 
 # `game_seats.agent_label` vocabulary for the start scope, mapped to the bias
@@ -38,6 +40,83 @@ OPPONENT_LABELS: Tuple[str, ...] = tuple(LABEL_TO_BIAS)
 
 # Reserved label for the seat the search agent under test occupies.
 HERO_LABEL = "hero"
+
+
+# --------------------------------------------------------------------------- #
+# Opponent-model specification (DBR model construction)
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class ModelSpec:
+    """How a **DBR** arm builds the hero's model of each opponent.
+
+    The runner's opponents are :class:`BlueprintOpponent` bias variants, whose true
+    strategy is *exactly* ``blueprint.strategy(state, bias)``.  So a synthetic model
+    of a seat is exact by wrapping the same blueprint under the same bias
+    (:class:`~poker_ai.modeling.model.SyntheticOpponentModel`), then optionally
+    injecting a target ℓ1 error and capping confidence — the design-doc §6.2 sweep
+    axes.  This spec captures the two knobs plus the perturbation seed:
+
+    - ``p_max`` — confidence cap.  ``1.0`` with ``error = 0`` is **naive best
+      response** (the exact-model, unconstrained EV ceiling — the "unsafe" envelope);
+      a lower cap is the safe DBR mixture.
+    - ``error`` — target ℓ1 perturbation of ``σ̂`` (0.0 = exact).  A single float here
+      is a constant target across info-sets; schedule-shaped error is a later sweep
+      axis passed programmatically (the CLI exposes the constant).
+    - ``confidence`` — constant ``c`` before the ``p_max`` clamp (default 1.0, so
+      ``p_max`` alone sets the cap).
+    - ``seed`` — perturbation seed; per-seat offset applied in
+      :func:`synthetic_models_for` so distinct seats perturb independently.
+
+    ``None`` model spec on the config ⇒ **no models** (vanilla Pluribus).
+    """
+
+    p_max: float = 1.0
+    error: float = 0.0
+    confidence: float = 1.0
+    seed: int = 0
+
+    def as_json(self) -> Dict[str, float]:
+        """Compact record for the ``games.opponent_models`` provenance column."""
+        return {
+            "p_max": float(self.p_max),
+            "error": float(self.error),
+            "confidence": float(self.confidence),
+            "seed": int(self.seed),
+        }
+
+
+def synthetic_models_for(
+    seat_labels: Mapping[int, str],
+    blueprint_policy: Policy,
+    spec: ModelSpec,
+) -> Dict[int, OpponentModel]:
+    """Build the hero's ``seat → OpponentModel`` map for one hand.
+
+    One :class:`~poker_ai.modeling.model.SyntheticOpponentModel` per non-hero seat,
+    wrapping ``blueprint_policy`` under that seat's actual bias — so with
+    ``error = 0`` the model reproduces the opponent's play exactly.  The hero's own
+    seat (label :data:`HERO_LABEL`) is skipped (and the agent drops it again
+    defensively).  The perturbation seed is offset by seat so two seats holding the
+    same bias still perturb independently.
+    """
+    models: Dict[int, OpponentModel] = {}
+    for seat, label in seat_labels.items():
+        if label == HERO_LABEL:
+            continue
+        if label not in LABEL_TO_BIAS:
+            raise ValueError(
+                f"synthetic_models_for: unknown opponent label {label!r} at seat {seat}"
+            )
+        models[int(seat)] = SyntheticOpponentModel(
+            blueprint_policy,
+            confidence=spec.confidence,
+            p_max=spec.p_max,
+            error=spec.error,
+            seed=spec.seed + int(seat),
+            bias=LABEL_TO_BIAS[label],
+        )
+    return models
 
 
 class BlueprintOpponent:

@@ -1,7 +1,7 @@
 """``ModelPolicy`` — a σ̂-backed drop-in Policy for modeled-seat leaf continuations (§4.3).
 
 .. note::
-   **Not on the Approach-A path (2026-07-22).**  Model-derived *leaf* continuations are
+   **Not on the DBR path (2026-07-22).**  Model-derived *leaf* continuations are
    **deferred for safety** (opponent_modeling §5.4): past the depth limit every seat
    rolls out under the blueprint, so exploitation stays confined to the searched
    subtree.  ``LeafConfig.seat_policies`` does not exist and nothing constructs a

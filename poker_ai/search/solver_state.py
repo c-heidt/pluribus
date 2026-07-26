@@ -58,12 +58,12 @@ class SolverConfig:
     # as ~5× more iterations at the same wall — better hole coverage — rather than a
     # shorter wall; lower ``max_wall_seconds`` if you want turnaround over coverage.)
     max_iterations: int = 5_000
-    max_wall_seconds: float = 10.0  # per-search wall budget (the binding stop)
+    max_wall_seconds: float = 20.0  # per-search wall budget (the binding stop)
     # Linear-CFR discount cadence.  Kept well below the per-replica iteration count
     # of the *expensive* subgames (multiway flop ~285/replica) so the discount fires
     # several times there — at the old 100 it barely engaged on those (and never at
     # n_rollouts=8, ~50 iters/replica).  Cheap late subgames just discount more often.
-    discount_interval: int = 50
+    discount_interval: int = 10
     # Parallel search (§6.7 row 11).  ``None`` → resolve to a cpu-based default
     # (cpu_count-1, SLURM-aware) — the sanctioned way to spend the wall budget is W
     # independent replicas merged once, so on a 48-core node this fans out to ~47
@@ -89,7 +89,7 @@ class SolverConfig:
     # a loose backstop.  **Off by default** so a flat ``max_iterations`` is honoured
     # verbatim (every existing test / pinned digest that sets an explicit iteration
     # count is unchanged); production turns it on in ``build_blueprint_session``.
-    auto_budget: bool = False
+    auto_budget: bool = True
     # Vector regime (heads-up flop/turn/river): **full-width**, so iterations-to-
     # converge is driven by tree *depth* (streets left to resolve), not the infoset
     # count — a per-stage constant ``(flop, turn, river)``.  The 200-buckets/street

@@ -26,6 +26,18 @@ solver of [subgame_solving.md](subgame_solving.md).
 > §4.2, §4.4) and the online-learner steps (§7 learning-curve bullet, §9 Phase 5) are kept
 > only as a **design record** and marked *removed* inline; they are not implemented.
 
+> **NAMING (authoritative).** The A/B/B0/B1 labels below are structural shorthand for
+> this doc; the **real names** (used in code and eval condition strings) are:
+> - **vanilla Pluribus** (`condition='vanilla'`) = real-time search with **no opponent
+>   model** = THE baseline. This is exactly what the doc calls **"B0"** — vanilla and
+>   B0 are the same agent. Vanilla Pluribus *searches*.
+> - **DBR** (`condition='DBR'`) = Approach A (CW-RR). **Naive best response** (the old
+>   "B1", `c ≡ 1` / `p_max = 1`) is the unsafe ceiling — a DBR arm, not a separate method.
+> - **OX-Search (HU)** = Approach B (PO-CES-HU), heads-up gadget — Part II, **not built**.
+>   **The multiplayer OX-Search / general multiway PO-CES is CANCELLED** (theory chapter only).
+> - **`blueprint_only`** = the blueprint with **no search** — a pipeline / blueprint-quality
+>   **test**, *not* an approach and *not* the baseline. Never call this "vanilla Pluribus".
+
 ---
 
 ## 1. Background
@@ -76,11 +88,12 @@ is untouched. That is what makes the baseline a controlled comparison
 
 ### Non-Goals
 
-- **No general multiway Approach B (PO-CES).** The multiway gadget of
-  design-doc §4.2 stays a theory-chapter design. Its heads-up instantiation
-  **PO-CES-HU** (design-doc §4.2b) *is* planned — as Part II of this document
-  (§11), after the Part I (CW-RR) critical path. Part I's belief-likelihood
-  swap is the only Part I component B-HU depends on.
+- **No general multiway Approach B (PO-CES) — CANCELLED.** The multiway OX-Search /
+  PO-CES gadget of design-doc §4.2 stays a theory-chapter design and will **not** be
+  built. Its heads-up instantiation **OX-Search-HU / PO-CES-HU** (design-doc §4.2b)
+  *is* planned — as Part II of this document (§11), after the Part I (CW-RR / DBR)
+  critical path. Part I's belief-likelihood swap is the only Part I component
+  OX-Search-HU depends on.
 - **No safety guarantees.** CW-RR has none by construction; safety is an
   empirical claim measured by the design doc's §6.1 proxy.
 - **Model-derived leaf continuations are deferred (safety).** Exploitation is
@@ -401,23 +414,28 @@ a modeled solve is byte-identical with the core on and off.
 
 ## 7. Evaluation integration ([evaluation.md](evaluation.md))
 
-- **Conditions & budget.** Three headline approaches, **10k hands each**
-  (per condition, *not* a shared 10k): **vanilla Pluribus** (blueprint-only, no
-  search), **B0** (search, empty `model_store` — adversarial, no exploitation),
-  **A** (search + models, over the `(p_max, τ)` grid). Optional **B1**
-  (`SyntheticOpponentModel` of the true opponent, `c ≡ 1`) as the naive-BR
-  ceiling. All at matched search budgets (design doc §6.3); convergence curves
-  logged, not just endpoints.
-  **The no-exploitation agent is *always* the baseline** — pure Pluribus (B0 =
-  search + empty model store at full scale; blueprint-only in the no-search
-  proxy). Every exploitation number is the **CRN-paired advantage over this
-  baseline** (the incremental value of exploiting); A, B, B1 and each
-  model-error sweep point are all differenced against the *same* B0 arm, never
+- **Conditions & budget.** Headline approaches, **10k hands each** (per condition,
+  *not* a shared 10k): **vanilla Pluribus** (real-time search with an **empty model
+  store — no opponent model**; the design doc calls this "B0" and it is THE baseline)
+  and **DBR** (Approach A — search + confidence-weighted models over the `(p_max, τ)`
+  grid). **Naive best response** (`SyntheticOpponentModel` of the true opponent,
+  `c ≡ 1` / `p_max = 1`) is the unsafe EV ceiling — a DBR arm, not a separate method.
+  All at matched search budgets (design doc §6.3); convergence curves logged, not
+  just endpoints. (OX-Search — Approach B, the heads-up PO-CES gadget — is Part II
+  and not wired here; **the multiplayer OX-Search variant is cancelled**.)
+  A separate **`blueprint_only`** arm — the blueprint played with **no search at
+  all** — is *not* an approach: it is a pipeline / blueprint-quality sanity check, not
+  a comparison point. **Vanilla Pluribus searches** — do not conflate it with
+  `blueprint_only`.
+  **The no-exploitation agent is *always* the baseline** — vanilla Pluribus (search,
+  no model). Every exploitation number is the **CRN-paired advantage over this
+  baseline** (the incremental value of exploiting); DBR, naive-BR and each
+  model-error sweep point are all differenced against the *same* vanilla arm, never
   reported as a bare EV. (design doc §6.1/§6.3.)
 - **Common random numbers across conditions (the free variance lever).** Every
   condition replays the **same per-hand deal seed** — hole cards, board, *and*
   the opponent-action RNG, keyed by hand index — so the shared-deal luck cancels
-  when you difference `A − B0` (and `B0 − vanilla`) per hand. At ~10k hands in
+  when you difference `DBR − vanilla` per hand. At ~10k hands in
   4-handed NLHE this beats any other single lever and costs **zero extra
   compute**: it is the same 10k deals, seeded identically, not more hands. It
   stacks with AIVAT ([evaluation.md](evaluation.md) §10.2) — report the CI on the
@@ -432,7 +450,7 @@ a modeled solve is byte-identical with the core on and off.
   "how good must the model be" question it approximated is answered *directly* by the
   synthetic model-error sweep (design doc §6.2) — inject a known error level and read the
   paired advantage, instead of inferring quality from opaque cumulative counts.
-- **Coverage-restricted reporting.** The `A − B0` signal lives only in hands
+- **Coverage-restricted reporting.** The `DBR − vanilla` signal lives only in hands
   where a modeled seat actually acted with `c > 0`; report the headline both
   overall **and restricted to modeled-decision hands** (mirrors §11.4's
   HU-coverage slicing), which concentrates the per-hand effect size and buys

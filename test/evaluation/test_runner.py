@@ -120,7 +120,7 @@ class TestRun:
     def test_hu_from_street_semantics(self):
         """``_hu_street``: street iff exactly two active seats incl. the hero.
 
-        HU coverage for B-HU (opponent-modeling doc §11.4): the earliest round
+        HU coverage for OX-Search-HU (opponent-modeling doc §11.4): the earliest round
         start that is heads-up *with the hero* counts; a table that is heads-up
         without the hero (hero folded) does not.
         """

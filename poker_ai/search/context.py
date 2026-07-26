@@ -142,8 +142,8 @@ class SubgameContext:
     rng: np.random.Generator
     #: seat → opponent model (opponent_modeling §5.1).  **Empty by default**, and an
     #: empty mapping activates no code path in the solver — the clamp early-outs, so
-    #: an unmodeled solve is bit-for-bit the baseline (condition B0 needs no separate
-    #: code path).  See :func:`poker_ai.search.vform.apply_model_clamp`.
+    #: an unmodeled solve is bit-for-bit vanilla Pluribus (the baseline needs no
+    #: separate code path).  See :func:`poker_ai.search.vform.apply_model_clamp`.
     models: Mapping[int, "OpponentModel"] = MappingProxyType({})
 
     @classmethod

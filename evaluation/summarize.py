@@ -227,8 +227,10 @@ def _query_strength(con: sqlite3.Connection) -> dict:
 
 
 # Baseline preference for the paired difference: the first arm present becomes the
-# reference the others are differenced against (treatment − baseline).
-_PAIRED_BASELINE_PREFERENCE = ("B0", "vanilla")
+# reference the others are differenced against (treatment − baseline).  The
+# no-exploitation baseline is **vanilla Pluribus** (search, no opponent model); the
+# no-search ``blueprint_only`` arm is only a fallback reference (a pipeline test).
+_PAIRED_BASELINE_PREFERENCE = ("vanilla", "blueprint_only")
 
 
 def _query_paired(con: sqlite3.Connection) -> dict:
@@ -245,6 +247,13 @@ def _query_paired(con: sqlite3.Connection) -> dict:
     cancellation), else raw ``hero_chips_delta``.  Defensive against a rare 32-bit
     ``deck_seed`` collision within an arm: such deck_seeds are dropped from the join
     (ambiguous) and counted, rather than paired arbitrarily.
+
+    Each comparison also carries a **coverage-restricted** delta (§9 A7): the same
+    paired difference over only the deals where the *treatment* arm actually made a
+    modeled decision (``decisions.modeled_decision = 1``).  A hand the model never
+    touched — the hero folded pre-flop, or every play was a blueprint fallback —
+    dilutes the full delta toward zero; the restricted delta is the exploitation
+    signal where the model applied.  ``None`` on baseline/unmodeled arms.
     """
     n_cond = _scalar(
         con, "SELECT COUNT(DISTINCT condition) FROM games WHERE condition IS NOT NULL"
@@ -282,6 +291,19 @@ def _query_paired(con: sqlite3.Connection) -> dict:
         for ds in seeds:
             per_cond[c].pop(ds, None)
 
+    # Deck-seeds on which each condition made ≥1 modeled decision — the coverage
+    # slice.  Keyed by condition so a comparison restricts to the *treatment*'s
+    # covered deals.  Empty for baseline/unmodeled arms (no modeled decisions).
+    covered: Dict[str, set] = {}
+    for r in _rows(
+        con,
+        "SELECT g.condition AS condition, g.deck_seed AS deck_seed "
+        "FROM games g JOIN decisions d ON d.game_id = g.game_id "
+        "WHERE d.modeled_decision = 1 AND g.condition IS NOT NULL "
+        "AND g.deck_seed IS NOT NULL GROUP BY g.condition, g.deck_seed",
+    ):
+        covered.setdefault(r["condition"], set()).add(r["deck_seed"])
+
     conditions = sorted(per_cond)
     baseline = next(
         (b for b in _PAIRED_BASELINE_PREFERENCE if b in per_cond), conditions[0]
@@ -295,16 +317,30 @@ def _query_paired(con: sqlite3.Connection) -> dict:
         shared = sorted(set(tmap) & set(base_map))
         deltas = [tmap[ds] - base_map[ds] for ds in shared]
         stat = _mean_ci(deltas)
-        comparisons.append(
-            {
-                "treatment": c,
-                "baseline": baseline,
-                "n_paired": len(deltas),
-                "mean_delta_bb100": stat["mean"],
-                "ci95_normal": stat["ci95"],
-                "ci95_bootstrap": _bootstrap_ci(deltas),
+        entry = {
+            "treatment": c,
+            "baseline": baseline,
+            "n_paired": len(deltas),
+            "mean_delta_bb100": stat["mean"],
+            "ci95_normal": stat["ci95"],
+            "ci95_bootstrap": _bootstrap_ci(deltas),
+        }
+        # Coverage-restricted delta: same pairs, but only deals the treatment arm
+        # actually modeled.  Absent (None) when the arm has no modeled decisions.
+        cov = covered.get(c)
+        if cov:
+            cshared = [ds for ds in shared if ds in cov]
+            cdeltas = [tmap[ds] - base_map[ds] for ds in cshared]
+            cstat = _mean_ci(cdeltas)
+            entry["covered"] = {
+                "n_paired": len(cdeltas),
+                "mean_delta_bb100": cstat["mean"],
+                "ci95_normal": cstat["ci95"],
+                "ci95_bootstrap": _bootstrap_ci(cdeltas),
             }
-        )
+        else:
+            entry["covered"] = None
+        comparisons.append(entry)
     return {
         "available": True,
         "metric": "bb100",
@@ -429,12 +465,13 @@ def _query_approach(con: sqlite3.Connection) -> dict:
 
 
 def _query_hu_coverage(con: sqlite3.Connection) -> dict:
-    """HU coverage (opponent-modeling doc §11.4): where B-HU could have fired.
+    """HU coverage: where OX-Search (HU) could have fired.
 
     ``games.hu_from_street`` is the earliest street at which a betting round began
-    heads-up with the hero.  ``eligible`` (street ≥ 2, turn or later) is the B-HU
-    activation predicate (design doc §4.2b); coverage-restricted A-vs-B
-    comparisons slice on it.  Logged for every condition, so the same query serves
+    heads-up with the hero.  ``eligible`` (street ≥ 2, turn or later) is the
+    OX-Search-HU activation predicate (design doc §4.2b); coverage-restricted
+    DBR-vs-OX-Search comparisons slice on it.  Logged for every condition, so the
+    same query serves
     them all.  Older snapshots (schema v1) lack the column → ``available: False``.
     """
     have = {r[1] for r in con.execute("PRAGMA table_info(games)")}
@@ -654,6 +691,15 @@ def _print_human(report: dict) -> str:
                 f"[{_fmt(b['lo'],'+.2f')}, {_fmt(b['hi'],'+.2f')}]   "
                 f"({cmp['n_paired']} paired hands)"
             )
+            cov = cmp.get("covered")
+            if cov:
+                cb = cov["ci95_bootstrap"]
+                L.append(
+                    f"  {'  └ modeled only':<14} "
+                    f"{_fmt(cov['mean_delta_bb100'],'+.2f')}  "
+                    f"[{_fmt(cb['lo'],'+.2f')}, {_fmt(cb['hi'],'+.2f')}]   "
+                    f"({cov['n_paired']} paired hands)"
+                )
 
     ov = rq["overall"]
     rf = ov["resolved_frac"]
@@ -676,7 +722,7 @@ def _print_human(report: dict) -> str:
     hc = report["hu_coverage"]
     if hc.get("available"):
         L.append("")
-        L.append("HU COVERAGE (B-HU eligibility: heads-up with hero from turn+)")
+        L.append("HU COVERAGE (OX-Search-HU eligibility: heads-up with hero from turn+)")
         streets = "  ".join(
             f"{_STREET_NAME.get(s, s)} {n}" for s, n in sorted(hc["by_street"].items())
         )

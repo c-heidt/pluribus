@@ -9,7 +9,7 @@ models are attached.  Those invariants are the point of this file:
 - **Multi-opponent** — one model per live opponent seat, each applied to its own seat.
 - **Regime selection is unchanged** — no ``force_mccfr_when_modeled``.  A modeled HU
   post-flop subgame still takes the *vector* path; this is what keeps the paired
-  A-vs-B0 comparison free of an MCCFR-vs-vector solution-quality confound.
+  DBR-vs-vanilla comparison free of an MCCFR-vs-vector solution-quality confound.
 - **The leaf stays blueprint** (§5.4, deferred for safety) — exploitation is confined
   to the searched subtree.
 - **Hero is never modeled**, enforced at the clamp as well as at the agent.
@@ -219,8 +219,8 @@ def test_modeled_solve_runs_under_the_search_core(monkeypatch, env_fn, regime):
     used to go through the ``PokerEnv``-only ``policy_state_for``.  With the core
     enabled a modeled solve raised ``AttributeError`` — and because
     ``SearchAgent._solve_and_store`` swallows solve exceptions, that surfaced as a
-    silent blueprint fallback: **zero exploitation, reported as A ≈ B0**.  A modeled
-    solve must therefore complete, and must actually have clamped.
+    silent blueprint fallback: **zero exploitation, DBR reads as ≈ vanilla
+    Pluribus**.  A modeled solve must therefore complete, and must actually have clamped.
 
     Keying the model by *cluster* removed the fallback entirely (P1b); the engine
     equivalence itself is gated in ``test_model_infoset_seam.py``.
@@ -242,9 +242,10 @@ def test_unmodeled_solve_still_uses_the_core(monkeypatch):
 
     This used to assert the opposite for the modeled solver — a modeled solve was
     forced onto the ``PokerEnv`` walk because the clamp needed ``policy_state_for``.
-    Since the clamp keys the model by cluster (P1b), both engines serve it, so A and
-    B0 now run on the same engine and the A-vs-B0 comparison carries no wall-clock
-    asymmetry.  Byte-identity across engines is gated in ``test_model_infoset_seam``.
+    Since the clamp keys the model by cluster (P1b), both engines serve it, so DBR
+    and vanilla now run on the same engine and the DBR-vs-vanilla comparison carries
+    no wall-clock asymmetry.  Byte-identity across engines is gated in
+    ``test_model_infoset_seam``.
     """
     from poker_ai.search.vector import _VectorSolver
     from poker_ai.search.solver_state import SolverState

@@ -180,8 +180,9 @@ and queried with `json_extract` / `->>` when needed).
 CREATE TABLE games (
     game_id            INTEGER PRIMARY KEY,
     run_id             TEXT    NOT NULL,   -- groups games of one experiment batch
-    condition          TEXT,               -- experiment arm: 'vanilla'|'B0'|'A(p_max,tau)' — the
-                                           --   cross-condition GROUP BY; NULL for single-arm runs (§10.1 CRN)
+    condition          TEXT,               -- experiment arm: 'vanilla' (baseline: search, no
+                                           --   model) | 'DBR(p_max=...)' | 'blueprint_only' (no-search
+                                           --   test) — the cross-condition GROUP BY; NULL for single-arm (§10.1)
     hand_index         INTEGER NOT NULL,   -- 0-based position within the run; the resume cursor (§10.1)
     schema_version     INTEGER NOT NULL,   -- bump on schema change; lets analysis span runs
     config_fingerprint TEXT    NOT NULL,   -- hash(solver + leaf + table composition)
@@ -491,12 +492,12 @@ loss. Two 6-max-specific breakdowns matter alongside the top line:
   present and falls back to the raw query above when it is not. (Seat-rotation
   pairing is an optional secondary fallback, §6.)
 - **Cross-condition paired difference (CRN)** — when comparing arms
-  (`condition` = vanilla/B0/A, §10.1), the headline is not each arm's absolute
+  (`condition` = vanilla / DBR, §10.1), the headline is not each arm's absolute
   `bb100` but the **per-hand difference** between arms on the matched deal: join on
-  `deck_seed`, compute `Δ = aivat_value(A) − aivat_value(B0)` per hand, and bootstrap
-  the CI on `mean(Δ)`. Because the shared card-luck cancels, this CI is dramatically
-  tighter than differencing the two arms' independent means — it is what makes a
-  small `A − B0` edge significant at ~10k hands. (The model-error *sweep* is the same Δ
+  `deck_seed`, compute `Δ = aivat_value(DBR) − aivat_value(vanilla)` per hand, and
+  bootstrap the CI on `mean(Δ)`. Because the shared card-luck cancels, this CI is
+  dramatically tighter than differencing the two arms' independent means — it is what
+  makes a small `DBR − vanilla` edge significant at ~10k hands. (The model-error *sweep* is the same Δ
   computed at each injected `SyntheticOpponentModel` error level — see
   [opponent_modeling.md](opponent_modeling.md) scope note; the old cumulative-count
   "learning curve" was removed with the online learner.)
@@ -675,7 +676,7 @@ Ordered so each step yields something usable before the next.
    [evaluation/aivat.py](../evaluation/aivat.py), wired into the runner behind the
    opt-in `--aivat` flag.
 10. **Cross-condition pairing / CRN (§10.1).** The variance lever that makes the
-    ~10k-hand-per-arm vanilla/B0/A comparison
+    ~10k-hand-per-arm vanilla/DBR comparison
     ([opponent_modeling.md](opponent_modeling.md) §7) detectable. Three parts:
     (a) a `max_hands` fixed-count run mode (paired mode: disables `time_budget`)
     so arms share the `hand_index` range; (b) a `condition` column + the
@@ -691,7 +692,7 @@ Ordered so each step yields something usable before the next.
     paired-mode total count, `_query_paired` deck-seed join.* (The cumulative-count
     learning-curve binning was dropped with the online learner; the model-quality axis is
     now the injected `SyntheticOpponentModel` error sweep, each level its own `condition`
-    paired against the B0 baseline.)
+    paired against the vanilla baseline.)
 
 ## 10. Planned Components
 
@@ -769,8 +770,8 @@ final VACUUM INTO; run the §8 summary
   count instead of a wall-clock budget, so conditions being compared cover the
   *same* `hand_index` range (§10.1 "Cross-condition pairing"). Time-budget mode
   desyncs conditions — a search agent completes far fewer hands than a
-  blueprint-only agent in equal wall-clock — which breaks pairing; use `max_hands`
-  for any A/B0/vanilla comparison.
+  no-search blueprint_only run in equal wall-clock — which breaks pairing; use `max_hands`
+  for any vanilla/DBR comparison.
 - **Resume / idempotency** via the `(run_id, hand_index)` cursor (§6): a restarted or
   preempted run reads the max completed `hand_index` and continues from the next.
   Deterministic `derive(run_seed, hand_index)` seeding makes the continuation
@@ -781,12 +782,13 @@ final VACUUM INTO; run the §8 summary
   runner); `config_fingerprint = hash(solver + leaf + table_policy)`.
 
 **Cross-condition pairing (common random numbers).** The single highest-leverage
-variance lever for comparing approaches (vanilla / B0 / A of
+variance lever for comparing approaches (vanilla / DBR of
 [opponent_modeling.md](opponent_modeling.md) §7), and it costs **zero extra
 compute** — it is the same hands, seeded identically, not more hands. **The
-no-exploitation arm — pure Pluribus (B0 = search + empty model store; `vanilla`
-blueprint-only when the proxy runs no search) — is *always* the baseline**: every
-exploitation number is the paired `Δ = aivat_value(treatment) − aivat_value(B0)`
+no-exploitation arm — vanilla Pluribus (search with an empty model store, no
+opponent model) — is *always* the baseline** (the design doc calls it "B0"; the
+no-search `blueprint_only` arm is a pipeline test, not this baseline): every
+exploitation number is the paired `Δ = aivat_value(treatment) − aivat_value(vanilla)`
 on the shared `deck_seed`, i.e. the *incremental* value of exploiting, never a bare
 per-arm EV. The mechanism is already latent in the deterministic seeding; this
 locks it:
@@ -812,14 +814,14 @@ locks it:
   and separately from any agent call).
 - **`deck_seed` is the cross-run join key.** Pair the conditions on `deck_seed`
   (equivalently `hand_index` under a shared `run_seed`) and difference per hand:
-  `Δ = aivat_value(A) − aivat_value(B0)` on the matched deal. The enormous
+  `Δ = aivat_value(DBR) − aivat_value(vanilla)` on the matched deal. The enormous
   shared card-luck cancels in `Δ`, so its CI is far tighter than either arm's —
   and this **stacks multiplicatively with AIVAT** (§10.2), which further corrects
   the residual opponent-action variance after the tree diverges. (`pairing_id`
   remains the *within*-run seat-rotation lever; this is the *across*-run one.)
 - **Fixed `max_hands`, not a time budget** (see the loop note above), so every
   condition contains the same `hand_index` set to pair against. Each condition is
-  its own `run_id`; a `condition` label column on `games` (e.g. `vanilla|B0|A`,
+  its own `run_id`; a `condition` label column on `games` (e.g. `vanilla|DBR|blueprint_only`,
   with the `(p_max, τ)` cell for A) makes the paired join self-describing without a
   run_id→method side table.
 - **What cancels vs. what doesn't.** Card luck cancels fully (shared hole cards +

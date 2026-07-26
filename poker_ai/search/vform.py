@@ -57,11 +57,11 @@ except ImportError:
 
 
 def clamp_sigma(sigma, m_rows, c_rows, gof):
-    """In-place ``σ ← σ + c·(σ̂ − σ)`` (the A-mix blend); returns ``sigma``.
+    """In-place ``σ ← σ + c·(σ̂ − σ)`` (the DBR mixture blend); returns ``sigma``.
 
     Pure-Python reference for the ``_clamp`` kernel (P2).  Uses ``c·σ̂ + (1−c)·σ``
     verbatim: the cheaper ``σ + c·(σ̂ − σ)`` is NOT exact at ``c = 1``, and
-    condition **B1 is ``c ≡ 1``**.  In-place is safe: ``sigma`` is always a fresh
+    naive best response is ``c ≡ 1``.  In-place is safe: ``sigma`` is always a fresh
     array from the caller (``regret_match_matrix`` at a root node, a fancy-index
     copy at a clustered one).
     """
@@ -140,7 +140,7 @@ def _policy_state(env, cluster, combo_cards, ci, public):
     ``policy_state_for`` is a ``PokerEnv`` method the ``FastState`` adapters have no
     way to serve, and reaching for it under the core raised ``AttributeError`` —
     which ``SearchAgent._solve_and_store`` swallowed into a silent blueprint
-    fallback (zero exploitation, reported as A ≈ B0).
+    fallback (zero exploitation -- DBR would read as no better than vanilla Pluribus).
 
     Falls back to the combo-keyed query when no cluster map is available (a
     hand-built env in a test); that path is ``PokerEnv``-only, as it always was.
@@ -252,7 +252,7 @@ def _fill_model_rows(entry, model, env, width, combo_cards, cof, is_root,
 def apply_model_clamp(sigma, ctx, state, env, pk, actor, width, combo_cards,
                       cof, n_rows, is_root, gof=None, cmaps=None, street=None,
                       root_cluster=None):
-    """Blend a modeled seat's realized strategy toward its model — (A-mix), doc §5.2.
+    """Blend a modeled seat's realized strategy toward its model — the DBR mixture, doc §5.2.
 
     ``σ̃ = c·σ̂ + (1 − c)·x`` per combo, where ``x`` is the seat's regret-matched free
     strategy (``sigma`` as produced by :func:`node_sigma`).  This is Data Biased

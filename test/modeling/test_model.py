@@ -2,7 +2,7 @@
 
 Covers :class:`SyntheticOpponentModel`: exact pass-through of the wrapped policy,
 the seeded ℓ1 perturbation (valid distribution, bounded distance, reproducible), and
-the confidence schedule + ``p_max`` clamp (condition B1 is ``c ≡ 1``).
+the confidence schedule + ``p_max`` clamp (naive best response is ``c ≡ 1``).
 """
 
 import numpy as np

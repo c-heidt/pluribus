@@ -46,9 +46,11 @@ from dataclasses import dataclass, field
 from typing import Iterable, Iterator, List, Optional
 
 # Bump on any schema change (games.schema_version); lets analysis span runs (§6).
-# v2: + games.hu_from_street (HU coverage for B-HU, opponent-modeling doc §11.4).
+# v2: + games.hu_from_street (HU coverage for OX-Search-HU, opponent-modeling doc §11.4).
 # v3: + games.condition (experiment arm for cross-condition CRN pairing, §10.1).
-SCHEMA_VERSION = 4
+# v5: + games.opponent_models + decisions.modeled_decision (A7 model provenance +
+#     coverage-restricted slicing, opponent-modeling doc §9).
+SCHEMA_VERSION = 5
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +62,7 @@ CREATE TABLE IF NOT EXISTS games (
     game_id            INTEGER PRIMARY KEY,
     run_id             TEXT    NOT NULL,
     condition          TEXT,
+    opponent_models    TEXT,
     hand_index         INTEGER NOT NULL,
     schema_version     INTEGER NOT NULL,
     config_fingerprint TEXT    NOT NULL,
@@ -120,7 +123,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     action_dist     TEXT,
     exploitability  REAL,
     game_value      REAL,
-    blueprint_weight REAL
+    blueprint_weight REAL,
+    modeled_decision INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS range_quality (
@@ -207,6 +211,7 @@ class GameRow:
     deck_seed: int
     # reproducibility / variance reduction / outcome / provenance (nullable) ----
     condition: Optional[str] = None              # experiment arm for CRN pairing (§10.1)
+    opponent_models: Optional[str] = None        # JSON: seats modeled + spec, else NULL (A7)
     agent_seed: Optional[int] = None
     aivat_value: Optional[float] = None          # filled once AIVAT exists (§10.2)
     pairing_id: Optional[int] = None
@@ -266,6 +271,7 @@ class DecisionRow:
     exploitability: Optional[float] = None
     game_value: Optional[float] = None
     blueprint_weight: Optional[float] = None     # blueprint-prior mass mixed in (§8)
+    modeled_decision: Optional[int] = None       # 1 iff a modeled solve produced this play (A7)
 
 
 @dataclass
@@ -364,6 +370,8 @@ class ExperimentLog:
             con.execute("ALTER TABLE games ADD COLUMN hu_from_street INTEGER")
         if "condition" not in have:       # v2 → v3
             con.execute("ALTER TABLE games ADD COLUMN condition TEXT")
+        if "opponent_models" not in have:  # v4 → v5 (A7 model provenance)
+            con.execute("ALTER TABLE games ADD COLUMN opponent_models TEXT")
         dhave = {r[1] for r in con.execute("PRAGMA table_info(decisions)")}
         # (A retired v3 → v4 migration added ``term_runout``/``term_payout`` — a
         # per-terminal scalar-evaluator mix that the vectorized walk no longer
@@ -371,6 +379,8 @@ class ExperimentLog:
         # older DB already has them, since ``asdict``-driven inserts simply skip them.)
         if "blueprint_weight" not in dhave:  # blueprint-prior shrinkage (§8)
             con.execute("ALTER TABLE decisions ADD COLUMN blueprint_weight REAL")
+        if "modeled_decision" not in dhave:  # v4 → v5 (A7 coverage flag)
+            con.execute("ALTER TABLE decisions ADD COLUMN modeled_decision INTEGER")
         # Indexes last — after the ALTERs, so an index on a freshly-migrated column
         # (idx_games_condition) has its column to reference.
         con.executescript(_INDEX_DDL)

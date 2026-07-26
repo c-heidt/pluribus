@@ -79,12 +79,21 @@ class SearchAgent:
         round1_max_players: int = 4,
         offtree_threshold: float = 0.25,
         models: Optional[Mapping[int, "OpponentModel"]] = None,
+        search_enabled: bool = True,
     ) -> None:
         # --- session-static ---
         self._leaf_policies = leaf_policies     # the four §4 variants (== cfg.leaf.policies)
         self._blueprint = blueprint_policy      # round-1 play + round-1->2 Bayes
         self._cfg = solver_cfg                  # carries .leaf (the LeafConfig)
         self._rng = rng
+        # When ``False`` the agent never solves — every boundary/observed-action
+        # search trigger is skipped, so ``play_distribution`` always returns the
+        # blueprint.  This is the **blueprint-only pipeline test** (no search): NOT
+        # an approach and NOT the baseline — real vanilla Pluribus *searches*.  The
+        # default ``True`` leaves every search path exactly as before (byte-identical),
+        # so vanilla (search, no model) and A (search + model) are unaffected.  Belief
+        # tracking still runs (cheap, harmless), but with no search it is never used.
+        self._search_enabled = bool(search_enabled)
         self._round1_threshold = float(round1_offtree_threshold)
         self._round1_max_players = int(round1_max_players)
         # Rounds 2-4: an off-tree opponent raise within this pot-fraction of a
@@ -95,7 +104,7 @@ class SearchAgent:
         # Opponent models, seat → model (opponent_modeling §6.3).  Session-static
         # source; ``on_hand_start`` freezes a per-hand snapshot into ``self._models``.
         # ``None``/empty ⇒ every model code path is inert and the agent is exactly
-        # the baseline (condition B0).
+        # vanilla Pluribus (search, no opponent model — the baseline).
         self._models_source: Mapping[int, "OpponentModel"] = models or {}
 
         # --- per-hand (initialised in on_hand_start) ---
@@ -113,6 +122,22 @@ class SearchAgent:
         self._ctx: Optional[SubgameContext] = None
         self._searched_this_round: bool = False
         self._folded: bool = False              # bot has folded → agent dormant
+
+    @property
+    def search_enabled(self) -> bool:
+        """True for vanilla Pluribus and DBR (both search); False only for the
+        no-search blueprint-only pipeline test."""
+        return self._search_enabled
+
+    @property
+    def has_models(self) -> bool:
+        """Whether this hand's frozen snapshot models any opponent (a DBR hand).
+
+        Read after :meth:`on_hand_start`.  The runner uses it to mark a hero
+        decision as model-informed (``decisions.modeled_decision``) so the summary
+        can restrict the exploitation slice to decisions where the model applied.
+        """
+        return bool(self._models)
 
     # ----------------------------------------------------------------- #
     # Lifecycle (Algorithm 2)
@@ -159,7 +184,12 @@ class SearchAgent:
             return
         self._apply_boundary_belief_update()
         self.tracker.on_board_update(new_cards)
-        self._solve_and_store(copy.deepcopy(env))
+        # The blueprint-only test (search disabled) plays the blueprint at every node,
+        # so skip the solve; the belief replay above still runs (cheap, and keeps
+        # range-quality logging meaningful) but nothing consumes ``last_search``.
+        # (Vanilla Pluribus keeps ``search_enabled=True`` and DOES solve here.)
+        if self._search_enabled:
+            self._solve_and_store(copy.deepcopy(env))
         self.pending_actions = []
 
     def on_observed_action(self, env_before: PokerEnv, seat: int, action: str) -> None:
@@ -185,6 +215,8 @@ class SearchAgent:
             if action == "fold":
                 self._folded = True
             return
+        if not self._search_enabled:
+            return                              # vanilla: never (re-)searches
         if self.last_search is not None:
             # Re-search only when an off-canonical opponent raise was actually
             # injected into the tree (present in ``legal_actions`` via the overlay,

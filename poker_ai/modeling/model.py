@@ -69,7 +69,7 @@ class SyntheticOpponentModel(OpponentModel):
     is exact by construction.  Two knobs implement the design-doc §6.2 sweeps:
 
     - ``confidence`` — a constant ``c`` or a callable ``c(state)`` (the schedule),
-      clamped to ``[0, p_max]``.  ``c ≡ 1`` (``p_max = 1``) is condition **B1**.
+      clamped to ``[0, p_max]``.  ``c ≡ 1`` (``p_max = 1``) is naive best response (the unsafe ceiling).
     - ``error`` — a **target ℓ1 distance** for a seeded per-infoset perturbation of
       ``σ̂``, either a constant or a callable ``error(state)`` (a *schedule*, e.g.
       street-graded or per-infoset-noisy — see :mod:`poker_ai.modeling.schedules`).

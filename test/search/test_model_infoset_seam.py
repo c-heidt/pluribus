@@ -5,7 +5,7 @@ That query used to go through ``PokerEnv.policy_state_for(combo)``, a method the
 compiled ``FastState`` adapters cannot serve — so a modeled solve fell off the Cython
 core, and (because ``SearchAgent._solve_and_store`` swallows solve exceptions) an
 attempt to force it produced a **silent blueprint fallback**: zero exploitation,
-reported as A ≈ B0.
+reported as DBR ≈ vanilla Pluribus.
 
 The fix keys the model by **cluster** instead of by combo, which is exact because
 ``info_set = (cluster, canonicalised history)`` and the history is public.  This file
@@ -197,7 +197,7 @@ def test_universe_inverts_the_dense_row_map():
 def test_modeled_solve_is_byte_identical_across_engines(monkeypatch, env_fn, regime):
     """Core on vs core off ⇒ identical solver state, with models attached.
 
-    This is the claim that lets condition A run on the core at all: the engine is an
+    This is the claim that lets DBR run on the core at all: the engine is an
     implementation detail of the *walk*, never of the result.
 
     **Vector regime only** — and not because the model seam is weaker in MCCFR, but

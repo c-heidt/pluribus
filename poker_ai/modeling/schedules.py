@@ -17,7 +17,7 @@ Three families:
   (per-infoset multiplicative jitter so magnitude is heterogeneous, not uniform).
 - **Confidence** — :func:`confidence_from_error` is the one knob; ``c(state) =
   clip(intercept + slope·error(state) + noise)``.  ``slope < 0`` is *calibrated*
-  (confident where accurate — the realistic, fair-to-CW-RR case); ``slope > 0`` is
+  (confident where accurate — the realistic, fair-to-DBR case); ``slope > 0`` is
   *anti-calibrated / overconfident* (confident where wrong — the adversarial case a
   strong opponent punishes); ``slope = 0`` is *flat* (the ablation that removes
   selective trust).  Named wrappers :func:`calibrated`, :func:`anti_calibrated`,
@@ -128,7 +128,7 @@ def confidence_from_error(
     ``z`` a per-infoset standard normal.  The named wrappers below pick the regime:
 
     - ``slope < 0`` — **calibrated**: ``c`` falls as error rises (confident where
-      accurate).  The realistic case and the one that lets CW-RR's confidence weighting
+      accurate).  The realistic case and the one that lets DBR's confidence weighting
       do its job.
     - ``slope > 0`` — **anti-calibrated / overconfident**: ``c`` rises with error
       (confident where wrong).  The adversarial case.
