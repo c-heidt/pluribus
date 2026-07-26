@@ -16,6 +16,8 @@ Gates here:
    hand-start frozen snapshot, and the bot's own seat is never modeled.
 """
 
+import hashlib
+
 import numpy as np
 import pytest
 
@@ -167,3 +169,84 @@ def test_snapshot_refreshes_on_the_next_hand():
     src[2] = _RecordingModel()
     ag.on_hand_start(_real_lut_env(0), my_seat=0)   # new hand → re-freeze
     assert set(ag._models) == {1, 2}
+
+
+# --------------------------------------------------------------------------- #
+# 5. Cluster-dedup of the belief sweep (the vanilla-and-DBR time win)
+# --------------------------------------------------------------------------- #
+
+def _info_set_row(state) -> np.ndarray:
+    """A deterministic, DISTINCT row per info-set (collision-free in practice).
+
+    The belief sweep's blueprint / model read is a function of the info-set
+    ``(cluster, history)`` alone, so a correct cluster-dedup may only ever hand a
+    combo the row of another combo sharing its info-set.  Seeding the row off the
+    info-set bytes turns any mis-grouping into a value mismatch the test catches.
+    """
+    key = bytes(state.info_set)
+    seed = int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "little")
+    n = len(state.legal_actions)
+    r = np.random.default_rng(seed).random(n) + 0.1
+    return r / r.sum()
+
+
+@pytest.mark.requires_lut
+@pytest.mark.parametrize("target_round", [0, 1, 2, 3])
+def test_dedup_by_cluster_matches_per_combo(target_round):
+    """``_dedupe_by_cluster`` is byte-identical to the per-combo sweep it replaces.
+
+    Grouping must be EXACT: ``clusters_for_board`` (the dedup's key) has to agree
+    with the cluster ``policy_state_for`` embeds in the info-set, or a combo would
+    receive a neighbour's row.  Checked over every feasible combo (the ones the real
+    sweep actually queries — board-compatible, so nonzero range) at each street.
+    """
+    env = _real_lut_env(target_round)
+    ag = _agent()
+    cc = env.combo_cards
+    public = env.policy_public_fields()
+
+    def row_fn(h: int) -> np.ndarray:
+        state = env.policy_state_for(
+            tuple(int(c) for c in cc[h]), for_blueprint=True, public=public
+        )
+        return _info_set_row(state)
+
+    deduped = ag._dedupe_by_cluster(env, cc, row_fn)
+    board = np.asarray(env.community_cards, dtype=np.int64)
+    feasible = np.flatnonzero(
+        ~(np.isin(cc[:, 0], board) | np.isin(cc[:, 1], board))
+    )
+    assert feasible.size > 0
+    for h in feasible.tolist():
+        np.testing.assert_array_equal(deduped(int(h)), row_fn(int(h)))
+
+
+@pytest.mark.requires_lut
+def test_dedup_actually_collapses_queries():
+    """The dedup must issue one read per distinct cluster, not one per combo — the
+    whole point.  On the flop root the 20-card LUT has far fewer clusters than
+    feasible combos, so the call count drops well below ``n_combos``."""
+    env = _real_lut_env(1)
+    ag = _agent()
+    cc = env.combo_cards
+    calls = {"n": 0}
+
+    def row_fn(h: int) -> np.ndarray:
+        calls["n"] += 1
+        return np.array([1.0, 0.0], dtype=np.float64)
+
+    deduped = ag._dedupe_by_cluster(env, cc, row_fn)
+    board = np.asarray(env.community_cards, dtype=np.int64)
+    feasible = np.flatnonzero(
+        ~(np.isin(cc[:, 0], board) | np.isin(cc[:, 1], board))
+    )
+    for h in feasible.tolist():
+        deduped(int(h))
+    # One read per distinct cluster among the feasible combos.
+    from information_abstraction.lookup import clusters_for_board
+    from poker_ai.search.cluster_maps import _STREET_NAME
+    clusters = clusters_for_board(
+        env.card_info_lut[_STREET_NAME[env.betting_round]], cc, board
+    )
+    n_clusters = len(set(int(clusters[h]) for h in feasible.tolist()))
+    assert calls["n"] == n_clusters < feasible.size

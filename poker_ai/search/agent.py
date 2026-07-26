@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Mapping, Optional, Tuple
 import numpy as np
 
 from environment.poker_env import PokerEnv
+from information_abstraction.lookup import clusters_for_board
+from poker_ai.search.cluster_maps import _STREET_NAME
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.policy import BiasClass, Policy
 from poker_ai.search.ranges import RangeTracker
@@ -462,7 +464,9 @@ class SearchAgent:
                 )
                 return np.asarray(model.strategy(state), dtype=np.float64)
 
-            return sigma_model
+            # The model row is a function of the info-set ``(cluster, history)``, so
+            # combos sharing a cluster share it — dedupe the sweep by cluster (P1).
+            return self._dedupe_by_cluster(env_before, combo_cards, sigma_model)
 
         if self._searched_this_round and self.last_search is not None:
             pk = self._solved_public_key(env_before)
@@ -504,7 +508,56 @@ class SearchAgent:
             )
             return self._blueprint.strategy(state, "none")
 
-        return sigma_blueprint
+        # info_set == (cluster, history) ⇒ every combo in a cluster returns the SAME
+        # blueprint row, so collapse the per-combo LMDB sweep to one read per distinct
+        # cluster (P1, mirroring the solver clamp's dedup — the vanilla belief win).
+        return self._dedupe_by_cluster(env_before, combo_cards, sigma_blueprint)
+
+    def _dedupe_by_cluster(
+        self,
+        env_before: PokerEnv,
+        combo_cards: np.ndarray,
+        row_fn: Callable[[int], np.ndarray],
+    ) -> Callable[[int], np.ndarray]:
+        """Memoise a per-combo policy read ``row_fn(h)`` by LUT cluster.
+
+        The belief sweep queries a blueprint / model row for every combo still in a
+        seat's range (:meth:`RangeTracker.on_action`), but that row is a function of
+        the info-set ``(cluster, history)`` alone — the history is fixed at
+        ``env_before`` and only the cluster varies with the hole.  So combos sharing a
+        cluster share the row, and one read per distinct cluster suffices (P1, the same
+        collapse the solver clamp does via :meth:`ClusterMapper.root_cluster_of`).  At
+        production bucket counts this is ~``n_combos / n_buckets`` fewer LMDB reads.
+
+        ``clusters_for_board`` is bit-exact with the cluster :meth:`PokerEnv.policy_state_for`
+        embeds in the info-set (both are the same LUT combinadic lookup — the seam
+        tests gate it), so the grouping is exact, not approximate.  Board-conflicting
+        combos (cluster ``-1``) share no info-set key, so they bypass the cache and read
+        directly; in practice they are never queried (they carry zero range mass, so
+        ``on_action`` skips them).
+
+        The cached row is returned by reference to multiple combos; callers must treat
+        it read-only, which the :meth:`RangeTracker.on_action` contract already does
+        (it reads a single action column and never mutates the vector).
+        """
+        clusters = clusters_for_board(
+            env_before.card_info_lut[_STREET_NAME[env_before.betting_round]],
+            combo_cards,
+            np.asarray(env_before.community_cards, dtype=np.int64),
+        )
+        cache: Dict[int, np.ndarray] = {}
+
+        def memoized(h: int) -> np.ndarray:
+            cl = int(clusters[h])
+            if cl < 0:                       # board-conflicting: no shared info-set
+                return row_fn(h)
+            row = cache.get(cl)
+            if row is None:
+                row = row_fn(h)
+                cache[cl] = row
+            return row
+
+        return memoized
 
     # ----------------------------------------------------------------- #
     # Round-1 trigger (pot-relative fraction-gap; chip-free)
