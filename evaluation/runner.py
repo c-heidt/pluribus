@@ -1235,7 +1235,32 @@ def _cli():
         default=0.0,
         type=float,
         show_default=True,
-        help="Target ℓ1 perturbation of each opponent model (0 = exact).",
+        help="Constant target ℓ1 perturbation of each opponent model (0 = exact). "
+        "Overridden by --model-error-schedule when given.",
+    )
+    @click.option(
+        "--model-confidence",
+        default=1.0,
+        type=float,
+        show_default=True,
+        help="Constant confidence c before the --model-p-max clamp. Overridden by "
+        "--model-confidence-schedule when given.",
+    )
+    @click.option(
+        "--model-error-schedule",
+        default=None,
+        type=str,
+        help="JSON error schedule (design §6.2 sweep axis), overriding --model-error. "
+        'E.g. \'{"kind":"street","by_round":{"0":0.05,"3":0.4}}\' or a "noise" sub-map '
+        "for per-infoset jitter. See poker_ai.modeling.schedules.error_from_spec.",
+    )
+    @click.option(
+        "--model-confidence-schedule",
+        default=None,
+        type=str,
+        help="JSON confidence schedule, overriding --model-confidence. E.g. "
+        '\'{"kind":"calibrated","gain":1.0}\' (confident where accurate) or '
+        '"anti_calibrated"/"flat". See schedules.confidence_from_spec.',
     )
     @click.option(
         "--model-seed",
@@ -1259,8 +1284,16 @@ def _cli():
             model_spec = ModelSpec(
                 p_max=float(opts["model_p_max"]),
                 error=float(opts["model_error"]),
+                confidence=float(opts["model_confidence"]),
                 seed=int(opts["model_seed"]),
+                error_schedule=opts["model_error_schedule"] or None,
+                confidence_schedule=opts["model_confidence_schedule"] or None,
             )
+            # Fail fast on a malformed schedule descriptor — before setup / any hands.
+            try:
+                model_spec.resolve()
+            except Exception as exc:
+                raise click.UsageError(f"invalid model schedule: {exc}") from exc
         elif cond.strip().lower() not in ("vanilla", "blueprint_only"):
             raise click.UsageError(
                 f"--condition={cond!r} is a DBR arm but --model-p-max was not "

@@ -7,6 +7,7 @@ evaluation needs the injected model identical for a given seed), and that
 """
 
 import numpy as np
+import pytest
 
 from environment.poker_env import PolicyState
 from poker_ai.modeling.model import SyntheticOpponentModel
@@ -114,3 +115,78 @@ class TestModelHonoursSchedule:
             FakePolicy([1.0]), confidence=sch.calibrated(err), error=err, p_max=1.0
         )
         assert m.confidence(_state(betting_round=0)) > m.confidence(_state(betting_round=3))
+
+
+class TestErrorFromSpec:
+    """The declarative JSON descriptor → error Spec resolver (CLI/config path)."""
+
+    def test_none_is_zero_and_scalar_passes_through(self):
+        assert sch.error_from_spec(None) == 0.0
+        assert sch.error_from_spec(0.3) == 0.3
+        assert sch.error_from_spec(2) == 2.0                 # int accepted
+
+    def test_uniform_kind(self):
+        assert sch.error_from_spec({"kind": "uniform", "e": 0.25}) == 0.25
+        assert sch.error_from_spec({}) == 0.0                # defaults to uniform e=0
+
+    def test_street_kind_matches_builder(self):
+        s = sch.error_from_spec(
+            {"kind": "street", "by_round": {"0": 0.05, "3": 0.4}, "default": 0.9}
+        )
+        assert s(_state(betting_round=0)) == 0.05
+        assert s(_state(betting_round=3)) == 0.4
+        assert s(_state(betting_round=1)) == 0.9             # unknown round → default
+
+    def test_noise_submap_wraps_base(self):
+        s = sch.error_from_spec(
+            {"kind": "uniform", "e": 0.2, "noise": {"sigma": 0.5, "seed": 3}}
+        )
+        # Matches the direct with_infoset_noise(0.2, sigma=0.5, seed=3) builder.
+        direct = sch.with_infoset_noise(0.2, sigma=0.5, seed=3)
+        assert s(_state(info_set=b"A")) == direct(_state(info_set=b"A"))
+        assert s(_state(info_set=b"A")) != s(_state(info_set=b"B"))
+
+    def test_unknown_kind_raises(self):
+        with pytest.raises(ValueError):
+            sch.error_from_spec({"kind": "quadratic"})
+
+
+class TestConfidenceFromSpec:
+    """The declarative JSON descriptor → confidence Spec resolver (CLI/config path)."""
+
+    def test_none_is_one_and_scalar_passes_through(self):
+        assert sch.confidence_from_spec(None) == 1.0
+        assert sch.confidence_from_spec(0.6) == 0.6
+
+    def test_flat_kind(self):
+        c = sch.confidence_from_spec({"kind": "flat", "c": 0.7})
+        assert c(_state(betting_round=0)) == c(_state(betting_round=3)) == 0.7
+
+    def test_calibrated_needs_error_spec(self):
+        with pytest.raises(ValueError):
+            sch.confidence_from_spec({"kind": "calibrated"})
+
+    def test_calibrated_falls_with_error(self):
+        err = sch.error_from_spec({"kind": "street", "by_round": {"0": 0.05, "3": 0.45}})
+        c = sch.confidence_from_spec({"kind": "calibrated", "gain": 1.0}, error_spec=err)
+        assert np.isclose(c(_state(betting_round=0)), 0.95)
+        assert np.isclose(c(_state(betting_round=3)), 0.55)
+
+    def test_anti_calibrated_rises_with_error(self):
+        err = sch.error_from_spec({"kind": "street", "by_round": {"0": 0.05, "3": 0.45}})
+        c = sch.confidence_from_spec(
+            {"kind": "anti_calibrated", "base": 0.4, "gain": 1.0}, error_spec=err
+        )
+        assert c(_state(betting_round=3)) > c(_state(betting_round=0))
+        assert np.isclose(c(_state(betting_round=0)), 0.45)
+
+    def test_general_kind(self):
+        err = sch.uniform_error(0.2)
+        c = sch.confidence_from_spec(
+            {"kind": "general", "intercept": 1.0, "slope": -0.5}, error_spec=err
+        )
+        assert np.isclose(c(_state()), 0.9)                  # 1 - 0.5*0.2
+
+    def test_unknown_kind_raises(self):
+        with pytest.raises(ValueError):
+            sch.confidence_from_spec({"kind": "bayesian"})

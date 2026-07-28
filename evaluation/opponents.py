@@ -19,12 +19,15 @@ Two seams the rest of the design leans on:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
+from poker_ai.modeling import schedules
 from poker_ai.modeling.model import OpponentModel, SyntheticOpponentModel
+from poker_ai.modeling.schedules import Spec
 from poker_ai.search.policy import BiasClass, Policy
 
 # `game_seats.agent_label` vocabulary for the start scope, mapped to the bias
@@ -61,10 +64,18 @@ class ModelSpec:
       response** (the exact-model, unconstrained EV ceiling — the "unsafe" envelope);
       a lower cap is the safe DBR mixture.
     - ``error`` — target ℓ1 perturbation of ``σ̂`` (0.0 = exact).  A single float here
-      is a constant target across info-sets; schedule-shaped error is a later sweep
-      axis passed programmatically (the CLI exposes the constant).
+      is a constant target across info-sets; a **schedule-shaped** error (street-graded
+      or per-infoset-noisy) is supplied via ``error_schedule`` below.
     - ``confidence`` — constant ``c`` before the ``p_max`` clamp (default 1.0, so
-      ``p_max`` alone sets the cap).
+      ``p_max`` alone sets the cap); a **schedule** (calibrated / anti-calibrated /
+      flat) is supplied via ``confidence_schedule`` below.
+    - ``error_schedule`` / ``confidence_schedule`` — optional JSON-string descriptors
+      (mirroring the runner's ``--fixed-seats`` JSON) resolved by
+      :mod:`poker_ai.modeling.schedules` (:func:`~poker_ai.modeling.schedules.error_from_spec`
+      / :func:`~poker_ai.modeling.schedules.confidence_from_spec`).  When present they
+      **override** the corresponding scalar, letting the *pure-vs-noisy* sweep axis
+      (design §6.2) be launched from the CLI/config rather than only in code.  Kept as
+      strings so the frozen spec stays hashable and round-trips through ``config.yaml``.
     - ``seed`` — perturbation seed; per-seat offset applied in
       :func:`synthetic_models_for` so distinct seats perturb independently.
 
@@ -75,15 +86,40 @@ class ModelSpec:
     error: float = 0.0
     confidence: float = 1.0
     seed: int = 0
+    error_schedule: Optional[str] = None
+    confidence_schedule: Optional[str] = None
 
-    def as_json(self) -> Dict[str, float]:
+    def resolve(self) -> Tuple[Spec, Spec]:
+        """Resolve ``(error, confidence)`` into the scalar-or-callable forms the model uses.
+
+        Falls back to the constant ``error`` / ``confidence`` scalars when no schedule
+        JSON is set.  The confidence schedule may reference the error schedule
+        (calibrated / anti-calibrated), so error is resolved first and passed in.  A
+        malformed descriptor raises here, so callers can validate a spec up front.
+        """
+        err_desc = json.loads(self.error_schedule) if self.error_schedule else self.error
+        error_spec = schedules.error_from_spec(err_desc)
+        conf_desc = (
+            json.loads(self.confidence_schedule)
+            if self.confidence_schedule
+            else self.confidence
+        )
+        confidence_spec = schedules.confidence_from_spec(conf_desc, error_spec=error_spec)
+        return error_spec, confidence_spec
+
+    def as_json(self) -> Dict[str, object]:
         """Compact record for the ``games.opponent_models`` provenance column."""
-        return {
+        out: Dict[str, object] = {
             "p_max": float(self.p_max),
             "error": float(self.error),
             "confidence": float(self.confidence),
             "seed": int(self.seed),
         }
+        if self.error_schedule:
+            out["error_schedule"] = json.loads(self.error_schedule)
+        if self.confidence_schedule:
+            out["confidence_schedule"] = json.loads(self.confidence_schedule)
+        return out
 
 
 def synthetic_models_for(
@@ -99,7 +135,12 @@ def synthetic_models_for(
     seat (label :data:`HERO_LABEL`) is skipped (and the agent drops it again
     defensively).  The perturbation seed is offset by seat so two seats holding the
     same bias still perturb independently.
+
+    The (possibly scheduled) error/confidence are resolved **once** here — they are
+    seat-independent (the descriptor is shared); only the per-infoset perturbation
+    *direction* varies by seat, via the seat-offset model seed.
     """
+    error_spec, confidence_spec = spec.resolve()
     models: Dict[int, OpponentModel] = {}
     for seat, label in seat_labels.items():
         if label == HERO_LABEL:
@@ -110,9 +151,9 @@ def synthetic_models_for(
             )
         models[int(seat)] = SyntheticOpponentModel(
             blueprint_policy,
-            confidence=spec.confidence,
+            confidence=confidence_spec,
             p_max=spec.p_max,
-            error=spec.error,
+            error=error_spec,
             seed=spec.seed + int(seat),
             bias=LABEL_TO_BIAS[label],
         )

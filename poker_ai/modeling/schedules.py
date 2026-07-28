@@ -31,6 +31,7 @@ sharpest test of robustness against a strong opponent.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping as _Mapping
 from typing import Callable, Mapping, Optional, Union
 
 import numpy as np
@@ -184,6 +185,122 @@ def flat(c: float) -> Callable[[PolicyState], float]:
     return confidence_from_error(intercept=float(c), slope=0.0)
 
 
+# --------------------------------------------------------------------------- #
+# Declarative resolvers (JSON-friendly descriptor → Spec)
+# --------------------------------------------------------------------------- #
+# The builders above are the programmatic API.  The eval CLI / config, though, can
+# only carry data (a JSON string), not a Python callable — so these two functions map
+# a small declarative descriptor onto the builders, letting a sweep specify a
+# street-graded / noisy error schedule or a calibrated / anti-calibrated confidence
+# schedule from the command line (see ``evaluation.opponents.ModelSpec``).  A bare
+# number (or ``None``) resolves to the constant scalar, so the scalar path is just the
+# degenerate descriptor.
+
+
+def error_from_spec(spec: Union[float, int, Mapping[str, object], None]) -> Spec:
+    """Resolve a JSON-friendly error descriptor into a scalar-or-callable ``Spec``.
+
+    - ``None`` → ``0.0`` (exact model); a bare number → uniform constant error.
+    - ``{"kind": "uniform", "e": <float>}`` — constant target ℓ1 error.
+    - ``{"kind": "street", "by_round": {"0": .., "3": ..}, "default": <float>}`` —
+      error graded by betting round (:func:`street_error`).
+
+    Any descriptor may carry an optional ``"noise"`` sub-map
+    ``{"sigma": .., "seed": .., "lo": .., "hi": ..}`` which wraps the resolved base in
+    :func:`with_infoset_noise` (per-infoset multiplicative jitter).
+    """
+    if spec is None:
+        return 0.0
+    if not isinstance(spec, _Mapping):
+        return float(spec)
+    kind = str(spec.get("kind", "uniform"))
+    if kind == "uniform":
+        base: Spec = uniform_error(float(spec.get("e", 0.0)))
+    elif kind == "street":
+        by_round = dict(spec.get("by_round", {}))
+        base = street_error(
+            {int(k): float(v) for k, v in by_round.items()},
+            default=float(spec.get("default", 0.0)),
+        )
+    else:
+        raise ValueError(
+            f"error_from_spec: unknown kind {kind!r} (expected 'uniform' | 'street')"
+        )
+    noise = spec.get("noise")
+    if noise:
+        if not isinstance(noise, _Mapping):
+            raise ValueError("error_from_spec: 'noise' must be a mapping")
+        base = with_infoset_noise(
+            base,
+            sigma=float(noise.get("sigma", 0.0)),
+            seed=int(noise.get("seed", 0)),
+            lo=float(noise.get("lo", 0.0)),
+            hi=float(noise.get("hi", 2.0)),
+        )
+    return base
+
+
+def confidence_from_spec(
+    spec: Union[float, int, Mapping[str, object], None],
+    *,
+    error_spec: Optional[Spec] = None,
+) -> Spec:
+    """Resolve a JSON-friendly confidence descriptor into a scalar-or-callable ``Spec``.
+
+    - ``None`` → ``1.0``; a bare number → flat constant confidence.
+    - ``{"kind": "flat", "c": <float>}`` — constant (the no-selective-trust ablation).
+    - ``{"kind": "calibrated", "gain": .., "noise": .., "seed": ..}`` — confident where
+      accurate (needs ``error_spec``).
+    - ``{"kind": "anti_calibrated", "base": .., "gain": .., "noise": .., "seed": ..}`` —
+      confident where wrong (needs ``error_spec``).
+    - ``{"kind": "general", "slope": .., "intercept": .., "noise": .., "seed": ..}`` —
+      the raw ``c = clip(intercept + slope·error + noise·z)`` form.
+
+    ``calibrated`` / ``anti_calibrated`` scale ``c`` by the local error, so the resolved
+    ``error_spec`` (see :func:`error_from_spec`) must be supplied for them; ``flat`` /
+    ``general`` ignore it.
+    """
+    if spec is None:
+        return 1.0
+    if not isinstance(spec, _Mapping):
+        return float(spec)
+    kind = str(spec.get("kind", "flat"))
+    if kind == "flat":
+        return flat(float(spec.get("c", 1.0)))
+    if kind == "general":
+        return confidence_from_error(
+            error_spec=error_spec,
+            slope=float(spec.get("slope", 0.0)),
+            intercept=float(spec.get("intercept", 1.0)),
+            noise=float(spec.get("noise", 0.0)),
+            seed=int(spec.get("seed", 1)),
+        )
+    if kind in ("calibrated", "anti_calibrated"):
+        if error_spec is None:
+            raise ValueError(
+                f"confidence_from_spec: kind {kind!r} needs an error_spec "
+                "(it scales c by the local error)"
+            )
+        if kind == "calibrated":
+            return calibrated(
+                error_spec,
+                gain=float(spec.get("gain", 1.0)),
+                noise=float(spec.get("noise", 0.0)),
+                seed=int(spec.get("seed", 1)),
+            )
+        return anti_calibrated(
+            error_spec,
+            base=float(spec.get("base", 0.4)),
+            gain=float(spec.get("gain", 1.0)),
+            noise=float(spec.get("noise", 0.0)),
+            seed=int(spec.get("seed", 1)),
+        )
+    raise ValueError(
+        f"confidence_from_spec: unknown kind {kind!r} "
+        "(expected 'flat' | 'calibrated' | 'anti_calibrated' | 'general')"
+    )
+
+
 __all__ = [
     "Spec",
     "uniform_error",
@@ -193,4 +310,6 @@ __all__ = [
     "calibrated",
     "anti_calibrated",
     "flat",
+    "error_from_spec",
+    "confidence_from_spec",
 ]

@@ -1,18 +1,21 @@
 """Tests for opponent agents + table-composition assignment (doc §10.1)."""
 
 import collections
+import json
 
 import numpy as np
 import pytest
 
 from environment.player import Player
-from environment.poker_env import PokerEnv
+from environment.poker_env import PokerEnv, PolicyState
 from evaluation.opponents import (
     HERO_LABEL,
     LABEL_TO_BIAS,
     OPPONENT_LABELS,
     BlueprintOpponent,
+    ModelSpec,
     assign_seats,
+    synthetic_models_for,
 )
 from test.search._helpers import UniformPolicy
 
@@ -95,3 +98,88 @@ class TestBlueprintOpponent:
     def test_unknown_label_rejected(self):
         with pytest.raises(ValueError):
             BlueprintOpponent("gto_god", UniformPolicy())
+
+
+# --------------------------------------------------------------------------- #
+# ModelSpec — scalar knobs and JSON-string schedules (DBR sweep wiring, A7)
+# --------------------------------------------------------------------------- #
+
+def _pstate(betting_round=3, info_set=b"k", legal=("fold", "call", "raise:1.0")):
+    n = len(legal)
+    return PolicyState(
+        player_i=0,
+        betting_round=betting_round,
+        info_set=info_set,
+        valid_mask=np.ones(n, dtype=bool),
+        legal_actions=tuple(legal),
+    )
+
+
+class TestModelSpec:
+
+    def test_scalar_resolve_is_constant(self):
+        err, conf = ModelSpec(error=0.2, confidence=0.7).resolve()
+        assert err == 0.2 and conf == 0.7                    # scalars, not callables
+
+    def test_as_json_scalar_has_no_schedule_keys(self):
+        j = ModelSpec(p_max=0.8, error=0.1, confidence=0.9, seed=3).as_json()
+        assert j == {"p_max": 0.8, "error": 0.1, "confidence": 0.9, "seed": 3}
+
+    def test_error_schedule_overrides_scalar(self):
+        spec = ModelSpec(
+            error=0.99,                                       # ignored once schedule is set
+            error_schedule=json.dumps(
+                {"kind": "street", "by_round": {"0": 0.0, "3": 0.4}}
+            ),
+        )
+        err, _ = spec.resolve()
+        assert callable(err)
+        assert err(_pstate(betting_round=0)) == 0.0
+        assert err(_pstate(betting_round=3)) == 0.4
+
+    def test_confidence_schedule_references_error_schedule(self):
+        # calibrated confidence must track the resolved error schedule.
+        spec = ModelSpec(
+            error_schedule=json.dumps(
+                {"kind": "street", "by_round": {"0": 0.05, "3": 0.45}}
+            ),
+            confidence_schedule=json.dumps({"kind": "calibrated", "gain": 1.0}),
+        )
+        _, conf = spec.resolve()
+        assert conf(_pstate(betting_round=0)) > conf(_pstate(betting_round=3))
+        assert np.isclose(conf(_pstate(betting_round=0)), 0.95)
+
+    def test_as_json_includes_parsed_schedules(self):
+        spec = ModelSpec(
+            p_max=1.0,
+            error_schedule=json.dumps({"kind": "uniform", "e": 0.2}),
+            confidence_schedule=json.dumps({"kind": "flat", "c": 0.5}),
+        )
+        j = spec.as_json()
+        assert j["error_schedule"] == {"kind": "uniform", "e": 0.2}
+        assert j["confidence_schedule"] == {"kind": "flat", "c": 0.5}
+
+    def test_malformed_schedule_raises_on_resolve(self):
+        with pytest.raises(ValueError):
+            ModelSpec(error_schedule=json.dumps({"kind": "nope"})).resolve()
+
+
+class TestSyntheticModelsFor:
+
+    def test_builds_one_model_per_non_hero_seat(self):
+        labels = {0: HERO_LABEL, 1: "bp", 2: "bp_fold"}
+        models = synthetic_models_for(labels, UniformPolicy(), ModelSpec())
+        assert set(models) == {1, 2}                          # hero seat skipped
+
+    def test_scheduled_confidence_reaches_the_built_model(self):
+        labels = {0: HERO_LABEL, 1: "bp"}
+        spec = ModelSpec(
+            error_schedule=json.dumps(
+                {"kind": "street", "by_round": {"0": 0.05, "3": 0.45}}
+            ),
+            confidence_schedule=json.dumps({"kind": "calibrated", "gain": 1.0}),
+            p_max=1.0,
+        )
+        m = synthetic_models_for(labels, UniformPolicy(), spec)[1]
+        # The model's confidence tracks the scheduled error (calibrated).
+        assert m.confidence(_pstate(betting_round=0)) > m.confidence(_pstate(betting_round=3))
