@@ -85,11 +85,16 @@ def iteration_budget(ctx: SubgameContext, cfg: SolverConfig, workers: int = 1) -
         # Global pooled budget (hot-path, ~linear in live players), split across the W
         # replicas → per-replica = ceil(global / workers), but never below the learning
         # floor (so a replica still learns properly at large W — the effective global
-        # then rises to floor × W).
+        # then rises to floor × W).  Both the per-player base and the floor are indexed
+        # by ``street_at_root`` (0=preflop … 3=river): a deep multiway flop needs more
+        # sampled work than a river.  At the 64-core target the per-street *floor* is
+        # what binds (global/63 < floor for every street/live-count).
         n_live = max(2, len(ctx.ranges))
-        global_budget = cfg.mccfr_global_per_player * n_live
+        street = ctx.street_at_root
+        global_budget = cfg.mccfr_global_per_player_by_street[street] * n_live
         global_budget = max(cfg.mccfr_global_min,
                             min(cfg.mccfr_global_max, global_budget))
-        budget = max(cfg.mccfr_min_per_replica, ceil(global_budget / w))
+        floor = cfg.mccfr_min_per_replica_by_street[street]
+        budget = max(floor, ceil(global_budget / w))
 
     return max(1, min(int(budget), int(cfg.max_iterations)))

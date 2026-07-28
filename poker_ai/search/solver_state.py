@@ -105,19 +105,26 @@ class SolverConfig:
     # is bounding the *total* sampled work — unlike the full-width vector regime, whose
     # replicas each need the whole per-replica learning horizon (so vector stays a
     # per-replica constant, not divided).  The global budget grows ~linearly with the
-    # live-player count (bigger hot path); clamped to ``[min, max]``.  **UNCALIBRATED
-    # at multiway scale** (no multiway blueprint yet) — see
-    # ``project_search_stopping_criterion``.
-    mccfr_global_per_player: int = 3000
+    # live-player count (bigger hot path); clamped to ``[min, max]``.
+    #
+    # Per-street (preflop, flop, turn, river) base pooled work **per live player** —
+    # ``global = base[street] * n_live``, clamped to ``[min, max]`` then split across
+    # the W replicas.  Per-street because a deep multiway flop needs far more sampled
+    # work to cover its hot path than a river.  Indexed by ``street_at_root``
+    # (0=preflop … 3=river).  Defaults are the old flat 3000 for every street (an
+    # un-tuned starting point — recalibrate per street on the multiway blueprint via
+    # the calibration harness).
+    mccfr_global_per_player_by_street: tuple = (3000, 3000, 3000, 3000)
     mccfr_global_min: int = 6000
     mccfr_global_max: int = 30000
-    # Per-replica **learning floor**: every replica runs at least this many iterations,
-    # so it learns properly even when the global budget divided by a large ``workers``
-    # would otherwise leave it starved (an under-learned replica pollutes the merged
-    # average).  Effectively raises the global budget to ``mccfr_min_per_replica ×
-    # workers`` once the plain division would fall below the floor — "a little higher
-    # for more workers".  Wall keeps shrinking with W down to this floor, then flattens.
-    mccfr_min_per_replica: int = 750
+    # Per-replica **learning floor**, per street: every replica runs at least this many
+    # iterations so it learns properly even when the global budget divided by a large
+    # ``workers`` would otherwise starve it (an under-learned replica pollutes the
+    # merged average).  On the 64-core target this floor is what actually **binds** —
+    # ``global / 63`` falls below it for every street and live-count — so this tuple is
+    # the primary per-street budget dial *at cluster scale* (the per-street global above
+    # governs low-W runs and the n_live scaling).  Indexed by ``street_at_root``.
+    mccfr_min_per_replica_by_street: tuple = (750, 750, 750, 750)
 
 
 class _CountingCache:

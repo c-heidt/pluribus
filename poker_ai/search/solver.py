@@ -65,6 +65,12 @@ class SearchResult:
         Wall-clock time spent in the iteration loop (excludes result packaging).
     regime : str
         Which CFR regime ran: ``'mccfr'`` or ``'vector'`` (eval doc §6).
+    n_live : int
+        Number of live ranges the solver sized the subgame on (``len(ctx.ranges)``)
+        — the exact axis the MCCFR budget scales by (and the vector/MCCFR split keys
+        on).  Logged per decision so calibration can group throughput/budget by the
+        live-player count; distinct from the table-active ``num_live`` (all-in
+        contestants keep a range here but are not table-active).
     leaf_mode : str
         Depth-limit leaf handling — ``'sampled_runout'`` | ``'decision_free'``
         (MCCFR) or ``'exact_range'`` (vector).  Together ``(regime, leaf_mode)`` is
@@ -84,6 +90,7 @@ class SearchResult:
     iterations_run: int
     wall_seconds: float
     regime: str
+    n_live: int
     leaf_mode: str
     stop_reason: str
     stats: SearchStats = field(default_factory=SearchStats)
@@ -247,6 +254,7 @@ def solve(
         iterations_run=iterations,
         wall_seconds=wall,
         regime=regime,
+        n_live=len(ctx.ranges),
         leaf_mode=_leaf_mode(regime, ctx, cfg),
         stop_reason=stop_reason,
         stats=stats,

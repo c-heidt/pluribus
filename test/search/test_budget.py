@@ -78,7 +78,8 @@ def test_mccfr_global_budget_splits_across_workers():
     """MCCFR global budget is divided among replicas → per-replica shrinks with W,
     total pooled work (~global) stays constant → wall drops with more workers, while
     the plain division stays above the learning floor."""
-    cfg = _cfg(auto_budget=True, max_iterations=1_000_000, mccfr_min_per_replica=750)
+    cfg = _cfg(auto_budget=True, max_iterations=1_000_000,
+               mccfr_min_per_replica_by_street=(750, 750, 750, 750))
     ctx = _ctx_for(0, 2)  # HU pre-flop, global = 6000
     assert iteration_budget(ctx, cfg, workers=1) == 6000
     assert iteration_budget(ctx, cfg, workers=4) == 1500   # ceil(6000/4)
@@ -92,7 +93,8 @@ def test_mccfr_global_budget_splits_across_workers():
 def test_mccfr_learning_floor_kicks_in_at_high_worker_counts():
     """At large W the plain division would starve a replica, so it floors — each
     replica still learns properly and the effective global rises to floor × W."""
-    cfg = _cfg(auto_budget=True, max_iterations=1_000_000, mccfr_min_per_replica=750)
+    cfg = _cfg(auto_budget=True, max_iterations=1_000_000,
+               mccfr_min_per_replica_by_street=(750, 750, 750, 750))
     ctx = _ctx_for(0, 2)  # global = 6000; 6000/W < 750 once W > 8
     assert iteration_budget(ctx, cfg, workers=16) == 750   # floored, not ceil(6000/16)=375
     assert iteration_budget(ctx, cfg, workers=63) == 750   # still the floor
@@ -105,6 +107,30 @@ def test_mccfr_global_clamped_to_min_and_max():
     # 2 players * 3000 = 6000 == the floor; 20 players * 3000 = 60000 → max 30000.
     assert iteration_budget(_ctx_for(0, 2), cfg, workers=1) == 6000
     assert iteration_budget(_ctx_for(1, 20), cfg, workers=1) == 30000
+
+
+def test_mccfr_budget_is_per_street():
+    """The MCCFR global base and learning floor are indexed by ``street_at_root``.
+
+    At a large worker count the per-street **floor** is what binds (global/W falls
+    below it), so distinct per-street floors yield distinct per-replica budgets —
+    the dial the cluster calibration actually sets.
+    """
+    cfg = _cfg(
+        auto_budget=True, max_iterations=1_000_000,
+        # flop (street 1) gets a big floor, river (street 3) a small one.
+        mccfr_min_per_replica_by_street=(750, 1200, 750, 400),
+    )
+    # W=63: global/63 << every floor, so the per-street floor governs directly.
+    assert iteration_budget(_ctx_for(1, 4), cfg, workers=63) == 1200   # flop floor
+    assert iteration_budget(_ctx_for(3, 3), cfg, workers=63) == 400    # river floor
+    # Per-street global base also independently differentiates at low W (floor inert).
+    cfg2 = _cfg(
+        auto_budget=True, max_iterations=1_000_000, mccfr_global_max=1_000_000,
+        mccfr_global_per_player_by_street=(3000, 9000, 3000, 3000),
+    )
+    assert iteration_budget(_ctx_for(1, 4), cfg2, workers=1) == 36000  # 9000 * 4 live
+    assert iteration_budget(_ctx_for(3, 4), cfg2, workers=1) == 12000  # 3000 * 4 live
 
 
 def test_auto_budget_off_returns_flat_max_iterations():
@@ -157,8 +183,9 @@ def test_solve_mccfr_pooled_budget_constant_across_workers():
     # Small global budget keeps the test fast; low learning floor so the plain
     # division (not the floor) governs at these worker counts.
     kw = dict(auto_budget=True, max_iterations=1_000_000, max_wall_seconds=1e9,
-              mccfr_global_per_player=300, mccfr_global_min=600, mccfr_global_max=6000,
-              mccfr_min_per_replica=50)
+              mccfr_global_per_player_by_street=(300, 300, 300, 300),
+              mccfr_global_min=600, mccfr_global_max=6000,
+              mccfr_min_per_replica_by_street=(50, 50, 50, 50))
 
     def run(workers):
         env = _preflop_env()

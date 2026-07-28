@@ -50,7 +50,9 @@ from typing import Iterable, Iterator, List, Optional
 # v3: + games.condition (experiment arm for cross-condition CRN pairing, §10.1).
 # v5: + games.opponent_models + decisions.modeled_decision (A7 model provenance +
 #     coverage-restricted slicing, opponent-modeling doc §9).
-SCHEMA_VERSION = 5
+# v6: + decisions.n_live (live-range count the solver sized its budget on — the
+#     calibration axis for per-street/per-live-count throughput & budget).
+SCHEMA_VERSION = 6
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +110,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     searched        INTEGER NOT NULL,
     is_research     INTEGER,
     num_live        INTEGER,
+    n_live          INTEGER,   -- live ranges the solver sized its budget on (calibration axis)
     pot_before      REAL,
     to_call         REAL,
     hero_stack      REAL,
@@ -254,7 +257,8 @@ class DecisionRow:
     searched: int                                # 0/1: search fired, or blueprint
     leaf_mode: Optional[str] = None
     is_research: Optional[int] = None            # 1 if an off-tree re-search
-    num_live: Optional[int] = None
+    num_live: Optional[int] = None               # table-active seats at the node
+    n_live: Optional[int] = None                 # live ranges the solver sized on (searched rows)
     pot_before: Optional[float] = None
     to_call: Optional[float] = None
     hero_stack: Optional[float] = None
@@ -381,6 +385,8 @@ class ExperimentLog:
             con.execute("ALTER TABLE decisions ADD COLUMN blueprint_weight REAL")
         if "modeled_decision" not in dhave:  # v4 → v5 (A7 coverage flag)
             con.execute("ALTER TABLE decisions ADD COLUMN modeled_decision INTEGER")
+        if "n_live" not in dhave:  # v5 → v6 (calibration axis)
+            con.execute("ALTER TABLE decisions ADD COLUMN n_live INTEGER")
         # Indexes last — after the ALTERs, so an index on a freshly-migrated column
         # (idx_games_condition) has its column to reference.
         con.executescript(_INDEX_DDL)
