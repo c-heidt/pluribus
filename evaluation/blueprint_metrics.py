@@ -248,9 +248,25 @@ class _StreetAccumulator:
         self.maxp_hist = np.zeros(_MAXP_BINS, dtype=np.int64)
         self.mass_hist = np.zeros(_MASS_BINS, dtype=np.int64)
         self.n_maxp_gt = {0.5: 0, 0.9: 0, 0.99: 0}
+        # Row-level sum(|regret|) over EVERY scanned row (not just "visited"),
+        # whenever a regret batch is available — a rough proxy for how much
+        # exploration a post-flop infoset actually accumulated, since regret
+        # updates are additive (poker_ai.blueprint.tree_utils.accumulate_regrets)
+        # and only periodically decayed, unlike a simple "any positive cell"
+        # test, which is nearly always true after a single traversal (regret
+        # matching's delta is voa[action]-vo, a weighted mean, so the best
+        # sampled action is positive almost by construction — see module
+        # docstring). Independent of the trained/visited gate so the full
+        # distribution is available for calibrating ``min_regret_magnitude``.
+        self.regret_mag_hist = np.zeros(_MASS_BINS, dtype=np.int64)
+        self.n_regret_mag_zero = 0
+        self.n_regret_mag_scanned = 0
 
     def update(
-        self, batch: np.ndarray, trained_mask: Optional[np.ndarray] = None
+        self,
+        batch: np.ndarray,
+        trained_mask: Optional[np.ndarray] = None,
+        regret_batch: Optional[np.ndarray] = None,
     ) -> None:
         """Fold a ``(rows, width)`` int32 batch into the running stats.
 
@@ -262,6 +278,11 @@ class _StreetAccumulator:
         ``row_mass > 0`` defensively so a "trained" row with literally zero
         stored mass (shouldn't happen, but would otherwise divide by zero
         below) is excluded rather than corrupting the histograms.
+
+        ``regret_batch`` (row-aligned with ``batch``), when given, folds its
+        row-level ``sum(|regret|)`` into ``regret_mag_hist`` for EVERY scanned
+        row regardless of ``trained_mask`` — a calibration aid, not gated on
+        "visited".
         """
         self.n_rows += batch.shape[0]
         row_mass = batch.sum(axis=1, dtype=np.int64)
@@ -269,6 +290,21 @@ class _StreetAccumulator:
             visited = trained_mask & (row_mass > 0)
         else:
             visited = row_mass > 0
+
+        if regret_batch is not None:
+            mag = np.abs(regret_batch).sum(axis=1, dtype=np.int64)
+            self.n_regret_mag_scanned += mag.shape[0]
+            nz = mag > 0
+            self.n_regret_mag_zero += int((~nz).sum())
+            if nz.any():
+                logm = np.log10(mag[nz].astype(np.float64))
+                idx = np.clip(
+                    (logm / _MASS_LOG10_MAX * _MASS_BINS).astype(np.int64),
+                    0,
+                    _MASS_BINS - 1,
+                )
+                np.add.at(self.regret_mag_hist, idx, 1)
+
         n_vis = int(visited.sum())
         if n_vis == 0:
             return
@@ -354,6 +390,7 @@ def compute_street_metrics(
     street: int,
     *,
     regret_files: Optional[Sequence[Path]] = None,
+    min_regret_magnitude: Optional[int] = None,
     sample_chunks: Optional[int] = None,
     batch_rows: int = _DEFAULT_BATCH_ROWS,
 ) -> Optional[dict]:
@@ -368,7 +405,7 @@ def compute_street_metrics(
     ``regret_files``, when given, row-joins the regret table (same per-street
     infoset index as the strategy table, see :func:`compute_leaf_coverage`) and
     gates "visited" — and therefore every downstream stat: play freq, mean
-    strategy, entropy/purity, visit-mass histogram — on ``any(regret_row > 0)``
+    strategy, entropy/purity, visit-mass histogram — on a trained-row test
     instead of raw strategy row mass. Pass ``None`` (the default) to keep the
     old mass-based test, which is what pre-flop (street 0, the real online
     running average) wants; pass ``[]`` to explicitly request the join but flag
@@ -376,6 +413,28 @@ def compute_street_metrics(
     not a trustworthy "was this trained" signal. Falls back to the mass-based
     test (with a warning in the returned dict's ``"warnings"``) when the regret
     files are absent or can't be row-aligned with the strategy files.
+
+    The trained-row test itself has two modes, selected by
+    ``min_regret_magnitude``:
+
+    - ``None`` (default) — ``any(regret_row > 0)``. Cheap, but weak: regret
+      matching's per-touch delta is ``voa[action] - vo`` against the *mean* of
+      that traversal's action values, so the best-performing action is
+      positive almost by construction after a SINGLE touch — this test barely
+      excludes anything once a row has been visited even once or twice.
+    - an ``int`` — ``sum(|regret_row|) >= min_regret_magnitude``. Regret
+      updates are additive and only periodically decayed
+      (:meth:`~poker_ai.tables.cfr_tables.CFRTables.apply_discount`), so total
+      magnitude across the row is a much better proxy for how much real
+      exploration an infoset accumulated (a row touched once has small
+      magnitude regardless of which action happened to end up positive; a
+      richly-explored row accumulates much more). There is no existing
+      production constant to mirror here (unlike ``min_strategy_mass``,
+      inherited from :class:`~poker_ai.search.policy.BlueprintPolicy`) — the
+      right cutoff depends on this run's payoff scale, so calibrate it from
+      the returned ``regret_magnitude_log10`` histogram/percentiles (computed
+      over every scanned row regardless of this threshold) before trusting a
+      specific value.
     """
     files = list(files)
     if not files:
@@ -429,10 +488,17 @@ def compute_street_metrics(
         for start in range(0, arr.shape[0], batch_rows):
             batch = np.asarray(arr[start : start + batch_rows])
             trained_mask = None
+            r_batch = None
             if r_arr is not None:
                 r_batch = np.asarray(r_arr[start : start + batch_rows])
-                trained_mask = (r_batch > 0).any(axis=1)
-            acc.update(batch, trained_mask=trained_mask)
+                if min_regret_magnitude is not None:
+                    trained_mask = (
+                        np.abs(r_batch).sum(axis=1, dtype=np.int64)
+                        >= min_regret_magnitude
+                    )
+                else:
+                    trained_mask = (r_batch > 0).any(axis=1)
+            acc.update(batch, trained_mask=trained_mask, regret_batch=r_batch)
 
     assert acc is not None
     labels, canonical = _action_labels(acc.width, street)
@@ -463,7 +529,11 @@ def compute_street_metrics(
         "n_infosets_scanned": acc.n_rows,
         "n_visited": nv,
         "visited_frac": (nv / acc.n_rows) if acc.n_rows else None,
-        "visited_definition": "regret_positive" if joined else "mass",
+        "visited_definition": (
+            "mass" if not joined
+            else "regret_magnitude" if min_regret_magnitude is not None
+            else "regret_positive"
+        ),
         "total_visit_mass": acc.total_mass,
         "play_freq": play_freq,
         "play_freq_buckets": _bucket(play_freq),
@@ -489,6 +559,16 @@ def compute_street_metrics(
             "p50": _hist_percentile(acc.mass_hist, 50, 0.0, _MASS_LOG10_MAX),
             "p90": _hist_percentile(acc.mass_hist, 90, 0.0, _MASS_LOG10_MAX),
         },
+        "regret_magnitude_log10": (
+            None if acc.n_regret_mag_scanned == 0 else {
+                "n_scanned": acc.n_regret_mag_scanned,
+                "n_zero": acc.n_regret_mag_zero,
+                "zero_frac": acc.n_regret_mag_zero / acc.n_regret_mag_scanned,
+                "p10": _hist_percentile(acc.regret_mag_hist, 10, 0.0, _MASS_LOG10_MAX),
+                "p50": _hist_percentile(acc.regret_mag_hist, 50, 0.0, _MASS_LOG10_MAX),
+                "p90": _hist_percentile(acc.regret_mag_hist, 90, 0.0, _MASS_LOG10_MAX),
+            }
+        ),
         "warnings": warnings,
     }
 
@@ -546,6 +626,7 @@ def compute_leaf_coverage(
     street: int,
     *,
     min_strategy_mass: int = _DEFAULT_MIN_STRATEGY_MASS,
+    min_regret_magnitude: Optional[int] = None,
     sample_chunks: Optional[int] = None,
     batch_rows: int = _DEFAULT_BATCH_ROWS,
 ) -> Tuple[Optional[dict], List[str]]:
@@ -596,6 +677,13 @@ def compute_leaf_coverage(
       node).
     - ``regret_fallback``/``regret_pos`` test for any positive regret in the
       full row, not only among legal actions, for the same reason.
+
+    ``min_regret_magnitude`` switches ``regret_pos`` from "any positive
+    regret" to "sum(|regret|) >= threshold" — see
+    :func:`compute_street_metrics` for why the boolean test is weak in
+    practice (near-guaranteed true after a single touch) and how to calibrate
+    a magnitude threshold from that function's ``regret_magnitude_log10``
+    output.
     """
     strategy_files = list(strategy_files)
     regret_files = list(regret_files)
@@ -634,7 +722,13 @@ def compute_leaf_coverage(
             r_batch = np.asarray(r_arr[start : start + batch_rows])
             n_scanned += s_batch.shape[0]
             avg_trusted = s_batch.sum(axis=1, dtype=np.int64) >= min_strategy_mass
-            regret_pos = (r_batch > 0).any(axis=1)
+            if min_regret_magnitude is not None:
+                regret_pos = (
+                    np.abs(r_batch).sum(axis=1, dtype=np.int64)
+                    >= min_regret_magnitude
+                )
+            else:
+                regret_pos = (r_batch > 0).any(axis=1)
             n_avg_trusted += int(avg_trusted.sum())
             n_regret_pos += int(regret_pos.sum())
             n_effective += int((avg_trusted | regret_pos).sum())
@@ -659,6 +753,10 @@ def compute_leaf_coverage(
     n_uniform = n_scanned - n_effective
     return {
         "min_strategy_mass": int(min_strategy_mass),
+        "regret_pos_definition": (
+            "regret_magnitude" if min_regret_magnitude is not None
+            else "regret_positive"
+        ),
         "n_chunks_total": len(strategy_files),
         "n_chunks_read": len(idx),
         "sampled": sampled,
@@ -689,6 +787,7 @@ def build_report(
     include_regret: bool = False,
     include_leaf_coverage: bool = False,
     min_strategy_mass: int = _DEFAULT_MIN_STRATEGY_MASS,
+    min_regret_magnitude: Optional[int] = None,
     sample_chunks: Optional[int] = None,
     batch_rows: int = _DEFAULT_BATCH_ROWS,
 ) -> dict:
@@ -696,15 +795,19 @@ def build_report(
 
     ``sample_chunks`` bounds how many chunks per street are read (``None`` =
     every chunk = exact frequencies).  Post-flop streets (1-3) always row-join
-    the regret table to gate "visited"/play-freq/determinism on regret
-    positivity rather than raw strategy mass (see module docstring) — this
-    doubles I/O for those streets regardless of the flags below, since it is
-    needed for a correct default read, not just a diagnostic. ``include_regret``
-    additionally adds the regret-health tables (off by default — a training
-    diagnostic, separate from the join above). ``include_leaf_coverage`` adds
-    the strategy/regret row-join that reports how a search leaf would resolve
-    each infoset (average vs. regret fallback vs. uniform); it reads both
-    tables, so it also roughly doubles I/O.
+    the regret table to gate "visited"/play-freq/determinism on a trained-row
+    test rather than raw strategy mass (see module docstring) — this doubles
+    I/O for those streets regardless of the flags below, since it is needed
+    for a correct default read, not just a diagnostic. By default that test is
+    ``any(regret_row > 0)``, which is weak in practice (see
+    :func:`compute_street_metrics`); pass ``min_regret_magnitude`` to switch to
+    ``sum(|regret_row|) >= min_regret_magnitude`` instead, once you've picked a
+    threshold from a first run's ``regret_magnitude_log10`` output.
+    ``include_regret`` additionally adds the regret-health tables (off by
+    default — a training diagnostic, separate from the join above).
+    ``include_leaf_coverage`` adds the strategy/regret row-join that reports
+    how a search leaf would resolve each infoset (average vs. regret fallback
+    vs. uniform); it reads both tables, so it also roughly doubles I/O.
     """
     import joblib
 
@@ -730,6 +833,7 @@ def build_report(
             s_files,
             r,
             regret_files=_chunk_files(cp_dir, "regret", r) if r != 0 else None,
+            min_regret_magnitude=min_regret_magnitude if r != 0 else None,
             sample_chunks=sample_chunks,
             batch_rows=batch_rows,
         )
@@ -750,6 +854,7 @@ def build_report(
                 _chunk_files(cp_dir, "regret", r),
                 r,
                 min_strategy_mass=min_strategy_mass,
+                min_regret_magnitude=min_regret_magnitude,
                 sample_chunks=sample_chunks,
                 batch_rows=batch_rows,
             )
@@ -768,6 +873,7 @@ def build_report(
             "sampled": any_sampled,
             "sample_chunks": sample_chunks if any_sampled else None,
             "min_strategy_mass": min_strategy_mass if include_leaf_coverage else None,
+            "min_regret_magnitude": min_regret_magnitude,
         },
         "streets": streets,
         "regret": regret,
@@ -801,15 +907,19 @@ def _print_human(report: dict) -> str:
             for name, s in report["streets"].items()
         )
         L.append(f"SAMPLED (estimate — play freqs from a chunk subset): {chunks}")
-    if any(s.get("visited_definition") == "regret_positive" for s in report["streets"].values()):
+    _REGRET_JOIN_MODES = ("regret_positive", "regret_magnitude")
+    if any(s.get("visited_definition") in _REGRET_JOIN_MODES for s in report["streets"].values()):
         L.append(
-            "* visited = ever recorded positive regret (post-flop strategy mass "
-            "is uninformative once offline-averaged — see module docstring)"
+            "* visited = trained-row test on the regret table (post-flop "
+            "strategy mass is uninformative once offline-averaged — see "
+            "module docstring); '+' = magnitude test, plain '*' = the weaker "
+            "default any(regret > 0) test"
         )
     L.append("─" * 76)
     for name, s in report["streets"].items():
         b = s["play_freq_buckets"]
-        star = "*" if s.get("visited_definition") == "regret_positive" else ""
+        vdef = s.get("visited_definition")
+        star = "+" if vdef == "regret_magnitude" else "*" if vdef == "regret_positive" else ""
         L.append(
             f"{name.upper():<8} {s['n_infosets_total']:>12,} infosets   "
             f"visited {_fmt(s['visited_frac'], '.1%')}{star}   "
@@ -835,6 +945,15 @@ def _print_human(report: dict) -> str:
             f"pure(>0.9) {_fmt(d['frac_maxp_gt_90'], '.1%')}   "
             f"pure(>0.99) {_fmt(d['frac_maxp_gt_99'], '.1%')}"
         )
+        rmag = s.get("regret_magnitude_log10")
+        if rmag:
+            L.append(
+                f"  regret |sum| log10     p10 {_fmt(rmag['p10'], '.2f')}   "
+                f"p50 {_fmt(rmag['p50'], '.2f')}   p90 {_fmt(rmag['p90'], '.2f')}   "
+                f"zero {_fmt(rmag['zero_frac'], '.1%')}"
+                + ("   (calibrate --min-regret-magnitude from this)"
+                   if vdef == "regret_positive" else "")
+            )
         rg = report["regret"].get(name)
         if rg:
             L.append(
@@ -845,9 +964,13 @@ def _print_human(report: dict) -> str:
         lc = report.get("leaf_coverage", {}).get(name)
         if lc:
             if lc["avg_trusted_frac"] is None:
+                lc_mode = (
+                    "magnitude" if lc.get("regret_pos_definition") == "regret_magnitude"
+                    else "positivity"
+                )
                 L.append(
                     f"  leaf coverage          effective {_fmt(lc['effective_frac'], '.1%')}"
-                    f" (trained via regret)   uniform {_fmt(lc['uniform_frac'], '.1%')}"
+                    f" (trained via regret {lc_mode})   uniform {_fmt(lc['uniform_frac'], '.1%')}"
                 )
             else:
                 L.append(
@@ -896,10 +1019,14 @@ def render_markdown(report: dict) -> str:
             f"{s['n_chunks_read']}/{s['n_chunks_total']} chunks"
             if s["sampled"] else ""
         )
+        vdef = s.get("visited_definition")
         visited_note = (
-            " (ever recorded positive regret — post-flop strategy mass is "
-            "uninformative once offline-averaged)"
-            if s.get("visited_definition") == "regret_positive" else ""
+            {
+                "regret_positive": " (ever recorded positive regret — post-flop "
+                    "strategy mass is uninformative once offline-averaged)",
+                "regret_magnitude": " (sum(|regret|) over min_regret_magnitude — "
+                    "post-flop strategy mass is uninformative once offline-averaged)",
+            }.get(vdef, "")
         )
         L.append(
             f"- Infosets: **{s['n_infosets_total']:,}** "
@@ -922,6 +1049,16 @@ def render_markdown(report: dict) -> str:
             f"{_fmt(d['entropy_p50'], '.2f')}/{_fmt(d['entropy_p90'], '.2f')}; "
             f"near-pure rows (max prob > 0.9): {_fmt(d['frac_maxp_gt_90'], '.1%')}"
         )
+        rmag = s.get("regret_magnitude_log10")
+        if rmag:
+            L.append(
+                f"- Regret row magnitude sum(|regret|) (log10): "
+                f"p10 {_fmt(rmag['p10'], '.1f')} / p50 {_fmt(rmag['p50'], '.1f')} / "
+                f"p90 {_fmt(rmag['p90'], '.1f')}, {_fmt(rmag['zero_frac'], '.1%')} "
+                f"exactly zero"
+                + (" — calibrate `--min-regret-magnitude` from this"
+                   if vdef == "regret_positive" else "")
+            )
         rg = report["regret"].get(name)
         if rg:
             L.append(
@@ -932,10 +1069,14 @@ def render_markdown(report: dict) -> str:
         lc = report.get("leaf_coverage", {}).get(name)
         if lc:
             if lc["avg_trusted_frac"] is None:
+                lc_mode = (
+                    "magnitude" if lc.get("regret_pos_definition") == "regret_magnitude"
+                    else "positivity"
+                )
                 L.append(
                     f"- Leaf coverage (as search-leaf continuation): "
                     f"**{_fmt(lc['effective_frac'], '.1%')} effective** "
-                    f"(trained via regret positivity — avg/regret-fallback split "
+                    f"(trained via regret {lc_mode} — avg/regret-fallback split "
                     f"n/a for offline-averaged post-flop streets, see module "
                     f"docstring); {_fmt(lc['uniform_frac'], '.1%')} resolve to uniform"
                 )
@@ -983,6 +1124,7 @@ def analyze(
     include_regret: bool = False,
     include_leaf_coverage: bool = False,
     min_strategy_mass: int = _DEFAULT_MIN_STRATEGY_MASS,
+    min_regret_magnitude: Optional[int] = None,
     sample_chunks: Optional[int] = None,
     batch_rows: int = _DEFAULT_BATCH_ROWS,
     write_files: bool = True,
@@ -999,6 +1141,7 @@ def analyze(
         include_regret=include_regret,
         include_leaf_coverage=include_leaf_coverage,
         min_strategy_mass=min_strategy_mass,
+        min_regret_magnitude=min_regret_magnitude,
         sample_chunks=sample_chunks,
         batch_rows=batch_rows,
     )
@@ -1075,6 +1218,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "matching BlueprintPolicy). Only affects --leaf-coverage.",
     )
     parser.add_argument(
+        "--min-regret-magnitude",
+        type=int,
+        default=None,
+        help="Switch the post-flop trained-row test from the default "
+        "'any(regret_row > 0)' (weak — near-guaranteed true after a single "
+        "touch, see module docstring) to 'sum(|regret_row|) >= N'. Calibrate N "
+        "from a first (unset) run's 'regret_magnitude_log10' percentiles in "
+        "the JSON output — there is no built-in default, unlike "
+        "--min-strategy-mass, since the right cutoff depends on this run's "
+        "payoff scale.",
+    )
+    parser.add_argument(
         "--no-files", action="store_true", help="Print only; do not write artifacts."
     )
     parser.add_argument(
@@ -1091,6 +1246,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         include_regret=args.regret,
         include_leaf_coverage=args.leaf_coverage,
         min_strategy_mass=args.min_strategy_mass,
+        min_regret_magnitude=args.min_regret_magnitude,
         sample_chunks=None if args.full else args.sample_chunks,
         batch_rows=args.batch_rows,
         write_files=not args.no_files,
