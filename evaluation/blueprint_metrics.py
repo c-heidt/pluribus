@@ -24,6 +24,27 @@ signal, so it is **off by default** (``--regret`` to include it, doubling I/O).
    on a training checkpoint only the pre-flop numbers and the (all-street) regret
    health are meaningful.
 
+.. important::
+   **Post-flop "visited" is regret-gated, not mass-gated.**
+   ``poker_ai.blueprint.offline_average.sigma_from_regret_chunk`` writes a
+   full-mass row (~``SIGMA_SCALE``) for *every* post-flop infoset, whether it
+   came from real regret-matching or a maskless uniform default for a row
+   that never accumulated positive regret in any snapshot. So a raw
+   ``strategy row mass > 0`` check — meaningful pre-flop, where the table is
+   still the real online running average — is trivially true for nearly
+   every post-flop row and can't tell a genuinely-trained infoset from an
+   untrained placeholder that silently spreads uniform mass over every
+   action column, including ``all_in``. To keep "visited" and the play-freq
+   / determinism / leaf-coverage numbers honest, post-flop streets (1-3) are
+   row-joined against the regret table and gated on
+   ``any(regret_row > 0)`` instead: this doubles I/O for those streets by
+   default (no ``--regret``/``--leaf-coverage`` flag needed to get a
+   trustworthy read) and reads the regret chunks alongside the strategy
+   chunks. If the regret chunks are missing or can't be row-aligned, this
+   falls back to the old mass-based check and adds a warning — check
+   ``streets.<name>.visited_definition`` (``"regret_positive"`` vs
+   ``"mass"``) or the printed ``*`` marker.
+
 Headline metrics, per street:
 
 - **Play frequencies** (visit-weighted): the strategy tables store the average
@@ -228,11 +249,26 @@ class _StreetAccumulator:
         self.mass_hist = np.zeros(_MASS_BINS, dtype=np.int64)
         self.n_maxp_gt = {0.5: 0, 0.9: 0, 0.99: 0}
 
-    def update(self, batch: np.ndarray) -> None:
-        """Fold a ``(rows, width)`` int32 batch into the running stats."""
+    def update(
+        self, batch: np.ndarray, trained_mask: Optional[np.ndarray] = None
+    ) -> None:
+        """Fold a ``(rows, width)`` int32 batch into the running stats.
+
+        ``trained_mask`` (row-aligned with ``batch``), when given, overrides the
+        default "visited" test (raw row mass ``> 0``) with a caller-supplied
+        signal — used for post-flop streets, where every row carries mass
+        regardless of training (see module docstring) so mass alone can't tell
+        a trained row from an untrained placeholder. Intersected with
+        ``row_mass > 0`` defensively so a "trained" row with literally zero
+        stored mass (shouldn't happen, but would otherwise divide by zero
+        below) is excluded rather than corrupting the histograms.
+        """
         self.n_rows += batch.shape[0]
         row_mass = batch.sum(axis=1, dtype=np.int64)
-        visited = row_mass > 0
+        if trained_mask is not None:
+            visited = trained_mask & (row_mass > 0)
+        else:
+            visited = row_mass > 0
         n_vis = int(visited.sum())
         if n_vis == 0:
             return
@@ -317,24 +353,69 @@ def compute_street_metrics(
     files: Sequence[Path],
     street: int,
     *,
+    regret_files: Optional[Sequence[Path]] = None,
     sample_chunks: Optional[int] = None,
     batch_rows: int = _DEFAULT_BATCH_ROWS,
 ) -> Optional[dict]:
     """Stream one street's strategy chunk files into a metrics dict.
 
     Reads either every file or ``sample_chunks`` evenly-spaced ones (see
-    :func:`_select_chunks`).  Frequencies are computed over the rows actually
+    :func:`_select_indices`).  Frequencies are computed over the rows actually
     read (``n_infosets_scanned``); ``n_infosets_total`` is exact regardless of
     sampling.  Returns ``None`` when the street has no chunk files (never
     trained — normal for streets beyond a truncated test game).
+
+    ``regret_files``, when given, row-joins the regret table (same per-street
+    infoset index as the strategy table, see :func:`compute_leaf_coverage`) and
+    gates "visited" — and therefore every downstream stat: play freq, mean
+    strategy, entropy/purity, visit-mass histogram — on ``any(regret_row > 0)``
+    instead of raw strategy row mass. Pass ``None`` (the default) to keep the
+    old mass-based test, which is what pre-flop (street 0, the real online
+    running average) wants; pass ``[]`` to explicitly request the join but flag
+    it as unavailable. See the module docstring for why post-flop mass alone is
+    not a trustworthy "was this trained" signal. Falls back to the mass-based
+    test (with a warning in the returned dict's ``"warnings"``) when the regret
+    files are absent or can't be row-aligned with the strategy files.
     """
     files = list(files)
     if not files:
         return None
-    selected, sampled = _select_chunks(files, sample_chunks)
+    idx, sampled = _select_indices(len(files), sample_chunks)
+
+    warnings: List[str] = []
+    joined = False
+    if regret_files is not None:
+        regret_files = list(regret_files)
+        if not regret_files:
+            warnings.append(
+                f"street {street}: no regret chunks found for the trained-row "
+                f"join — visited/play_freq fall back to raw strategy mass "
+                f"(uninformative post-flop once offline-averaged; see module "
+                f"docstring)"
+            )
+        elif len(regret_files) != len(files):
+            warnings.append(
+                f"street {street}: {len(files)} strategy chunks vs "
+                f"{len(regret_files)} regret chunks — cannot row-join for the "
+                f"trained-row test; falling back to raw strategy mass"
+            )
+        else:
+            mismatch = next(
+                (i for i in idx if _rows_in(files[i]) != _rows_in(regret_files[i])),
+                None,
+            )
+            if mismatch is not None:
+                warnings.append(
+                    f"street {street}: chunk {mismatch} row mismatch between "
+                    f"strategy and regret tables — trained-row join disabled, "
+                    f"falling back to raw strategy mass"
+                )
+            else:
+                joined = True
 
     acc: Optional[_StreetAccumulator] = None
-    for path in selected:
+    for i in idx:
+        path = files[i]
         arr = np.load(path, mmap_mode="r")
         if arr.ndim != 2:
             raise ValueError(f"{path} is not a 2-D chunk array (shape {arr.shape})")
@@ -344,8 +425,14 @@ def compute_street_metrics(
             raise ValueError(
                 f"Inconsistent action width in {path}: {arr.shape[1]} != {acc.width}"
             )
+        r_arr = np.load(regret_files[i], mmap_mode="r") if joined else None
         for start in range(0, arr.shape[0], batch_rows):
-            acc.update(np.asarray(arr[start : start + batch_rows]))
+            batch = np.asarray(arr[start : start + batch_rows])
+            trained_mask = None
+            if r_arr is not None:
+                r_batch = np.asarray(r_arr[start : start + batch_rows])
+                trained_mask = (r_batch > 0).any(axis=1)
+            acc.update(batch, trained_mask=trained_mask)
 
     assert acc is not None
     labels, canonical = _action_labels(acc.width, street)
@@ -370,12 +457,13 @@ def compute_street_metrics(
         "n_actions": acc.width,
         "action_labels_canonical": canonical,
         "n_chunks_total": len(files),
-        "n_chunks_read": len(selected),
+        "n_chunks_read": len(idx),
         "sampled": sampled,
         "n_infosets_total": _infer_total_rows(files),
         "n_infosets_scanned": acc.n_rows,
         "n_visited": nv,
         "visited_frac": (nv / acc.n_rows) if acc.n_rows else None,
+        "visited_definition": "regret_positive" if joined else "mass",
         "total_visit_mass": acc.total_mass,
         "play_freq": play_freq,
         "play_freq_buckets": _bucket(play_freq),
@@ -401,6 +489,7 @@ def compute_street_metrics(
             "p50": _hist_percentile(acc.mass_hist, 50, 0.0, _MASS_LOG10_MAX),
             "p90": _hist_percentile(acc.mass_hist, 90, 0.0, _MASS_LOG10_MAX),
         },
+        "warnings": warnings,
     }
 
 
@@ -475,6 +564,21 @@ def compute_leaf_coverage(
     ``effective`` (``avg_trusted + regret_fallback``) is the fraction of leaf
     queries that resolve to a real strategy — the true leaf coverage.
 
+    **Post-flop (street 1-3) is a special case**, and ``avg_trusted``/
+    ``regret_fallback`` are ``None`` there: ``poker_ai.blueprint.offline_average.
+    sigma_from_regret_chunk`` writes every post-flop strategy row with
+    ~``SIGMA_SCALE`` mass regardless of whether the underlying regret was ever
+    positive (untrained rows get a maskless uniform default, not zero mass), so
+    the ``avg_trusted`` mass check is structurally ~100%-true there and cannot
+    distinguish a genuinely trained infoset from an untrained placeholder — it
+    is not a meaningful "did BlueprintPolicy get a real opinion" signal for
+    post-flop the way it is pre-flop (the real online running average).  For
+    those streets ``effective``/``uniform`` fall back to the one signal that
+    *is* informative — row-level regret positivity — so ``effective == the
+    fraction of infosets with any positive regret ever recorded`` and
+    ``avg_trusted``/``regret_fallback`` report as ``None`` rather than a
+    number that would misleadingly read as "fully covered."
+
     The join is positional: both tables share the per-street infoset index
     (:class:`poker_ai.tables.cfr_tables.CFRTables`), so row *i* is the same
     infoset in ``strategy_{street}_chunk_*`` and ``regret_{street}_chunk_*``.
@@ -487,10 +591,11 @@ def compute_leaf_coverage(
     Caveats (documented, mild, and in the safe direction for a diagnostic):
 
     - The policy masks the strategy row to the node's *legal* actions before the
-      mass check; this pass uses the raw row sum, so ``avg_trusted`` is a slight
-      over-count (a masked row could dip below the threshold at some node).
-    - ``regret_fallback`` tests for any positive regret in the full row, not only
-      among legal actions, for the same reason.
+      mass check; this pass uses the raw row sum, so pre-flop ``avg_trusted`` is
+      a slight over-count (a masked row could dip below the threshold at some
+      node).
+    - ``regret_fallback``/``regret_pos`` test for any positive regret in the
+      full row, not only among legal actions, for the same reason.
     """
     strategy_files = list(strategy_files)
     regret_files = list(regret_files)
@@ -537,7 +642,20 @@ def compute_leaf_coverage(
     if n_scanned == 0:
         return None, warnings
 
-    n_regret_fallback = n_effective - n_avg_trusted   # regret_pos & ~avg_trusted
+    if street == 0:
+        # Pre-flop: avg_trusted (real online-average mass) and regret_pos are
+        # independent signals — either one alone yields a non-uniform leaf.
+        avg_trusted_frac: Optional[float] = n_avg_trusted / n_scanned
+        n_regret_fallback = n_effective - n_avg_trusted   # regret_pos & ~avg_trusted
+        regret_fallback_frac: Optional[float] = n_regret_fallback / n_scanned
+    else:
+        # Post-flop: avg_trusted is structurally ~always true post-offline-
+        # averaging (see docstring) and uninformative, so effective collapses
+        # to regret positivity alone; avg_trusted/regret_fallback don't apply.
+        n_effective = n_regret_pos
+        avg_trusted_frac = None
+        n_regret_fallback = 0
+        regret_fallback_frac = None
     n_uniform = n_scanned - n_effective
     return {
         "min_strategy_mass": int(min_strategy_mass),
@@ -546,8 +664,8 @@ def compute_leaf_coverage(
         "sampled": sampled,
         "n_infosets_total": _infer_total_rows(strategy_files),
         "n_scanned": n_scanned,
-        "avg_trusted_frac": n_avg_trusted / n_scanned,
-        "regret_fallback_frac": n_regret_fallback / n_scanned,
+        "avg_trusted_frac": avg_trusted_frac,
+        "regret_fallback_frac": regret_fallback_frac,
         "effective_frac": n_effective / n_scanned,
         "uniform_frac": n_uniform / n_scanned,
         "counts": {
@@ -577,11 +695,16 @@ def build_report(
     """Assemble the full metrics report dict for ``blueprint_path``.
 
     ``sample_chunks`` bounds how many chunks per street are read (``None`` =
-    every chunk = exact frequencies).  ``include_regret`` adds the regret-health
-    tables (off by default — it is a training diagnostic and doubles I/O).
-    ``include_leaf_coverage`` adds the strategy/regret row-join that reports how
-    a search leaf would resolve each infoset (average vs. regret fallback vs.
-    uniform); it reads both tables, so it also roughly doubles I/O.
+    every chunk = exact frequencies).  Post-flop streets (1-3) always row-join
+    the regret table to gate "visited"/play-freq/determinism on regret
+    positivity rather than raw strategy mass (see module docstring) — this
+    doubles I/O for those streets regardless of the flags below, since it is
+    needed for a correct default read, not just a diagnostic. ``include_regret``
+    additionally adds the regret-health tables (off by default — a training
+    diagnostic, separate from the join above). ``include_leaf_coverage`` adds
+    the strategy/regret row-join that reports how a search leaf would resolve
+    each infoset (average vs. regret fallback vs. uniform); it reads both
+    tables, so it also roughly doubles I/O.
     """
     import joblib
 
@@ -604,9 +727,14 @@ def build_report(
                 f"checkpoint expects {n_expected} — metrics cover the files present"
             )
         m = compute_street_metrics(
-            s_files, r, sample_chunks=sample_chunks, batch_rows=batch_rows
+            s_files,
+            r,
+            regret_files=_chunk_files(cp_dir, "regret", r) if r != 0 else None,
+            sample_chunks=sample_chunks,
+            batch_rows=batch_rows,
         )
         if m is not None:
+            warnings.extend(m.pop("warnings", []))
             streets[_STREET_NAME[r]] = m
         if include_regret:
             rm = compute_regret_metrics(
@@ -673,12 +801,18 @@ def _print_human(report: dict) -> str:
             for name, s in report["streets"].items()
         )
         L.append(f"SAMPLED (estimate — play freqs from a chunk subset): {chunks}")
+    if any(s.get("visited_definition") == "regret_positive" for s in report["streets"].values()):
+        L.append(
+            "* visited = ever recorded positive regret (post-flop strategy mass "
+            "is uninformative once offline-averaged — see module docstring)"
+        )
     L.append("─" * 76)
     for name, s in report["streets"].items():
         b = s["play_freq_buckets"]
+        star = "*" if s.get("visited_definition") == "regret_positive" else ""
         L.append(
             f"{name.upper():<8} {s['n_infosets_total']:>12,} infosets   "
-            f"visited {_fmt(s['visited_frac'], '.1%')}   "
+            f"visited {_fmt(s['visited_frac'], '.1%')}{star}   "
             f"mass {s['total_visit_mass']:.3g}"
         )
         L.append(
@@ -710,12 +844,18 @@ def _print_human(report: dict) -> str:
             )
         lc = report.get("leaf_coverage", {}).get(name)
         if lc:
-            L.append(
-                f"  leaf coverage          effective {_fmt(lc['effective_frac'], '.1%')}   "
-                f"(avg {_fmt(lc['avg_trusted_frac'], '.1%')} + "
-                f"regret {_fmt(lc['regret_fallback_frac'], '.1%')})   "
-                f"uniform {_fmt(lc['uniform_frac'], '.1%')}"
-            )
+            if lc["avg_trusted_frac"] is None:
+                L.append(
+                    f"  leaf coverage          effective {_fmt(lc['effective_frac'], '.1%')}"
+                    f" (trained via regret)   uniform {_fmt(lc['uniform_frac'], '.1%')}"
+                )
+            else:
+                L.append(
+                    f"  leaf coverage          effective {_fmt(lc['effective_frac'], '.1%')}   "
+                    f"(avg {_fmt(lc['avg_trusted_frac'], '.1%')} + "
+                    f"regret {_fmt(lc['regret_fallback_frac'], '.1%')})   "
+                    f"uniform {_fmt(lc['uniform_frac'], '.1%')}"
+                )
     if report["warnings"]:
         L.append("")
         L.append("WARNINGS")
@@ -756,9 +896,14 @@ def render_markdown(report: dict) -> str:
             f"{s['n_chunks_read']}/{s['n_chunks_total']} chunks"
             if s["sampled"] else ""
         )
+        visited_note = (
+            " (ever recorded positive regret — post-flop strategy mass is "
+            "uninformative once offline-averaged)"
+            if s.get("visited_definition") == "regret_positive" else ""
+        )
         L.append(
             f"- Infosets: **{s['n_infosets_total']:,}** "
-            f"({_fmt(s['visited_frac'], '.1%')} visited), "
+            f"({_fmt(s['visited_frac'], '.1%')} visited{visited_note}), "
             f"action columns: {s['n_actions']}{scan}"
             + ("" if s["action_labels_canonical"]
                else " *(non-canonical width — generic raise labels)*")
@@ -786,14 +931,23 @@ def render_markdown(report: dict) -> str:
             )
         lc = report.get("leaf_coverage", {}).get(name)
         if lc:
-            L.append(
-                f"- Leaf coverage (as search-leaf continuation, "
-                f"min_strategy_mass={lc['min_strategy_mass']}): "
-                f"**{_fmt(lc['effective_frac'], '.1%')} effective** "
-                f"(non-uniform) = {_fmt(lc['avg_trusted_frac'], '.1%')} trusted "
-                f"average + {_fmt(lc['regret_fallback_frac'], '.1%')} regret "
-                f"fallback; {_fmt(lc['uniform_frac'], '.1%')} resolve to uniform"
-            )
+            if lc["avg_trusted_frac"] is None:
+                L.append(
+                    f"- Leaf coverage (as search-leaf continuation): "
+                    f"**{_fmt(lc['effective_frac'], '.1%')} effective** "
+                    f"(trained via regret positivity — avg/regret-fallback split "
+                    f"n/a for offline-averaged post-flop streets, see module "
+                    f"docstring); {_fmt(lc['uniform_frac'], '.1%')} resolve to uniform"
+                )
+            else:
+                L.append(
+                    f"- Leaf coverage (as search-leaf continuation, "
+                    f"min_strategy_mass={lc['min_strategy_mass']}): "
+                    f"**{_fmt(lc['effective_frac'], '.1%')} effective** "
+                    f"(non-uniform) = {_fmt(lc['avg_trusted_frac'], '.1%')} trusted "
+                    f"average + {_fmt(lc['regret_fallback_frac'], '.1%')} regret "
+                    f"fallback; {_fmt(lc['uniform_frac'], '.1%')} resolve to uniform"
+                )
         L.append("")
         L.append("| action | play freq | mean strategy |")
         L.append("|---|---:|---:|")
