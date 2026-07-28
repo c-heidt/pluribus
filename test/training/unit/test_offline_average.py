@@ -290,6 +290,93 @@ class TestAverageStreet:
         np.testing.assert_array_equal(got[0], expected)
         assert got[0].sum() >= 10  # clears min_strategy_mass at read time
 
+    def test_confirming_fraction_dominates_absolute_floor_at_scale(self, tmp_path):
+        """On a run with many retained snapshots, 'confirmed by 2' is a very
+        low bar (the reported real-world symptom: ~99% visited even after the
+        MIN_CONFIRMING_SNAPSHOTS=2 fix, on an 81-snapshot run) — the default
+        min_confirming_fraction=0.5 must dominate and reject a row confirmed
+        by only 2 of, say, 10 snapshots."""
+        r = 1
+        n_snaps = 10
+        confirmed_by = 2  # well past the absolute floor of 2... exactly at it
+        snap_dirs = []
+        for s in range(n_snaps):
+            d = tmp_path / f"checkpoint_{1000 * (s + 1)}"
+            regret = np.array(
+                [[10, 0, 0, 0, 0]] if s < confirmed_by else [[0, 0, 0, 0, 0]],
+                dtype=np.int32,
+            )
+            self._write_regret(d, r, regret)
+            snap_dirs.append(d)
+
+        out = tmp_path / "out"
+        out.mkdir()
+        average_street(snap_dirs, snap_dirs[-1], r, out, 1_000_000)  # default gates
+        got = np.load(out / f"strategy_{r}_chunk_000000.npy")
+        # 2/10 confirmations clears the absolute floor (2) but not the
+        # fraction floor (ceil(0.5*10)=5) -> still deferred to zero.
+        np.testing.assert_array_equal(got[0], np.zeros(5, dtype=np.int32))
+
+    def test_confirming_fraction_publishes_when_majority_confirms(self, tmp_path):
+        r = 1
+        n_snaps = 10
+        confirmed_by = 6  # majority of 10 -> clears ceil(0.5*10)=5
+        snap_dirs = []
+        for s in range(n_snaps):
+            d = tmp_path / f"checkpoint_{1000 * (s + 1)}"
+            regret = np.array(
+                [[10, 0, 0, 0, 0]] if s < confirmed_by else [[0, 0, 0, 0, 0]],
+                dtype=np.int32,
+            )
+            self._write_regret(d, r, regret)
+            snap_dirs.append(d)
+
+        out = tmp_path / "out"
+        out.mkdir()
+        average_street(snap_dirs, snap_dirs[-1], r, out, 1_000_000)  # default gates
+        got = np.load(out / f"strategy_{r}_chunk_000000.npy")
+        assert got[0].sum() >= 10  # published, clears min_strategy_mass
+        assert got[0][0] == 1_000_000  # pure fold, averaged only over confirmers
+
+    def test_min_snapshot_regret_magnitude_excludes_weak_snapshots(self, tmp_path):
+        """A snapshot with a tiny positive-regret blip (the single-touch noise
+        case) must not count toward confirmation when a magnitude floor is
+        set, even though it would under the plain 'any positive' test."""
+        r = 1
+        weak = np.array([[1, 0, 0, 0, 0]], dtype=np.int32)     # barely positive
+        strong = np.array([[500, 0, 0, 0, 0]], dtype=np.int32)  # clearly positive
+        d_weak = tmp_path / "checkpoint_1000"
+        d_strong = tmp_path / "checkpoint_2000"
+        self._write_regret(d_weak, r, weak)
+        self._write_regret(d_strong, r, strong)
+
+        out = tmp_path / "out"
+        out.mkdir()
+        # Without a magnitude floor: both count (any positive) -> 2/2 confirms,
+        # clears both the floor (2) and the fraction (ceil(0.5*2)=1).
+        average_street(
+            [d_weak, d_strong], d_strong, r, out, 1_000_000,
+        )
+        got_without = np.load(out / f"strategy_{r}_chunk_000000.npy")
+        assert got_without[0].sum() > 0
+
+        # With a magnitude floor above `weak`'s regret sum (1) but below
+        # `strong`'s (500): only `strong` counts -> 1/2 confirms, below the
+        # (still-active) floor of 2 -> deferred to zero.
+        out2 = tmp_path / "out2"
+        out2.mkdir()
+        average_street(
+            [d_weak, d_strong], d_strong, r, out2, 1_000_000,
+            min_confirming_snapshots=1, min_confirming_fraction=0.0,
+            min_snapshot_regret_magnitude=100,
+        )
+        got_with = np.load(out2 / f"strategy_{r}_chunk_000000.npy")
+        # Only `strong` confirms (1 snapshot) -> clears min_confirming_snapshots=1
+        # -> published as exactly `strong`'s own regret-matched row, not an
+        # average that included the weak snapshot.
+        expected = np.rint(1_000_000 * sigma_from_regret_chunk(strong)[0]).astype(np.int32)
+        np.testing.assert_array_equal(got_with[0], expected)
+
 
 # ---------------------------------------------------------------------------
 # build_final_blueprint — end-to-end, restore through the real tables

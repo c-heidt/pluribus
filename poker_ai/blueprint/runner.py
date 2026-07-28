@@ -467,14 +467,51 @@ def start(
     help=(
         "Minimum number of independent averaged snapshots that must show "
         "positive regret for a post-flop row before it is published (default "
-        "2 — one snapshot alone is a single categorical sample of an evolving "
-        "strategy, not yet convergence). Rows short of this are written "
-        "all-zero and correctly deferred to the live regret-match fallback at "
-        "read time, instead of publishing a falsely-confident average."
+        "2). This is a FLOOR, not the only requirement — see "
+        "--min_confirming_fraction, which usually dominates it on any run "
+        "with more than a handful of retained snapshots. Rows short of the "
+        "effective requirement are written all-zero and correctly deferred to "
+        "the live regret-match fallback at read time, instead of publishing a "
+        "falsely-confident average."
+    ),
+)
+@click.option(
+    "--min_confirming_fraction",
+    type=float,
+    default=None,
+    help=(
+        "Minimum FRACTION of all averaged snapshots that must independently "
+        "confirm a row (default 0.5, a majority), IN ADDITION to "
+        "--min_confirming_snapshots: the effective requirement is "
+        "max(min_confirming_snapshots, ceil(min_confirming_fraction * "
+        "n_snapshots_averaged)). The absolute floor alone doesn't scale — on "
+        "a run with dozens of retained snapshots, 'confirmed by any 2 of "
+        "them' is a very low bar, since a single-touch positive-regret blip "
+        "(see the module docstring) only needs to land in 2 out of, say, 81 "
+        "snapshots, which is close to certain for anything touched at all "
+        "across a long run. Expressing the bar as a fraction of THIS run's "
+        "own snapshot count keeps it meaningful regardless of how many "
+        "checkpoints were retained."
+    ),
+)
+@click.option(
+    "--min_snapshot_regret_magnitude",
+    type=int,
+    default=None,
+    help=(
+        "Optional: minimum sum(positive regret) a SINGLE snapshot's row must "
+        "show before that snapshot counts toward confirming a row at all (on "
+        "top of, not instead of, plain positivity). Unset (default) keeps the "
+        "plain 'any positive' per-snapshot test. There is NO built-in default "
+        "value for this one, deliberately: what counts as meaningful regret "
+        "for a single snapshot depends on this run's chip/payoff scale, so "
+        "calibrate it for your specific run rather than trusting a guessed "
+        "constant across configurations."
     ),
 )
 def average_snapshots(
-    train_dir, output_dir, scale, min_t, workers, resume, min_confirming_snapshots
+    train_dir, output_dir, scale, min_t, workers, resume,
+    min_confirming_snapshots, min_confirming_fraction, min_snapshot_regret_magnitude,
 ):
     """Build a final blueprint by averaging a run's retained snapshots.
 
@@ -483,6 +520,7 @@ def average_snapshots(
     directory loadable by the evaluation / search stack unchanged.
     """
     from poker_ai.blueprint.offline_average import (
+        MIN_CONFIRMING_FRACTION_DEFAULT,
         MIN_CONFIRMING_SNAPSHOTS_DEFAULT,
         SIGMA_SCALE_DEFAULT,
         build_final_blueprint,
@@ -499,6 +537,11 @@ def average_snapshots(
             MIN_CONFIRMING_SNAPSHOTS_DEFAULT if min_confirming_snapshots is None
             else min_confirming_snapshots
         ),
+        min_confirming_fraction=(
+            MIN_CONFIRMING_FRACTION_DEFAULT if min_confirming_fraction is None
+            else min_confirming_fraction
+        ),
+        min_snapshot_regret_magnitude=min_snapshot_regret_magnitude,
     )
 
 

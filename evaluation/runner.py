@@ -433,6 +433,7 @@ def _capture_hero_decision(
             leaf_mode=res.leaf_mode,
             is_research=0,          # blueprint opponents never play off-tree (§10.1)
             num_live=num_live,
+            n_live=int(res.n_live),  # live ranges the solver sized its budget on (calibration axis)
             pot_before=pot_before,
             to_call=to_call,
             hero_stack=hero_stack,

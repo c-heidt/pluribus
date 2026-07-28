@@ -40,14 +40,25 @@ to the legal actions and renormalises, so the scale cancels and the
 ``min_strategy_mass`` gate (default 10) passes comfortably (row mass
 ``~SIGMA_SCALE`` = 1e6).
 
-A row also needs at least :data:`MIN_CONFIRMING_SNAPSHOTS_DEFAULT`
-*independent* snapshots to have shown positive regret before it is published
-at all — one confirming snapshot alone is a single categorical sample of an
-evolving strategy (regret matching's per-touch delta is ``voa[action] - vo``
-against that traversal's own mean, so the best-performing action of a single
-touch is positive almost by construction; it does not mean the row has
-converged). Short of that bar the row is written all-zero and — as above —
-correctly deferred to the live regret-match fallback rather than publishing a
+A row also needs independent confirmation from enough retained snapshots
+before it is published at all — one confirming snapshot alone is a single
+categorical sample of an evolving strategy (regret matching's per-touch delta
+is ``voa[action] - vo`` against that traversal's own mean, so the
+best-performing action of a single touch is positive almost by construction;
+it does not mean the row has converged). The requirement is
+``max(MIN_CONFIRMING_SNAPSHOTS_DEFAULT, ceil(MIN_CONFIRMING_FRACTION_DEFAULT *
+n_snapshots_averaged))`` — the absolute floor alone doesn't scale: on a run
+with dozens of retained snapshots, "confirmed by any 2 of them" stays a very
+low bar (a single-touch positive-regret blip only needs to land in 2 out of,
+say, 81 snapshots, which is close to certain for anything touched at all
+across a long run), so the fraction requirement — a majority by default —
+usually dominates. Optionally, :data:`MIN_SNAPSHOT_REGRET_MAGNITUDE_DEFAULT`
+raises the bar further by requiring each confirming snapshot's own positive
+regret to clear a magnitude threshold too, not just be positive at all (unset
+by default — no natural cutoff exists across differently-scaled runs, so this
+needs calibrating per run rather than trusting a guess). Short of the
+effective requirement, the row is written all-zero and — as above — correctly
+deferred to the live regret-match fallback rather than publishing a
 falsely-confident average. This keeps a published row's mass a genuine
 confidence signal again (as it already was for pre-flop's real online visit
 counts), rather than every row trivially clearing ``min_strategy_mass``
@@ -98,7 +109,40 @@ SIGMA_SCALE_DEFAULT = 1_000_000
 #: independently at least twice" is meaningful regardless of stakes or chunk
 #: size). Below this, the row is written all-zero and deferred to the live
 #: regret-match fallback (see :func:`average_chunk`).
+#:
+#: This is a FLOOR, not the only requirement — see
+#: :data:`MIN_CONFIRMING_FRACTION_DEFAULT`, which usually dominates it on any
+#: run with more than a handful of retained snapshots.
 MIN_CONFIRMING_SNAPSHOTS_DEFAULT = 2
+
+#: Minimum FRACTION of all averaged snapshots that must independently confirm
+#: a row (in addition to, not instead of, the absolute floor above): the
+#: effective requirement is ``max(MIN_CONFIRMING_SNAPSHOTS_DEFAULT,
+#: ceil(MIN_CONFIRMING_FRACTION_DEFAULT * n_snapshots_averaged))``.  The
+#: absolute floor alone doesn't scale: on a run with dozens of retained
+#: snapshots, "confirmed by any 2 of them" is a very low bar — a row only
+#: needs to get lucky (a single-touch positive blip, see
+#: :data:`MIN_CONFIRMING_SNAPSHOTS_DEFAULT`'s docstring) in 2 out of, say, 81
+#: snapshots, which is nearly certain for anything touched at all across a
+#: long run. Expressing the bar as a fraction of the run's OWN snapshot count
+#: keeps it meaningful regardless of how many checkpoints were retained.
+#: 0.5 (a majority) is the natural, easily-justified default: it asks whether
+#: the row's positive-regret evidence held up across most of training's span,
+#: not just a couple of scattered points in it.
+MIN_CONFIRMING_FRACTION_DEFAULT = 0.5
+
+#: Optional minimum ``sum(positive regret)`` a SINGLE snapshot's row must show
+#: before that snapshot counts toward confirming a row at all (on top of, not
+#: instead of, the plain positivity test). ``None`` (default) keeps the plain
+#: "any positive" per-snapshot test. Unlike the two constants above, there is
+#: NO built-in default value here deliberately: what counts as "a meaningful
+#: amount of regret" for one snapshot depends on this run's chip/payoff scale
+#: (stakes, bet-sizing abstraction), the same problem that ruled out a
+#: magnitude threshold as the sole fix earlier — see
+#: [[project_blueprint_metrics_leaf_coverage_gap]]. Calibrate it for a specific
+#: run (e.g. via a throwaway inspection of a few snapshots' regret chunks)
+#: rather than trusting a guessed constant across configurations.
+MIN_SNAPSHOT_REGRET_MAGNITUDE_DEFAULT: Optional[int] = None
 
 #: Streets whose strategy is reconstructed offline from snapshots.  Pre-flop
 #: (street 0) keeps its trained running average and is copied through verbatim.
@@ -157,6 +201,8 @@ def average_chunk(
     scale: int,
     resume: bool = False,
     min_confirming_snapshots: int = MIN_CONFIRMING_SNAPSHOTS_DEFAULT,
+    min_confirming_fraction: float = MIN_CONFIRMING_FRACTION_DEFAULT,
+    min_snapshot_regret_magnitude: Optional[int] = MIN_SNAPSHOT_REGRET_MAGNITUDE_DEFAULT,
 ) -> bool:
     """Average one ``(street, chunk)`` across snapshots; the unit of work.
 
@@ -168,10 +214,16 @@ def average_chunk(
     chunk (~``_TASK_PEAK_MB``), independent of the snapshot count or the run's
     total on-disk size.
 
-    ``min_confirming_snapshots`` (see :data:`MIN_CONFIRMING_SNAPSHOTS_DEFAULT`)
-    additionally requires that many snapshots to have independently shown
-    positive regret for a row before its average is published; short of that
-    the row is written all-zero, deferring to the live regret-match fallback.
+    A row is published (its average written with real, ``min_strategy_mass``-
+    clearing mass) only if it is independently confirmed by at least
+    ``max(min_confirming_snapshots, ceil(min_confirming_fraction *
+    len(snapshot_dirs)))`` snapshots — see :data:`MIN_CONFIRMING_SNAPSHOTS_DEFAULT`
+    and :data:`MIN_CONFIRMING_FRACTION_DEFAULT`. A snapshot counts toward that
+    tally if its row shows any positive regret, or — when
+    ``min_snapshot_regret_magnitude`` is set — only if its positive-regret sum
+    also clears that bar (see :data:`MIN_SNAPSHOT_REGRET_MAGNITUDE_DEFAULT`).
+    Short of the confirmation requirement, the row is written all-zero,
+    deferring to the live regret-match fallback.
 
     Returns
     -------
@@ -202,39 +254,52 @@ def average_chunk(
         arr = np.load(path)
         k = min(arr.shape[0], n_rows)  # earlier snapshots may hold fewer rows
         chunk = arr[:k]
-        # A row with no positive regret in THIS snapshot has no real signal —
-        # sigma_from_regret_chunk's maskless-uniform fallback for it is a pure
-        # placeholder, not a genuine regret-matched opinion. Excluded from both
-        # the accumulator and the divisor (not just zeroed, which would still
-        # dilute the mean for rows with real signal in other snapshots): a row
-        # trained late keeps its average over only the snapshots where it had
-        # something to say, rather than being watered down by early snapshots'
-        # placeholder uniform contributions.
-        has_signal = np.clip(chunk, 0, None).sum(axis=1) > 0.0
+        # A row with no positive regret in THIS snapshot (or, if
+        # min_snapshot_regret_magnitude is set, without ENOUGH positive
+        # regret) has no real signal — sigma_from_regret_chunk's
+        # maskless-uniform fallback for it is a pure placeholder, not a
+        # genuine regret-matched opinion. Excluded from both the accumulator
+        # and the divisor (not just zeroed, which would still dilute the mean
+        # for rows with real signal in other snapshots): a row trained late
+        # keeps its average over only the snapshots where it had something to
+        # say, rather than being watered down by early snapshots' placeholder
+        # uniform contributions.
+        pos_sum = np.clip(chunk, 0, None).sum(axis=1)
+        if min_snapshot_regret_magnitude is not None:
+            has_signal = pos_sum >= min_snapshot_regret_magnitude
+        else:
+            has_signal = pos_sum > 0.0
         if has_signal.any():
             sigma = sigma_from_regret_chunk(chunk)
             acc[:k][has_signal] += sigma[has_signal]
             count[:k][has_signal] += 1
         del arr  # release the ~80 MB snapshot chunk before the next load
 
+    # The fraction requirement scales with THIS run's own snapshot count, so
+    # "confirmed by 2" doesn't become a trivial bar on a run with dozens of
+    # retained snapshots (see MIN_CONFIRMING_FRACTION_DEFAULT's docstring for
+    # why the absolute floor alone isn't enough at scale).
+    required = max(
+        min_confirming_snapshots,
+        int(np.ceil(min_confirming_fraction * len(snapshot_dirs))),
+    )
     out = np.zeros((n_rows, n_actions), dtype=np.int32)
-    present = count >= min_confirming_snapshots
+    present = count >= required
     if present.any():
         mean = acc[present] / count[present][:, None]
         out[present] = np.rint(scale * mean).astype(np.int32)
-    # Rows present in no snapshot, present but with no snapshot ever recording
-    # a positive-regret action, or confirmed by fewer than
-    # min_confirming_snapshots independent snapshots, stay all-zero. At read
-    # time this correctly falls back to live regret matching (mass 0 <
-    # min_strategy_mass, see poker_ai.search.policy.BlueprintPolicy.
-    # _average_strategy) — which degrades to uniform-over-LEGAL-actions for a
-    # never-converged row too (its regret is all-non-positive there as well),
-    # so the visible behaviour for such a row is unchanged from the old
-    # maskless uniform default, minus (a) wasted placeholder mass baked into
-    # every under-explored row, and (b) that
-    # default's illegal-column leakage (it spread mass over every action
-    # column regardless of the node's actual legal set; the live fallback
-    # masks to state.valid_mask).
+    # Rows present in no snapshot, present but never showing (sufficient)
+    # positive regret, or confirmed by fewer than `required` independent
+    # snapshots, stay all-zero. At read time this correctly falls back to live
+    # regret matching (mass 0 < min_strategy_mass, see
+    # poker_ai.search.policy.BlueprintPolicy._average_strategy) — which
+    # degrades to uniform-over-LEGAL-actions for a never-converged row too
+    # (its regret is all-non-positive there as well), so the visible
+    # behaviour for such a row is unchanged from the old maskless uniform
+    # default, minus (a) wasted placeholder mass baked into every
+    # under-explored row, and (b) that default's illegal-column leakage (it
+    # spread mass over every action column regardless of the node's actual
+    # legal set; the live fallback masks to state.valid_mask).
 
     # Atomic: a killed job never leaves a truncated .npy that a later --resume
     # would mistake for finished work.
@@ -271,6 +336,8 @@ def average_street(
     workers: int = 1,
     resume: bool = False,
     min_confirming_snapshots: int = MIN_CONFIRMING_SNAPSHOTS_DEFAULT,
+    min_confirming_fraction: float = MIN_CONFIRMING_FRACTION_DEFAULT,
+    min_snapshot_regret_magnitude: Optional[int] = MIN_SNAPSHOT_REGRET_MAGNITUDE_DEFAULT,
 ) -> int:
     """Average the regret-matched strategy of street *r* across snapshots.
 
@@ -295,8 +362,8 @@ def average_street(
         Chunks to process concurrently (peak RAM ≈ ``workers * 800 MB``).
     resume : bool, optional
         Skip chunks whose output already exists.
-    min_confirming_snapshots : int, optional
-        See :func:`average_chunk` / :data:`MIN_CONFIRMING_SNAPSHOTS_DEFAULT`.
+    min_confirming_snapshots, min_confirming_fraction, min_snapshot_regret_magnitude
+        See :func:`average_chunk` and the matching ``MIN_*_DEFAULT`` constants.
 
     Returns
     -------
@@ -305,7 +372,8 @@ def average_street(
     """
     tasks = [
         (snapshot_dirs, final_dir, r, chunk_id, out_dir, scale, resume,
-         min_confirming_snapshots)
+         min_confirming_snapshots, min_confirming_fraction,
+         min_snapshot_regret_magnitude)
         for chunk_id in _chunk_ids(final_dir, f"regret_{r}")
     ]
     return _run_chunk_tasks(tasks, workers)
@@ -395,6 +463,8 @@ def build_final_blueprint(
     workers: int = 1,
     resume: bool = False,
     min_confirming_snapshots: int = MIN_CONFIRMING_SNAPSHOTS_DEFAULT,
+    min_confirming_fraction: float = MIN_CONFIRMING_FRACTION_DEFAULT,
+    min_snapshot_regret_magnitude: Optional[int] = MIN_SNAPSHOT_REGRET_MAGNITUDE_DEFAULT,
 ) -> Path:
     """Build a final blueprint by averaging a run's retained snapshots.
 
@@ -423,11 +493,11 @@ def build_final_blueprint(
         Continue into an existing *out_dir*, skipping artefacts that are
         already complete.  Every output is written atomically, so anything
         present is finished and safe to skip.  Use after an interrupted build.
-    min_confirming_snapshots : int, optional
-        See :func:`average_chunk` / :data:`MIN_CONFIRMING_SNAPSHOTS_DEFAULT`.
-        A post-flop row confirmed (positive regret) by fewer than this many of
-        the averaged snapshots is written all-zero instead of published,
-        deferring to the live regret-match fallback at read time.
+    min_confirming_snapshots, min_confirming_fraction, min_snapshot_regret_magnitude
+        See :func:`average_chunk` and the matching ``MIN_*_DEFAULT`` constants.
+        A post-flop row not independently confirmed by enough of the averaged
+        snapshots is written all-zero instead of published, deferring to the
+        live regret-match fallback at read time.
 
     Returns
     -------
@@ -476,11 +546,22 @@ def build_final_blueprint(
             f"below the warm-up. Lower --min_t (e.g. 0) to average the "
             f"available checkpoints anyway."
         )
+    effective_required = max(
+        min_confirming_snapshots,
+        int(np.ceil(min_confirming_fraction * len(avg_snapshots))),
+    )
     log.info(
-        "Averaging %d/%d snapshots (t in [%s, %s], min_t=%s) into %s",
+        "Averaging %d/%d snapshots (t in [%s, %s], min_t=%s) into %s — a "
+        "post-flop row must be independently confirmed by >= %d/%d of them "
+        "(min_confirming_snapshots=%d, min_confirming_fraction=%s%s) to be "
+        "published",
         len(avg_snapshots), len(checkpoints),
         f"{states[avg_snapshots[0]]['t']:,}", f"{states[avg_snapshots[-1]]['t']:,}",
         f"{min_t:,}", out_dir,
+        effective_required, len(avg_snapshots),
+        min_confirming_snapshots, min_confirming_fraction,
+        f", min_snapshot_regret_magnitude={min_snapshot_regret_magnitude}"
+        if min_snapshot_regret_magnitude is not None else "",
     )
     if len(avg_snapshots) < min_confirming_snapshots:
         log.warning(
@@ -529,7 +610,8 @@ def build_final_blueprint(
     # instead of draining at each street boundary.
     tasks = [
         (avg_snapshots, final_dir, r, chunk_id, out_cp, scale, resume,
-         min_confirming_snapshots)
+         min_confirming_snapshots, min_confirming_fraction,
+         min_snapshot_regret_magnitude)
         for r in _POSTFLOP_STREETS
         for chunk_id in _chunk_ids(final_dir, f"regret_{r}")
     ]
@@ -561,12 +643,16 @@ def _cli(
     workers: int = 1,
     resume: bool = False,
     min_confirming_snapshots: int = MIN_CONFIRMING_SNAPSHOTS_DEFAULT,
+    min_confirming_fraction: float = MIN_CONFIRMING_FRACTION_DEFAULT,
+    min_snapshot_regret_magnitude: Optional[int] = MIN_SNAPSHOT_REGRET_MAGNITUDE_DEFAULT,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     build_final_blueprint(
         Path(train_dir), Path(output_dir), scale=scale, min_t=min_t,
         workers=workers, resume=resume,
         min_confirming_snapshots=min_confirming_snapshots,
+        min_confirming_fraction=min_confirming_fraction,
+        min_snapshot_regret_magnitude=min_snapshot_regret_magnitude,
     )
 
 
@@ -584,9 +670,19 @@ if __name__ == "__main__":
         "--min_confirming_snapshots", type=int,
         default=MIN_CONFIRMING_SNAPSHOTS_DEFAULT,
     )
+    parser.add_argument(
+        "--min_confirming_fraction", type=float,
+        default=MIN_CONFIRMING_FRACTION_DEFAULT,
+    )
+    parser.add_argument(
+        "--min_snapshot_regret_magnitude", type=int,
+        default=MIN_SNAPSHOT_REGRET_MAGNITUDE_DEFAULT,
+    )
     args = parser.parse_args()
     _cli(
         args.train_dir, args.output_dir, args.scale, args.min_t,
         workers=args.workers, resume=args.resume,
         min_confirming_snapshots=args.min_confirming_snapshots,
+        min_confirming_fraction=args.min_confirming_fraction,
+        min_snapshot_regret_magnitude=args.min_snapshot_regret_magnitude,
     )
