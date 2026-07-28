@@ -42,10 +42,21 @@ def _ctx_for(street, n_players):
 # Model units
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.parametrize("street,expected", [(1, 1500), (2, 1000), (3, 500)])
+# Only turn/river are vector now — a HU flop root has two future chance nodes left
+# and routes to sampled MCCFR (see ``test_hu_flop_uses_mccfr_budget`` below).
+@pytest.mark.parametrize("street,expected", [(2, 1000), (3, 500)])
 def test_vector_budget_is_per_stage_constant(street, expected):
     cfg = _cfg(auto_budget=True)
     assert iteration_budget(_ctx_for(street, 2), cfg) == expected
+
+
+def test_hu_flop_uses_mccfr_budget():
+    """HU flop is no longer vector: its budget is the MCCFR global pool (÷ workers),
+    not the vector per-stage constant (1500).  Mirrors ``_select_regime``."""
+    cfg = _cfg(auto_budget=True, max_iterations=1_000_000)
+    ctx = _ctx_for(1, 2)                                    # HU flop
+    assert iteration_budget(ctx, cfg, workers=1) == 6000   # global = 3000 * 2 live
+    assert iteration_budget(ctx, cfg, workers=6) == 1000   # ceil(6000 / 6), split by W
 
 
 def test_vector_budget_is_independent_of_workers():

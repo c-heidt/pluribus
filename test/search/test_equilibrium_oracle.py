@@ -22,6 +22,7 @@ Marked ``slow`` (full enumeration + the MCCFR iteration budget).
 """
 
 import collections
+import dataclasses
 import itertools
 
 import numpy as np
@@ -31,6 +32,7 @@ from information_abstraction.lookup import clusters_for_board
 from poker_ai.search.mccfr import _MCCFRSolver
 from poker_ai.search.policy import SearchPolicy
 from poker_ai.search.solver import solve, SolverState
+from poker_ai.search.vector import _VectorSolver
 from poker_ai.search.solver_state import SolverConfig
 
 from test.search.brute_force_cfr import (
@@ -535,18 +537,20 @@ def test_flop_oracle_self_consistent(_seeded):
 
 @pytest.mark.slow
 def test_vector_flop_cluster_keyed_matches_oracle_losslessly(_seeded):
-    """The cluster-keyed vector **flop** solve matches the flop Nash oracle (lossless LUT).
+    """The vector regime's **flop** solve matches the flop Nash oracle (lossless LUT).
 
-    The decisive gate for routing the flop to the vector regime (§6.5): a flop
-    subgame solved by the vector regime — turn and river chance-*sampled*, both
-    future streets stored per LUT cluster — must reach the same equilibrium as the
-    independent turn+river-*enumerating* oracle **when the LUT is lossless** (one
-    cluster per hole+board).  A lossless LUT makes the two-street abstraction a
-    no-op, so this isolates the two-chance-level walk / gather-scatter code from
-    abstraction coarseness: any residual gap is a mechanics bug, not information
-    loss.  Full-width vector updates converge fast even though each (turn, river)
-    row is only refreshed when that runout is sampled, so the budget is generous
-    and the exploitability gate matches the turn path's.
+    A **capability** gate for the vector regime's two-chance-level path.  Production
+    no longer *routes* a HU flop to the vector regime — the full-width flop→turn→river
+    walk is ~1 iter/s and its budget does not divide across workers, so the flop goes
+    to sampled MCCFR (see ``test_mccfr_flop_reaches_equilibrium`` and
+    ``_select_regime``).  But the vector code still *supports* a flop root, so this
+    keeps that path correct: driven **directly** (``_VectorSolver``, bypassing the
+    router, exactly as ``test_mccfr_regime_reaches_equilibrium`` drives MCCFR on a HU
+    river the router sends to vector), a flop solve — turn and river chance-*sampled*,
+    both future streets stored per LUT cluster — must reach the same equilibrium as the
+    independent turn+river-*enumerating* oracle when the LUT is lossless (one cluster
+    per hole+board).  A lossless LUT makes the two-street abstraction a no-op, so any
+    residual gap is a mechanics bug, not information loss.
     """
     env, r0, r1, s0, s1 = _flop_subgame(_seeded)
     _install_lossless_lut(env)
@@ -560,30 +564,205 @@ def test_vector_flop_cluster_keyed_matches_oracle_losslessly(_seeded):
         leaf=ctx.leaf, max_iterations=3000, max_wall_seconds=600.0,
         discount_interval=200, workers=1,
     )
-    res = solve(env, ctx, cfg)
-    assert res.state.vstrat, "expected the vector regime for a HU flop subgame"
+    # Drive the vector regime directly (the router now sends a HU flop to MCCFR).
+    state = SolverState.empty()
+    solver = _VectorSolver(env, state, ctx, cfg, ctx.rng)
+    delta = cfg.discount_interval
+    for t in range(1, cfg.max_iterations + 1):
+        solver.iterate()
+        if delta > 0 and t % delta == 0:
+            k = t / delta
+            state.discount(k / (k + 1.0))
+    assert state.vstrat, "vector regime accumulated no strategy on the flop root"
     # The flop root must build cluster-keyed nodes on **both** future streets
-    # (turn AND river) — the two-chance-level path is the whole point of the
-    # change, and a missing street's uniform fallback could otherwise slip past
-    # the exploitability gate if uniform play on it happened to be cheap.
+    # (turn AND river) — the two-chance-level path is the whole point — and a
+    # missing street's uniform fallback could otherwise slip past the
+    # exploitability gate if uniform play on it happened to be cheap.
     cluster_stages = {
-        pk[0] for pk, rs in res.state.vrow_space.items() if rs == "cluster"
+        pk[0] for pk, rs in state.vrow_space.items() if rs == "cluster"
     }
     assert {"turn", "river"} <= cluster_stages, (
         f"expected cluster-keyed turn AND river nodes in a flop subgame; "
         f"got cluster stages {sorted(cluster_stages)}"
     )
     # The flop root itself stays lossless (combo-keyed), read by SearchPolicy.
-    assert any(rs == "combo" for rs in res.state.vrow_space.values()), (
+    assert any(rs == "combo" for rs in state.vrow_space.values()), (
         "expected a combo-keyed (lossless) flop-root node"
     )
 
-    sigma = _solver_flop_sigma(res.state, env, sub)
+    sigma = _solver_flop_sigma(state, env, sub)
     expl = flop_exploitability(sub, sigma)
     value = flop_game_value(sub, sigma)
     assert expl < 0.05 * scale, f"vector flop path exploitable: expl={expl:.4f} scale={scale}"
     assert abs(value - oracle_value) < 0.03 * scale, (
         f"vector flop game value {value:.4f} != oracle {oracle_value:.4f} (scale {scale})"
+    )
+
+
+@pytest.mark.slow
+def test_mccfr_flop_reaches_equilibrium(_seeded):
+    """The **production** flop path — MCCFR on a HU flop root — reaches the oracle **value**.
+
+    The router now sends a HU flop to external-sampling MCCFR (two future chance
+    nodes make the full-width vector walk too slow / non-scaling, ``_select_regime``).
+    This is the Nash gate for that path: it closes the one gap the other oracle tests
+    leave — MCCFR **crossing chance nodes** (turn+river) reaching the correct
+    equilibrium **value** (the river MCCFR test crosses none; the vector flop test
+    crosses two but is full-width).  Driven through ``solve`` so the routing is
+    exercised.
+
+    Gate = the unique zero-sum **game value** matches the independent turn+river-
+    enumerating oracle.  Deliberately **not** an exploitability gate: unlike the river
+    MCCFR test (one street, every infoset swept), sampled MCCFR across *two* chance
+    nodes cannot reach every runout/cluster-conditioned betting node in a single-worker
+    budget, so the sampled average has genuinely-unreached infosets — their exploit
+    dominates a whole-tree best response, but they never reach play (production plays
+    the **final iterate**, shrinks under-trained nodes to the blueprint, re-solves on a
+    deviation, and pools far more samples across the 64-worker fleet).  That per-infoset
+    coverage/convergence cost is the known quality trade for the ~100× flop speed-up
+    ([[project_vector_flop_regime_lever]]); the achievable, meaningful Nash signal for a
+    sampled multi-street solve is that it reaches the right value.
+    """
+    env, r0, r1, s0, s1 = _flop_subgame(_seeded)
+    _install_lossless_lut(env)
+    sub = build_flop_subgame(env, r0, r1, s0, s1)
+    scale = _flop_scale(sub)
+    oracle_value = flop_game_value(sub, BruteForceFlopCFR(sub).solve(_FLOP_ORACLE_ITERS))
+
+    ranges = {0: r0.astype(np.float32), 1: r1.astype(np.float32)}
+    ctx = _ctx(env, ranges=ranges, seed=7)
+    cfg = SolverConfig(
+        leaf=ctx.leaf, max_iterations=20000, max_wall_seconds=600.0,
+        discount_interval=2000, workers=1,
+    )
+    res = solve(env, ctx, cfg)
+    assert res.regime == "mccfr", f"expected MCCFR routing for a HU flop, got {res.regime}"
+    assert res.state.vstrat, "MCCFR flop accumulated no strategy"
+
+    sigma = _solver_flop_sigma(res.state, env, sub)
+    value = flop_game_value(sub, sigma)
+    assert abs(value - oracle_value) < 0.05 * scale, (
+        f"mccfr flop game value {value:.4f} != oracle {oracle_value:.4f} (scale {scale})"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# §8.6 ceiling gate — DBR with a perfect model must exploit (search-internal)
+# --------------------------------------------------------------------------- #
+
+class _FoldHeavyModel:
+    """A **perfect** opponent model that folds most of the time (``sigma-hat``).
+
+    ``confidence == 1`` ⇒ ``p_max = 1`` ⇒ the DBR clamp pins the opponent's search
+    strategy to *exactly* this row every iteration (``sigma-tilde = sigma-hat``), so it
+    is a genuine, known, non-equilibrium opponent to best-respond to — and the
+    opponent's accumulated average in the DBR solve is ``sigma-hat`` itself.
+    """
+
+    def __init__(self, pfold: float = 0.8):
+        self.pfold = float(pfold)
+
+    def strategy(self, state):
+        legal = list(state.legal_actions)
+        n = len(legal)
+        row = np.full(n, (1.0 - self.pfold) / max(1, n - 1), dtype=np.float64)
+        if "fold" in legal:
+            row[legal.index("fold")] = self.pfold
+        else:                                    # no fold available → uniform
+            row[:] = 1.0 / n
+        return row / row.sum()
+
+    def confidence(self, state):
+        return 1.0
+
+    def reopen_after_fork(self):
+        pass
+
+
+def _drive_vector_flop(env, ctx, cfg) -> SolverState:
+    """Full-width vector solve of a flop root, driven directly (the router now sends a
+    HU flop to sampled MCCFR).  Full-width ⇒ tight, exact-per-iteration convergence, so
+    the clamp's exploitation shows as a clean deterministic value rather than through
+    MCCFR sampling noise.  The clamp seam (``vform.apply_model_clamp``) is the SAME one
+    the production MCCFR flop path runs, so this validates the mechanism in use."""
+    state = SolverState.empty()
+    solver = _VectorSolver(env, state, ctx, cfg, ctx.rng)
+    d = cfg.discount_interval
+    for t in range(1, cfg.max_iterations + 1):
+        solver.iterate()
+        if d > 0 and t % d == 0:
+            k = t / d
+            state.discount(k / (k + 1.0))
+    return state
+
+
+@pytest.mark.slow
+def test_dbr_with_perfect_model_beats_vanilla_vs_the_opponent(_seeded):
+    """§8.6 ceiling: with a PERFECT model, DBR is not worse than vanilla — and exploits.
+
+    The go/no-go for the whole exploitation programme, as a **deterministic subgame
+    value** rather than noisy sampled play: best-responding to a fixed, known,
+    non-equilibrium opponent ``sigma-hat`` (DBR, ``p_max = 1``) cannot score *worse*
+    than playing the equilibrium against it (vanilla), and on an exploitable opponent it
+    scores strictly better.  This is the invariant an end-to-end bb/100 comparison is
+    *trying* to measure — but on dev hardware the per-hand all-in variance swamps it
+    (CI ±100+ bb/100 at any feasible hand count), so the played-EV ceiling is a
+    production-hardware procedure; here we assert the exact search-internal value.
+
+    Construction: solve the same small flop subgame vanilla and DBR (fold-heavy model on
+    the opponent seat).  With ``p_max = 1`` the DBR solve's opponent average *is*
+    ``sigma-hat``, so score hero vs that same ``sigma-hat`` both ways — DBR hero (a best
+    response) and vanilla hero (the equilibrium) — via the exact ``flop_game_value``.
+    Driven full-width (vector) for a tight, low-variance signal (see ``_drive_vector_flop``);
+    parametrised over the autouse ``_seeded`` trials for a spread of subgames.
+
+    Two gates: (1) **non-inferiority** — ``DBR >= vanilla`` within a small convergence-noise
+    tolerance (the literal §8.6 "STOP if it fails"); (2) the clamp is **not a silent
+    no-op** — DBR's hero strategy actually differs from vanilla's.  (The strictly-positive
+    exploitation magnitude — mean gain ~+0.7 over these subgames, every trial ≥ 0 — is
+    measured; it is left unasserted per-trial only because the smallest subgame's gain is
+    within convergence noise of 0.)
+    """
+    env, r0, r1, s0, s1 = _flop_subgame(_seeded)
+    _install_lossless_lut(env)
+    sub = build_flop_subgame(env, r0, r1, s0, s1)
+    scale = _flop_scale(sub)
+    ranges = {0: r0.astype(np.float32), 1: r1.astype(np.float32)}
+    ctx_van = _ctx(env, ranges=ranges, seed=7)                       # hero == seat 0
+    ctx_dbr = dataclasses.replace(ctx_van, models={1: _FoldHeavyModel()})
+    cfg = SolverConfig(
+        leaf=ctx_van.leaf, max_iterations=3000, max_wall_seconds=600.0,
+        discount_interval=300, workers=1, auto_budget=False,
+    )
+    p_van = _solver_flop_sigma(_drive_vector_flop(env, ctx_van, cfg), env, sub)
+    p_dbr = _solver_flop_sigma(_drive_vector_flop(env, ctx_dbr, cfg), env, sub)
+
+    def hero_ev(hero_from, opp_from):
+        # Splice: hero (seat 0) rows from one solve, opponent (seat 1 == sigma-hat) rows
+        # from the DBR solve; score with the exact subgame value.
+        prof = {k: row for k, row in hero_from.items() if k[0] == 0}
+        prof.update({k: row for k, row in opp_from.items() if k[0] != 0})
+        return flop_game_value(sub, prof)
+
+    val_dbr = hero_ev(p_dbr, p_dbr)          # best response to sigma-hat
+    val_van = hero_ev(p_van, p_dbr)          # equilibrium hero vs sigma-hat
+    gain = val_dbr - val_van
+
+    # (1) Non-inferiority — the §8.6 ceiling.  tol absorbs residual convergence noise at
+    # 3000 full-width iterations.  A regressed exploiter is sharply negative.
+    assert gain >= -0.02 * scale, (
+        f"DBR worse than vanilla vs sigma-hat — gain={gain:.3f} scale={scale} "
+        f"(exploitation regressed; §8.6 says STOP)"
+    )
+    # (2) The clamp is live, not a silent no-op: hero's DBR strategy differs from vanilla's
+    # (best-responding to a fold-heavy opponent is not the equilibrium).
+    max_diff = max(
+        (float(np.abs(p_dbr[k] - p_van[k]).max()) for k in p_dbr if k[0] == 0),
+        default=0.0,
+    )
+    assert max_diff > 1e-3, (
+        f"DBR hero strategy identical to vanilla — the model clamp had no effect "
+        f"(max row diff {max_diff:.2e})"
     )
 
 

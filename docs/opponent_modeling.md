@@ -343,12 +343,12 @@ belief-likelihood swap is unchanged — `σ̂` is now supplied by `SyntheticOppo
 
 ### 6.4 Regime gating (`solver.py`) — NO GATE (2026-07-22)
 
-**`_select_regime` is unchanged from vanilla.** Because A clamps **both**
+**`_select_regime` is unchanged from vanilla.** Because DBR clamps **both**
 regimes (§5.2 MCCFR, §6.7 vector), there is no `force_mccfr_when_modeled` gate:
 a modeled subgame takes exactly the regime it would take vanilla (HU
-flop/turn/river → vector, else MCCFR). This removes the MCCFR-vs-vector
-solution-quality confound that forcing would have injected into the paired
-A-vs-B0 comparison. Log `regime` per solve as today.
+turn/river → vector; HU flop, HU pre-flop, and any multiway → MCCFR). This removes
+the MCCFR-vs-vector solution-quality confound that forcing would have injected into
+the paired DBR-vs-vanilla comparison. Log `regime` per solve as today.
 
 ### 6.5 What does not change
 

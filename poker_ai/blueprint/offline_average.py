@@ -18,8 +18,19 @@ search stack unchanged (``CFRTables(index_path=<out>/lmdb_index)`` +
 Row alignment is positional: every retained checkpoint shares the one
 ``lmdb_index`` written by the run, so ``(street, row)`` denotes the same
 information set in every snapshot and the average is a plain per-row mean over
-the snapshots that contain the row (rows allocated later in training are absent
-from earlier, shorter chunk files — those contribute to a smaller divisor).
+the snapshots **that had a real regret-matching opinion for that row** — not
+every snapshot the row is merely present in. A snapshot whose regret row for
+an infoset never went positive contributes nothing (see :func:`average_chunk`):
+its would-be maskless-uniform placeholder is excluded from both the sum and
+the divisor, rather than diluting the mean of snapshots that *did* converge on
+something. A row with NO retained snapshot ever recording positive regret for
+it is written all-zero; at read time this correctly falls back to live regret
+matching (:meth:`poker_ai.search.policy.BlueprintPolicy._average_strategy`,
+mass 0 < ``min_strategy_mass``), which itself degrades to uniform-over-legal
+for such a row (its regret is all-non-positive there too) — so the visible
+behaviour for a genuinely never-converged infoset is unchanged, it just isn't
+baked redundantly into the stored table, and the fallback masks to the node's
+actual legal actions rather than spreading mass over every column.
 
 The post-flop average is stored as scaled integer pseudo-counts (the strategy
 tables are ``int32`` visit counts), so a row that averaged the probability
@@ -155,8 +166,20 @@ def average_chunk(
             continue
         arr = np.load(path)
         k = min(arr.shape[0], n_rows)  # earlier snapshots may hold fewer rows
-        acc[:k] += sigma_from_regret_chunk(arr[:k])
-        count[:k] += 1
+        chunk = arr[:k]
+        # A row with no positive regret in THIS snapshot has no real signal —
+        # sigma_from_regret_chunk's maskless-uniform fallback for it is a pure
+        # placeholder, not a genuine regret-matched opinion. Excluded from both
+        # the accumulator and the divisor (not just zeroed, which would still
+        # dilute the mean for rows with real signal in other snapshots): a row
+        # trained late keeps its average over only the snapshots where it had
+        # something to say, rather than being watered down by early snapshots'
+        # placeholder uniform contributions.
+        has_signal = np.clip(chunk, 0, None).sum(axis=1) > 0.0
+        if has_signal.any():
+            sigma = sigma_from_regret_chunk(chunk)
+            acc[:k][has_signal] += sigma[has_signal]
+            count[:k][has_signal] += 1
         del arr  # release the ~80 MB snapshot chunk before the next load
 
     out = np.zeros((n_rows, n_actions), dtype=np.int32)
@@ -164,8 +187,17 @@ def average_chunk(
     if present.any():
         mean = acc[present] / count[present][:, None]
         out[present] = np.rint(scale * mean).astype(np.int32)
-    # Rows present in no snapshot stay all-zero → the readout falls back to
-    # regret matching for them (mass 0 < min_strategy_mass).
+    # Rows present in no snapshot, or present but with no snapshot ever
+    # recording a positive-regret action, stay all-zero. At read time this
+    # correctly falls back to live regret matching (mass 0 < min_strategy_mass,
+    # see poker_ai.search.policy.BlueprintPolicy._average_strategy) — which
+    # degrades to uniform-over-LEGAL-actions for these rows too (their regret
+    # row is all-non-positive by construction), so the visible behaviour is
+    # unchanged from the old maskless uniform default, minus (a) wasted
+    # placeholder mass baked into every under-explored row, and (b) that
+    # default's illegal-column leakage (it spread mass over every action
+    # column regardless of the node's actual legal set; the live fallback
+    # masks to state.valid_mask).
 
     # Atomic: a killed job never leaves a truncated .npy that a later --resume
     # would mistake for finished work.

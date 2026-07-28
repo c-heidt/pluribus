@@ -192,6 +192,48 @@ class TestAverageStreet:
         np.testing.assert_array_equal(got[1], np.zeros(5, dtype=np.int32))
         assert got[0].sum() > 0
 
+    def test_no_positive_regret_row_stays_zero_even_if_present(self, tmp_path):
+        """A row present in every snapshot but never showing positive regret
+        in any of them must stay all-zero (defer to the live regret-match
+        fallback), not get the maskless-uniform placeholder baked in."""
+        r = 1
+        early = np.array([[-3, -1, -7, -2, -9]], dtype=np.int32)   # all-negative
+        late = np.array([[0, 0, 0, 0, 0]], dtype=np.int32)         # all-zero
+        early_dir = tmp_path / "checkpoint_1000"
+        late_dir = tmp_path / "checkpoint_2000"
+        self._write_regret(early_dir, r, early)
+        self._write_regret(late_dir, r, late)
+
+        out = tmp_path / "out"
+        out.mkdir()
+        average_street([early_dir, late_dir], late_dir, r, out, 1_000_000)
+        got = np.load(out / f"strategy_{r}_chunk_000000.npy")
+        np.testing.assert_array_equal(got[0], np.zeros(5, dtype=np.int32))
+
+    def test_placeholder_snapshots_excluded_not_just_zeroed(self, tmp_path):
+        """A row with real signal in one snapshot and no signal in another
+        must average over ONLY the real-signal snapshot — not include the
+        no-signal snapshot's placeholder (whether uniform or zero) in the
+        divisor, which would needlessly dilute a row that did converge."""
+        r = 1
+        no_signal = np.array([[-3, -1, -7, -2, -9]], dtype=np.int32)  # all-negative
+        real = np.array([[10, 0, 0, 0, 0]], dtype=np.int32)           # pure fold
+        d_no_signal = tmp_path / "checkpoint_1000"
+        d_real = tmp_path / "checkpoint_2000"
+        self._write_regret(d_no_signal, r, no_signal)
+        self._write_regret(d_real, r, real)
+
+        out = tmp_path / "out"
+        out.mkdir()
+        average_street([d_no_signal, d_real], d_real, r, out, 1_000_000)
+        got = np.load(out / f"strategy_{r}_chunk_000000.npy")
+
+        # Averaged over the ONE real-signal snapshot alone: exactly its
+        # regret-matched row (pure fold), not diluted by the no-signal one.
+        expected = np.rint(1_000_000 * sigma_from_regret_chunk(real)[0]).astype(np.int32)
+        np.testing.assert_array_equal(got[0], expected)
+        assert got[0][0] == 1_000_000  # pure fold, not watered down toward uniform
+
 
 # ---------------------------------------------------------------------------
 # build_final_blueprint — end-to-end, restore through the real tables

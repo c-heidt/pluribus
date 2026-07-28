@@ -104,9 +104,9 @@ def _stub_lut(env: PokerEnv) -> None:
 def _preflop_env(low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
     """Heads-up small-deck env at the preflop root (the MCCFR regime).
 
-    A heads-up *flop* subgame now routes to the vector regime (§6.5), so the
-    MCCFR fork-parallel tests root at the preflop instead — still ``_select_regime``
-    → MCCFR, heads-up play extending to real showdowns.
+    Roots at the preflop so ``_select_regime`` → MCCFR with heads-up play extending
+    to real showdowns.  (A HU flop is also MCCFR now, but the preflop root keeps the
+    fork-parallel tests independent of the flop's cluster machinery.)
     """
     np.random.seed(seed)
     env = PokerEnv(
@@ -312,7 +312,7 @@ class TestPlanner:
 class TestParallelSolve:
 
     def _run(self, *, workers, iters=40, seed=0):
-        env = _preflop_env(seed=0)  # HU preflop → MCCFR (flop now routes to vector)
+        env = _preflop_env(seed=0)  # HU preflop → MCCFR
         ctx = _ctx(env, seed=seed)
         return solve(env, ctx, _cfg(iters=iters, workers=workers))
 
@@ -401,8 +401,7 @@ class TestParallelSolve:
 
     def test_warm_start_re_search_parallel(self):
         # A warm-started parallel re-search runs, keeps the baseline's frozen rows,
-        # and produces a non-empty merged state.  MCCFR path → preflop root (a HU
-        # flop now routes to the vector regime, §6.5).
+        # and produces a non-empty merged state.  MCCFR path → preflop root.
         env = _preflop_env(seed=0)
         ctx = _ctx(env, seed=0)
         first = solve(env, ctx, _cfg(iters=30, workers=1))

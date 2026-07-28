@@ -662,9 +662,10 @@ def turn_exploitability(sub: TurnSubgame, sigma: Mapping[TInfoset, np.ndarray]) 
 # =========================================================================== #
 #
 # A HU **flop** subgame is flop betting → **turn chance** → per-turn turn betting
-# → **river chance** → per-(turn, river) river betting → showdown.  With the
-# vector regime routing the flop to itself (cluster-keyed future streets), it must
-# match the exact Nash of this two-chance-level game, so this oracle generalises
+# → **river chance** → per-(turn, river) river betting → showdown.  Both solver paths
+# for a flop root — production MCCFR (sampled) and the vector regime driven directly
+# (full-width, cluster-keyed future streets) — must match the Nash of this
+# two-chance-level game, so this oracle generalises
 # the turn oracle: infosets and payoffs are keyed by a **runout tuple** that grows
 # as chance nodes are crossed — ``()`` in flop betting, ``(turn,)`` in turn
 # betting, ``(turn, river)`` in river betting.  Each chance node deals the next

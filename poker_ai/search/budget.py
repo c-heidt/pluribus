@@ -45,9 +45,16 @@ from poker_ai.search.solver_state import SolverConfig
 
 
 def _is_vector(ctx: SubgameContext) -> bool:
-    """Vector iff heads-up (two live seats) on the flop/turn/river — §6.5, mirrors
-    ``_select_regime``."""
-    return len(ctx.ranges) == 2 and ctx.street_at_root in (1, 2, 3)
+    """Vector iff heads-up (two live seats) on the **turn/river** — §6.5, mirrors
+    ``_select_regime``.
+
+    A heads-up **flop** root has two future chance nodes left (turn+river) and is
+    routed to sampled MCCFR instead — the full-width vector walk over the whole
+    flop→turn→river tree is ~1 iter/s and its budget does not divide across workers,
+    so it does not scale on the 64-core target.  Turn (one chance node ahead) and
+    river (none) stay vector.
+    """
+    return len(ctx.ranges) == 2 and ctx.street_at_root in (2, 3)
 
 
 def iteration_budget(ctx: SubgameContext, cfg: SolverConfig, workers: int = 1) -> int:

@@ -67,8 +67,8 @@ class TestRegimeSelect:
 
     @pytest.mark.parametrize("street,n,expected", [
         (0, 2, "mccfr"),   # preflop HU
-        (1, 2, "vector"),  # flop HU (cluster-keyed future streets, §6.5)
-        (2, 2, "vector"),  # turn HU
+        (1, 2, "mccfr"),   # flop HU (two future chance nodes → sampled MCCFR, §6.5)
+        (2, 2, "vector"),  # turn HU (one future chance node → vector)
         (3, 2, "vector"),  # river HU
         (2, 3, "mccfr"),   # turn 3-way (multiway → MCCFR)
         (1, 3, "mccfr"),   # flop 3-way
@@ -92,6 +92,31 @@ class TestRegimeSelect:
         res = solve(env, ctx, _cfg(ctx, iters=5))
         assert res.iterations_run == 5
         assert len(res.state.vregret) > 0
+
+    @pytest.mark.parametrize("env_fn,regime,budget", [
+        (lambda: _late_env(2, seed=1), "vector", 1000),   # HU turn → auto budget 1000
+        (lambda: _preflop_env(seed=3), "mccfr", 6000),    # HU preflop → auto budget 6000
+    ])
+    def test_wall_gate_binds_under_auto_budget(self, env_fn, regime, budget):
+        """The wall-clock backstop MUST still bind with ``auto_budget=True``.
+
+        In auto mode the structural iteration budget replaces ``max_iterations`` as the
+        primary stop, but ``max_wall_seconds`` is enforced independently every iteration
+        (``run_loop``), so a tiny wall cuts the solve short at ``stop_reason='wall_cap'``
+        far below the (large) structural budget — a slow-per-iteration subgame can never
+        run past its time budget regardless of the auto iteration count.  Both regimes.
+        """
+        env = env_fn()
+        ctx = _ctx(env)
+        assert _select_regime(ctx) == regime
+        cfg = SolverConfig(
+            leaf=ctx.leaf, max_iterations=30_000, max_wall_seconds=1e-6,
+            discount_interval=200, workers=1, auto_budget=True,
+        )
+        res = solve(env, ctx, cfg)
+        assert res.stop_reason == "wall_cap", (regime, res.stop_reason)
+        # The wall cut it short well below the (much larger) structural budget.
+        assert 0 < res.iterations_run < budget, (regime, res.iterations_run)
 
 
 # --------------------------------------------------------------------------- #

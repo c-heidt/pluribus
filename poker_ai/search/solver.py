@@ -90,18 +90,28 @@ class SearchResult:
 
 
 def _select_regime(ctx: SubgameContext) -> str:
-    """Regime for ``ctx`` (§6.5): vector iff heads-up flop/turn/river, else MCCFR.
+    """Regime for ``ctx`` (§6.5): vector iff heads-up **turn/river**, else MCCFR.
 
     Vector-form CFR is the *small / late* path — a heads-up (two live seats)
-    subgame rooted on the flop, turn, or river.  The paper routes a subgame to
-    the vector regime whenever it is "relatively large or early" is **false**
-    (main p.5, supp p.22); a heads-up post-preflop subgame is neither, so all of
-    it takes the vector path.  With the future streets keyed by LUT cluster (the
-    sampled board folded into the id, §6.5) a flop root needs no explicit
-    per-runout axis, so the flop joins the turn/river here.  Everything else —
-    the preflop root, and any multiway subgame — uses external-sampling MCCFR.
+    subgame with **at most one future chance node** left to resolve: a **turn** root
+    (river ahead) or a **river** root (nothing ahead).  There it is full-width and
+    cheap, and its exactness-per-iteration is a real quality win.
+
+    A heads-up **flop** root, though, still has **two** future chance nodes
+    (turn *and* river): the vector walk is full-width across the whole flop→turn→river
+    betting tree (~10^5 nodes/iteration), which is ~1 iteration/second even on the
+    compiled core — its per-replica budget (1500) would need ~minutes/replica, and the
+    budget is *not* divisible across workers (each full-width replica needs the whole
+    horizon), so more cores do not shorten it.  So the flop goes to **external-sampling
+    MCCFR** instead: sampled opponent actions make each iteration ~100× cheaper, and the
+    MCCFR budget is a global pool *divided* across replicas, so it scales down with the
+    worker count on the 64-core target.  (The vector regime still *supports* a flop root
+    — the differential/oracle harness drives it directly — it is just no longer routed
+    there in production.)
+
+    Everything else — the pre-flop root, and any multiway subgame — is MCCFR too.
     """
-    if len(ctx.ranges) == 2 and ctx.street_at_root in (1, 2, 3):
+    if len(ctx.ranges) == 2 and ctx.street_at_root in (2, 3):
         return "vector"
     return "mccfr"
 

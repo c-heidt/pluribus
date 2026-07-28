@@ -7,9 +7,10 @@ models are attached.  Those invariants are the point of this file:
 - **Determinism** (§8.5) — a seeded solve with models is reproducible, and model rows
   are first-draw only.
 - **Multi-opponent** — one model per live opponent seat, each applied to its own seat.
-- **Regime selection is unchanged** — no ``force_mccfr_when_modeled``.  A modeled HU
-  post-flop subgame still takes the *vector* path; this is what keeps the paired
-  DBR-vs-vanilla comparison free of an MCCFR-vs-vector solution-quality confound.
+- **Regime selection is unchanged** — no ``force_mccfr_when_modeled``.  Regime is
+  model-**independent** (a HU turn/river takes vector, a HU flop/preflop takes MCCFR,
+  regardless of models), so vanilla and DBR use the *identical* regime per subgame —
+  which is what keeps the paired DBR-vs-vanilla comparison free of a regime confound.
 - **The leaf stays blueprint** (§5.4, deferred for safety) — exploitation is confined
   to the searched subtree.
 - **Hero is never modeled**, enforced at the clamp as well as at the agent.

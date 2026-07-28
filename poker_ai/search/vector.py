@@ -73,7 +73,14 @@ _regret_match_matrix = regret_match_matrix
 
 
 class _VectorSolver:
-    """Heads-up flop/turn/river vector-form Linear CFR over a fixed subgame root.
+    """Heads-up turn/river vector-form Linear CFR over a fixed subgame root.
+
+    Production routes a HU **turn or river** subgame here (``_select_regime``): at
+    most one future chance node remains, so the full-width per-combo walk is cheap.
+    A HU **flop** root (two future chance nodes) is routed to sampled MCCFR instead —
+    the vector walk still *supports* a flop root (the code below is street-general and
+    the oracle harness drives it directly), it is just too slow full-width to route
+    there in production.
 
     Constructed with the same ``(root_env, state, ctx, cfg, rng)`` surface as
     :class:`poker_ai.search.mccfr._MCCFRSolver` so :func:`solve` dispatches on the
