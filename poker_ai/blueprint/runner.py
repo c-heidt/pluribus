@@ -460,7 +460,22 @@ def start(
         "resume would trust."
     ),
 )
-def average_snapshots(train_dir, output_dir, scale, min_t, workers, resume):
+@click.option(
+    "--min_confirming_snapshots",
+    type=int,
+    default=None,
+    help=(
+        "Minimum number of independent averaged snapshots that must show "
+        "positive regret for a post-flop row before it is published (default "
+        "2 — one snapshot alone is a single categorical sample of an evolving "
+        "strategy, not yet convergence). Rows short of this are written "
+        "all-zero and correctly deferred to the live regret-match fallback at "
+        "read time, instead of publishing a falsely-confident average."
+    ),
+)
+def average_snapshots(
+    train_dir, output_dir, scale, min_t, workers, resume, min_confirming_snapshots
+):
     """Build a final blueprint by averaging a run's retained snapshots.
 
     Reconstructs the post-flop average strategy offline from the retained
@@ -468,6 +483,7 @@ def average_snapshots(train_dir, output_dir, scale, min_t, workers, resume):
     directory loadable by the evaluation / search stack unchanged.
     """
     from poker_ai.blueprint.offline_average import (
+        MIN_CONFIRMING_SNAPSHOTS_DEFAULT,
         SIGMA_SCALE_DEFAULT,
         build_final_blueprint,
     )
@@ -479,6 +495,10 @@ def average_snapshots(train_dir, output_dir, scale, min_t, workers, resume):
         min_t=min_t,
         workers=workers,
         resume=resume,
+        min_confirming_snapshots=(
+            MIN_CONFIRMING_SNAPSHOTS_DEFAULT if min_confirming_snapshots is None
+            else min_confirming_snapshots
+        ),
     )
 
 

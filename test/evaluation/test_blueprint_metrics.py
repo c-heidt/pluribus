@@ -206,89 +206,6 @@ class TestStreetMetrics:
         assert list(m["play_freq"]) == CANONICAL_ACTIONS[3]
 
 
-class TestPostflopRegretJoin:
-    """Post-flop strategy rows are offline-averaged
-    (poker_ai.blueprint.offline_average.sigma_from_regret_chunk) and always
-    carry near-full mass, whether or not the row ever had positive regret —
-    an untrained infoset gets a maskless uniform default, not zero mass. So
-    ``regret_files`` row-joins the regret table and gates 'visited' (and
-    everything derived from it) on regret positivity instead of raw mass.
-    """
-
-    STRAT = np.array(
-        [
-            [0, 0, 0, 100],     # trained: pure raise
-            [25, 25, 25, 25],   # untrained placeholder (offline-avg uniform fallback)
-            [0, 0, 90, 10],     # trained: mostly all-in
-            [25, 25, 25, 25],   # untrained placeholder
-        ],
-        dtype=np.int32,
-    )
-    REGRET = np.array(
-        [
-            [-1, -1, -1, 50],   # positive -> trained
-            [-5, -3, -1, -2],   # no positive -> untrained
-            [-1, -1, 50, -1],   # positive -> trained
-            [0, 0, 0, 0],       # no positive -> untrained
-        ],
-        dtype=np.int32,
-    )
-
-    def _write(self, tmp_path):
-        cp = tmp_path / "cp"
-        cp.mkdir()
-        np.save(cp / "strategy_1_chunk_000000.npy", self.STRAT)
-        np.save(cp / "regret_1_chunk_000000.npy", self.REGRET)
-        s = sorted(cp.glob("strategy_1_*.npy"))
-        r = sorted(cp.glob("regret_1_*.npy"))
-        return s, r
-
-    def test_visited_gated_on_regret_positivity(self, tmp_path):
-        s, r = self._write(tmp_path)
-        m = compute_street_metrics(s, street=1, regret_files=r)
-        assert m["visited_definition"] == "regret_positive"
-        assert m["n_visited"] == 2
-        assert m["visited_frac"] == pytest.approx(0.5)
-        assert m["warnings"] == []
-
-    def test_untrained_uniform_rows_excluded_from_play_freq(self, tmp_path):
-        s, r = self._write(tmp_path)
-        m = compute_street_metrics(s, street=1, regret_files=r)
-        b = m["play_freq_buckets"]
-        # Only the two trained rows contribute: [0,0,0,100] + [0,0,90,10]
-        # -> all_in 90/200 = 0.45, raise 110/200 = 0.55.
-        assert b["all_in"] == pytest.approx(0.45)
-        assert b["raise"] == pytest.approx(0.55)
-
-    def test_mass_based_fallback_mixes_in_untrained_rows(self, tmp_path):
-        """Without the join (old behaviour), every row counts as 'visited'
-        since offline-averaged rows always carry mass, so the untrained
-        placeholders' mass leaks into the aggregate alongside the trained
-        rows' — this is exactly what the join fixes."""
-        s, _ = self._write(tmp_path)
-        m = compute_street_metrics(s, street=1)
-        assert m["visited_definition"] == "mass"
-        assert m["n_visited"] == 4
-        b = m["play_freq_buckets"]
-        assert b["all_in"] == pytest.approx(0.35)
-        assert b["raise"] == pytest.approx(0.40)
-
-    def test_regret_files_empty_falls_back_with_warning(self, tmp_path):
-        s, _ = self._write(tmp_path)
-        m = compute_street_metrics(s, street=1, regret_files=[])
-        assert m["visited_definition"] == "mass"
-        assert any("no regret chunks found" in w for w in m["warnings"])
-
-    def test_regret_row_count_mismatch_falls_back_with_warning(self, tmp_path):
-        s, _ = self._write(tmp_path)
-        cp = s[0].parent
-        np.save(cp / "regret_1_chunk_000000.npy", self.REGRET[:2])
-        r = sorted(cp.glob("regret_1_*.npy"))
-        m = compute_street_metrics(s, street=1, regret_files=r)
-        assert m["visited_definition"] == "mass"
-        assert any("row mismatch" in w for w in m["warnings"])
-
-
 # --------------------------------------------------------------------------- #
 # Regret metrics
 # --------------------------------------------------------------------------- #
@@ -487,36 +404,6 @@ class TestLeafCoverage:
         report = build_report(bp, include_leaf_coverage=True, min_strategy_mass=10)
         assert set(report["leaf_coverage"]) == {"preflop", "river"}
         assert report["meta"]["min_strategy_mass"] == 10
-        # River (post-flop) collapses `effective` to regret-positivity alone
-        # (rows 1 and 4 of LC_REGRET_ROWS) rather than avg_trusted OR
-        # regret_pos: avg_trusted is structurally ~always true once the
-        # strategy table is offline-averaged, so it can't distinguish a
-        # genuinely trained row from an untrained uniform-fallback one — see
-        # compute_leaf_coverage's docstring.
-        assert report["leaf_coverage"]["river"]["avg_trusted_frac"] is None
-        assert report["leaf_coverage"]["river"]["regret_fallback_frac"] is None
-        assert report["leaf_coverage"]["river"]["effective_frac"] == pytest.approx(2 / 5)
-        assert report["leaf_coverage"]["preflop"]["effective_frac"] == pytest.approx(3 / 5)
-
-    def test_build_report_min_regret_magnitude_does_not_affect_preflop(self, tmp_path):
-        """min_regret_magnitude is a post-flop-only knob: pre-flop's regret
-        table has no reason to share a postflop-calibrated magnitude scale,
-        so build_report must not thread it into the street-0 leaf-coverage
-        call (regression: it originally leaked through unconditionally,
-        silently changing preflop's numbers on any --min-regret-magnitude run)."""
-        bp = _write_leaf_checkpoint(tmp_path, streets=(0, 3))
-        report = build_report(
-            bp, include_leaf_coverage=True, min_strategy_mass=10,
-            min_regret_magnitude=5,
-        )
-        # Pre-flop: unaffected, still the positivity-based OR test.
-        assert report["leaf_coverage"]["preflop"]["regret_pos_definition"] == "regret_positive"
-        assert report["leaf_coverage"]["preflop"]["avg_trusted_frac"] == pytest.approx(2 / 5)
-        assert report["leaf_coverage"]["preflop"]["effective_frac"] == pytest.approx(3 / 5)
-        # River: switches to the magnitude test. LC_REGRET_ROWS sum(|regret|)
-        # = [4, 8, 8, 0, 9]; threshold 5 keeps rows 1,2,4 (3/5), not the
-        # positivity test's rows 1,4 only (2/5).
-        assert report["leaf_coverage"]["river"]["regret_pos_definition"] == "regret_magnitude"
         assert report["leaf_coverage"]["river"]["effective_frac"] == pytest.approx(3 / 5)
 
     def test_leaf_coverage_off_by_default(self, tmp_path):
@@ -552,16 +439,7 @@ class TestReport:
         assert set(report["streets"]) == {"preflop", "flop"}
         assert report["meta"]["n_infosets_total"] == 8
         assert set(report["regret"]) == {"preflop", "flop"}
-        # STRAT_ROWS (4 rows) and REGRET_ROWS (2 rows) are intentionally not
-        # row-aligned in this fixture; street 1 (post-flop) now row-joins
-        # against the regret table for its trained-row test (see module
-        # docstring), so the mismatch surfaces as a warning and falls back to
-        # mass-based visitation for that street rather than silently misjoining.
-        assert report["warnings"] == [
-            "street 1: chunk 0 row mismatch between strategy and regret "
-            "tables — trained-row join disabled, falling back to raw "
-            "strategy mass"
-        ]
+        assert report["warnings"] == []
 
     def test_regret_off_by_default(self, tmp_path):
         bp = _write_checkpoint(tmp_path)

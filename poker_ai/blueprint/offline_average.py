@@ -39,6 +39,21 @@ vector ``p`` is written as ``round(SIGMA_SCALE * p)``.  At read time
 to the legal actions and renormalises, so the scale cancels and the
 ``min_strategy_mass`` gate (default 10) passes comfortably (row mass
 ``~SIGMA_SCALE`` = 1e6).
+
+A row also needs at least :data:`MIN_CONFIRMING_SNAPSHOTS_DEFAULT`
+*independent* snapshots to have shown positive regret before it is published
+at all — one confirming snapshot alone is a single categorical sample of an
+evolving strategy (regret matching's per-touch delta is ``voa[action] - vo``
+against that traversal's own mean, so the best-performing action of a single
+touch is positive almost by construction; it does not mean the row has
+converged). Short of that bar the row is written all-zero and — as above —
+correctly deferred to the live regret-match fallback rather than publishing a
+falsely-confident average. This keeps a published row's mass a genuine
+confidence signal again (as it already was for pre-flop's real online visit
+counts), rather than every row trivially clearing ``min_strategy_mass``
+regardless of how much training it actually saw — so a plain mass check
+(``evaluation/blueprint_metrics.py``, ``BlueprintPolicy``) is meaningful for
+post-flop without any special-casing.
 """
 
 from __future__ import annotations
@@ -70,6 +85,20 @@ _TASK_PEAK_MB = 800
 #: stored row sums to ~``SIGMA_SCALE`` — far above ``min_strategy_mass`` and
 #: well within ``int32`` range.
 SIGMA_SCALE_DEFAULT = 1_000_000
+
+#: Minimum number of RETAINED SNAPSHOTS that must independently record a
+#: positive-regret action for a post-flop row before its averaged strategy is
+#: published with full (trusted) mass.  A row confirmed by only one snapshot is
+#: a single categorical sample of an evolving strategy — exactly the situation
+#: :class:`poker_ai.search.policy.BlueprintPolicy` already distrusts for
+#: pre-flop's real visit counts ("a row visited once ... is worse than regret
+#: matching", see its docstring) — so the same standard is applied here rather
+#: than inventing a payoff-scale-dependent regret-magnitude threshold (there is
+#: no natural default for one; this constant needs none, since "reconfirmed
+#: independently at least twice" is meaningful regardless of stakes or chunk
+#: size). Below this, the row is written all-zero and deferred to the live
+#: regret-match fallback (see :func:`average_chunk`).
+MIN_CONFIRMING_SNAPSHOTS_DEFAULT = 2
 
 #: Streets whose strategy is reconstructed offline from snapshots.  Pre-flop
 #: (street 0) keeps its trained running average and is copied through verbatim.
@@ -127,6 +156,7 @@ def average_chunk(
     out_dir: Path,
     scale: int,
     resume: bool = False,
+    min_confirming_snapshots: int = MIN_CONFIRMING_SNAPSHOTS_DEFAULT,
 ) -> bool:
     """Average one ``(street, chunk)`` across snapshots; the unit of work.
 
@@ -137,6 +167,11 @@ def average_chunk(
     Peak memory is one float64 accumulator + one int64 counter + one snapshot
     chunk (~``_TASK_PEAK_MB``), independent of the snapshot count or the run's
     total on-disk size.
+
+    ``min_confirming_snapshots`` (see :data:`MIN_CONFIRMING_SNAPSHOTS_DEFAULT`)
+    additionally requires that many snapshots to have independently shown
+    positive regret for a row before its average is published; short of that
+    the row is written all-zero, deferring to the live regret-match fallback.
 
     Returns
     -------
@@ -183,18 +218,20 @@ def average_chunk(
         del arr  # release the ~80 MB snapshot chunk before the next load
 
     out = np.zeros((n_rows, n_actions), dtype=np.int32)
-    present = count > 0
+    present = count >= min_confirming_snapshots
     if present.any():
         mean = acc[present] / count[present][:, None]
         out[present] = np.rint(scale * mean).astype(np.int32)
-    # Rows present in no snapshot, or present but with no snapshot ever
-    # recording a positive-regret action, stay all-zero. At read time this
-    # correctly falls back to live regret matching (mass 0 < min_strategy_mass,
-    # see poker_ai.search.policy.BlueprintPolicy._average_strategy) — which
-    # degrades to uniform-over-LEGAL-actions for these rows too (their regret
-    # row is all-non-positive by construction), so the visible behaviour is
-    # unchanged from the old maskless uniform default, minus (a) wasted
-    # placeholder mass baked into every under-explored row, and (b) that
+    # Rows present in no snapshot, present but with no snapshot ever recording
+    # a positive-regret action, or confirmed by fewer than
+    # min_confirming_snapshots independent snapshots, stay all-zero. At read
+    # time this correctly falls back to live regret matching (mass 0 <
+    # min_strategy_mass, see poker_ai.search.policy.BlueprintPolicy.
+    # _average_strategy) — which degrades to uniform-over-LEGAL-actions for a
+    # never-converged row too (its regret is all-non-positive there as well),
+    # so the visible behaviour for such a row is unchanged from the old
+    # maskless uniform default, minus (a) wasted placeholder mass baked into
+    # every under-explored row, and (b) that
     # default's illegal-column leakage (it spread mass over every action
     # column regardless of the node's actual legal set; the live fallback
     # masks to state.valid_mask).
@@ -233,6 +270,7 @@ def average_street(
     scale: int,
     workers: int = 1,
     resume: bool = False,
+    min_confirming_snapshots: int = MIN_CONFIRMING_SNAPSHOTS_DEFAULT,
 ) -> int:
     """Average the regret-matched strategy of street *r* across snapshots.
 
@@ -257,6 +295,8 @@ def average_street(
         Chunks to process concurrently (peak RAM ≈ ``workers * 800 MB``).
     resume : bool, optional
         Skip chunks whose output already exists.
+    min_confirming_snapshots : int, optional
+        See :func:`average_chunk` / :data:`MIN_CONFIRMING_SNAPSHOTS_DEFAULT`.
 
     Returns
     -------
@@ -264,7 +304,8 @@ def average_street(
         Number of strategy chunks written for this street (skipped excluded).
     """
     tasks = [
-        (snapshot_dirs, final_dir, r, chunk_id, out_dir, scale, resume)
+        (snapshot_dirs, final_dir, r, chunk_id, out_dir, scale, resume,
+         min_confirming_snapshots)
         for chunk_id in _chunk_ids(final_dir, f"regret_{r}")
     ]
     return _run_chunk_tasks(tasks, workers)
@@ -353,6 +394,7 @@ def build_final_blueprint(
     min_t: Optional[int] = None,
     workers: int = 1,
     resume: bool = False,
+    min_confirming_snapshots: int = MIN_CONFIRMING_SNAPSHOTS_DEFAULT,
 ) -> Path:
     """Build a final blueprint by averaging a run's retained snapshots.
 
@@ -381,6 +423,11 @@ def build_final_blueprint(
         Continue into an existing *out_dir*, skipping artefacts that are
         already complete.  Every output is written atomically, so anything
         present is finished and safe to skip.  Use after an interrupted build.
+    min_confirming_snapshots : int, optional
+        See :func:`average_chunk` / :data:`MIN_CONFIRMING_SNAPSHOTS_DEFAULT`.
+        A post-flop row confirmed (positive regret) by fewer than this many of
+        the averaged snapshots is written all-zero instead of published,
+        deferring to the live regret-match fallback at read time.
 
     Returns
     -------
@@ -435,6 +482,16 @@ def build_final_blueprint(
         f"{states[avg_snapshots[0]]['t']:,}", f"{states[avg_snapshots[-1]]['t']:,}",
         f"{min_t:,}", out_dir,
     )
+    if len(avg_snapshots) < min_confirming_snapshots:
+        log.warning(
+            "Only %d snapshot(s) >= min_t are being averaged, but "
+            "min_confirming_snapshots=%d — no post-flop row can ever be "
+            "confirmed, so the entire post-flop average will be written "
+            "empty (every row deferred to the live regret-match fallback). "
+            "Lower --min_t to include more snapshots, or pass a lower "
+            "min_confirming_snapshots, if that isn't intended.",
+            len(avg_snapshots), min_confirming_snapshots,
+        )
 
     # ------------------------------------------------------------------
     # Assemble the output directory.
@@ -471,7 +528,8 @@ def build_final_blueprint(
     # ~75% of the work, so a flat task list keeps every worker busy to the end
     # instead of draining at each street boundary.
     tasks = [
-        (avg_snapshots, final_dir, r, chunk_id, out_cp, scale, resume)
+        (avg_snapshots, final_dir, r, chunk_id, out_cp, scale, resume,
+         min_confirming_snapshots)
         for r in _POSTFLOP_STREETS
         for chunk_id in _chunk_ids(final_dir, f"regret_{r}")
     ]
@@ -502,11 +560,13 @@ def _cli(
     min_t: Optional[int],
     workers: int = 1,
     resume: bool = False,
+    min_confirming_snapshots: int = MIN_CONFIRMING_SNAPSHOTS_DEFAULT,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     build_final_blueprint(
         Path(train_dir), Path(output_dir), scale=scale, min_t=min_t,
         workers=workers, resume=resume,
+        min_confirming_snapshots=min_confirming_snapshots,
     )
 
 
@@ -520,8 +580,13 @@ if __name__ == "__main__":
     parser.add_argument("--min_t", type=int, default=None)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--min_confirming_snapshots", type=int,
+        default=MIN_CONFIRMING_SNAPSHOTS_DEFAULT,
+    )
     args = parser.parse_args()
     _cli(
         args.train_dir, args.output_dir, args.scale, args.min_t,
         workers=args.workers, resume=args.resume,
+        min_confirming_snapshots=args.min_confirming_snapshots,
     )

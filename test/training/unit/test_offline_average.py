@@ -80,8 +80,14 @@ class TestAverageStreet:
         out = tmp_path / "out"
         out.mkdir()
         scale = 1_000_000
+        # min_confirming_snapshots=1: this test is about the presence-count
+        # divisor, not the confirming-snapshots publish gate, and row 2 is
+        # deliberately confirmed by only one snapshot.
         # final_dir defines the shape → the 3-row snapshot.
-        n = average_street([snap_short, snap_full], snap_full, r, out, scale)
+        n = average_street(
+            [snap_short, snap_full], snap_full, r, out, scale,
+            min_confirming_snapshots=1,
+        )
         assert n == 1
 
         got = np.load(out / f"strategy_{r}_chunk_000000.npy")
@@ -186,7 +192,12 @@ class TestAverageStreet:
 
         out = tmp_path / "out"
         out.mkdir()
-        average_street([snap_dir], final_dir, r, out, 1_000_000)
+        # min_confirming_snapshots=1: this test is about absence-from-file vs
+        # presence, not the confirming-snapshots publish gate, and there is
+        # only one snapshot to confirm anything at all.
+        average_street(
+            [snap_dir], final_dir, r, out, 1_000_000, min_confirming_snapshots=1
+        )
         got = np.load(out / f"strategy_{r}_chunk_000000.npy")
         assert got.shape == (2, 5)
         np.testing.assert_array_equal(got[1], np.zeros(5, dtype=np.int32))
@@ -225,7 +236,13 @@ class TestAverageStreet:
 
         out = tmp_path / "out"
         out.mkdir()
-        average_street([d_no_signal, d_real], d_real, r, out, 1_000_000)
+        # min_confirming_snapshots=1: this test is about dilution by a
+        # no-signal snapshot, not the confirming-snapshots publish gate, and
+        # the row is deliberately confirmed by only one real-signal snapshot.
+        average_street(
+            [d_no_signal, d_real], d_real, r, out, 1_000_000,
+            min_confirming_snapshots=1,
+        )
         got = np.load(out / f"strategy_{r}_chunk_000000.npy")
 
         # Averaged over the ONE real-signal snapshot alone: exactly its
@@ -233,6 +250,45 @@ class TestAverageStreet:
         expected = np.rint(1_000_000 * sigma_from_regret_chunk(real)[0]).astype(np.int32)
         np.testing.assert_array_equal(got[0], expected)
         assert got[0][0] == 1_000_000  # pure fold, not watered down toward uniform
+
+    def test_default_defers_row_confirmed_by_only_one_snapshot(self, tmp_path):
+        """The MIN_CONFIRMING_SNAPSHOTS_DEFAULT (2) gate: a row with real
+        signal in exactly one snapshot is NOT published by default — it's a
+        single categorical sample, same standard BlueprintPolicy already
+        applies to a once-visited pre-flop row. Deferred to zero (live
+        regret-match fallback) rather than a falsely-confident average."""
+        r = 1
+        only_signal = np.array([[10, 0, 0, 0, 0]], dtype=np.int32)  # pure fold
+        snap = tmp_path / "checkpoint_1000"
+        self._write_regret(snap, r, only_signal)
+
+        out = tmp_path / "out"
+        out.mkdir()
+        average_street([snap], snap, r, out, 1_000_000)  # default gate
+        got = np.load(out / f"strategy_{r}_chunk_000000.npy")
+        np.testing.assert_array_equal(got[0], np.zeros(5, dtype=np.int32))
+
+    def test_default_publishes_row_confirmed_by_two_snapshots(self, tmp_path):
+        """The same row, but independently confirmed by a second snapshot,
+        clears the default gate and is published with full mass."""
+        r = 1
+        signal_a = np.array([[10, 0, 0, 0, 0]], dtype=np.int32)  # pure fold
+        signal_b = np.array([[8, 0, 0, 0, 0]], dtype=np.int32)   # also fold-leaning
+        snap_a = tmp_path / "checkpoint_1000"
+        snap_b = tmp_path / "checkpoint_2000"
+        self._write_regret(snap_a, r, signal_a)
+        self._write_regret(snap_b, r, signal_b)
+
+        out = tmp_path / "out"
+        out.mkdir()
+        average_street([snap_a, snap_b], snap_b, r, out, 1_000_000)  # default gate
+        got = np.load(out / f"strategy_{r}_chunk_000000.npy")
+        expected = np.rint(
+            1_000_000 * (sigma_from_regret_chunk(signal_a)[0]
+                         + sigma_from_regret_chunk(signal_b)[0]) / 2
+        ).astype(np.int32)
+        np.testing.assert_array_equal(got[0], expected)
+        assert got[0].sum() >= 10  # clears min_strategy_mass at read time
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +474,12 @@ class TestBuildFinalBlueprint:
         np.save(train_dir / "checkpoint_5000" / "regret_2_chunk_000000.npy", late)
 
         out_dir = tmp_path / "out"
-        build_final_blueprint(train_dir, out_dir, min_t=2000)
+        # min_confirming_snapshots=1: this test is about min_t filtering, not
+        # the confirming-snapshots publish gate, and only one snapshot
+        # survives the min_t=2000 cutoff by construction.
+        build_final_blueprint(
+            train_dir, out_dir, min_t=2000, min_confirming_snapshots=1
+        )
 
         got = np.load(out_dir / "checkpoint_5000" / "strategy_2_chunk_000000.npy")
         expected = np.rint(
