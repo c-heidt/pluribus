@@ -118,6 +118,20 @@ export PLURIBUS_SEARCH_CORE=${PLURIBUS_SEARCH_CORE:-1}
 # master switch above already lights every kernel.
 export PLURIBUS_CORE_KERNELS=${PLURIBUS_CORE_KERNELS:-}
 
+# Optional: rebuild the compiled core on THIS node (opt-in, REBUILD_EXT=1).  The
+# generated .c/.so are gitignored, so a node whose last build predates a newly
+# committed .pyx symbol silently keeps the stale kernel and the preflight below
+# fails ("kernels requested but NOT live").  A clean rebuild here — on the compute
+# node, matching its arch — self-heals it.  Default off preserves the pre-built
+# discipline; submit with --export=...,REBUILD_EXT=1 to force a fresh build.
+REBUILD_EXT=${REBUILD_EXT:-0}
+if [ "$REBUILD_EXT" = "1" ]; then
+  echo "REBUILD_EXT=1 → clean rebuild of poker_ai/_core on $(hostname)"
+  rm -rf build/
+  rm -f poker_ai/_core/*.so poker_ai/_core/*.c   # generated + gitignored
+  python setup.py build_ext --inplace
+fi
+
 # Preflight: with the search core on, the compiled paths must be ACTUALLY LIVE,
 # not merely requested.  Each kernel rebinds itself at import behind
 # ``except ImportError: pass``, so a missing/stale .so — or the evaluator kernel's
