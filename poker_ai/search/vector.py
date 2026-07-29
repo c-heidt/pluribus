@@ -55,6 +55,7 @@ import numpy as np
 
 from poker_ai.search.cluster_maps import ClusterMapper
 from poker_ai.search.context import SubgameContext
+from poker_ai.search.reference import compute_cbv_ref
 from poker_ai.search.solver_state import SolverConfig, SolverState
 from poker_ai.search.vform import (
     _regret_match_matrix_py,
@@ -70,6 +71,10 @@ from poker_ai.search.vform import (
 # compiled-kernel byte-parity tests and any caller that historically imported it
 # from this module.
 _regret_match_matrix = regret_match_matrix
+
+# OX-Search opt-out row columns (Approach B gadget, §11.3 step 11): the opponent's
+# per-combo choice to ENTER the subgame or take the CBV_ref alternative (OUT).
+_OX_ENTER, _OX_OUT = 0, 1
 
 
 class _VectorSolver:
@@ -165,6 +170,108 @@ class _VectorSolver:
         # The sampled board runout for the current iteration (filled in :meth:`iterate`).
         self._completion: Tuple[int, ...] = ()
 
+        # OX-Search gadget root (Approach B, §11.3 step 11): OFF unless ``cfg.beta``
+        # is set, in which case the solve is byte-for-byte the vanilla/DBR walk.  A
+        # finite β swaps the opponent's fixed root reach for the belief/opt-out
+        # gadget mix and adds the CBV_ref-anchored opt-out row (see :meth:`_ox_setup`).
+        self._ox = getattr(cfg, "beta", None) is not None
+        if self._ox:
+            self._ox_setup()
+
+    # ------------------------------------------------------------------
+    # OX-Search gadget root (Approach B — adaptation-safe exploitation, §11.3)
+    # ------------------------------------------------------------------
+
+    def _ox_setup(self) -> None:
+        """Prepare the gadget-root references (fixed for the solve).
+
+        Computes the belief entry distribution ``p̂``, the exploitation/safety chance
+        coefficients from ``(k, β)``, and the exact ``CBV_ref`` pass (anchored to the
+        blueprint — the locked decision), and allocates the per-combo opt-out regret
+        row **inside** ``state.vregret`` so it is Linear-CFR discounted and
+        cross-replica accumulated exactly like every other regret table.
+        """
+        beta = float(self.cfg.beta)
+        if beta < 0.0:
+            raise ValueError(f"OX-Search beta must be >= 0, got {beta}.")
+        bot = int(self.ctx.my_seat)
+        if bot not in self._seats:
+            raise ValueError(f"OX-Search: bot seat {bot} not live ({self._seats}).")
+        self._ox_bot = bot
+        self._ox_opp = self._seats[0] if self._seats[1] == bot else self._seats[1]
+
+        bc = np.asarray(self.ctx.board_compatible, dtype=np.float64)
+        self._ox_bc = bc
+        # k = board-compatible opponent root combos (root street lossless ⇒ cluster ==
+        # combo).  The uniform-1/k safety entry folds into ``c_safe`` (= kβ/(kβ+1)·1/k),
+        # so k enters ONLY through the two chance coefficients.
+        k = float(bc.sum())
+        if k <= 0.0:
+            raise ValueError("OX-Search: no board-compatible root combos (k = 0).")
+        denom = k * beta + 1.0
+        self._ox_c_expl = 1.0 / denom          # exploitation branch: chance, entry ∝ p̂
+        self._ox_c_safe = beta / denom         # safety branch: chance·(1/k), opt-out q
+
+        # p̂: the opponent's believed entry distribution (the A4 belief lives in
+        # ctx.ranges[opp]); board-masked and normalised to a distribution over the k
+        # feasible infosets so it balances against the uniform-1/k safety entry.
+        phat = self._reach[self._ox_opp].copy()      # already ranges[opp] * bc
+        tot = phat.sum()
+        self._ox_phat = phat / tot if tot > 0.0 else phat
+
+        # CBV_ref: the opponent's exact best-response counterfactual value vs the bot
+        # playing the BLUEPRINT, per opponent root combo — the opt-out alternative
+        # payoff.  Fixed for the solve (a property of blueprint + subgame), re-anchored
+        # to the blueprint every solve.  (At workers > 1 each replica recomputes this
+        # deterministic pass; hoisting it ahead of the fan-out is a later perf lever.)
+        self._ox_cbv = np.asarray(
+            compute_cbv_ref(self.root_env, self.ctx, self.cfg), dtype=np.float64
+        )
+
+        # Per-combo opt-out regret row (width 2: [enter, out]) as a combo-keyed root
+        # node in state.vregret under a synthetic key, so state.discount / accumulate
+        # sweep it uniformly with the real tables.  Reused on a warm re-search.
+        self._ox_optout_key = (self.root_env.public_key, "OX_OPTOUT")
+        if self._ox_optout_key not in self.state.vregret:
+            self.state.vregret[self._ox_optout_key] = np.zeros(
+                (self._n_combos, 2), dtype=np.float64
+            )
+            self.state.vrow_space[self._ox_optout_key] = "combo"
+        # Opt-out saturation (Thm 4.5 guard): mean enter-prob over the feasible
+        # infosets, refreshed each iteration; ≈ 1 ⇒ the safety branch never opts out
+        # ⇒ raise β.  Read off the solver by the agent/eval (step 12).
+        self.ox_enter_prob = float("nan")
+
+    def _iterate_ox(self) -> None:
+        """One gadget-root iteration (§11.3 step 11).
+
+        The walk itself is unchanged: the opponent plays its adversarial regret-matched
+        strategy inside the subgame (reach-only exploitation).  Only the opponent's
+        **root entry reach** becomes the gadget mix ``c_expl·p̂ + c_safe·q_enter``, and
+        the opt-out row is updated from the opponent's per-combo subgame CFV vs
+        ``CBV_ref`` (weighted by the safety-branch chance ``c_safe``).  The per-infoset
+        ``CBV_ref`` shift cancels in every interior/bot regret, so it appears ONLY here.
+        """
+        bot, opp = self._ox_bot, self._ox_opp
+        optr = self.state.vregret[self._ox_optout_key]      # (n_combos, 2)
+        q = regret_match_matrix(optr)                        # [:,0]=enter, [:,1]=out
+        q_enter = q[:, _OX_ENTER]
+        opp_entry = (self._ox_c_expl * self._ox_phat
+                     + self._ox_c_safe * q_enter) * self._ox_bc
+        # Bot best-responds to the gadget-weighted opponent (bot regrets update here).
+        self._walk(self._walk_env, bot, self._reach[bot], opp_entry)
+        # Opponent adapts; its per-combo subgame root value is the opt-out ENTER value.
+        v_enter = self._walk(self._walk_env, opp, opp_entry, self._reach[bot])
+        # Opt-out CFR update: ENTER → subgame CFV, OUT → CBV_ref; counterfactual weight
+        # is the safety-branch chance reach ``c_safe``.  Infeasible combos have
+        # v_enter == CBV_ref == 0, so their rows never move.
+        v_out = self._ox_cbv
+        node_v = q_enter * v_enter + q[:, _OX_OUT] * v_out
+        optr[:, _OX_ENTER] += self._ox_c_safe * (v_enter - node_v)
+        optr[:, _OX_OUT] += self._ox_c_safe * (v_out - node_v)
+        feas = self._ox_bc > 0.0
+        self.ox_enter_prob = float(q_enter[feas].mean()) if feas.any() else float("nan")
+
     # ------------------------------------------------------------------
     # One iteration (§6.5 vector regime)
     # ------------------------------------------------------------------
@@ -182,6 +289,11 @@ class _VectorSolver:
             self._cmaps.refresh(self._completion)
         else:
             self._completion = ()
+        if self._ox:
+            # OX-Search: the opponent enters via the belief/opt-out gadget mix
+            # (bot pass then opponent pass, sharing the sampled completion above).
+            self._iterate_ox()
+            return
         s0, s1 = self._seats
         # Alternating updates: one full tree pass per traverser.  ``_walk_env`` is
         # the compiled FastState adapter under PLURIBUS_SEARCH_CORE (else the

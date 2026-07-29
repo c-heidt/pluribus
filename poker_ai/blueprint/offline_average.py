@@ -72,6 +72,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -456,6 +457,12 @@ def _copy_lmdb_index(src_index: Path, dst_index: Path, n_players: int) -> None:
         if tmp_street.exists():
             shutil.rmtree(tmp_street)
         tmp_street.mkdir(parents=True)
+        # This runs single-threaded in the main process, ahead of the
+        # --workers-parallelized chunk averaging below, and a large street's
+        # B-tree walk can take a while — log around it so it doesn't read as
+        # a hang.
+        log.info("Copying LMDB index street_%d (compacting)...", r)
+        t0 = time.time()
         env = lmdb.open(
             str(src_street), map_size=map_size, subdir=True,
             readonly=True, lock=False,
@@ -468,6 +475,7 @@ def _copy_lmdb_index(src_index: Path, dst_index: Path, n_players: int) -> None:
         finally:
             env.close()
         os.replace(tmp_street, dst_street)
+        log.info("street_%d copied in %.1fs", r, time.time() - t0)
 
 
 def build_final_blueprint(

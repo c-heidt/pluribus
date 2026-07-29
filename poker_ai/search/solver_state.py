@@ -125,6 +125,14 @@ class SolverConfig:
     # the primary per-street budget dial *at cluster scale* (the per-street global above
     # governs low-W runs and the n_live scaling).  Indexed by ``street_at_root``.
     mccfr_min_per_replica_by_street: tuple = (750, 750, 750, 750)
+    # OX-Search safety parameter β (Approach B, PO-CES-HU; Ge et al. ICML 2024,
+    # Thm 4.6: ``exp(σ₂ˢ) − exp(σ) ≤ Δ/β``).  ``None`` → OX-Search is OFF and the
+    # vector solve is byte-for-byte the vanilla/DBR path (no gadget root, no opt-out
+    # row, no ``CBV_ref`` pass).  A finite β turns on the gadget root
+    # (:mod:`poker_ai.search.vector`): smaller β ⇒ more exploitation of the belief
+    # ``p̂``; larger β ⇒ safer (β is an upper bound; OX auto-balances).  Only the
+    # heads-up turn/river **vector** regime consumes it; the MCCFR regime ignores it.
+    beta: "float | None" = None
 
 
 class _CountingCache:

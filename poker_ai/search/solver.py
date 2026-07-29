@@ -157,6 +157,7 @@ def config_fingerprint(
             "max_wall_seconds": cfg.max_wall_seconds,
             "discount_interval": cfg.discount_interval,
             "workers": cfg.workers,
+            "beta": getattr(cfg, "beta", None),
         },
         "leaf": {
             "n_rollouts": cfg.leaf.n_rollouts,
