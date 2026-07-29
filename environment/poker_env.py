@@ -176,12 +176,12 @@ class _NumpyJSONEncoder(json.JSONEncoder):
 # axis to give up.
 RAISE_SIZES_BY_STAGE: Dict[str, Dict[str, List[float]]] = {
     "pre_flop": {
-        "first_raise":      [1.0, 2.0, 3.0],
-        "subsequent_raise": [1.0],
+        "first_raise":      [1.0, 1.5, 2.0, 2.5, 3.0, 4.0],
+        "subsequent_raise": [0.5, 1.0, 1.5],
     },
     "flop": {
-        "first_raise":      [0.5, 1.0, 1.5],
-        "subsequent_raise": [1.0],
+        "first_raise":      [0.33, 0.5, 0.75, 1.0, 1.5, 2.0],
+        "subsequent_raise": [0.5, 1.0, 1.5],
     },
     "turn": {
         "first_raise":      [0.5, 1.0],
@@ -192,8 +192,69 @@ RAISE_SIZES_BY_STAGE: Dict[str, Dict[str, List[float]]] = {
         "subsequent_raise": [1.0],
     },
 }
+"""Preflop/flop widened 2026-07-29 (from [1.0,2.0,3.0]/[1.0] and
+[0.5,1.0,1.5]/[1.0]) to give reraises a genuine middle size instead of a
+binary pot-or-shove choice — the ``subsequent_raise`` grid was a single
+1.0x-pot entry on every street, which structurally funnelled aggression
+onto all-in whenever a reraise was favoured at all (see
+[[project_dbr_offline_average_gate_bias]] for the empirical finding this
+responds to).  Turn/river are untouched: verified paper-conformant (Brown
+& Sandholm 2019 Science supplement, "at most three raise sizes for the
+first raise... at most two for the remaining raises").  Preflop/flop stay
+well short of the paper's own up-to-14-per-node richness — a prior, much
+richer preflop grid (9 first-raise / 7 subsequent options) was tried at
+6-max and rolled back (see git history) for allocating ~1B infosets at
+only ~10M iterations/player, leaving most rows with a handful of noisy
+updates; this widening is a deliberately smaller step, not a return to
+that grid, and should be validated on a smaller game/iteration budget
+before committing to a full-scale retrain."""
 
-MAX_RAISES_PER_ROUND: int = 3
+def max_raises_per_round(n_players: int) -> int:
+    """Raise-count cap for one betting round, scaled to the table size.
+
+    Was a flat ``3`` regardless of player count, which meant that at 4+
+    players a handful of early-acting raisers could exhaust the cap before
+    every player got a single chance to enter the raising war — the last
+    player(s) to act would be locked out of ever raising that round, purely
+    by seat position, once the earlier actors used it up. Scaling the cap
+    with ``n_players`` guarantees at least one full go-around: if every
+    player in turn raises once, the last one still gets their raise in
+    before the cap forces the round down to call/fold. Not derived from the
+    paper — real NLHE bounds re-raising only by stack depth, no raise-count
+    cap is stated in the rules (Science supplement, "Rules for no-limit
+    Texas hold'em poker"); this is purely an abstraction-tractability
+    device for this codebase, so there is no "correct" paper value to
+    match, only a fairness floor.
+    """
+    return n_players
+
+
+def action_grid_fingerprint(n_players: int) -> str:
+    """Stable fingerprint of this run's action-space shape.
+
+    Hashes :data:`RAISE_SIZES_BY_STAGE` together with the resolved
+    :func:`max_raises_per_round` — everything the per-stage byte alphabet
+    (:data:`_ACTION_BYTE`, built in :func:`_canonical_action_tokens`) is
+    derived from.  Resuming a checkpoint written under a different action
+    grid would silently misinterpret already-written rows (the byte a
+    token maps to shifts when the grid changes), so this is checked as a
+    structural key
+    (:class:`poker_ai.tables.checkpoint.CheckpointManager._STRUCTURAL_KEYS`)
+    rather than left to surface — or not — as a confusing shape-mismatch
+    error deep in ``ChunkStore.restore``.
+    """
+    import hashlib
+    import json
+
+    payload = {
+        "raise_sizes_by_stage": {
+            stage: {k: sorted(v) for k, v in cfg.items()}
+            for stage, cfg in sorted(RAISE_SIZES_BY_STAGE.items())
+        },
+        "max_raises_per_round": max_raises_per_round(n_players),
+    }
+    blob = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +576,7 @@ class PokerEnv:
         # Config (immutable after init — skipped in __deepcopy__)
         self._low_card_rank: int = low_card_rank
         self._high_card_rank: int = high_card_rank
+        self._max_raises_per_round: int = max_raises_per_round(n_players)
         self._initial_n_chips: int = players[0].n_chips
         # Per-seat starting stack, so ``payout`` nets each seat against its OWN
         # start rather than seat 0's.  Identical to ``_initial_n_chips`` for the
@@ -693,6 +755,7 @@ class PokerEnv:
         # check; `card_info_lut` is read-only and large, so it is shared too.
         for attr in (
             "small_blind", "big_blind", "_low_card_rank", "_high_card_rank",
+            "_max_raises_per_round",
             "_initial_n_chips", "_initial_chips_by_seat",
             "_betting_stage_to_round", "_player_i_lut",
             "_extra_legal_actions", "_overlay_version",
@@ -1294,8 +1357,9 @@ class PokerEnv:
         Mirrors the gating that :meth:`legal_actions` applies before
         delegating to :meth:`_get_available_raise_sizes`: an inactive
         player, a call amount that meets or exceeds the stack, having
-        already hit :data:`MAX_RAISES_PER_ROUND`, or **facing a lone
-        all-in** (no other live player could call a raise) all yield an
+        already hit :attr:`_max_raises_per_round` (see
+        :func:`max_raises_per_round`), or **facing a lone all-in** (no
+        other live player could call a raise) all yield an
         empty list.  Stack-clamping and min-raise enforcement come from
         ``_get_available_raise_sizes`` itself.
         """
@@ -1305,7 +1369,7 @@ class PokerEnv:
         n_chips_to_call = biggest_bet - self.current_player.n_bet_chips
         if n_chips_to_call >= self.current_player.n_chips:
             return []
-        if self._n_raises >= MAX_RAISES_PER_ROUND:
+        if self._n_raises >= self._max_raises_per_round:
             return []
         if dynamics.n_players_with_moves(self) < 2:
             # Facing a lone all-in — a raise/over-shove would only be returned
@@ -1388,7 +1452,7 @@ class PokerEnv:
         :attr:`legal_actions`, not a property of this return value.
 
         Off-tree returns are not guaranteed to be *playable*: at
-        ``_n_raises >= MAX_RAISES_PER_ROUND`` or otherwise unplayable
+        ``_n_raises >= _max_raises_per_round`` or otherwise unplayable
         states, :meth:`inject_action` will reject the string and
         return ``False``.  That rejection is the env's signal that
         the abstraction tree cannot represent the observation; the
@@ -1468,7 +1532,7 @@ class PokerEnv:
         Sanity-checked: a raise that would fall below the minimum raise
         increment, exceed the current player's stack (where canonical
         code would substitute ``all_in``), or arrive while
-        ``_n_raises >= MAX_RAISES_PER_ROUND`` / at a non-betting stage
+        ``_n_raises >= _max_raises_per_round`` / at a non-betting stage
         is rejected.  Rejection is communicated via the return value
         plus a warning log; the overlay is not mutated.
 
@@ -1537,7 +1601,7 @@ class PokerEnv:
             return False
         if not self.current_player.is_active:
             return False
-        if self._n_raises >= MAX_RAISES_PER_ROUND:
+        if self._n_raises >= self._max_raises_per_round:
             return False
         biggest_bet = max(p.n_bet_chips for p in self.players)
         n_chips_to_call = biggest_bet - self.current_player.n_bet_chips
@@ -1844,7 +1908,7 @@ class PokerEnv:
             # responses are call or fold (a raise/over-shove would just be
             # returned uncalled).  ``n_players_with_moves`` counts the current
             # live player, so ``>= 2`` means another live player remains.
-            if (self._n_raises < MAX_RAISES_PER_ROUND
+            if (self._n_raises < self._max_raises_per_round
                     and dynamics.n_players_with_moves(self) >= 2):
                 actions += self._get_available_raise_sizes()
         overlay = self._extra_legal_actions.get(public_state)

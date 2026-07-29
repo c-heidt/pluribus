@@ -74,7 +74,7 @@ class CoreDriver:
     external-sampling opponent draws come from.
     """
 
-    def __init__(self, tables):
+    def __init__(self, tables, n_players: int):
         """Wire the core against ``tables`` and verify the pure-shm invariant.
 
         Parameters
@@ -85,6 +85,9 @@ class CoreDriver:
             fallback, so a missing/stale cache would read "uniform everywhere"
             with no crash.  :meth:`_verify_caches` turns that silent failure
             into a loud one at startup.
+        n_players : int
+            This run's player count — resolves :func:`max_raises_per_round`
+            before it is dumped into the (process-global) state engine.
         """
         # Deferred so an unbuilt checkout can still import the training module.
         from environment.action_space import (
@@ -93,10 +96,10 @@ class CoreDriver:
             MAX_ACTIONS_PER_STREET,
         )
         from environment.poker_env import (
-            MAX_RAISES_PER_ROUND,
             RAISE_SIZES_BY_STAGE,
             _ACTION_BYTE,
             _STAGE_ID,
+            max_raises_per_round,
         )
         from poker_ai._core import _state as _cy_state
         from poker_ai._core import _traverse as _cy_traverse
@@ -115,7 +118,8 @@ class CoreDriver:
         # grid and would silently drift.  Idempotent across processes.
         if not _cy_state.is_configured():
             _cy_state.configure(
-                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND
+                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE,
+                max_raises_per_round(n_players),
             )
 
         self._FastState = _cy_state.FastState

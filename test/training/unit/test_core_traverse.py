@@ -37,7 +37,7 @@ from environment.action_space import (
     MAX_ACTIONS_PER_STREET,
 )
 from environment.poker_env import (
-    MAX_RAISES_PER_ROUND,
+    max_raises_per_round,
     RAISE_SIZES_BY_STAGE,
     _ACTION_BYTE,
     _STAGE_ID,
@@ -56,7 +56,7 @@ from test.training.core_diff import (
 )
 
 # Dump the encoding alphabet + raise grid into the compiled state engine once.
-cy.configure(_STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND)
+cy.configure(_STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, max_raises_per_round(3))
 
 N_PLAYERS = 2
 _T = 100  # arbitrary iteration index (unweighted increment; unused by the core)

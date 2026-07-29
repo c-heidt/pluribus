@@ -93,7 +93,7 @@ class TestCoreDriverGuardrails:
         )
         try:
             with pytest.raises(RuntimeError, match="pure-shm"):
-                CoreDriver(tables)
+                CoreDriver(tables, N_PLAYERS)
         finally:
             tables.close()
 
@@ -106,7 +106,7 @@ class TestCoreDriverGuardrails:
             # Desync one street's occupancy counter from its allocated rows.
             tables._index_caches[0]._occupancy.value -= 1
             with pytest.raises(RuntimeError, match="complete mirror"):
-                CoreDriver(tables)
+                CoreDriver(tables, N_PLAYERS)
         finally:
             tables._index_caches[0]._occupancy.value += 1
             tables.close()
@@ -114,7 +114,7 @@ class TestCoreDriverGuardrails:
     def test_builds_on_prewarmed_cache(self, tmp_path, lut):
         tables = _cached_tables(tmp_path, lut)
         try:
-            driver = CoreDriver(tables)  # must not raise
+            driver = CoreDriver(tables, N_PLAYERS)  # must not raise
             assert driver is not None
         finally:
             tables.close()
@@ -130,7 +130,7 @@ class TestRunCfr:
     def test_accumulates_wellformed_local_delta(self, tmp_path, lut):
         tables = _cached_tables(tmp_path, lut)
         try:
-            driver = CoreDriver(tables)
+            driver = CoreDriver(tables, N_PLAYERS)
             local_delta = {}
             np.random.seed(7)
             state = new_game(N_PLAYERS, lut)
@@ -150,7 +150,7 @@ class TestRunCfr:
         # populated in the same shape the Python path leaves it.
         tables = _cached_tables(tmp_path, lut)
         try:
-            driver = CoreDriver(tables)
+            driver = CoreDriver(tables, N_PLAYERS)
             local_delta = {}
             np.random.seed(11)
             state = new_game(N_PLAYERS, lut)
@@ -167,7 +167,7 @@ class TestRunCfr:
         # the worker's persistent-batch semantics.
         tables = _cached_tables(tmp_path, lut)
         try:
-            driver = CoreDriver(tables)
+            driver = CoreDriver(tables, N_PLAYERS)
             np.random.seed(3)
             buf = {}
             for _ in range(5):

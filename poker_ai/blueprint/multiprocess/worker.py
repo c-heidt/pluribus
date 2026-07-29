@@ -198,7 +198,10 @@ class Worker(mp.Process):
         # before forking, so the pure-shm read path already sees a complete
         # mirror; the driver's own guardrail re-checks that per street.  Stays
         # None (Python path) when unset or biased.
-        self._core = CoreDriver(self._tables) if core_enabled(self._bias) else None
+        self._core = (
+            CoreDriver(self._tables, self._n_players)
+            if core_enabled(self._bias) else None
+        )
 
         while True:
             name, kwargs = self._job_queue.get(block=True)

@@ -34,12 +34,15 @@ if _core.CORE_AVAILABLE:
         _ACTION_BYTE,
         _STAGE_ID,
         RAISE_SIZES_BY_STAGE,
-        MAX_RAISES_PER_ROUND,
+        max_raises_per_round,
     )
     from poker_ai._core import _state as _cystate
 
+    # 4th arg is accepted for signature stability but no longer drives the cap
+    # check — FastState derives max_raises_per_round(n_players) from its own
+    # n_players (this module parametrizes over several player counts).
     _cystate.configure(
-        _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND
+        _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, max_raises_per_round(2)
     )
     FastState = _cystate.FastState
 

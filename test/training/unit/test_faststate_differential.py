@@ -37,14 +37,21 @@ if _core.CORE_AVAILABLE:
         _ACTION_BYTE,
         _STAGE_ID,
         RAISE_SIZES_BY_STAGE,
-        MAX_RAISES_PER_ROUND,
+        max_raises_per_round,
     )
     from poker_ai._core._state_ref import FastStateRef
     from poker_ai._core import _state as _cystate
 
     # Dump the live alphabet + raise grid into the compiled engine (never
     # hard-coded — same anti-drift discipline as the Phase-1 kernels).
-    _cystate.configure(_STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND)
+    # The 4th arg is accepted for signature stability but no longer drives the
+    # cap check — both FastState (_state.pyx) and FastStateRef derive
+    # max_raises_per_round(n_players) from each state's OWN n_players, since
+    # this module parametrizes over several player counts and a single
+    # process-wide scalar can't be correct for all of them at once.
+    _cystate.configure(
+        _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, max_raises_per_round(2)
+    )
     FastState = _cystate.FastState
 
 

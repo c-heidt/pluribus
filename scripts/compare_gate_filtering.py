@@ -4,8 +4,12 @@ kept vs. rows it filtered out.
 Tests whether the confirmation gates in ``poker_ai/blueprint/offline_average.py``
 (``min_confirming_fraction`` / ``min_snapshot_regret_magnitude``) prune infosets
 uniformly across action types, or disproportionately drop close/marginal
-decisions while keeping high-conviction ones (e.g. all-in nodes past
-``MAX_RAISES_PER_ROUND``, which has nothing to split its regret with).
+decisions while keeping high-conviction ones — confirmed empirically to be the
+latter: ``min_snapshot_regret_magnitude`` is a flat threshold, and CFR regret
+magnitude scales with an action's payoff variance (fold's is bounded/low,
+all-in's spans the whole stack), not with correctness, so it structurally
+favours all-in regardless of whether it is actually the better play (see
+project memory ``project_dbr_offline_average_gate_bias``).
 
 Usage::
 

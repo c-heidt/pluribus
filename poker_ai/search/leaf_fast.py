@@ -75,7 +75,7 @@ def _resolve_core_policy(policies, profile):
     return p if p._ensure_core() is not None else None
 
 
-def _core_state():
+def _core_state(n_players: int):
     """Return a configured ``FastState`` class, or ``None`` if unavailable."""
     try:
         from poker_ai._core import CORE_AVAILABLE
@@ -84,10 +84,11 @@ def _core_state():
         from poker_ai._core import _state as _cystate
         if not _cystate.is_configured():
             from environment.poker_env import (
-                _ACTION_BYTE, _STAGE_ID, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
+                _ACTION_BYTE, _STAGE_ID, RAISE_SIZES_BY_STAGE, max_raises_per_round,
             )
             _cystate.configure(
-                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND
+                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE,
+                max_raises_per_round(n_players),
             )
         return _cystate.FastState
     except Exception:
@@ -138,7 +139,7 @@ def continuation_value_vector_fast(
     n = frontier_env.n_players
     cfg = ctx.leaf
     n_combos = frontier_env.n_combos
-    FastState = _core_state()
+    FastState = _core_state(n)
     if (
         FastState is None
         or frontier_env.is_terminal

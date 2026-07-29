@@ -421,7 +421,8 @@ class TestBuildFinalBlueprint:
         # Turn (street 2) rows, and a pre-flop (street 0) average-strategy row.
         turn_keys = ["t0", "t1", "t2"]
         preflop_key = "pf0"
-        preflop_phi = np.array([7, 3, 0, 0, 0, 0], dtype=np.int32)  # street 0 width 6
+        preflop_phi = np.zeros(MAX_ACTIONS_PER_STREET[0], dtype=np.int32)
+        preflop_phi[:2] = [7, 3]
 
         tables = _new_tables(index_path, "shm_w")
         try:

@@ -10,7 +10,7 @@ import copy
 import pytest
 
 from environment.player import Player
-from environment.poker_env import PokerEnv, new_game, MAX_RAISES_PER_ROUND
+from environment.poker_env import PokerEnv, new_game
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +238,7 @@ class TestActionSemantics:
 class TestRaiseCap:
     def test_no_raises_after_max_raises(self):
         env = new_game(n_players=2, card_info_lut={})
-        for _ in range(MAX_RAISES_PER_ROUND):
+        for _ in range(env._max_raises_per_round):
             raise_actions = [a for a in env.legal_actions if a and a.startswith("raise:")]
             if not raise_actions:
                 break

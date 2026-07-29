@@ -116,6 +116,31 @@ def _validate_info_set_encoding(state_dict: dict) -> None:
         )
 
 
+def _validate_action_grid(state_dict: dict, expected_n_players: int) -> None:
+    """Assert the base blueprint uses the current raise-size/cap abstraction.
+
+    Same failure mode as :func:`_validate_info_set_encoding`: the LMDB
+    index and chunk rows a warm-start copies were written under one
+    per-stage action-byte alphabet, and opening them under a different one
+    (a ``RAISE_SIZES_BY_STAGE`` / ``max_raises_per_round`` change) silently
+    misinterprets every already-written row rather than failing loudly. A
+    ``server_state.pkl`` written before this field existed cannot be
+    verified — rejected rather than assumed compatible.
+    """
+    from environment.poker_env import action_grid_fingerprint
+
+    expected = action_grid_fingerprint(expected_n_players)
+    saved = state_dict.get("action_grid_fingerprint")
+    if saved != expected:
+        raise ValueError(
+            f"Warm-start action-grid mismatch: warm_start={saved!r} vs "
+            f"current={expected!r}. The base blueprint's raise-size "
+            f"abstraction differs from the current one — re-train the "
+            f"base under the current RAISE_SIZES_BY_STAGE / "
+            f"max_raises_per_round, or warm-start from a matching blueprint."
+        )
+
+
 def apply_warm_start(
     save_path: Path,
     warm_start_path: Path,
@@ -161,6 +186,7 @@ def apply_warm_start(
     state_dict = joblib.load(src_cp / "server_state.pkl")
     _validate_n_players(state_dict, expected_n_players)
     _validate_info_set_encoding(state_dict)
+    _validate_action_grid(state_dict, expected_n_players)
 
     src_lmdb = warm_start_path / "lmdb_index"
     if not src_lmdb.exists():
@@ -191,16 +217,18 @@ def apply_warm_start(
     # and skipped silently — that is how we let the user reconfigure
     # operational and bias hyperparameters without tripping the
     # structural-mismatch check.
-    from environment.poker_env import INFO_SET_ENCODING
+    from environment.poker_env import INFO_SET_ENCODING, action_grid_fingerprint
 
     new_state = {
         "t": 0,
         "discount_active": True,
         "n_chunks_per_street": _extract_n_chunks(state_dict),
         "n_players": int(state_dict["n_players"]),
-        # Carry the (validated) encoding forward so the staged checkpoint
-        # keeps satisfying the structural-config check on later resumes.
+        # Carry the (validated) encoding/grid forward so the staged
+        # checkpoint keeps satisfying the structural-config check on later
+        # resumes (including a later warm-start off THIS staged blueprint).
         "info_set_encoding": INFO_SET_ENCODING,
+        "action_grid_fingerprint": action_grid_fingerprint(expected_n_players),
     }
     # Only forward chunk_size when the source actually had one — a
     # ``None`` value would trip the structural-config check in
@@ -244,6 +272,7 @@ def stage_warm_start_lmdb(
     state_dict = joblib.load(src_cp / "server_state.pkl")
     _validate_n_players(state_dict, expected_n_players)
     _validate_info_set_encoding(state_dict)
+    _validate_action_grid(state_dict, expected_n_players)
 
     src_lmdb = warm_start_path / "lmdb_index"
     if not src_lmdb.exists():

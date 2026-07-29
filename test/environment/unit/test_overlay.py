@@ -13,6 +13,18 @@ def _env(n_players: int = 2):
     return PokerEnv(players=[Player(i, 10000) for i in range(n_players)])
 
 
+def _off_tree_fraction(env: PokerEnv) -> float:
+    """A raise fraction guaranteed not to be in ``env``'s current canonical grid.
+
+    Tests that need a genuinely off-tree probe should use this rather than a
+    hardcoded literal (e.g. ``1.5``) — a literal risks silently colliding
+    with the canonical grid after a ``RAISE_SIZES_BY_STAGE`` change, which
+    would leave the test passing while no longer exercising the off-tree
+    path it claims to.
+    """
+    return max(env.canonical_raise_fractions(), default=1.0) + 0.37
+
+
 class TestInjectAction:
 
     def test_appears_in_legal_actions(self):
@@ -378,8 +390,8 @@ class TestInjectActionSanityChecks:
 
     def test_rejects_when_max_raises_reached(self):
         env = _env()
-        # Force three raises into the round.
-        env._n_raises = 3
+        # Force the cap for this env's player count into the round.
+        env._n_raises = env._max_raises_per_round
         assert env.inject_action("raise:1.5") is False
         assert not env.has_overlay_at_current_node
 
@@ -440,21 +452,23 @@ class TestOverlayCacheLineageConsistency:
 
     def test_sibling_injection_visible_to_env_that_already_cached(self):
         a = _env()
+        action = f"raise:{_off_tree_fraction(a)}"
         _ = a.legal_actions                      # a caches the root node
         b = copy.deepcopy(a)                      # shares the overlay + version box
-        assert b.inject_action("raise:1.5") is True
+        assert b.inject_action(action) is True
         # The overlay is shared, so BOTH envs must offer the injected action.
-        assert "raise:1.5" in b.legal_actions
-        assert "raise:1.5" in a.legal_actions
+        assert action in b.legal_actions
+        assert action in a.legal_actions
 
     def test_reset_on_sibling_purges_cached_injection(self):
         c = _env()
-        c.inject_action("raise:1.5")
+        action = f"raise:{_off_tree_fraction(c)}"
+        c.inject_action(action)
         _ = c.legal_actions                      # c caches the node WITH the injection
         d = copy.deepcopy(c)
         d.reset_overlay()                         # clears the shared overlay
         # The shared overlay is now empty, so c must no longer offer the action.
-        assert "raise:1.5" not in c.legal_actions
+        assert action not in c.legal_actions
         assert not c.has_overlay_at_current_node
 
     def test_overlay_version_shared_by_reference(self):

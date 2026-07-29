@@ -614,7 +614,15 @@ cdef class FastState:
                 actions.append("all_in")
         else:
             actions.append("call")
-            if self.n_raises < _MAX_RAISES and self._n_players_with_moves() >= 2:
+            # max_raises_per_round(n_players) == n_players (environment.poker_env)
+            # — a trivial identity, computed inline from ``self.n_players`` rather
+            # than the ``_MAX_RAISES`` global from ``configure()``: a single
+            # process-wide scalar can't be correct across multiple player counts
+            # in one process (differential tests parametrize over several), and
+            # this field is already on the object. Keep this in sync with
+            # ``max_raises_per_round`` if its formula ever stops being the
+            # identity function.
+            if self.n_raises < self.n_players and self._n_players_with_moves() >= 2:
                 actions += self._get_available_raise_sizes()
         return actions
 

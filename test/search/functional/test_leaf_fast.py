@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(
 if _core.CORE_AVAILABLE:
     from environment.player import Player
     from environment.poker_env import (
-        PokerEnv, _ACTION_BYTE, _STAGE_ID, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
+        PokerEnv, _ACTION_BYTE, _STAGE_ID, RAISE_SIZES_BY_STAGE, max_raises_per_round,
     )
     from poker_ai._core import _state as _cystate
     from poker_ai.search.context import SubgameContext
@@ -42,7 +42,12 @@ if _core.CORE_AVAILABLE:
     from poker_ai.search.mccfr import _BIAS_CLASSES
     from test.search._helpers import UniformPolicy
 
-    _cystate.configure(_STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND)
+    # 4th arg is accepted for signature stability but no longer drives the cap
+    # check — FastState derives max_raises_per_round(n_players) from its own
+    # n_players.
+    _cystate.configure(
+        _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, max_raises_per_round(2)
+    )
     FastState = _cystate.FastState
 
 

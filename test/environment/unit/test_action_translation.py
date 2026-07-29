@@ -36,6 +36,36 @@ def _stub_lut(env):
     env.card_info_lut = defaultdict(lambda: defaultdict(lambda: 0))
 
 
+def _grid_only_in_first_raise(stage: str) -> list:
+    """Fractions on-tree for ``stage``'s first raise but not a subsequent one.
+
+    Grid-agnostic replacement for hardcoding a specific fraction that
+    happens to differ between the two raise-index grids today — this
+    derives it from whatever :data:`RAISE_SIZES_BY_STAGE` currently is, so
+    it keeps working across grid changes rather than silently testing the
+    wrong thing (or nothing) once a hardcoded fraction migrates onto both
+    grids.
+    """
+    cfg = RAISE_SIZES_BY_STAGE[stage]
+    return sorted(set(cfg["first_raise"]) - set(cfg["subsequent_raise"]))
+
+
+def _off_tree_flop_pair(env):
+    """(off, on) ``"raise:<f>"`` strings: an off-tree flop first-raise
+    fraction and its canonical pseudo-harmonic neighbour under whatever
+    the flop grid currently is — derived via the real production
+    translation function rather than a hardcoded "0.6 snaps to 0.5"
+    literal, so these stay correct across grid changes.
+    """
+    off_fraction = 0.6
+    on_fraction = env._translate_fraction(off_fraction, "flop", 0, randomized=False)
+    assert on_fraction != off_fraction, (
+        "0.6 is no longer off-tree on the flop first_raise grid — pick a "
+        "different probe fraction for this helper."
+    )
+    return f"raise:{off_fraction}", f"raise:{on_fraction}"
+
+
 # ---------------------------------------------------------------------------
 # Pseudo-harmonic probability + neighbour location
 # ---------------------------------------------------------------------------
@@ -160,28 +190,50 @@ class TestCanonicalizeHistory:
         ]
 
     def test_off_tree_raise_snaps_deterministically(self):
-        # flop first_raise grid [0.5,1.0,1.5]; 0.6 in (0.5, 1.0):
-        # P_A = ((1.0-0.6)(1+0.5)) / ((1.0-0.5)(1+0.6)) = 0.6/0.8 = 0.75 >= 0.5
-        # -> A = 0.5.
+        # 0.6 is off-tree on the flop first_raise grid regardless of its
+        # exact contents (see _off_tree_flop_pair); the expected snap is
+        # derived from the same production translation function rather
+        # than a hardcoded target, so this holds across grid changes.
         env = _env()
-        out = env._canonicalize_history({"flop": ["raise:0.6"]})
-        assert out == [("flop", ["raise:0.5"])]
+        off, on = _off_tree_flop_pair(env)
+        out = env._canonicalize_history({"flop": [off]})
+        assert out == [("flop", [on])]
 
     def test_raise_index_advances_to_subsequent_grid(self):
-        # 1.5 is in flop first_raise but NOT in subsequent_raise
-        # ([1.0]); so the 2nd raise's 1.5 is off-tree and snaps
-        # (above-grid -> 1.0), proving the index advanced.
+        # A fraction on-tree for flop's FIRST raise but not a subsequent one
+        # proves the raise index advanced between the two history entries:
+        # if it hadn't, the identical second entry would pass through
+        # unchanged (still an exact first_raise match) instead of snapping.
         env = _env()
-        out = env._canonicalize_history({"flop": ["raise:1.5", "raise:1.5"]})
-        assert out == [("flop", ["raise:1.5", "raise:1.0"])]
+        first_only = _grid_only_in_first_raise("flop")
+        assert first_only, (
+            "flop's first_raise grid needs a fraction absent from "
+            "subsequent_raise for this test to be meaningful"
+        )
+        f = first_only[0]
+        expected_second = env._translate_fraction(f, "flop", 1, randomized=False)
+        assert expected_second != f
+        out = env._canonicalize_history({"flop": [f"raise:{f}", f"raise:{f}"]})
+        assert out == [("flop", [f"raise:{f}", f"raise:{expected_second}"])]
 
     def test_all_in_advances_raise_index(self):
-        # subsequent_raise on flop is [1.0]; first_raise is [0.5, 1.0, 1.5].
-        # 0.33 snaps to 0.5 on the first grid but to 1.0 on the subsequent
-        # grid, so the result 1.0 proves all_in advanced the raise index.
+        # all_in is the FIRST raise, so the SECOND raise canonicalises
+        # against subsequent_raise, not first_raise. A fraction exactly
+        # on-tree for first_raise but not subsequent_raise proves the index
+        # advanced: unchanged would mean the bug (still matching
+        # first_raise verbatim); snapping to something else proves the
+        # coarser subsequent_raise grid was actually used.
         env = _env()
-        out = env._canonicalize_history({"flop": ["all_in", "raise:0.33"]})
-        assert out == [("flop", ["all_in", "raise:1.0"])]
+        first_only = _grid_only_in_first_raise("flop")
+        assert first_only, (
+            "flop's first_raise grid needs a fraction absent from "
+            "subsequent_raise for this test to be meaningful"
+        )
+        f = first_only[0]
+        expected = env._translate_fraction(f, "flop", 1, randomized=False)
+        assert expected != f
+        out = env._canonicalize_history({"flop": ["all_in", f"raise:{f}"]})
+        assert out == [("flop", ["all_in", f"raise:{expected}"])]
 
     def test_fold_call_skip_pass_through(self):
         env = _env()
@@ -216,17 +268,19 @@ class TestBlueprintInfoSet:
         assert env._blueprint_info_set(combo) == env._compute_info_set(combo)
 
     def test_off_tree_resolves_to_on_tree_key(self):
-        # An off-tree raise:0.6 flop history must yield the SAME blueprint
-        # key as the env where the canonical neighbour (0.5) was played.
-        off = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.6")
-        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.5")
+        # An off-tree flop history must yield the SAME blueprint key as the
+        # env where the canonical neighbour was played.
+        off_action, on_action = _off_tree_flop_pair(_env())
+        off = _play_to_flop_with(_stub_and_return(_env(seed=1)), off_action)
+        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), on_action)
         combo = (int(off.combo_cards[0, 0]), int(off.combo_cards[0, 1]))
         assert off._blueprint_info_set(combo) == on._compute_info_set(combo)
         # And the non-canonicalised key differs (off-tree fraction present).
         assert off._compute_info_set(combo) != on._compute_info_set(combo)
 
     def test_policy_state_for_blueprint_flag_threads_canonicalisation(self):
-        env = _play_to_flop_with(_stub_and_return(_env(seed=2)), "raise:0.6")
+        off_action, _ = _off_tree_flop_pair(_env())
+        env = _play_to_flop_with(_stub_and_return(_env(seed=2)), off_action)
         combo = (int(env.combo_cards[0, 0]), int(env.combo_cards[0, 1]))
         ps_bp = env.policy_state_for(combo, for_blueprint=True)
         ps_raw = env.policy_state_for(combo)
@@ -252,10 +306,11 @@ class TestCanonicalPublicKey:
         assert env.canonical_public_key == env.public_key
 
     def test_off_tree_snaps_to_canonical_neighbour(self):
-        # The off-tree (0.6) env's canonical key equals the raw key of the env
-        # that actually played the canonical neighbour (0.6 -> 0.5).
-        off = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.6")
-        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.5")
+        # The off-tree env's canonical key equals the raw key of the env
+        # that actually played the canonical neighbour.
+        off_action, on_action = _off_tree_flop_pair(_env())
+        off = _play_to_flop_with(_stub_and_return(_env(seed=1)), off_action)
+        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), on_action)
         assert off.canonical_public_key == on.public_key
         # The raw key still differs — the off-tree fraction is present verbatim.
         assert off.public_key != on.public_key
@@ -288,8 +343,9 @@ class TestBlueprintLookupHit:
     to uniform."""
 
     def test_for_blueprint_hits_populated_row(self):
-        off = _play_to_flop_with(_stub_and_return(_env(seed=3)), "raise:0.6")
-        on = _play_to_flop_with(_stub_and_return(_env(seed=3)), "raise:0.5")
+        off_action, on_action = _off_tree_flop_pair(_env())
+        off = _play_to_flop_with(_stub_and_return(_env(seed=3)), off_action)
+        on = _play_to_flop_with(_stub_and_return(_env(seed=3)), on_action)
         combo = (int(off.combo_cards[0, 0]), int(off.combo_cards[0, 1]))
         r = 1
         key = on._compute_info_set(combo)

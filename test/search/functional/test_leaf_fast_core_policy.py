@@ -36,7 +36,7 @@ if _core.CORE_AVAILABLE:
     from environment.player import Player
     from environment.poker_env import (
         PokerEnv, PolicyState,
-        _ACTION_BYTE, _STAGE_ID, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
+        _ACTION_BYTE, _STAGE_ID, RAISE_SIZES_BY_STAGE, max_raises_per_round,
     )
     from poker_ai._core import _state as _cystate
     from poker_ai.search.context import SubgameContext
@@ -49,7 +49,12 @@ if _core.CORE_AVAILABLE:
     from poker_ai.tables.index import lmdb_map_size_for_players
     from test.search._helpers import UniformPolicy
 
-    _cystate.configure(_STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND)
+    # 4th arg is accepted for signature stability but no longer drives the cap
+    # check — FastState derives max_raises_per_round(n_players) from its own
+    # n_players.
+    _cystate.configure(
+        _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, max_raises_per_round(2)
+    )
     FastState = _cystate.FastState
     _CAPS = {r: 1 << 14 for r in range(4)}
     _BIASES = ("none", "fold", "call", "raise")

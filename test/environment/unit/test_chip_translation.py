@@ -9,10 +9,7 @@ import math
 import pytest
 
 from environment.player import Player
-from environment.poker_env import (
-    MAX_RAISES_PER_ROUND,
-    PokerEnv,
-)
+from environment.poker_env import PokerEnv
 
 
 def _env(low: int = 10, high: int = 14, n_players: int = 2):
@@ -35,7 +32,7 @@ class TestCanonicalRaiseFractions:
 
     def test_empty_when_max_raises_reached(self):
         env = _env()
-        env._n_raises = MAX_RAISES_PER_ROUND
+        env._n_raises = env._max_raises_per_round
         assert env.canonical_raise_fractions() == []
 
     def test_empty_when_inactive_player(self):
@@ -195,7 +192,7 @@ class TestStringForChips:
 
     def test_no_canonical_raises_off_tree(self):
         env = _env()
-        env._n_raises = MAX_RAISES_PER_ROUND
+        env._n_raises = env._max_raises_per_round
         chips = env.current_player.n_chips // 2
         s = env.string_for_chips(chips)
         assert s.startswith("raise:")

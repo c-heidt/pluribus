@@ -90,7 +90,7 @@ def _make_source_blueprint(
         np.save(cp / "regret_0_chunk_000000.npy", np.zeros(4, dtype=np.int32))
         np.save(cp / "strategy_0_chunk_000000.npy", np.zeros(4, dtype=np.int32))
 
-    from environment.poker_env import INFO_SET_ENCODING
+    from environment.poker_env import INFO_SET_ENCODING, action_grid_fingerprint
 
     state = {
         "n_players": n_players,
@@ -99,6 +99,7 @@ def _make_source_blueprint(
         "chunk_size": 4_000_000,
         "discount_active": False,
         "info_set_encoding": INFO_SET_ENCODING,
+        "action_grid_fingerprint": action_grid_fingerprint(n_players),
     }
     joblib.dump(state, cp / "server_state.pkl")
     return cp
@@ -175,11 +176,12 @@ class TestApplyWarmStart:
         src.mkdir()
         cp = src / f"checkpoint_{int(time.time())}"
         cp.mkdir()
-        from environment.poker_env import INFO_SET_ENCODING
+        from environment.poker_env import INFO_SET_ENCODING, action_grid_fingerprint
         joblib.dump(
             {"n_players": 6, "t": 1, "n_chunks_per_street": {r: 0 for r in range(4)},
              "chunk_size": 4_000_000, "discount_active": False,
-             "info_set_encoding": INFO_SET_ENCODING},
+             "info_set_encoding": INFO_SET_ENCODING,
+             "action_grid_fingerprint": action_grid_fingerprint(6)},
             cp / "server_state.pkl",
         )
         dst = tmp_path / "biased"

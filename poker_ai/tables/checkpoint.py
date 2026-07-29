@@ -570,6 +570,7 @@ class CheckpointManager:
         "c",
         "chunk_size",
         "info_set_encoding",
+        "action_grid_fingerprint",
     )
     """Hyperparameters whose values must match between the saved state
     and the current :class:`Server` for a resume to be safe.  Changing
@@ -607,6 +608,9 @@ class CheckpointManager:
             if key == "info_set_encoding":
                 from environment.poker_env import INFO_SET_ENCODING
                 return INFO_SET_ENCODING
+            if key == "action_grid_fingerprint":
+                from environment.poker_env import action_grid_fingerprint
+                return action_grid_fingerprint(self._server._n_players)
             return getattr(self._server, "_" + key)
 
         mismatches = []

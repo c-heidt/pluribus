@@ -193,7 +193,7 @@ def simple_search(
     # falls back to the Python path (core stays None) when unset or biased.
     core = None
     if core_enabled(bias):
-        core = CoreDriver(tables)
+        core = CoreDriver(tables, n_players)
         log.info("PLURIBUS_CFR_CORE=1 — driving CFR through the compiled core")
     discount_state = DiscountState(
         duration_cycles=discount_duration_cycles,

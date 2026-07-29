@@ -36,9 +36,9 @@ import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from environment.poker_env import (
-    MAX_RAISES_PER_ROUND,
     RAISE_SIZES_BY_STAGE,
     encode_info_set,
+    max_raises_per_round,
 )
 
 # Stage names in play order, mirroring PokerEnv._betting_stage strings.
@@ -253,7 +253,7 @@ class FastStateRef:
             actions.append("call")
             # Raises are only meaningful when another live player could call
             # them; facing a lone all-in the only responses are call/fold.
-            if (self.n_raises < MAX_RAISES_PER_ROUND
+            if (self.n_raises < max_raises_per_round(self.n_players)
                     and self.n_players_with_moves() >= 2):
                 actions += self._get_available_raise_sizes()
         return actions

@@ -58,11 +58,19 @@ _LUT_PATH = "data/20cards_exact"
 #     traversal takes a different (equally valid) trajectory.
 # Verified at re-baseline time: digest is identical with PLURIBUS_CORE_KERNELS
 # unset vs "all", and reproducible across runs.
+# Re-baselined 2026-07-29 after widening RAISE_SIZES_BY_STAGE for preflop/flop
+# and making MAX_RAISES_PER_ROUND player-count-dependent (was flat 3) — both
+# change the action abstraction the digest is explicitly tied to (see module
+# docstring). Full test/environment/ suite green (3655 passed) before this
+# re-baseline; regenerated via train_and_digest(), not via `-k regenerate -s`
+# (that marker is @pytest.mark.skip unconditionally, so `-k` alone doesn't
+# run it — called the helper directly instead).
 # Previous digests:
+#   00cb45e7dc0c67a2a2a7beb14068c3061a8f26be952ecf1c546be42ff147aed2  (pre raise-grid widening)
 #   7fef05fc8c7c421e8c667bd049530aeb3121c16aeb41ecbeb7f33bdd83243022  (pre preflop-only phi)
 #   4ca50490d570bd4a8318b03112dd40f0466796d89c4fd8ee5a9ddb350b4f99c9  (after _hand_over all-in fix)
 #   e23d93b6b08842048d37b58ee0c166e3c9260fd803712ead082d8efe5f221251  (pre all-in fixes)
-GOLDEN_DIGEST = "00cb45e7dc0c67a2a2a7beb14068c3061a8f26be952ecf1c546be42ff147aed2"
+GOLDEN_DIGEST = "e3395c03920c6bfcbe134e183077b3140a5b7cd3bae6b105b5f2b58133a901c0"
 
 
 def train_and_digest(save_path: Path, *, n_iterations: int = N_ITERATIONS):

@@ -739,12 +739,13 @@ class Server:
             Flat dict with path-like values converted to absolute
             strings so the checkpoint is portable between CWDs.
         """
-        from environment.poker_env import INFO_SET_ENCODING
+        from environment.poker_env import INFO_SET_ENCODING, action_grid_fingerprint
 
         t_val = t if t is not None else self._current_t
         config = dict(
             t=t_val,
             info_set_encoding=INFO_SET_ENCODING,
+            action_grid_fingerprint=action_grid_fingerprint(self._n_players),
             strategy_interval=self._strategy_interval,
             max_runtime_hours=self._max_runtime_hours,
             discount_duration_cycles=self._discount_state.duration_cycles,

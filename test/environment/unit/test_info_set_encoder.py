@@ -117,13 +117,29 @@ def _play_to_flop_with(env, flop_action):
     return env
 
 
+def _off_tree_flop_pair(env):
+    """(off, on) ``"raise:<f>"`` strings: an off-tree flop first-raise
+    fraction and its canonical pseudo-harmonic neighbour under whatever
+    the flop grid currently is — derived via the real production
+    translation function rather than a hardcoded "0.6 snaps to 0.5"
+    literal, so this stays correct across grid changes.
+    """
+    off_fraction = 0.6
+    on_fraction = env._translate_fraction(off_fraction, "flop", 0, randomized=False)
+    assert on_fraction != off_fraction, (
+        "0.6 is no longer off-tree on the flop first_raise grid — pick a "
+        "different probe fraction for this helper."
+    )
+    return f"raise:{off_fraction}", f"raise:{on_fraction}"
+
+
 class TestCanonicalizationEquivalence:
     def test_off_tree_blueprint_key_equals_on_tree(self):
-        # flop grid first_raise=[0.5,1.0,1.5]; 0.6 snaps to 0.5.
+        off_action, on_action = _off_tree_flop_pair(_env())
         off = _stub_lut(_env(seed=3))
-        _play_to_flop_with(off, "raise:0.6")
+        _play_to_flop_with(off, off_action)
         on = _stub_lut(_env(seed=3))
-        _play_to_flop_with(on, "raise:0.5")
+        _play_to_flop_with(on, on_action)
         combo = (int(off.combo_cards[0, 0]), int(off.combo_cards[0, 1]))
         # Byte-identical: off-tree blueprint key == on-tree raw key.
         assert off._blueprint_info_set(combo) == on._compute_info_set(combo)

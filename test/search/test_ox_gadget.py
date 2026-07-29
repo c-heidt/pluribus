@@ -31,6 +31,7 @@ oracle for best-response values.
 import numpy as np
 import pytest
 
+from poker_ai.search.parallel import run_loop
 from poker_ai.search.solver import solve
 from poker_ai.search.solver_state import SolverConfig, SolverState
 from poker_ai.search.vector import _OX_ENTER, _VectorSolver
@@ -41,6 +42,7 @@ from test.search.test_equilibrium_oracle import (
     _install_lossless_lut,
     _river_subgame,
     _solver_sigma,
+    _turn_subgame,
 )
 
 
@@ -100,28 +102,32 @@ def test_ox_beta_zero_matches_belief_best_response(_seeded):
 # --------------------------------------------------------------------------- #
 @pytest.mark.slow
 def test_ox_large_beta_ignores_belief(_seeded):
-    """As β → ∞ the exploitation coefficient ``1/(kβ+1) → 0``, so two very different
-    beliefs over the same support must yield (nearly) the same refined bot strategy.
+    """As β → ∞ the exploitation coefficient ``1/(kβ+1) → 0``, so the belief cannot
+    influence the solve: two very different beliefs must yield the same bot **value**.
+
+    We compare *exploitability* (a value — identical across every equilibrium of the
+    subgame) rather than the raw strategy mixture: at large β the safety resolve is
+    belief-independent, but an infoset can be *indifferent*, and there the mixture is
+    not unique (a ~1e-8 belief perturbation can tip a near-tie and swing the mixture
+    while leaving the value untouched).  The value is the belief-independence claim
+    that actually holds.
     """
     env, r0, r1, s0, s1 = _river_subgame(_seeded)
     _install_lossless_lut(env)
     sub = build_subgame(env, r0, r1, s0, s1)
+    opp = 1
 
-    opp = [i for i in s1]                                   # the two opp support combos
-    belief_a = np.zeros(env.n_combos); belief_a[opp[0]] = 0.9; belief_a[opp[1]] = 0.1
-    belief_b = np.zeros(env.n_combos); belief_b[opp[0]] = 0.1; belief_b[opp[1]] = 0.9
+    belief_a = np.zeros(env.n_combos); belief_a[s1[0]] = 0.9; belief_a[s1[1]] = 0.1
+    belief_b = np.zeros(env.n_combos); belief_b[s1[0]] = 0.1; belief_b[s1[1]] = 0.9
 
-    def bot_sigma(belief):
+    def exploitability(belief):
         ctx = _ctx(env, ranges={0: _normalize(r0), 1: _normalize(belief)}, seed=7)
-        res = solve(env, ctx, _cfg(ctx.leaf, beta=1e6, iters=800, discount=50))
-        return _solver_sigma(res.state, env, sub)
+        res = solve(env, ctx, _cfg(ctx.leaf, beta=1e6, iters=1200, discount=50))
+        return br_value(sub, opp, _solver_sigma(res.state, env, sub))
 
-    sa, sb = bot_sigma(belief_a), bot_sigma(belief_b)
-    bot = 0
-    diffs = [np.abs(sa[k] - sb[k]).max() for k in sa if k[0] == bot and k in sb]
-    assert diffs, "expected bot decision rows to compare"
-    assert max(diffs) < 1e-2, (
-        f"large-β strategy still belief-dependent (max row diff {max(diffs):.4f})"
+    ea, eb = exploitability(belief_a), exploitability(belief_b)
+    assert abs(ea - eb) < 0.02 * _delta(sub), (
+        f"large-β exploitability still belief-dependent: {ea:.3f} vs {eb:.3f}"
     )
 
 
@@ -221,3 +227,75 @@ def test_ox_safety_margin_bound(_seeded):
     assert dev_small > 0.05, (
         f"small β did not exploit (max deviation from uniform {dev_small:.3f})"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Turn-root gates — exercise the CHANCE-SAMPLING path (v_enter sampled per river
+# vs CBV_ref enumerated).  A turn root has a river chance node, so this covers the
+# machinery the river-root gates above cannot reach.
+# --------------------------------------------------------------------------- #
+def test_ox_turn_root_beta_zero_matches_belief(_seeded):
+    """β = 0 on a TURN root is byte-identical to a vanilla solve with opp range = ``p̂``.
+
+    The turn root samples one river per iteration; this confirms ``_iterate_ox``
+    drives that chance-sampled dual-pass walk exactly as the vanilla loop does (same
+    completion draw, same pass order), so the OX plumbing is correct across the
+    chance node — not just on a river root.
+    """
+    env, r0, r1, s0, s1 = _turn_subgame(_seeded)
+    _install_lossless_lut(env)
+    ranges = {0: _normalize(r0), 1: _normalize(r1)}
+
+    ctx_v = _ctx(env, ranges=dict(ranges), seed=7)
+    ctx_ox = _ctx(env, ranges=dict(ranges), seed=7)
+    res_v = solve(env, ctx_v, _cfg(ctx_v.leaf, beta=None, iters=200, discount=50))
+    res_ox = solve(env, ctx_ox, _cfg(ctx_ox.leaf, beta=0.0, iters=200, discount=50))
+
+    shared = set(res_v.state.vregret) & set(res_ox.state.vregret)
+    assert shared, "expected shared vector nodes (incl. clustered river nodes)"
+    for pk in shared:
+        assert np.array_equal(res_v.state.vregret[pk], res_ox.state.vregret[pk]), (
+            f"β=0 turn vregret diverged from vanilla at {pk!r}"
+        )
+        assert np.array_equal(res_v.state.vstrat[pk], res_ox.state.vstrat[pk]), (
+            f"β=0 turn vstrat diverged from vanilla at {pk!r}"
+        )
+
+
+@pytest.mark.slow
+def test_ox_turn_root_opt_out_active_and_finite(_seeded):
+    """A moderate-β TURN solve runs the opt-out path — sampled ``v_enter`` (one river)
+    vs enumerated ``CBV_ref`` — end to end: everything stays finite, the saturation
+    metric is a valid probability, and the opt-out row genuinely moves (so a
+    feasibility/measure mismatch between the sampled and enumerated river paths, which
+    would leave the row dead or produce NaN/inf, is caught).
+
+    (A full turn-root safety-margin gate is blocked by the cluster-node external-read
+    guard — the bot's river strategy is stored per LUT cluster and not externally
+    readable — so this asserts finiteness + activity rather than the Δ/β bound, which
+    the river-root gate covers.)
+    """
+    env, r0, r1, s0, s1 = _turn_subgame(_seeded)
+    _install_lossless_lut(env)
+    belief = np.zeros(env.n_combos)
+    for j, c in enumerate(s1):
+        belief[c] = 1.0 + j
+    ctx = _ctx(env, ranges={0: _normalize(r0), 1: _normalize(belief)}, seed=7)
+
+    st = SolverState.empty()
+    cfg = _cfg(ctx.leaf, beta=3.0, iters=600, discount=50)
+    solver = _VectorSolver(env, st, ctx, cfg, ctx.rng)
+    run_loop(solver, st, cfg)
+
+    # Everything finite (a sampled/enumerated river mismatch tends to surface as NaN).
+    for pk, mat in st.vregret.items():
+        assert np.isfinite(mat).all(), f"non-finite regret at {pk!r}"
+    optr = st.vregret[(env.public_key, "OX_OPTOUT")]
+    assert np.isfinite(optr).all()
+    # Saturation metric is a valid probability.
+    assert 0.0 <= solver.ox_enter_prob <= 1.0, solver.ox_enter_prob
+    # The opt-out actually moved for some feasible combo (v_enter ≠ CBV_ref somewhere).
+    feas = solver._ox_bc > 0
+    assert np.abs(optr[feas]).max() > 0.0, "opt-out row never moved (dead sampled path)"
+    q = regret_match_matrix(optr)
+    assert np.all(q[feas] >= 0.0) and np.allclose(q[feas].sum(axis=1), 1.0)

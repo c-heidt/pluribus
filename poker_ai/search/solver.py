@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -34,6 +35,8 @@ from poker_ai.search.parallel import (
 from poker_ai.search.policy import SearchPolicy
 from poker_ai.search.solver_state import SearchStats, SolverConfig, SolverState
 from poker_ai.search.vector import _VectorSolver
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "solve",
@@ -199,6 +202,18 @@ def solve(
     SearchResult
     """
     regime = _select_regime(ctx)
+    if getattr(cfg, "beta", None) is not None and regime != "vector":
+        # OX-Search (the gadget root, §11.3) lives ONLY in the vector regime; the
+        # MCCFR regime ignores ``beta`` entirely.  Setting β for a subgame that routes
+        # to MCCFR would silently run an ordinary (naive) best response while the
+        # caller believes adaptation-safety is enforced — surface it loudly rather than
+        # fail an exploitation guarantee in silence.  (Step 12's agent additionally
+        # gates β to the vector-regime condition; this is the backstop.)
+        logger.warning(
+            "OX-Search beta=%s set but subgame routed to %r (not 'vector'): the "
+            "gadget is INACTIVE and this solve is an ordinary best response, NOT "
+            "adaptation-safe.", cfg.beta, regime,
+        )
     workers = resolve_workers(getattr(cfg, "workers", 1))
     # Structural iteration budget (§6.5): replace ``max_iterations`` with the
     # per-replica count derived from the subgame's structure — vector = per-stage
