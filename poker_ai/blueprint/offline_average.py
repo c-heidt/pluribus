@@ -72,12 +72,13 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import joblib
 import numpy as np
+from tqdm import tqdm
 
 from utils.io import atomic_numpy_save
 
@@ -312,19 +313,33 @@ def _average_chunk_task(args: Tuple) -> bool:
     return average_chunk(*args)
 
 
-def _run_chunk_tasks(tasks: List[Tuple], workers: int) -> int:
+def _run_chunk_tasks(
+    tasks: List[Tuple], workers: int, desc: str = "Averaging chunks"
+) -> int:
     """Run ``(street, chunk)`` tasks serially or across a process pool.
 
     Returns the number of chunks actually written (skipped-by-resume excluded).
     Processes, not threads: each task's peak memory is then private and the
     total ceiling is exactly ``workers * _TASK_PEAK_MB``.
+
+    Progress is reported per chunk as it *completes* (not submission order —
+    chunks vary hugely in size, e.g. river dwarfs flop/turn, so completion
+    order is the only one that reflects real progress).
     """
     if not tasks:
         return 0
     if workers <= 1:
-        return sum(_average_chunk_task(t) for t in tasks)
+        return sum(
+            _average_chunk_task(t) for t in tqdm(tasks, desc=desc, unit="chunk")
+        )
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        return sum(pool.map(_average_chunk_task, tasks))
+        futures = [pool.submit(_average_chunk_task, t) for t in tasks]
+        written = 0
+        for fut in tqdm(
+            as_completed(futures), total=len(futures), desc=desc, unit="chunk"
+        ):
+            written += fut.result()
+        return written
 
 
 def average_street(
@@ -376,7 +391,7 @@ def average_street(
          min_snapshot_regret_magnitude)
         for chunk_id in _chunk_ids(final_dir, f"regret_{r}")
     ]
-    return _run_chunk_tasks(tasks, workers)
+    return _run_chunk_tasks(tasks, workers, desc=f"street {r}")
 
 
 def _load_state(checkpoint_dir: Path) -> dict:
@@ -621,7 +636,7 @@ def build_final_blueprint(
         len(tasks), workers, workers, _TASK_PEAK_MB,
         " [resume: complete chunks skipped]" if resume else "",
     )
-    written = _run_chunk_tasks(tasks, workers)
+    written = _run_chunk_tasks(tasks, workers, desc="post-flop chunks")
     log.info(
         "Post-flop strategy: %d chunk(s) written, %d already complete",
         written, len(tasks) - written,
