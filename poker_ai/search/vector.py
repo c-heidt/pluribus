@@ -181,6 +181,18 @@ class _VectorSolver:
         self._my_combo: Optional[int] = root_env.combo_index.get(my)
         self._my_seat = ctx.my_seat
 
+        # Root-value convergence signal (calibration): the hero's per-combo root
+        # counterfactual value, normalised by the opponent's board-masked reach mass
+        # so it reads as the played hand's conditional EV vs the belief opponent
+        # (chips).  Tracked only when the bot is a live seat holding a combo row; a
+        # write-only side counter that never touches a table or the RNG stream.
+        self._val_iter = 0
+        self._opp_mass: Optional[float] = None
+        if self._my_seat in self._seats and self._my_combo is not None:
+            opp = self._seats[0] if self._seats[1] == self._my_seat else self._seats[1]
+            m = float(self._reach[opp].sum())
+            self._opp_mass = m if m > 0.0 else None
+
         # Future streets (§6.5): the per-LUT-cluster storage machinery — the
         # deterministic per-street cluster universes, the per-iteration dense
         # combo→cluster rows / board feasibility / scatter plans — is shared with the
@@ -324,8 +336,29 @@ class _VectorSolver:
         # Alternating updates: one full tree pass per traverser.  ``_walk_env`` is
         # the compiled FastState adapter under PLURIBUS_SEARCH_CORE (else the
         # PokerEnv root) — same walk, only make/undo speed differs.
-        self._walk(self._walk_env, s0, self._reach[s0], self._reach[s1])
-        self._walk(self._walk_env, s1, self._reach[s1], self._reach[s0])
+        v0 = self._walk(self._walk_env, s0, self._reach[s0], self._reach[s1])
+        v1 = self._walk(self._walk_env, s1, self._reach[s1], self._reach[s0])
+        if self._opp_mass is not None:
+            self._record_root_value(s0, v0)
+            self._record_root_value(s1, v1)
+
+    def _record_root_value(self, seat: int, v: np.ndarray) -> None:
+        """Accumulate the hero's linearly-weighted root-EV estimate (calibration).
+
+        Fires only for the bot's seat; ``v`` is the root per-combo counterfactual
+        value the walk just returned.  Linear (Linear-CFR-matching) weighting
+        downweights the noisy early iterates.  Dividing by the opponent reach mass
+        turns the counterfactual value into the played hand's conditional EV vs the
+        belief opponent (chips), so it is comparable across regimes and interpretable
+        in mbb.  A pure side-effect: reads one already-computed float, writes two
+        counters, and never advances the RNG or a table (solve stays byte-identical).
+        """
+        if seat != self._my_seat:
+            return
+        self._val_iter += 1
+        w = float(self._val_iter)
+        self.state.root_value_num += w * float(v[self._my_combo]) / self._opp_mass
+        self.state.root_value_den += w
 
     # ------------------------------------------------------------------
     # Recursion (always entered on a non-terminal node)

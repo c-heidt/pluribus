@@ -99,6 +99,14 @@ class SearchResult:
     # is ALSO the "OX was active" signal — the agent plays the weighted-average (not the
     # final iterate) exactly when this is set (decision 5), and the eval logs it.
     ox_enter_prob: Optional[float] = None
+    # Calibration root-value signal (eval doc §9): the hero's root counterfactual value
+    # for its ACTUAL hand, as the played hand's conditional EV vs the belief opponent
+    # (chips), linearly averaged over iterations and pooled across replicas.  ``None``
+    # when no played-combo value was tracked (bot not a live seat / hand not in range /
+    # zero iterations).  A value-based, equilibrium-invariant convergence signal — the
+    # calibration reads it in place of full-policy L1 (which never vanishes at an
+    # indifferent infoset and over-weights cold, never-played mass).
+    root_value: Optional[float] = None
 
 
 def _select_regime(ctx: SubgameContext) -> str:
@@ -259,6 +267,12 @@ def solve(
     ox = (ox_enter_prob(state, root_env, ctx.board_compatible)
           if getattr(cfg, "beta", None) is not None and regime == "vector" else None)
 
+    # Root-value convergence signal (calibration): read the pooled linear estimate off
+    # the solved/merged state.  ``den == 0`` ⇒ nothing was tracked (bot not live, hand
+    # not in range, or zero iterations) ⇒ leave it ``None``.
+    rv_den = getattr(state, "root_value_den", 0.0)
+    root_value = (state.root_value_num / rv_den) if rv_den > 0.0 else None
+
     return SearchResult(
         policy=SearchPolicy(state, use_average=False),
         average_policy=SearchPolicy(state, use_average=True),
@@ -271,4 +285,5 @@ def solve(
         stop_reason=stop_reason,
         stats=stats,
         ox_enter_prob=ox,
+        root_value=root_value,
     )

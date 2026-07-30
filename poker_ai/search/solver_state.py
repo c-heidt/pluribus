@@ -275,6 +275,17 @@ class SolverState:
     node_count: int = 0
     legal_at_hits: int = 0
     legal_at_misses: int = 0
+    # Root-value convergence signal (calibration; eval doc §9).  A linearly-weighted
+    # running estimate of the hero's root counterfactual value for its ACTUAL hand,
+    # normalised to read as the played hand's conditional EV vs the belief opponent
+    # (chips) — accumulated by whichever regime runs.  ``num``/``den`` are summed
+    # across parallel replicas in :meth:`accumulate` and read as ``num/den`` by
+    # ``solve`` (``None`` when ``den == 0``: no played-combo value was tracked).
+    # These are **write-only side counters** — the regimes only ever add to them off a
+    # value the walk already computed, touching no table and no RNG stream, so a solve
+    # is byte-for-byte identical whether or not the value is tracked.
+    root_value_num: float = 0.0
+    root_value_den: float = 0.0
 
     @classmethod
     def empty(cls) -> "SolverState":
@@ -300,6 +311,8 @@ class SolverState:
         self.node_count = 0
         self.legal_at_hits = 0
         self.legal_at_misses = 0
+        self.root_value_num = 0.0
+        self.root_value_den = 0.0
         if hasattr(self.leaf_value_cache, "hits"):
             self.leaf_value_cache.hits = 0
             self.leaf_value_cache.misses = 0
@@ -366,6 +379,13 @@ class SolverState:
                         dst[key] = delta.copy()
                     else:
                         acc += delta
+        # Root-value estimate: pool the replicas' linearly-weighted sums (summing
+        # num + den merges their per-iteration estimates into one pooled linear
+        # average).  The baseline is a *prior* search's estimate, so it is NOT added —
+        # each replica already reset these to zero and accrues only this search's work.
+        for st in states:
+            out.root_value_num += st.root_value_num
+            out.root_value_den += st.root_value_den
         return out
 
     # ------------------------------------------------------------------

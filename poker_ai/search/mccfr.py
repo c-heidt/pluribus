@@ -246,6 +246,15 @@ class _MCCFRSolver:
                 )
             )
         self._iter = 0
+        # Root-value convergence signal (calibration; see the vector regime).  MCCFR's
+        # per-combo value is already the EV vs the belief-sampled opponents (their
+        # holes are drawn from the beliefs), so no reach-mass normalisation is applied.
+        # Only iterations where the played combo is card-consistent with the sampled
+        # field contribute (an overlapping draw is an impossible joint, not a sample).
+        # Write-only side counter — the walk is untouched.
+        self._val_iter = 0
+        self._track_root_value = (self._my_seat in self._live_seats
+                                  and self._my_combo is not None)
 
     def _make_walk_env(self, env):
         """The env the walk traverses this iteration: a fresh FastState adapter over
@@ -279,7 +288,28 @@ class _MCCFRSolver:
         # Single vectorized walk: regret + average strategy in one pass over the
         # traverser's whole range (opponents/chance still sampled).  Under the search
         # core the walk runs on a FastState adapter built from the reseated root.
-        self._vectorized_iterate(self._make_walk_env(env), i, holes)
+        v = self._vectorized_iterate(self._make_walk_env(env), i, holes)
+        if self._track_root_value and i == self._my_seat:
+            self._record_root_value(v, holes)
+
+    def _record_root_value(self, v: np.ndarray,
+                           holes: Dict[int, Tuple[int, int]]) -> None:
+        """Accumulate the hero's linearly-weighted root-EV estimate (calibration).
+
+        ``v`` is the root per-combo counterfactual value the traverser walk returned
+        (already the EV vs the belief-sampled opponents, so no normalisation).  Skips
+        iterations where the played hand shares a card with a sampled opponent hole —
+        an impossible joint whose value is not a valid sample.  Pure side-effect:
+        reads one float, writes two counters, never advances the RNG (byte-identical).
+        """
+        mine = set(self._my_hole)
+        for s in range(self.n_players):
+            if s != self._my_seat and mine & {int(c) for c in holes[s]}:
+                return
+        self._val_iter += 1
+        w = float(self._val_iter)
+        self.state.root_value_num += w * float(v[self._my_combo])
+        self.state.root_value_den += w
 
     def restore_root(self) -> None:
         """Rewind ``root_env`` to its pristine card-state after the in-place walk.
@@ -425,7 +455,8 @@ class _MCCFRSolver:
     # Traverser-vectorized walk (§6.5 — leaf-free turn/river subgames)
     # ------------------------------------------------------------------
 
-    def _vectorized_iterate(self, env, i: int, holes: Dict[int, Tuple[int, int]]) -> None:
+    def _vectorized_iterate(self, env, i: int,
+                            holes: Dict[int, Tuple[int, int]]) -> np.ndarray:
         """One vectorized external-sampling walk: all of ``i``'s combos at once.
 
         Regret and average strategy accrue in a single pass — ``pi_p`` is exact
@@ -433,7 +464,8 @@ class _MCCFRSolver:
         strategy pass is needed.  Opponents sample one action from their single
         sampled hole's row; the board is the frozen reseat runout.  Writes the
         shared ``vregret``/``vstrat`` matrices — the same tables the vector regime
-        and :class:`SearchPolicy` read.
+        and :class:`SearchPolicy` read.  Returns the traverser's ``(n_combos,)`` root
+        counterfactual value (used by the calibration root-value signal).
         """
         if self._cmaps is not None and self._cmaps.n_completion:
             # Frozen future runout for this iteration (the board cards past the
@@ -456,7 +488,7 @@ class _MCCFRSolver:
         excl_arr = np.fromiter(excl, dtype=cc.dtype, count=len(excl))
         disjoint = ~(np.isin(cc[:, 0], excl_arr) | np.isin(cc[:, 1], excl_arr))
         pi_p0 = self._reach[i] * disjoint
-        self._vwalk(env, i, pi_p0, holes)
+        return self._vwalk(env, i, pi_p0, holes)
 
     def _vwalk(self, env, p: int, pi_p: np.ndarray,
                holes: Dict[int, Tuple[int, int]]) -> np.ndarray:

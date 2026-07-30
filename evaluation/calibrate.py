@@ -9,10 +9,15 @@ the two quantities that make a budget feasible:
 - **Throughput** (it/s at the production worker count) — machine-dependent; sets
   ``wall = per_replica_iters / it_s`` (+ the fork/merge fixed cost of a parallel
   solve).
-- **Convergence** — machine-independent; how many iterations until the hero's *root
-  average strategy* stops changing (self-consistency vs a long reference budget).
-  On 52-card there is no equilibrium oracle, so this L1-stability of the actually-
-  played decision is the honest, oracle-free budget signal.
+- **Convergence** — machine-independent; how much **value is still on the table** at
+  budget ``t`` vs a long reference budget: ``|v_t − v_ref|`` of the hero's root
+  counterfactual EV for its actual hand, in mbb.  A *value* gap (not a strategy-
+  distribution L1) because value is invariant across equivalent equilibria — the
+  full-policy L1 never vanishes at an indifferent infoset (its mixture is free) and
+  over-weights cold, never-played tail mass, which also makes it unfair to the
+  noisier MCCFR average.  Hot-action L1 and argmax-stability on the played decision
+  are kept as secondary diagnostics.  On 52-card there is no equilibrium oracle, so
+  this self-referential value gap is the honest, oracle-free budget signal.
 
 It reuses the evaluation stack end-to-end: it plays real hands with the trained
 blueprint + bias opponents (:mod:`evaluation.runner` / :mod:`evaluation.opponents`),
@@ -257,6 +262,47 @@ def _root_sigma(res, s: RootSample) -> Optional[np.ndarray]:
     return np.asarray(sig, dtype=np.float64)
 
 
+def _hot_l1(sig: Optional[np.ndarray], ref: Optional[np.ndarray],
+            floor: float = 0.05) -> float:
+    """L1 restricted to the *hot* actions (max prob ≥ ``floor`` in ``sig`` or ``ref``).
+
+    The full-distribution L1 never vanishes at an indifferent infoset — the mixture
+    is free there, so it drifts among equal-value distributions — and it charges
+    convergence for cold, never-played tail mass.  Restricting to the actions that
+    carry real probability measures the *played* decision instead.
+    """
+    if sig is None or ref is None:
+        return float("nan")
+    hot = np.maximum(sig, ref) >= floor
+    if not hot.any():
+        return 0.0
+    return float(np.abs(sig[hot] - ref[hot]).sum())
+
+
+def _argmax_match(sig: Optional[np.ndarray], ref: Optional[np.ndarray]) -> float:
+    """1.0 if the top (played) action matches the reference, else 0.0 (nan on miss).
+
+    Since the bot plays the final iterate's top action, "the played action stops
+    flipping" is the operational convergence bar the value gap does not show directly.
+    """
+    if sig is None or ref is None:
+        return float("nan")
+    return 1.0 if int(np.argmax(sig)) == int(np.argmax(ref)) else 0.0
+
+
+def _value_gap_mbb(val: Optional[float], ref_val: Optional[float],
+                   big_blind: int) -> float:
+    """``|val − ref|`` in milli-big-blinds; nan if either root value is missing.
+
+    ``val`` is the hero's root counterfactual EV for its actual hand (chips) — an
+    equilibrium-invariant, hot-path-weighted signal (cold actions contribute ~0 to a
+    value), so "value still on the table per budget" is the honest convergence measure.
+    """
+    if val is None or ref_val is None:
+        return float("nan")
+    return abs(float(val) - float(ref_val)) / float(big_blind) * 1000.0
+
+
 @dataclass
 class SweepRow:
     condition: str
@@ -270,6 +316,14 @@ class SweepRow:
     stop_reason: str
     sample: int
     rep: int
+    # Primary convergence signal: value still on the table vs the top-budget
+    # reference, in milli-big-blinds (equilibrium-invariant, hot-path-weighted).
+    value_gap_mbb: float
+    root_value: float           # hero root EV for the played hand (chips), or nan
+    # Secondary diagnostics on the played decision (the value gap does not show these).
+    hot_l1: float               # L1 over hot actions only (≥ 5% mass in t or ref)
+    argmax_match: float         # 1.0 if the top action matches the reference, else 0.0
+    # Legacy full-policy L1 — kept as a column for continuity, no longer the driver.
     l1_to_ref: float
 
     @property
@@ -285,14 +339,18 @@ def sweep_cell(
     ladder: Sequence[int],
     reps: int,
     base_seed: int,
+    big_blind: int,
 ) -> List[SweepRow]:
     """Re-solve each root at every ladder budget (``reps`` replicates) at ``workers``.
 
     Each solve forces ``auto_budget=False`` + ``max_iterations = per_replica`` and a
     huge wall cap, so the loop always completes the structural budget and the wall it
-    reports is a clean throughput measurement (never wall-clipped).  The L1 metric is
-    the root average strategy at ``t`` vs the same (sample, replicate) reference at the
-    top of the ladder.
+    reports is a clean throughput measurement (never wall-clipped).  The **primary**
+    convergence signal is the hero's root-value gap (mbb) at ``t`` vs the same
+    ``(sample, replicate)`` reference at the top of the ladder — a value, so it is
+    invariant across equivalent equilibria and weighted toward the hot (played)
+    actions.  Hot-action L1 and argmax-stability on the root average strategy are kept
+    as played-decision diagnostics; the full-policy L1 is retained only as a column.
     """
     ladder = list(ladder)
     t_ref = ladder[-1]
@@ -301,6 +359,7 @@ def sweep_cell(
         for rep in range(reps):
             seed = int(base_seed) + 1000 * si + rep
             sigmas: Dict[int, Optional[np.ndarray]] = {}
+            values: Dict[int, Optional[float]] = {}
             meta: Dict[int, Tuple[int, float, str]] = {}
             for t in ladder:
                 env_t = copy.deepcopy(s.env)
@@ -311,19 +370,25 @@ def sweep_cell(
                 )
                 res = solve(env_t, ctx_t, cfg_t)
                 sigmas[t] = _root_sigma(res, s)
+                values[t] = res.root_value
                 meta[t] = (int(res.iterations_run), float(res.wall_seconds),
                            str(res.stop_reason))
-            ref = sigmas[t_ref]
+            ref_sig = sigmas[t_ref]
+            ref_val = values[t_ref]
             for t in ladder:
-                sig = sigmas[t]
-                l1 = (float(np.abs(sig - ref).sum())
-                      if sig is not None and ref is not None else float("nan"))
+                sig, val = sigmas[t], values[t]
+                l1 = (float(np.abs(sig - ref_sig).sum())
+                      if sig is not None and ref_sig is not None else float("nan"))
                 pooled, wall, stop = meta[t]
                 rows.append(SweepRow(
                     condition=s.condition, regime=s.regime, street=s.street,
                     n_live=s.n_live, per_replica=int(t), workers=int(workers),
                     pooled_iters=pooled, wall_seconds=wall, stop_reason=stop,
-                    sample=si, rep=rep, l1_to_ref=l1,
+                    sample=si, rep=rep,
+                    value_gap_mbb=_value_gap_mbb(val, ref_val, big_blind),
+                    root_value=(float(val) if val is not None else float("nan")),
+                    hot_l1=_hot_l1(sig, ref_sig), argmax_match=_argmax_match(sig, ref_sig),
+                    l1_to_ref=l1,
                 ))
     return rows
 
@@ -335,19 +400,22 @@ def sweep_cell(
 class CellSummary:
     cell: Cell
     ladder: List[int]
-    mean_l1: Dict[int, float]                 # per per-replica budget
+    mean_value_gap_mbb: Dict[int, float]      # PRIMARY: value on the table (mbb) per budget
+    mean_hot_l1: Dict[int, float]             # hot-action L1 per budget (diagnostic)
+    argmax_stability: Dict[int, float]        # P(top action == reference) per budget
+    mean_l1: Dict[int, float]                 # legacy full-policy L1 per budget
     mean_wall: Dict[int, float]               # seconds at `workers`
     throughput_it_s: float                    # per-replica it/s at the top budget
     pooled_it_s: float                        # pooled it/s at the top budget
-    suggested: Dict[str, Optional[int]]       # threshold -> smallest converged budget
+    suggested: Dict[str, Optional[int]]       # mbb threshold -> smallest converged budget
     n_samples: int
     workers: int
 
 
 def _first_below(ladder: Sequence[int], curve: Mapping[int, float], thr: float) -> Optional[int]:
-    """Smallest ladder budget whose mean L1 is below ``thr``.
+    """Smallest ladder budget whose mean value gap is below ``thr`` (mbb).
 
-    ``ladder`` here EXCLUDES the reference (top) budget: L1 at the reference is
+    ``ladder`` here EXCLUDES the reference (top) budget: the gap at the reference is
     trivially 0 (it is compared against itself), so a cell that only "converges"
     there has not actually converged — it returns ``None`` (unresolved), signalling
     that ``--max-iters`` should be raised.
@@ -359,31 +427,45 @@ def _first_below(ladder: Sequence[int], curve: Mapping[int, float], thr: float) 
     return None
 
 
+def _mean_ignoring_nan(vals: Sequence[float]) -> float:
+    clean = [v for v in vals if not np.isnan(v)]
+    return float(np.mean(clean)) if clean else float("nan")
+
+
 def summarize_cell(cell: Cell, rows: Sequence[SweepRow],
                    thresholds: Sequence[float]) -> CellSummary:
     ladder = sorted({r.per_replica for r in rows})
-    by_t = defaultdict(list)
+    gap_t = defaultdict(list)
+    hot_t = defaultdict(list)
+    amatch_t = defaultdict(list)
+    l1_t = defaultdict(list)
     wall_t = defaultdict(list)
     pooled_t = defaultdict(list)
     for r in rows:
-        if not np.isnan(r.l1_to_ref):
-            by_t[r.per_replica].append(r.l1_to_ref)
+        gap_t[r.per_replica].append(r.value_gap_mbb)
+        hot_t[r.per_replica].append(r.hot_l1)
+        amatch_t[r.per_replica].append(r.argmax_match)
+        l1_t[r.per_replica].append(r.l1_to_ref)
         wall_t[r.per_replica].append(r.wall_seconds)
         pooled_t[r.per_replica].append(r.pooled_iters)
-    mean_l1 = {t: (float(np.mean(by_t[t])) if by_t[t] else float("nan")) for t in ladder}
+    mean_gap = {t: _mean_ignoring_nan(gap_t[t]) for t in ladder}
+    mean_hot = {t: _mean_ignoring_nan(hot_t[t]) for t in ladder}
+    amatch = {t: _mean_ignoring_nan(amatch_t[t]) for t in ladder}
+    mean_l1 = {t: _mean_ignoring_nan(l1_t[t]) for t in ladder}
     mean_wall = {t: float(np.mean(wall_t[t])) for t in ladder}
     t_top = ladder[-1]
     w = rows[0].workers
     top_wall = mean_wall[t_top]
     per_rep_it_s = (t_top / top_wall) if top_wall > 0 else float("nan")
     pooled_it_s = (float(np.mean(pooled_t[t_top])) / top_wall) if top_wall > 0 else float("nan")
-    # The suggestion search excludes the reference (top) budget: L1 there is 0 by
+    # The suggestion search excludes the reference (top) budget: the gap there is 0 by
     # construction, so "converged only at the reference" == did not converge.
     below_ref = ladder[:-1]
-    suggested = {f"{thr:g}": _first_below(below_ref, mean_l1, thr) for thr in thresholds}
+    suggested = {f"{thr:g}": _first_below(below_ref, mean_gap, thr) for thr in thresholds}
     n_samples = len({r.sample for r in rows})
     return CellSummary(
-        cell=cell, ladder=ladder, mean_l1=mean_l1, mean_wall=mean_wall,
+        cell=cell, ladder=ladder, mean_value_gap_mbb=mean_gap, mean_hot_l1=mean_hot,
+        argmax_stability=amatch, mean_l1=mean_l1, mean_wall=mean_wall,
         throughput_it_s=per_rep_it_s, pooled_it_s=pooled_it_s,
         suggested=suggested, n_samples=n_samples, workers=w,
     )
@@ -402,7 +484,7 @@ def suggest_config(summaries: Sequence[CellSummary], *, threshold: float,
     MCCFR floor per street = the **max** over live-player counts of the per-cell
     suggested per-replica budget (cover the slowest-converging live-count), rounded
     up.  Vector per street from the heads-up vector cells.  Cells with no converged
-    suggestion at ``threshold`` keep the current default and are flagged.
+    suggestion at ``threshold`` (mbb value gap) keep the current default and are flagged.
     """
     key = f"{threshold:g}"
     mccfr_by_street: Dict[int, int] = {}
@@ -431,7 +513,7 @@ def suggest_config(summaries: Sequence[CellSummary], *, threshold: float,
         for i, st in enumerate((1, 2, 3))
     ]
     return {
-        "threshold_l1": threshold,
+        "threshold_mbb": threshold,
         "mccfr_min_per_replica_by_street": tuple(mccfr_floor),
         "vector_budget_by_street": tuple(vector),
         "unresolved_cells": unresolved,
@@ -447,11 +529,14 @@ def _write_rows_csv(rows: Sequence[SweepRow], path: Path) -> None:
         w = csv.writer(fh)
         w.writerow(["condition", "regime", "street", "n_live", "per_replica",
                     "workers", "pooled_iters", "wall_seconds", "stop_reason",
-                    "sample", "rep", "l1_to_ref"])
+                    "sample", "rep", "value_gap_mbb", "root_value", "hot_l1",
+                    "argmax_match", "l1_to_ref"])
         for r in rows:
             w.writerow([r.condition, r.regime, r.street, r.n_live, r.per_replica,
                         r.workers, r.pooled_iters, f"{r.wall_seconds:.6f}",
-                        r.stop_reason, r.sample, r.rep, f"{r.l1_to_ref:.6f}"])
+                        r.stop_reason, r.sample, r.rep, f"{r.value_gap_mbb:.6f}",
+                        f"{r.root_value:.6f}", f"{r.hot_l1:.6f}",
+                        f"{r.argmax_match:.6f}", f"{r.l1_to_ref:.6f}"])
 
 
 def _print_report(summaries: Sequence[CellSummary], config: Dict[str, object],
@@ -463,18 +548,23 @@ def _print_report(summaries: Sequence[CellSummary], config: Dict[str, object],
         print("!! compiled search core is OFF — throughput/wall are PURE-PYTHON, "
               "NOT production. Re-run with PLURIBUS_SEARCH_CORE=1.")
     hdr = (f"{'condition':<10} {'regime':<7} {'street':<8} {'n_live':>6} "
-           f"{'W':>4} {'top_it':>7} {'it/s':>8} {'wall@top':>9} {'sugg':>7} {'wall@sugg':>10}")
+           f"{'W':>4} {'top_it':>7} {'it/s':>8} {'wall@top':>9} {'gap@top':>8} "
+           f"{'sugg':>7} {'wall@sugg':>10}")
     print(hdr)
     print("-" * len(hdr))
-    key = f"{config['threshold_l1']:g}"
+    key = f"{config['threshold_mbb']:g}"
     for s in sorted(summaries, key=lambda x: (x.cell[0], x.cell[1], x.cell[2], x.cell[3])):
         cond, regime, street, n_live = s.cell
         t_top = s.ladder[-1]
         sugg = s.suggested.get(key)
         wall_sugg = s.mean_wall.get(sugg) if sugg is not None else None
+        # Gap at the *penultimate* budget: gap@top is 0 by construction (self-compare),
+        # so the last-below-reference rung is what shows the residual value on the table.
+        t_pen = s.ladder[-2] if len(s.ladder) > 1 else t_top
+        gap_pen = s.mean_value_gap_mbb.get(t_pen, float("nan"))
         print(f"{cond:<10} {regime:<7} {_STREET_NAME.get(street, street):<8} "
               f"{n_live:>6} {s.workers:>4} {t_top:>7} {s.throughput_it_s:>8.1f} "
-              f"{s.mean_wall[t_top]:>9.2f} "
+              f"{s.mean_wall[t_top]:>9.2f} {gap_pen:>8.1f} "
               f"{(str(sugg) if sugg is not None else '>max'):>7} "
               f"{(f'{wall_sugg:.2f}' if wall_sugg is not None else '-'):>10}")
     if wall_target is not None:
@@ -488,8 +578,8 @@ def _print_report(summaries: Sequence[CellSummary], config: Dict[str, object],
                 cond, regime, street, n_live = s.cell
                 print(f"  ! {cond}/{regime}/{_STREET_NAME.get(street, street)}/"
                       f"n_live={n_live}: wall@sugg={wall_sugg:.2f}s > {wall_target:.2f}s")
-    print("\nSuggested SolverConfig block (L1 threshold "
-          f"{config['threshold_l1']:g}):")
+    print("\nSuggested SolverConfig block (value-gap threshold "
+          f"{config['threshold_mbb']:g} mbb):")
     print(f"    mccfr_min_per_replica_by_street = {config['mccfr_min_per_replica_by_street']}"
           "   # (preflop, flop, turn, river)")
     print(f"    vector_budget_by_street         = {config['vector_budget_by_street']}"
@@ -596,7 +686,7 @@ def run_calibration(
                         cell, len(sample_list), resolved_workers, ladder)
             rows = sweep_cell(
                 sample_list, prod_cfg, workers=resolved_workers,
-                ladder=ladder, reps=reps, base_seed=run_seed,
+                ladder=ladder, reps=reps, base_seed=run_seed, big_blind=big_blind,
             )
             all_rows.extend(rows)
 
@@ -615,7 +705,8 @@ def run_calibration(
         "search_core": "on" if core_on else "off (PURE PYTHON — not production)",
         "workers": resolved_workers,
         "ladder": list(ladder),
-        "thresholds": list(thresholds),
+        "metric": "value_gap_mbb",  # primary convergence signal (hero root EV, mbb)
+        "thresholds_mbb": list(thresholds),
         "suggested_config": {
             k: (list(v) if isinstance(v, tuple) else v) for k, v in config.items()
         },
@@ -625,6 +716,9 @@ def run_calibration(
                 "street": _STREET_NAME.get(s.cell[2], s.cell[2]), "n_live": s.cell[3],
                 "n_samples": s.n_samples, "throughput_it_s": s.throughput_it_s,
                 "pooled_it_s": s.pooled_it_s,
+                "mean_value_gap_mbb": {str(t): s.mean_value_gap_mbb[t] for t in s.ladder},
+                "argmax_stability": {str(t): s.argmax_stability[t] for t in s.ladder},
+                "mean_hot_l1": {str(t): s.mean_hot_l1[t] for t in s.ladder},
                 "mean_l1": {str(t): s.mean_l1[t] for t in s.ladder},
                 "mean_wall_seconds": {str(t): s.mean_wall[t] for t in s.ladder},
                 "suggested": s.suggested,
@@ -676,11 +770,11 @@ def _cli():
                   help="Independent re-solve replicates per root (tames MCCFR noise).")
     @click.option("--min-iters", default=250, type=int, show_default=True)
     @click.option("--max-iters", default=4000, type=int, show_default=True,
-                  help="Top of the per-replica ladder (also the L1 reference budget).")
+                  help="Top of the per-replica ladder (also the value-gap reference budget).")
     @click.option("--ladder-points", default=6, type=int, show_default=True)
-    @click.option("--thresholds", default="0.05,0.03,0.02", show_default=True,
-                  help="L1 convergence thresholds; the middle one drives the "
-                  "suggested config.")
+    @click.option("--thresholds", default="20,10,5", show_default=True,
+                  help="Value-gap convergence thresholds in mbb (hero root EV still on "
+                  "the table); the middle one drives the suggested config.")
     @click.option("--collect-iters", default=64, type=int, show_default=True,
                   help="Cheap per-solve budget used only to advance collection hands.")
     @click.option("--table-policy", default="random", show_default=True,
