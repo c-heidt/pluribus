@@ -52,7 +52,9 @@ from typing import Iterable, Iterator, List, Optional
 #     coverage-restricted slicing, opponent-modeling doc §9).
 # v6: + decisions.n_live (live-range count the solver sized its budget on — the
 #     calibration axis for per-street/per-live-count throughput & budget).
-SCHEMA_VERSION = 6
+# v7: + decisions.ox_enter_prob (OX-Search Approach B opt-out saturation; NULL for
+#     vanilla/DBR and non-vector subgames, so a non-NULL row is a genuine OX decision).
+SCHEMA_VERSION = 7
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +129,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     exploitability  REAL,
     game_value      REAL,
     blueprint_weight REAL,
-    modeled_decision INTEGER
+    modeled_decision INTEGER,
+    ox_enter_prob   REAL      -- OX-Search opt-out saturation; NULL off the gadget
 );
 
 CREATE TABLE IF NOT EXISTS range_quality (
@@ -276,6 +279,7 @@ class DecisionRow:
     game_value: Optional[float] = None
     blueprint_weight: Optional[float] = None     # blueprint-prior mass mixed in (§8)
     modeled_decision: Optional[int] = None       # 1 iff a modeled solve produced this play (A7)
+    ox_enter_prob: Optional[float] = None        # OX-Search opt-out saturation; None off the gadget
 
 
 @dataclass
@@ -387,6 +391,8 @@ class ExperimentLog:
             con.execute("ALTER TABLE decisions ADD COLUMN modeled_decision INTEGER")
         if "n_live" not in dhave:  # v5 → v6 (calibration axis)
             con.execute("ALTER TABLE decisions ADD COLUMN n_live INTEGER")
+        if "ox_enter_prob" not in dhave:  # v6 → v7 (OX-Search opt-out saturation)
+            con.execute("ALTER TABLE decisions ADD COLUMN ox_enter_prob REAL")
         # Indexes last — after the ALTERs, so an index on a freshly-migrated column
         # (idx_games_condition) has its column to reference.
         con.executescript(_INDEX_DDL)

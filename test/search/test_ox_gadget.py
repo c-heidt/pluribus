@@ -33,7 +33,7 @@ import pytest
 
 from poker_ai.search.solver import solve
 from poker_ai.search.solver_state import SolverConfig, SolverState
-from poker_ai.search.vector import _OX_ENTER, _VectorSolver
+from poker_ai.search.vector import _OX_ENTER, _OX_OUT, _VectorSolver
 from poker_ai.search.vform import regret_match_matrix
 from test.search._helpers import _ctx
 from test.search.brute_force_cfr import br_value, build_subgame
@@ -123,6 +123,66 @@ def test_ox_large_beta_ignores_belief(_seeded):
     assert max(diffs) < 1e-2, (
         f"large-β strategy still belief-dependent (max row diff {max(diffs):.4f})"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Gate: the safety-branch OPT-OUT node is the paper's shifted gadget node.
+# --------------------------------------------------------------------------- #
+def test_ox_opt_out_equals_shifted_gadget(_seeded):
+    """The opt-out row update `_iterate_ox` performs is byte-identical to the paper's
+    SHIFTED safety-branch node.
+
+    The paper shifts every subgame utility by ``−CBV_ref(I₁)``, so at the opt-out node
+    ENTER pays ``v_enter − CBV_ref`` and OUT pays ``0``.  This code compares the RAW
+    values (ENTER = v_enter, OUT = CBV_ref) instead — which is the SAME node because a
+    per-infoset constant cancels in a CFR regret.  This gate proves that equivalence on
+    the REAL ``v_enter`` the walk produces, not just on paper: it drives one gadget
+    iteration two ways from identical fresh solvers and checks the opt-out row deltas
+    coincide with BOTH the raw and the shifted formulas.
+    """
+    env, r0, r1, s0, s1 = _river_subgame(_seeded)         # river root ⇒ no chance sampling
+    _install_lossless_lut(env)
+    ranges = {0: _normalize(r0), 1: _normalize(r1)}
+
+    def fresh_solver():
+        ctx = _ctx(env, ranges=dict(ranges), seed=7)
+        st = SolverState.empty()
+        sv = _VectorSolver(env, st, ctx, _cfg(ctx.leaf, beta=2.0), ctx.rng)
+        # Pre-seed a NON-uniform opt-out so q ≠ [0.5, 0.5] (the general case).
+        optr = st.vregret[sv._ox_optout_key]
+        optr[sv._ox_bc > 0, _OX_ENTER] = 0.7
+        return sv, st, optr
+
+    # (A) run the real `_iterate_ox` and record the opt-out row delta.
+    sa, sta, optr_a = fresh_solver()
+    sa._completion = ()
+    before = optr_a.copy()
+    sa._iterate_ox()
+    actual = optr_a - before
+
+    # (B) reproduce the SAME walk manually on an identical solver to recover v_enter,
+    # then form both the raw (implemented) and shifted (paper) opt-out deltas.
+    sb, stb, optr_b = fresh_solver()
+    sb._completion = ()
+    q = regret_match_matrix(optr_b)
+    qe, qo = q[:, _OX_ENTER], q[:, _OX_OUT]
+    opp_entry = (sb._ox_c_expl * sb._ox_phat + sb._ox_c_safe * qe) * sb._ox_bc
+    sb._walk(sb._walk_env, sb._ox_bot, sb._reach[sb._ox_bot], opp_entry)     # bot pass
+    v_enter = sb._walk(sb._walk_env, sb._ox_opp, opp_entry, sb._reach[sb._ox_bot])
+    cbv, cs = sb._ox_cbv, sb._ox_c_safe
+
+    node_raw = qe * v_enter + qo * cbv                    # implemented (raw) formula
+    d_raw = np.stack([cs * (v_enter - node_raw), cs * (cbv - node_raw)], axis=1)
+    ve_s, vo_s = v_enter - cbv, np.zeros_like(cbv)        # paper: shift by −CBV_ref
+    node_s = qe * ve_s + qo * vo_s
+    d_shift = np.stack([cs * (ve_s - node_s), cs * (vo_s - node_s)], axis=1)
+
+    assert np.allclose(actual, d_raw), "real _iterate_ox opt-out delta != raw formula"
+    assert np.allclose(d_raw, d_shift), "raw opt-out != paper's shifted gadget node"
+    # OUT must never regret positively where the bot is already ≤ blueprint (v_enter ≤ CBV
+    # ⇒ opponent prefers OUT ⇒ ENTER regret ≤ 0), a direct check of the maximizer sign.
+    safe = v_enter <= cbv
+    assert np.all(actual[safe, _OX_ENTER] <= 1e-12), "ENTER regret grew where bot is safe"
 
 
 # --------------------------------------------------------------------------- #

@@ -110,6 +110,29 @@ _BOARD_LEN_TO_STREET: Mapping[int, str] = {0: "preflop", 3: "flop", 4: "turn", 5
 # Config + session
 # ---------------------------------------------------------------------------
 
+import re as _re
+
+_OX_BETA_RE = _re.compile(r"beta\s*=\s*([0-9][0-9.eE+\-]*)")
+
+
+def _parse_ox_beta(condition: str) -> float:
+    """Extract ``β`` from an OX-Search condition label like ``'OX(beta=3.0)'``.
+
+    OX-Search requires a finite non-negative β (the safety parameter, Thm 4.6); a
+    label without a parseable ``beta=`` is a mistake, so raise rather than silently
+    disable the gadget.
+    """
+    m = _OX_BETA_RE.search(condition)
+    if m is None:
+        raise ValueError(
+            f"OX-Search condition {condition!r} has no 'beta=' — expected e.g. "
+            "'OX(beta=3.0)' (β = the adaptation-safety parameter)."
+        )
+    beta = float(m.group(1))
+    if beta < 0.0:
+        raise ValueError(f"OX-Search beta must be >= 0, got {beta} in {condition!r}.")
+    return beta
+
 
 @dataclass
 class EvalConfig:
@@ -132,8 +155,10 @@ class EvalConfig:
     #                   naive best response is DBR at p_max=1)
     #   blueprint_only: search_enabled=False, model_spec=None   (NOT an approach —
     #                   a no-search pipeline / blueprint-quality test only)
-    # (OX-Search — the heads-up gadget — is a future approach, not yet wired; the
-    # multiplayer OX-Search variant is cancelled.)
+    #   OX(beta=X)    : search_enabled=True,  model_spec=None, beta=X  (OX-Search /
+    #                   Approach B — adaptation-safe exploitation; REACH-ONLY, so NO
+    #                   model, the belief enters via the tracked ranges; the gadget is
+    #                   HU turn/river only, inactive elsewhere).  Multiplayer OX cancelled.
     # Vanilla Pluribus *searches*; only the blueprint-only test skips search.  Kept
     # independent of ``condition`` so a caller can label freely; the CLI and
     # :meth:`for_condition` set both together so they never disagree.  Defaults
@@ -141,6 +166,10 @@ class EvalConfig:
     # unchanged.
     search_enabled: bool = True
     model_spec: Optional[ModelSpec] = None
+    # OX-Search safety parameter β (Approach B); ``None`` for every non-OX arm, so the
+    # gadget is OFF and the solve is byte-identical vanilla/DBR.  Threaded into the
+    # ``SolverConfig`` built by :func:`build_blueprint_session`.
+    beta: Optional[float] = None
     table_policy: str = "all_blueprint"       # all_blueprint | random | fixed
     fixed_seats: Optional[Dict[int, str]] = None   # required for table_policy='fixed'
     time_budget_hours: float = 1.0            # wall-clock budget; 0 → unbounded
@@ -200,28 +229,43 @@ class EvalConfig:
 
         ``condition='vanilla'`` ⇒ vanilla Pluribus: **search, no opponent model** (THE
         baseline).  ``'blueprint_only'`` ⇒ no search at all — a pipeline / blueprint-
-        quality test, not an approach.  Anything else (a ``DBR`` arm, e.g.
-        ``'DBR(p_max=0.8)'`` — naive best response is DBR at ``p_max=1``) ⇒ search
-        **with** the given ``model_spec`` (required — a modeled arm with no spec is a
-        mistake, not vanilla Pluribus).
+        quality test, not an approach.  ``'OX(beta=X)'`` ⇒ OX-Search (Approach B):
+        search with the gadget root at safety parameter ``β=X`` and **no** model
+        (reach-only exploitation; the belief enters via the tracked ranges).  Anything
+        else (a ``DBR`` arm, e.g. ``'DBR(p_max=0.8)'`` — naive best response is DBR at
+        ``p_max=1``) ⇒ search **with** the given ``model_spec`` (required — a modeled
+        arm with no spec is a mistake, not vanilla Pluribus).
         """
         low = condition.strip().lower()
+        beta = None
         if low == "vanilla":
             search_enabled, spec = True, None      # real Pluribus: search, no model
         elif low == "blueprint_only":
             search_enabled, spec = False, None     # pipeline test only (no search)
+        elif low.startswith("ox"):
+            # OX-Search is REACH-ONLY: search on, β set, NO model.  A model_spec here
+            # is a wiring mistake (OX consumes no DBR machinery).
+            if model_spec is not None:
+                raise ValueError(
+                    f"condition {condition!r} is OX-Search (reach-only) but a "
+                    "model_spec was given; OX takes no opponent model."
+                )
+            beta = _parse_ox_beta(condition)
+            search_enabled, spec = True, None
         else:
             if model_spec is None:
                 raise ValueError(
                     f"condition {condition!r} is a modeled (DBR) arm but no "
                     "model_spec was given ('vanilla' is the model-free search "
-                    "baseline; 'blueprint_only' is the no-search pipeline test)"
+                    "baseline; 'blueprint_only' is the no-search pipeline test; "
+                    "'OX(beta=X)' is the reach-only safe-exploitation arm)"
                 )
             search_enabled, spec = True, model_spec
         return cls(
             condition=condition,
             search_enabled=search_enabled,
             model_spec=spec,
+            beta=beta,
             **kwargs,
         )
 
@@ -453,6 +497,10 @@ def _capture_hero_decision(
             # 1 iff a modeled solve produced this play (DBR) — the
             # coverage flag the summary restricts the exploitation slice to (§9 A7).
             modeled_decision=1 if hero.has_models else 0,
+            # OX-Search (Approach B) opt-out saturation for this solve — NULL for
+            # vanilla/DBR and for any non-vector subgame (the gadget was inactive).
+            # ≈1 ⇒ β too small (Thm 4.5 guard).  Also marks a genuinely OX decision.
+            ox_enter_prob=res.ox_enter_prob,
         )
 
     # Blueprint play — round 1 (no search), or the search-miss / failed-solve
@@ -1084,6 +1132,7 @@ def build_blueprint_session(
         max_iterations=max_iterations,
         max_wall_seconds=max_wall_seconds,
         workers=workers,
+        beta=cfg.beta,          # OX-Search gadget (Approach B); None ⇒ off (vanilla/DBR)
     )
     return EvalSession(
         config=cfg,
@@ -1295,10 +1344,13 @@ def _cli():
                 model_spec.resolve()
             except Exception as exc:
                 raise click.UsageError(f"invalid model schedule: {exc}") from exc
+        elif cond.strip().lower().startswith("ox"):
+            pass   # OX-Search is reach-only (no model); β is parsed in for_condition
         elif cond.strip().lower() not in ("vanilla", "blueprint_only"):
             raise click.UsageError(
                 f"--condition={cond!r} is a DBR arm but --model-p-max was not "
-                "given ('vanilla' and 'blueprint_only' are the only model-free arms)."
+                "given ('vanilla', 'blueprint_only', and 'OX(beta=X)' are the "
+                "model-free arms)."
             )
         arm = EvalConfig.for_condition(cond, model_spec=model_spec, run_id=opts["run_id"])
         cfg = EvalConfig(
@@ -1306,6 +1358,7 @@ def _cli():
             condition=arm.condition,
             search_enabled=arm.search_enabled,
             model_spec=arm.model_spec,
+            beta=arm.beta,
             run_seed=opts["run_seed"],
             table_policy=opts["table_policy"],
             fixed_seats=fixed_seats,

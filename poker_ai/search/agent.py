@@ -345,8 +345,15 @@ class SearchAgent:
             if pk in self.last_search.state.legal_at:
                 hr = self._hand_row(env)
                 legal = [a for a in env.legal_actions if a is not None]
+                # OX-Search (Approach B, decision 5) plays the weighted-AVERAGE — every
+                # §4.2 safety guarantee attaches to CFR's average, not the final iterate.
+                # ``ox_enter_prob`` is set exactly when the gadget ran (vector regime +
+                # β); vanilla/DBR leave it ``None`` and play the final iterate as before.
+                played = (self.last_search.average_policy
+                          if self.last_search.ox_enter_prob is not None
+                          else self.last_search.policy)
                 prob = np.asarray(
-                    self.last_search.policy.strategy_for(pk, hr, legal),
+                    played.strategy_for(pk, hr, legal),
                     dtype=np.float64,
                 )
                 total = prob.sum()

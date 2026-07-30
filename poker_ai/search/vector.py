@@ -77,6 +77,32 @@ _regret_match_matrix = regret_match_matrix
 _OX_ENTER, _OX_OUT = 0, 1
 
 
+def ox_optout_key(root_env):
+    """The synthetic ``state.vregret`` key holding the OX-Search opt-out regret row.
+
+    Distinct from every real node key (a ``(betting_stage:str, history:tuple)`` pair):
+    here element 0 is itself the root public key and element 1 is a sentinel string.
+    """
+    return (root_env.public_key, "OX_OPTOUT")
+
+
+def ox_enter_prob(state, root_env, board_compatible):
+    """Opt-out saturation (Thm 4.5 guard): mean ENTER-probability over the feasible
+    opponent infosets, read off the solved ``state``; ``None`` if no OX solve ran.
+
+    ≈ 1 ⇒ the safety branch never opts out ⇒ β is too small (raise it).  Reads the
+    final (serial or merged-replica) opt-out row, so it is regime- and worker-agnostic.
+    """
+    optr = state.vregret.get(ox_optout_key(root_env))
+    if optr is None:
+        return None
+    feas = np.asarray(board_compatible, dtype=bool)
+    if not feas.any():
+        return float("nan")
+    q = regret_match_matrix(optr)
+    return float(q[feas, _OX_ENTER].mean())
+
+
 class _VectorSolver:
     """Heads-up turn/river vector-form Linear CFR over a fixed subgame root.
 
@@ -231,7 +257,7 @@ class _VectorSolver:
         # Per-combo opt-out regret row (width 2: [enter, out]) as a combo-keyed root
         # node in state.vregret under a synthetic key, so state.discount / accumulate
         # sweep it uniformly with the real tables.  Reused on a warm re-search.
-        self._ox_optout_key = (self.root_env.public_key, "OX_OPTOUT")
+        self._ox_optout_key = ox_optout_key(self.root_env)
         if self._ox_optout_key not in self.state.vregret:
             self.state.vregret[self._ox_optout_key] = np.zeros(
                 (self._n_combos, 2), dtype=np.float64

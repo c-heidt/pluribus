@@ -33,7 +33,7 @@ from poker_ai.search.parallel import (
 )
 from poker_ai.search.policy import SearchPolicy
 from poker_ai.search.solver_state import SearchStats, SolverConfig, SolverState
-from poker_ai.search.vector import _VectorSolver
+from poker_ai.search.vector import _VectorSolver, ox_enter_prob
 
 __all__ = [
     "solve",
@@ -94,6 +94,11 @@ class SearchResult:
     leaf_mode: str
     stop_reason: str
     stats: SearchStats = field(default_factory=SearchStats)
+    # OX-Search (Approach B, §11.3): the opt-out saturation metric (mean ENTER-prob
+    # over feasible opponent infosets) when the gadget ran, else ``None``.  Non-``None``
+    # is ALSO the "OX was active" signal — the agent plays the weighted-average (not the
+    # final iterate) exactly when this is set (decision 5), and the eval logs it.
+    ox_enter_prob: Optional[float] = None
 
 
 def _select_regime(ctx: SubgameContext) -> str:
@@ -248,6 +253,12 @@ def solve(
         wall = time.perf_counter() - start
         stats = state.stats_snapshot()
 
+    # OX-Search saturation metric (Approach B): read off the solved/merged state's
+    # opt-out row, and only in the regime that runs the gadget.  Non-None is the
+    # "OX was active" signal the agent uses to play the weighted-average (decision 5).
+    ox = (ox_enter_prob(state, root_env, ctx.board_compatible)
+          if getattr(cfg, "beta", None) is not None and regime == "vector" else None)
+
     return SearchResult(
         policy=SearchPolicy(state, use_average=False),
         average_policy=SearchPolicy(state, use_average=True),
@@ -259,4 +270,5 @@ def solve(
         leaf_mode=_leaf_mode(regime, ctx, cfg),
         stop_reason=stop_reason,
         stats=stats,
+        ox_enter_prob=ox,
     )

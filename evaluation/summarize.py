@@ -291,15 +291,21 @@ def _query_paired(con: sqlite3.Connection) -> dict:
         for ds in seeds:
             per_cond[c].pop(ds, None)
 
-    # Deck-seeds on which each condition made ≥1 modeled decision — the coverage
-    # slice.  Keyed by condition so a comparison restricts to the *treatment*'s
-    # covered deals.  Empty for baseline/unmodeled arms (no modeled decisions).
+    # Deck-seeds on which each condition actually applied its exploitation mechanism
+    # — the coverage slice.  Keyed by condition so a comparison restricts to the
+    # *treatment*'s covered deals.  A deal counts as covered when the treatment made
+    # ≥1 genuine treatment decision: a modeled (DBR) decision ``modeled_decision = 1``,
+    # OR an OX-Search decision ``ox_enter_prob IS NOT NULL`` (the gadget fired — HU
+    # turn/river, Approach B; OX is reach-only so ``modeled_decision`` is always 0 for
+    # it, and this per-decision signal is more precise than the per-hand
+    # ``hu_from_street``).  Empty for baseline/unmodeled arms (vanilla, blueprint_only).
     covered: Dict[str, set] = {}
     for r in _rows(
         con,
         "SELECT g.condition AS condition, g.deck_seed AS deck_seed "
         "FROM games g JOIN decisions d ON d.game_id = g.game_id "
-        "WHERE d.modeled_decision = 1 AND g.condition IS NOT NULL "
+        "WHERE (d.modeled_decision = 1 OR d.ox_enter_prob IS NOT NULL) "
+        "AND g.condition IS NOT NULL "
         "AND g.deck_seed IS NOT NULL GROUP BY g.condition, g.deck_seed",
     ):
         covered.setdefault(r["condition"], set()).add(r["deck_seed"])
