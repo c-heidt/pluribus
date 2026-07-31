@@ -331,11 +331,45 @@ class SweepRow:
         return (self.condition, self.regime, int(self.street), int(self.n_live))
 
 
+# --- Sweep pool hooks (module-level ⇒ fork-inherited cleanly by the hand pool) ------
+def _sweep_setup(worker_id: int, shared: dict):
+    """After fork: reopen the leaf-fleet LMDB (MDB_BAD_RSLOT), start a result list."""
+    try:
+        from poker_ai.search.parallel import _reopen_leaf_fleet_lmdb
+        if shared["samples"]:
+            _reopen_leaf_fleet_lmdb(shared["samples"][0].ctx)
+    except Exception:  # pragma: no cover - reopen is best-effort
+        pass
+    return {"results": []}
+
+
+def _sweep_process(spec_idx: int, state: dict, shared: dict) -> None:
+    """Solve one ``(sample, rep, budget)`` at search ``workers=1`` (the deployment model)."""
+    si, rep, t = shared["specs"][spec_idx]
+    s = shared["samples"][si]
+    seed = shared["base_seed"] + 1000 * si + rep
+    env_t = copy.deepcopy(s.env)
+    ctx_t = dataclasses.replace(s.ctx, rng=np.random.default_rng(seed))
+    cfg_t = dataclasses.replace(
+        shared["prod_cfg"], auto_budget=False, max_iterations=int(t),
+        workers=1, max_wall_seconds=1e9,
+    )
+    res = solve(env_t, ctx_t, cfg_t, regime_override=shared["force_regime"])
+    state["results"].append((
+        si, rep, int(t), _root_sigma(res, s), res.root_value,
+        int(res.iterations_run), float(res.wall_seconds), str(res.stop_reason),
+    ))
+
+
+def _sweep_teardown(state: dict):
+    return state["results"]
+
+
 def sweep_cell(
     samples: Sequence[RootSample],
     prod_cfg: SolverConfig,
     *,
-    workers: int,
+    pool_workers: int,
     ladder: Sequence[int],
     reps: int,
     base_seed: int,
@@ -343,67 +377,81 @@ def sweep_cell(
     force_regime: Optional[str] = None,
     ref_values: Optional[Dict[Tuple[int, int], Optional[float]]] = None,
 ) -> Tuple[List[SweepRow], Dict[Tuple[int, int], Optional[float]]]:
-    """Re-solve each root at every ladder budget (``reps`` replicates) at ``workers``.
+    """Re-solve each root at every ladder budget, one solve per core at **search W=1**.
 
-    Each solve forces ``auto_budget=False`` + ``max_iterations = per_replica`` and a
-    huge wall cap, so the loop always completes the structural budget and the wall it
-    reports is a clean throughput measurement (never wall-clipped).  The **primary**
-    convergence signal is the hero's root-value gap (mbb) at ``t`` vs a top-budget
-    reference — a value, so it is invariant across equivalent equilibria and weighted
-    toward the hot (played) actions.  Hot-action L1 and argmax-stability on the root
-    average strategy are kept as played-decision diagnostics; the full-policy L1 is a
-    column only.
+    The solves fan out across ``pool_workers`` cores via the single-core hand pool
+    (:func:`evaluation.hand_pool.run_index_pool`), each running the search at
+    ``workers=1`` — the **deployment model** (one hand per core, no nested pool).  So
+    the wall each solve reports **is** the honest per-search cost under that model, and
+    the sweep itself is core-parallel.  Each solve forces ``auto_budget=False`` +
+    ``max_iterations = t`` + a huge wall cap, so the loop always completes the budget
+    and the wall is never clipped.
 
-    ``force_regime`` overrides the production regime routing (the turn regime A/B
-    solves the same roots under both regimes).  Rows are labelled with the forced
-    regime so they form their own cell.
+    The **primary** convergence signal is the hero's root-value gap (mbb) vs a top-budget
+    reference — a value (equilibrium-invariant, hot-path-weighted).  Hot-action L1 +
+    argmax-stability are played-decision diagnostics; full-policy L1 is a column only.
 
-    ``ref_values`` supplies the **value-gap reference** keyed by ``(sample_idx,
-    rep)`` — used by the A/B so MCCFR's gap is measured against the *vector-exact*
-    ground truth (vector@top), not MCCFR's own noisy top budget.  When ``None`` each
-    ``(sample, rep)`` self-references its own top-budget value.  Returns
-    ``(rows, computed_ref_values)`` so the caller can feed the vector references into
-    the MCCFR pass.  (The strategy diagnostics ``hot_l1``/``argmax`` always
-    self-reference — cross-regime strategy mixtures are not comparable.)
+    ``force_regime`` overrides the production regime routing (the turn A/B solves the
+    same roots under both).  ``ref_values`` (keyed ``(sample, rep)``) supplies the
+    value-gap reference so MCCFR's gap is measured against the *vector-exact* ground
+    truth; ``None`` ⇒ each ``(sample, rep)`` self-references its own top budget.  Returns
+    ``(rows, computed_ref_values)`` so the caller feeds the vector refs into the MCCFR
+    pass.  (Strategy diagnostics always self-reference — cross-regime mixtures aren't
+    comparable.)
     """
+    from evaluation.hand_pool import run_index_pool
+
     ladder = list(ladder)
     t_ref = ladder[-1]
+    specs = [(si, rep, t) for si in range(len(samples))
+             for rep in range(reps) for t in ladder]
+    if not specs:
+        return [], {}
+    shared = {"samples": samples, "prod_cfg": prod_cfg, "base_seed": int(base_seed),
+              "force_regime": force_regime, "specs": specs}
+    payloads = run_index_pool(
+        n_workers=min(int(pool_workers), len(specs)) or 1,
+        setup=_sweep_setup, process=_sweep_process, teardown=_sweep_teardown,
+        shared=shared, target=len(specs),
+    )
+    # Parent-side LMDB reopen after the fork (MDB_BAD_RSLOT), mirroring run_parallel —
+    # the parent solves/collects more roots after this returns.
+    try:
+        from poker_ai.search.parallel import _reopen_leaf_fleet_lmdb
+        if samples:
+            _reopen_leaf_fleet_lmdb(samples[0].ctx)
+    except Exception:  # pragma: no cover
+        pass
+
+    # Gather the per-solve results keyed (sample, rep, budget).
+    by: Dict[Tuple[int, int, int], tuple] = {}
+    for pl in payloads:
+        for (si, rep, t, sig, val, iters, wall, stop) in (pl or []):
+            by[(si, rep, t)] = (sig, val, iters, wall, stop)
+
     rows: List[SweepRow] = []
     computed_refs: Dict[Tuple[int, int], Optional[float]] = {}
     for si, s in enumerate(samples):
         for rep in range(reps):
-            seed = int(base_seed) + 1000 * si + rep
-            sigmas: Dict[int, Optional[np.ndarray]] = {}
-            values: Dict[int, Optional[float]] = {}
-            meta: Dict[int, Tuple[int, float, str]] = {}
-            for t in ladder:
-                env_t = copy.deepcopy(s.env)
-                ctx_t = dataclasses.replace(s.ctx, rng=np.random.default_rng(seed))
-                cfg_t = dataclasses.replace(
-                    prod_cfg, auto_budget=False, max_iterations=int(t),
-                    workers=int(workers), max_wall_seconds=1e9,
-                )
-                res = solve(env_t, ctx_t, cfg_t, regime_override=force_regime)
-                sigmas[t] = _root_sigma(res, s)
-                values[t] = res.root_value
-                meta[t] = (int(res.iterations_run), float(res.wall_seconds),
-                           str(res.stop_reason))
-            ref_sig = sigmas[t_ref]
-            computed_refs[(si, rep)] = values[t_ref]
-            # Value-gap reference: a supplied (cross-regime, e.g. vector-exact) value
-            # if given, else this regime's own top-budget value (self-convergence).
+            top = by.get((si, rep, t_ref))
+            ref_sig = top[0] if top is not None else None
+            computed_refs[(si, rep)] = top[1] if top is not None else None
+            # Value-gap reference: a supplied (cross-regime, vector-exact) value if given,
+            # else this regime's own top-budget value (self-convergence).
             ref_val = (ref_values.get((si, rep)) if ref_values is not None
-                       else values[t_ref])
+                       else computed_refs[(si, rep)])
             row_regime = force_regime if force_regime is not None else s.regime
             for t in ladder:
-                sig, val = sigmas[t], values[t]
+                g = by.get((si, rep, t))
+                if g is None:
+                    continue
+                sig, val, iters, wall, stop = g
                 l1 = (float(np.abs(sig - ref_sig).sum())
                       if sig is not None and ref_sig is not None else float("nan"))
-                pooled, wall, stop = meta[t]
                 rows.append(SweepRow(
                     condition=s.condition, regime=row_regime, street=s.street,
-                    n_live=s.n_live, per_replica=int(t), workers=int(workers),
-                    pooled_iters=pooled, wall_seconds=wall, stop_reason=stop,
+                    n_live=s.n_live, per_replica=int(t), workers=1,
+                    pooled_iters=int(iters), wall_seconds=float(wall), stop_reason=stop,
                     sample=si, rep=rep,
                     value_gap_mbb=_value_gap_mbb(val, ref_val, big_blind),
                     root_value=(float(val) if val is not None else float("nan")),
@@ -509,18 +557,26 @@ def _production_regime(street: int, n_live: int) -> str:
 
 def suggest_config(summaries: Sequence[CellSummary], *, threshold: float,
                    default_mccfr: int = 750,
-                   default_vector: Tuple[int, int, int] = (1500, 1000, 500)
+                   default_vector: Tuple[int, int, int] = (1500, 1000, 500),
+                   wall_safety: float = 2.0
                    ) -> Dict[str, object]:
-    """Fold per-cell suggested budgets into a ``SolverConfig`` block.
+    """Fold per-cell suggested budgets + per-street wall caps into a config block.
 
     MCCFR floor per street = the **max** over live-player counts of the per-cell
     suggested per-replica budget (cover the slowest-converging live-count), rounded
     up.  Vector per street from the heads-up vector cells.  Cells with no converged
     suggestion at ``threshold`` (mbb value gap) keep the current default and are flagged.
+
+    ``max_wall_seconds_by_street`` (preflop, flop, turn, river) is the per-round **time
+    backstop** for the deployment (1 hand / core, search W=1): the measured per-search
+    wall at the suggested budget × ``wall_safety`` (so the iteration budget normally
+    binds and the wall only clips a pathological tail).  Streets with no converged /
+    measured cell get ``None`` — the caller keeps the flat ``max_wall_seconds`` there.
     """
     key = f"{threshold:g}"
     mccfr_by_street: Dict[int, int] = {}
     vector_by_street: Dict[int, int] = {}
+    wall_by_street: Dict[int, float] = {}
     unresolved: List[str] = []
     for s in summaries:
         _cond, regime, street, n_live = s.cell
@@ -538,6 +594,11 @@ def suggest_config(summaries: Sequence[CellSummary], *, threshold: float,
             mccfr_by_street[street] = max(mccfr_by_street.get(street, 0), int(val))
         elif regime == "vector":
             vector_by_street[street] = max(vector_by_street.get(street, 0), int(val))
+        # Per-street wall backstop: the measured W=1 wall at the suggested budget,
+        # max over live-counts (cover the slowest), scaled by the safety factor.
+        w_at_sugg = s.mean_wall.get(val)
+        if w_at_sugg is not None:
+            wall_by_street[street] = max(wall_by_street.get(street, 0.0), float(w_at_sugg))
 
     mccfr_floor = [
         _round_up(mccfr_by_street[st]) if st in mccfr_by_street else default_mccfr
@@ -548,9 +609,16 @@ def suggest_config(summaries: Sequence[CellSummary], *, threshold: float,
         _round_up(vector_by_street[st]) if st in vector_by_street else default_vector[i]
         for i, st in enumerate((1, 2, 3))
     ]
+    # max_wall_seconds_by_street is (preflop, flop, turn, river) = streets 0..3; None
+    # where unmeasured/unconverged so the caller keeps its flat default there.
+    max_wall = tuple(
+        round(wall_by_street[st] * wall_safety, 2) if st in wall_by_street else None
+        for st in (0, 1, 2, 3)
+    )
     return {
         "threshold_mbb": threshold,
         "mccfr_min_per_replica_by_street": tuple(mccfr_floor),
+        "max_wall_seconds_by_street": max_wall,
         "vector_budget_by_street": tuple(vector),
         "unresolved_cells": unresolved,
     }
@@ -588,46 +656,55 @@ def _gap_at_wall(summary: CellSummary, target_wall: float) -> Tuple[int, float, 
     return t, summary.mean_wall[t], summary.mean_value_gap_mbb.get(t, float("nan"))
 
 
-def _turn_ab_pairs(summaries: Sequence[CellSummary]) -> Dict[str, Dict[str, CellSummary]]:
-    """Per-condition ``{regime: summary}`` for HU turn cells that have BOTH regimes."""
-    turn: Dict[str, Dict[str, CellSummary]] = {}
+def _regime_ab_pairs(
+    summaries: Sequence[CellSummary],
+) -> Dict[Tuple[str, int], Dict[str, CellSummary]]:
+    """Per ``(condition, street)`` ``{regime: summary}`` for HU cells with BOTH regimes.
+
+    Keyed by ``(condition, street)`` so the vector-vs-MCCFR comparison covers every HU
+    postflop street the A/B ran on (flop and/or turn), not just the turn.
+    """
+    pairs: Dict[Tuple[str, int], Dict[str, CellSummary]] = {}
     for s in summaries:
         cond, regime, street, n_live = s.cell
-        if int(street) == 2 and int(n_live) == 2:
-            turn.setdefault(cond, {})[regime] = s
-    return {c: d for c, d in turn.items() if "vector" in d and "mccfr" in d}
+        if int(n_live) == 2:
+            pairs.setdefault((cond, int(street)), {})[regime] = s
+    return {k: d for k, d in pairs.items() if "vector" in d and "mccfr" in d}
 
 
-def _print_turn_ab(summaries: Sequence[CellSummary],
-                   wall_target: Optional[float]) -> None:
-    """Head-to-head: at a fixed wall, which turn regime is closer to the exact answer.
+def _print_regime_ab(summaries: Sequence[CellSummary],
+                     wall_target: Optional[float]) -> None:
+    """Head-to-head: at a fixed wall, which regime is closer to the exact answer.
 
     Both regimes' gaps are measured against the SAME vector-exact reference (set up in
-    the sweep), so this is a genuine 'distance to truth at equal wall' comparison, not
-    a per-regime self-convergence readout.
+    the sweep — vector is exact-per-iteration), so this is a genuine 'distance to truth
+    at equal wall' comparison per HU postflop street (flop / turn), not a per-regime
+    self-convergence readout.
     """
-    pairs = _turn_ab_pairs(summaries)
+    pairs = _regime_ab_pairs(summaries)
     if not pairs:
         return
     target = wall_target if wall_target is not None else 20.0
     print("\n" + "=" * 92)
-    print(f"TURN REGIME A/B — value still on the table at ~{target:.0f}s wall "
+    print(f"REGIME A/B (HU) — value still on the table at ~{target:.0f}s wall "
           "(both vs the vector-exact ref; lower = closer to truth)")
     print("=" * 92)
-    hdr = f"{'condition':<10} {'regime':<7} {'budget':>7} {'wall':>8} {'gap(mbb)':>9}"
+    hdr = (f"{'condition':<10} {'street':<7} {'regime':<7} {'budget':>7} "
+           f"{'wall':>8} {'gap(mbb)':>9}")
     print(hdr)
     print("-" * len(hdr))
-    for cond, d in sorted(pairs.items()):
+    for (cond, street), d in sorted(pairs.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        sname = _STREET_NAME.get(street, street)
         gaps = {}
         for regime in ("vector", "mccfr"):
             t, wall, gap = _gap_at_wall(d[regime], target)
             gaps[regime] = gap
-            print(f"{cond:<10} {regime:<7} {t:>7} {wall:>8.2f} {gap:>9.1f}")
+            print(f"{cond:<10} {sname:<7} {regime:<7} {t:>7} {wall:>8.2f} {gap:>9.1f}")
         v, m = gaps["vector"], gaps["mccfr"]
         if not (np.isnan(v) or np.isnan(m)):
             winner = "vector" if v <= m else "mccfr"
-            print(f"  -> at ~{target:.0f}s wall, {winner.upper()} is closer to the "
-                  f"exact answer (vector {v:.1f} vs mccfr {m:.1f} mbb)")
+            print(f"  -> {sname} at ~{target:.0f}s wall, {winner.upper()} is closer to "
+                  f"the exact answer (vector {v:.1f} vs mccfr {m:.1f} mbb)")
     print("=" * 92)
 
 
@@ -676,11 +753,13 @@ def _print_report(summaries: Sequence[CellSummary], config: Dict[str, object],
           "   # (preflop, flop, turn, river)")
     print(f"    vector_budget_by_street         = {config['vector_budget_by_street']}"
           "   # (flop, turn, river)")
+    print(f"    max_wall_seconds_by_street      = {config['max_wall_seconds_by_street']}"
+          "   # (preflop, flop, turn, river); W=1 wall backstop, None=flat default")
     if config["unresolved_cells"]:
         print("  NOTE: did not converge below threshold within the ladder (kept default): "
               + ", ".join(config["unresolved_cells"]))
     print("=" * 92 + "\n")
-    _print_turn_ab(summaries, wall_target)
+    _print_regime_ab(summaries, wall_target)
 
 
 # --------------------------------------------------------------------------- #
@@ -710,7 +789,7 @@ def run_calibration(
     use_decision_free_equity: bool,
     out_dir: Path,
     wall_target: Optional[float],
-    turn_regime_ab: bool = True,
+    regime_ab_streets: Sequence[int] = (2,),
 ) -> Dict[str, object]:
     out_dir.mkdir(parents=True, exist_ok=True)
     top = int(ladder[-1])
@@ -793,39 +872,47 @@ def run_calibration(
             session, cond_cfg, collect_cfg, condition,
             n_hands=collect_hands, per_cell_cap=per_cell_cap, run_seed=run_seed,
         )
-        # Turn regime A/B: solve HU turn roots under BOTH regimes.  Runs **per
-        # condition** (this loop is inside the conditions loop; the cell key carries
-        # the condition), so vanilla AND each DBR arm get their own comparison — the
-        # decision can legitimately flip for DBR, because the model clamp concentrates
-        # the opponent's effective range/strategy, which changes both the full-range
-        # settlement cost (vector) and the sampling variance (MCCFR).  Disabled only
-        # when OX-Search is on (``beta`` set): the gadget root exists solely in the
-        # vector regime, so an MCCFR solve of the same root would silently drop the
-        # gadget and compare a different game — the OX turn stays vector-only.
-        ab_on = turn_regime_ab and getattr(prod_cfg, "beta", None) is None
+        # Regime A/B: solve HU roots on the ``regime_ab_streets`` under BOTH regimes.
+        # Runs **per condition** (this loop is inside the conditions loop; the cell key
+        # carries the condition), so vanilla AND each DBR arm get their own comparison —
+        # the decision can legitimately flip for DBR, because the model clamp
+        # concentrates the opponent's effective range/strategy, which changes both the
+        # full-range settlement cost (vector) and the sampling variance (MCCFR).  Vector
+        # is exact-per-iteration on every HU postflop street (flop samples the
+        # (turn,river) completion, turn the river), so vector@top is the shared exact
+        # reference both regimes' gaps are measured against.  Disabled when OX-Search is
+        # on (``beta`` set): the gadget root exists solely in the vector regime, so an
+        # MCCFR solve would silently drop it — those streets stay vector-only.
+        # NOTE: the HU **flop** A/B is SLOW (full-width vector flop ~1.3 it/s, the very
+        # reason production routes it to MCCFR) — pair it with a small ladder.
+        ab_streets = set(int(s) for s in regime_ab_streets)
+        ab_on = bool(ab_streets) and getattr(prod_cfg, "beta", None) is None
         for cell, sample_list in samples.items():
             _cond, _regime, street, n_live = cell
-            is_hu_turn = (int(street) == 2 and int(n_live) == 2)
-            if ab_on and is_hu_turn:
-                logger.info("turn regime A/B on cell %s (%d roots): vector vs mccfr "
-                            "vs shared vector-exact ref", cell, len(sample_list))
+            is_ab = (int(n_live) == 2 and int(street) in ab_streets)
+            if ab_on and is_ab:
+                logger.info("regime A/B on cell %s (%d roots): vector (exact ref) + "
+                            "mccfr vs it", cell, len(sample_list))
+                # Vector FIRST — it produces the exact shared reference; MCCFR is then
+                # measured against it (distance-to-truth).  Which regime is *production*
+                # for this street only matters to suggest_config (via _production_regime).
                 vec_rows, vec_refs = sweep_cell(
-                    sample_list, prod_cfg, workers=resolved_workers, ladder=ladder,
+                    sample_list, prod_cfg, pool_workers=resolved_workers, ladder=ladder,
                     reps=reps, base_seed=run_seed, big_blind=big_blind,
                     force_regime="vector",
                 )
                 mc_rows, _ = sweep_cell(
-                    sample_list, prod_cfg, workers=resolved_workers, ladder=ladder,
+                    sample_list, prod_cfg, pool_workers=resolved_workers, ladder=ladder,
                     reps=reps, base_seed=run_seed, big_blind=big_blind,
                     force_regime="mccfr", ref_values=vec_refs,
                 )
                 all_rows.extend(vec_rows)
                 all_rows.extend(mc_rows)
                 continue
-            logger.info("sweeping cell %s (%d roots) at W=%d over %s",
+            logger.info("sweeping cell %s (%d roots) search W=1 over %d cores, ladder %s",
                         cell, len(sample_list), resolved_workers, ladder)
             rows, _ = sweep_cell(
-                sample_list, prod_cfg, workers=resolved_workers,
+                sample_list, prod_cfg, pool_workers=resolved_workers,
                 ladder=ladder, reps=reps, base_seed=run_seed, big_blind=big_blind,
             )
             all_rows.extend(rows)
@@ -866,27 +953,32 @@ def run_calibration(
             for s in summaries
         ],
     }
-    # Turn regime A/B head-to-head (per condition): both regimes' value gap at a fixed
-    # wall vs the SHARED vector-exact reference — "which turn regime is closer to truth
-    # at equal wall".  Empty unless the A/B ran (vanilla/DBR, ``beta`` off, HU turn).
+    # Regime A/B head-to-head (per condition × HU street): both regimes' value gap at a
+    # fixed wall vs the SHARED vector-exact reference — "which regime is closer to truth
+    # at equal wall".  Empty unless the A/B ran (vanilla/DBR, ``beta`` off, HU flop/turn).
     ab_target = wall_target if wall_target is not None else 20.0
-    ab_pairs = _turn_ab_pairs(summaries)
+    ab_pairs = _regime_ab_pairs(summaries)
     if ab_pairs:
-        summary_json["turn_regime_ab"] = {
+        summary_json["regime_ab"] = {
             "wall_target_s": ab_target,
             "note": ("both gaps vs the vector-exact reference; lower = closer to the "
-                     "true value; per condition (DBR can differ from vanilla)"),
-            "conditions": {
-                cond: {
-                    regime: {
-                        "budget": _gap_at_wall(d[regime], ab_target)[0],
-                        "wall_s": _gap_at_wall(d[regime], ab_target)[1],
-                        "value_gap_mbb": _gap_at_wall(d[regime], ab_target)[2],
-                    }
-                    for regime in ("vector", "mccfr")
+                     "true value; per (condition, street) — DBR can differ from vanilla, "
+                     "and the flop can differ from the turn"),
+            "cells": [
+                {
+                    "condition": cond,
+                    "street": _STREET_NAME.get(street, street),
+                    **{
+                        regime: {
+                            "budget": _gap_at_wall(d[regime], ab_target)[0],
+                            "wall_s": _gap_at_wall(d[regime], ab_target)[1],
+                            "value_gap_mbb": _gap_at_wall(d[regime], ab_target)[2],
+                        }
+                        for regime in ("vector", "mccfr")
+                    },
                 }
-                for cond, d in ab_pairs.items()
-            },
+                for (cond, street), d in sorted(ab_pairs.items())
+            ],
         }
     (out_dir / "calibration_summary.json").write_text(json.dumps(summary_json, indent=2))
     _print_report(summaries, config, wall_target, core_on=core_on)
@@ -953,10 +1045,13 @@ def _cli():
     @click.option("--wall-target", default=None, type=float,
                   help="Per-decision wall budget (s); flags cells whose suggested "
                   "budget would exceed it, and sets the wall for the turn regime A/B.")
-    @click.option("--turn-regime-ab/--no-turn-regime-ab", default=True, show_default=True,
-                  help="Solve HU turn roots under BOTH vector and MCCFR (per condition) "
-                  "vs a shared vector-exact reference, to compare which regime is closer "
-                  "to truth at equal wall. Auto-off under OX-Search (gadget is vector-only).")
+    @click.option("--regime-ab-streets", default="turn", show_default=True,
+                  help="Comma list of HU postflop streets (flop,turn,river) to solve "
+                  "under BOTH vector and MCCFR vs a shared vector-exact reference — "
+                  "compares which regime is closer to truth at equal wall (per condition). "
+                  "'none' disables. Auto-off under OX-Search (gadget is vector-only). "
+                  "WARNING: 'flop' is SLOW (full-width vector flop ~1.3 it/s) — use a "
+                  "small --max-iters/--collect-hands when including it.")
     @click.option("--out-dir", default="calibration_out", type=str, show_default=True)
     def run(**o):
         """Collect roots, sweep budgets, and emit a suggested SolverConfig block."""
@@ -971,6 +1066,12 @@ def _cli():
                                 error=float(o["model_error"]),
                                 seed=int(o["model_seed"]))
                       if need_model else None)
+        _street_id = {"preflop": 0, "flop": 1, "turn": 2, "river": 3}
+        ab_raw = o["regime_ab_streets"].strip().lower()
+        regime_ab_streets = () if ab_raw in ("none", "") else tuple(
+            _street_id[s.strip()] for s in ab_raw.split(",")
+            if s.strip() and s.strip() in _street_id
+        )
         run_calibration(
             blueprint_path=o["blueprint_path"], lut_path=o["lut_path"],
             conditions=conditions, model_spec=model_spec,
@@ -983,7 +1084,7 @@ def _cli():
             low_card_rank=o["low_card_rank"], high_card_rank=o["high_card_rank"],
             use_decision_free_equity=not o["no_decision_free_equity"],
             out_dir=Path(o["out_dir"]), wall_target=o["wall_target"],
-            turn_regime_ab=o["turn_regime_ab"],
+            regime_ab_streets=regime_ab_streets,
         )
 
     return calibrate

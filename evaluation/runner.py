@@ -46,9 +46,11 @@ RNG sub-stream keeps it from perturbing the played hand.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import datetime
 import json
 import logging
+import os
 import time
 import traceback
 from dataclasses import dataclass
@@ -877,6 +879,124 @@ def run_evaluation(
     return n_attempted
 
 
+def _reopen_session_after_fork(session: EvalSession) -> None:
+    """Reopen the session's fork-inherited LMDB handles in a worker (``MDB_BAD_RSLOT``).
+
+    Mirrors :func:`poker_ai.search.parallel._reopen_leaf_fleet_lmdb` but over the
+    :class:`EvalSession`: the blueprint policy and the leaf-fleet variants (which share
+    one ``CFRTables``/LMDB index) each get a fresh reader slot after the fork.  Per-hand
+    opponent models are built from this same reopened blueprint, so they need no
+    separate reopen.  Deduped by object id (the four §4 leaf variants share one object).
+    """
+    seen: set = set()
+
+    def _reopen(obj) -> None:
+        if obj is None or id(obj) in seen:
+            return
+        fn = getattr(obj, "reopen_after_fork", None)
+        if fn is not None:
+            seen.add(id(obj))
+            fn()
+
+    _reopen(session.blueprint_policy)
+    for pol in session.solver_cfg.leaf.policies.values():
+        _reopen(pol)
+
+
+# --- Parallel eval: pool hooks (module-level so they are fork-inherited cleanly) ---
+def _eval_worker_setup(worker_id: int, shared: dict):
+    """Per-worker init after fork: reopen LMDB, open this worker's node-local DB."""
+    _reopen_session_after_fork(shared["session"])
+    wdir = shared["worker_dir"]
+    os.makedirs(wdir, exist_ok=True)
+    wpath = os.path.join(wdir, f"w{worker_id:03d}.sqlite")
+    if os.path.exists(wpath):
+        os.remove(wpath)   # a stale DB from a crashed prior attempt (never merged)
+    return {"log": ExperimentLog.open(wpath), "path": wpath, "n_ok": 0, "n_fail": 0}
+
+
+def _eval_worker_process(hand_index: int, state: dict, shared: dict) -> None:
+    ok = _play_and_log_one(
+        shared["session"], state["log"], shared["cfg"], shared["fingerprint"],
+        hand_index, shared["now_fn"], shared["git_sha"], shared["hostname"],
+    )
+    state["n_ok" if ok else "n_fail"] += 1
+
+
+def _eval_worker_teardown(state: dict) -> dict:
+    state["log"].close()
+    return {"path": state["path"], "n_ok": state["n_ok"], "n_fail": state["n_fail"]}
+
+
+def run_evaluation_parallel(
+    session: EvalSession,
+    target_db_path,
+    *,
+    n_workers: int,
+    now_fn: Callable[[], str] = _now_iso,
+    git_sha: Optional[str] = None,
+    hostname: Optional[str] = None,
+    sync_fn: Optional[Callable[[], None]] = None,
+    max_hands: Optional[int] = None,
+    stop_event=None,
+) -> int:
+    """Play hands **in parallel** — one hand per core, search ``workers=1`` (no nested pool).
+
+    Each of ``n_workers`` forked workers pulls the next ``hand_index`` from a shared
+    dynamic counter (skipping the completed-set for resume), plays + logs it to its OWN
+    node-local DB; the parent then merges those into ``target_db_path`` with disjoint id
+    ranges (:func:`~evaluation.sqlite_logging.merge_logs`) and syncs.  Because every hand
+    is fully determined by ``hand_index`` (deal, seats, seeds), the result is
+    **bit-reproducible regardless of ``n_workers``**, and CRN pairing across conditions
+    holds.  Dynamic pull matters: most hands fold pre-flop (no search) while a few are
+    minutes-long turn solves, so static sharding would idle cores.
+
+    Stop: ``max_hands`` (or ``cfg.max_hands``) as a **total** target (resume-safe), else
+    the wall budget ``cfg.time_budget_hours``; ``stop_event`` (an ``mp.Event``) is polled
+    at each hand boundary for SIGTERM.  Returns hands attempted this call.
+    """
+    from evaluation.hand_pool import run_index_pool
+    from evaluation.sqlite_logging import merge_logs
+
+    cfg = session.config
+    _validate_config(cfg)
+    fingerprint = config_fingerprint(session.solver_cfg, cfg.fingerprint_table_policy())
+    # One hand per core ⇒ force search workers=1 (no nested fork; deeper undivided MCCFR).
+    session = dataclasses.replace(
+        session, solver_cfg=dataclasses.replace(session.solver_cfg, workers=1)
+    )
+    # Completed-set resume cursor (dynamic out-of-order completion ⇒ max+1 is unsafe).
+    tlog = ExperimentLog.open(os.fspath(target_db_path))
+    try:
+        skip = tlog.completed_hand_indices(cfg.run_id)
+    finally:
+        tlog.close()
+    target = max_hands if max_hands is not None else cfg.max_hands
+    budget_s = 0.0 if target is not None else cfg.time_budget_hours * 3600.0
+    shared = {
+        "session": session, "cfg": cfg, "fingerprint": fingerprint,
+        "now_fn": now_fn, "git_sha": git_sha, "hostname": hostname,
+        "worker_dir": f"{os.fspath(target_db_path)}.workers",
+    }
+    payloads = run_index_pool(
+        n_workers=n_workers, setup=_eval_worker_setup, process=_eval_worker_process,
+        teardown=_eval_worker_teardown, shared=shared,
+        target=target, skip=skip, wall_budget_s=budget_s, stop_event=stop_event,
+    )
+    payloads = [p for p in payloads if p is not None]
+    merge_logs(os.fspath(target_db_path), [p["path"] for p in payloads])
+    n_ok = sum(p["n_ok"] for p in payloads)
+    n_fail = sum(p["n_fail"] for p in payloads)
+    if n_fail:
+        logger.warning("parallel eval run %s: %d of %d hands failed",
+                       cfg.run_id, n_fail, n_ok + n_fail)
+    if sync_fn is not None:
+        sync_fn()
+    logger.info("parallel eval run %s: %d hands (%d workers)",
+                cfg.run_id, n_ok + n_fail, n_workers)
+    return n_ok + n_fail
+
+
 def _play_and_log_one(
     session: EvalSession,
     log: ExperimentLog,
@@ -1173,6 +1293,30 @@ def _install_sigterm_stop():
     return stop.is_set
 
 
+def _install_sigterm_stop_event():
+    """SIGTERM/SIGINT → a **multiprocessing** Event, visible to forked pool workers.
+
+    The threading Event of :func:`_install_sigterm_stop` lives only in the parent and
+    is invisible across a fork, so the parallel runner needs an ``mp.Event`` (created
+    from the same ``fork`` context the pool uses) — set it in the parent's signal
+    handler, inherited by the workers, polled at each hand boundary.
+    """
+    import multiprocessing as mp
+    import signal
+
+    try:
+        ev = mp.get_context("fork").Event()
+    except ValueError:  # platform without fork
+        ev = mp.Event()
+
+    def _handle(signum, frame) -> None:
+        ev.set()
+
+    signal.signal(signal.SIGTERM, _handle)
+    signal.signal(signal.SIGINT, _handle)
+    return ev
+
+
 def _cli():
     import socket
     from pathlib import Path
@@ -1319,6 +1463,23 @@ def _cli():
         show_default=True,
         help="Seed for the per-info-set model perturbation (offset per seat).",
     )
+    @click.option(
+        "--parallel-workers",
+        default=None,
+        type=int,
+        help="Number of hands to play concurrently, one per core (search runs at "
+        "workers=1 inside — no nested pool).  Default (unset) = auto (cpu-1).  This is "
+        "the DEFAULT execution mode: hands are i.i.d. + seeded by index, so it is "
+        "bit-reproducible vs sequential and packs the box (most hands fold pre-flop). "
+        "Ignored under --sequential; --workers (search W) is ignored unless --sequential.",
+    )
+    @click.option(
+        "--sequential",
+        is_flag=True,
+        default=False,
+        help="Force the old one-hand-at-a-time loop (search parallelism via --workers) "
+        "instead of the default per-hand parallel runner.",
+    )
     def run(**opts):
         """Play a time-budgeted evaluation run, logging one transaction per hand."""
         fixed_seats = None
@@ -1396,6 +1557,40 @@ def _cli():
             max_wall_seconds=opts["max_wall_seconds"],
             workers=opts["workers"],
         )
+        if not opts["sequential"]:
+            # DEFAULT: per-hand parallel — one hand per core, search workers=1.  Workers
+            # write their own node-local DBs, merged into ``db_path`` with disjoint id
+            # ranges, then synced.  Bit-reproducible vs sequential (hands seeded by index).
+            from poker_ai.search.parallel import resolve_workers
+            n_workers = resolve_workers(opts["parallel_workers"])
+            stop_event = _install_sigterm_stop_event()
+
+            def _sync_par() -> None:  # fresh handle: the parent holds no open log here
+                _l = ExperimentLog.open(db_path)
+                try:
+                    _l.sync_to(sync_path)
+                finally:
+                    _l.close()
+
+            n = run_evaluation_parallel(
+                session,
+                db_path,
+                n_workers=n_workers,
+                git_sha=_git_sha(),
+                hostname=socket.gethostname(),
+                sync_fn=(_sync_par if sync_path is not None else None),
+                stop_event=stop_event,
+            )
+            dest = sync_path if sync_path is not None else db_path
+            click.echo(f"played {n} hands for run_id={cfg.run_id} "
+                       f"({n_workers} parallel workers) → {dest}")
+            from evaluation.summarize import summarize
+            try:
+                summarize(dest)
+            except Exception:
+                logger.exception("end-of-run summary failed for run %s", cfg.run_id)
+            return
+
         should_stop = _install_sigterm_stop()
         log = ExperimentLog.open(db_path)
         # Periodic + on-SIGTERM + final VACUUM INTO sync-back to the permanent FS

@@ -168,6 +168,10 @@ def config_fingerprint(
         "solver": {
             "max_iterations": cfg.max_iterations,
             "max_wall_seconds": cfg.max_wall_seconds,
+            "max_wall_seconds_by_street": (
+                list(cfg.max_wall_seconds_by_street)
+                if getattr(cfg, "max_wall_seconds_by_street", None) is not None else None
+            ),
             "discount_interval": cfg.discount_interval,
             "workers": cfg.workers,
             "beta": getattr(cfg, "beta", None),
@@ -239,6 +243,18 @@ def solve(
     # The primary, machine-independent stop; the original ``max_iterations`` stays the
     # absolute per-replica ceiling.  ``auto_budget=False`` leaves it untouched.
     cfg = dataclasses.replace(cfg, max_iterations=iteration_budget(ctx, cfg, workers))
+    # Per-street wall backstop: resolve the round's cap from ``street_at_root`` when the
+    # calibration supplied a per-street tuple, else keep the flat ``max_wall_seconds``.
+    # ``None`` ⇒ byte-identical to before (no wall change).  Indexed 0=preflop … 3=river.
+    by_street = getattr(cfg, "max_wall_seconds_by_street", None)
+    if by_street is not None:
+        st = int(ctx.street_at_root)
+        if not (0 <= st < len(by_street)):
+            raise ValueError(
+                f"max_wall_seconds_by_street has {len(by_street)} entries but "
+                f"street_at_root={st}; expected one per street (preflop..river)."
+            )
+        cfg = dataclasses.replace(cfg, max_wall_seconds=float(by_street[st]))
     # Both regimes parallelize the same way (§6.7 row 11): W independent replicas,
     # merged once.  The vector regime is chance-sampled (one river per iteration),
     # so its replicas draw independent river substreams and summing their regrets

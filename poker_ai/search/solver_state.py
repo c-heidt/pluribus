@@ -58,7 +58,15 @@ class SolverConfig:
     # as ~5× more iterations at the same wall — better hole coverage — rather than a
     # shorter wall; lower ``max_wall_seconds`` if you want turnaround over coverage.)
     max_iterations: int = 5_000
-    max_wall_seconds: float = 20.0  # per-search wall budget (the binding stop)
+    max_wall_seconds: float = 20.0  # per-search wall backstop (the binding stop)
+    # Per-street wall backstop (preflop, flop, turn, river) — the wall cap varies wildly
+    # by round (a river solve is seconds, a full-width turn solve can be minutes), so the
+    # calibration measures one cap per round under the deployment model (1 hand / core,
+    # search ``workers=1``) and emits this tuple.  ``None`` (default) ⇒ the flat
+    # ``max_wall_seconds`` is used for every street, so every existing caller / test /
+    # pinned digest is byte-identical.  When set, ``solve`` resolves the cap from
+    # ``ctx.street_at_root`` (0=preflop … 3=river).
+    max_wall_seconds_by_street: "tuple | None" = None
     # Linear-CFR discount cadence.  Kept well below the per-replica iteration count
     # of the *expensive* subgames (multiway flop ~285/replica) so the discount fires
     # several times there — at the old 100 it barely engaged on those (and never at

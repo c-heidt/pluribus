@@ -515,6 +515,94 @@ class ExperimentLog:
         row = cur.fetchone()
         return 0 if row is None or row[0] is None else int(row[0]) + 1
 
+    def completed_hand_indices(self, run_id: str) -> "set[int]":
+        """The SET of ``hand_index`` already logged (games ∪ hand_failures) for ``run_id``.
+
+        The **parallel** resume cursor.  Under the dynamic hand pool hands complete
+        out of order, so the ``max + 1`` cursor of :meth:`next_hand_index` is unsafe
+        (a hand still running when the process dies leaves a gap *below* the max that
+        ``max + 1`` would skip).  The parallel runner instead enqueues the *complement*
+        of this set up to the target count, so gaps are refilled and nothing is
+        double-played.  The per-hand transaction keeps each hand all-or-nothing, so the
+        set is exact.
+        """
+        cur = self._con.execute(
+            "SELECT hand_index FROM games         WHERE run_id = :r "
+            "UNION "
+            "SELECT hand_index FROM hand_failures WHERE run_id = :r",
+            {"r": run_id},
+        )
+        return {int(r[0]) for r in cur.fetchall()}
+
+
+# Tables merged from per-worker DBs, in FK-dependency order, with the surrogate-key
+# columns each one shifts by the worker's disjoint base (see :func:`merge_logs`).
+_MERGE_SHIFT = {
+    "games": {"game_id"},
+    "game_seats": {"game_id"},                 # composite PK (game_id, seat)
+    "decisions": {"decision_id", "game_id"},
+    "range_quality": {"id", "game_id"},
+    "hand_failures": {"id"},
+}
+_MERGE_ORDER = ("games", "game_seats", "decisions", "range_quality", "hand_failures")
+
+
+def merge_logs(target_path, worker_paths, *, base_block: int = 1 << 40) -> None:
+    """Merge per-worker node-local DBs into ``target_path`` (disjoint-range, resume-safe).
+
+    Each worker writes a vanilla DB (autoincrement ids from 1) — the hot insert path is
+    untouched.  The merge shifts worker k's surrogate ids (and the FKs that reference
+    them) into a **disjoint block** ``free_base + k · base_block``, where ``free_base``
+    is a block boundary **above the target's current max id**.  So (a) workers never
+    collide with each other, (b) a resumed run never collides with a prior attempt
+    already merged into the target, and (c) every ``game_id`` FK still points at its
+    shifted parent (parent + child shift by the same base).  ``base_block`` (2^40) is
+    far larger than any per-attempt-per-worker row count, so blocks never overlap.
+
+    The target is opened with the normal schema/migrations, so it is created if absent.
+    Foreign keys are disabled for the bulk copy (rows are inserted parent-first anyway;
+    the shift preserves referential integrity) and re-enabled after.
+    """
+    tgt = open(target_path)
+    con = tgt._con
+    try:
+        row = con.execute(
+            "SELECT MAX(m) FROM ("
+            "  SELECT MAX(game_id)     AS m FROM games "
+            "  UNION ALL SELECT MAX(decision_id) FROM decisions "
+            "  UNION ALL SELECT MAX(id)          FROM range_quality "
+            "  UNION ALL SELECT MAX(id)          FROM hand_failures)"
+        ).fetchone()
+        max_id = int(row[0]) if row and row[0] is not None else 0
+        free_base = ((max_id // base_block) + 1) * base_block
+        con.execute("PRAGMA foreign_keys=OFF")
+        try:
+            for k, wpath in enumerate(worker_paths):
+                base = free_base + k * base_block
+                con.execute("ATTACH ? AS w", (str(wpath),))
+                try:
+                    con.execute("BEGIN")
+                    for table in _MERGE_ORDER:
+                        cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
+                        shift = _MERGE_SHIFT[table]
+                        sel = ", ".join(
+                            (f"({c} + {base})" if c in shift else c) for c in cols
+                        )
+                        con.execute(
+                            f"INSERT INTO main.{table} ({', '.join(cols)}) "
+                            f"SELECT {sel} FROM w.{table}"
+                        )
+                    con.execute("COMMIT")
+                except BaseException:
+                    con.execute("ROLLBACK")
+                    raise
+                finally:
+                    con.execute("DETACH w")
+        finally:
+            con.execute("PRAGMA foreign_keys=ON")
+    finally:
+        tgt.close()
+
 
 def open(path) -> ExperimentLog:  # noqa: A001 — matches the doc's ``open(path)`` API
     """Module-level alias for :meth:`ExperimentLog.open` (doc §9.2 sketch)."""

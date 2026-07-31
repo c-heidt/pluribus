@@ -63,7 +63,7 @@ REPS=${REPS:-2}
 MIN_ITERS=${MIN_ITERS:-250}
 MAX_ITERS=${MAX_ITERS:-4000}
 LADDER_POINTS=${LADDER_POINTS:-6}
-THRESHOLDS=${THRESHOLDS:-0.05,0.03,0.02}
+THRESHOLDS=${THRESHOLDS:-20,10,5}          # mbb value-gap (metric = hero root EV on the table)
 COLLECT_ITERS=${COLLECT_ITERS:-64}
 TABLE_POLICY=${TABLE_POLICY:-random}       # random → street/live-count coverage
 RUN_SEED=${RUN_SEED:-0}
@@ -72,7 +72,8 @@ SMALL_BLIND=${SMALL_BLIND:-50}
 STARTING_STACK=${STARTING_STACK:-10000}
 LOW_CARD_RANK=${LOW_CARD_RANK:-2}
 HIGH_CARD_RANK=${HIGH_CARD_RANK:-14}
-WALL_TARGET=${WALL_TARGET:-}               # per-decision wall budget (s), optional
+WALL_TARGET=${WALL_TARGET:-30}             # per-decision wall budget (s); drives the A/B head-to-head + flags over-budget cells (set empty to disable)
+REGIME_AB_STREETS=${REGIME_AB_STREETS:-turn}  # HU vector-vs-MCCFR A/B streets: turn | flop,turn | none  (flop is SLOW: full-width vector flop ~1.3 it/s)
 
 # Permanent-FS destination for the two output files.
 PERM_DIR=${PERM_DIR:-"$WORKSPACE/calibration/$RUN_ID"}
@@ -238,7 +239,9 @@ echo "  - Workers:           ${WORKERS:-(auto = SLURM_CPUS_PER_TASK-1)}"
 echo "  - CPUs:              ${SLURM_CPUS_PER_TASK:-(unset)}"
 echo "  - Collect hands:     $COLLECT_HANDS  (per-cell cap $PER_CELL_CAP, reps $REPS)"
 echo "  - Ladder:            $MIN_ITERS..$MAX_ITERS x $LADDER_POINTS points"
-echo "  - Thresholds:        $THRESHOLDS"
+echo "  - Thresholds (mbb):  $THRESHOLDS"
+echo "  - Wall target (s):   ${WALL_TARGET:-(disabled)}"
+echo "  - Regime A/B:        $REGIME_AB_STREETS"
 echo "  - Table policy:      $TABLE_POLICY"
 echo "  - Search core:       ${PLURIBUS_SEARCH_CORE:-0}"
 echo "  - LUT / blueprint:   $LUT_PATH  |  $BLUEPRINT_PATH"
@@ -272,6 +275,7 @@ python -m evaluation.calibrate run \
   --starting-stack "$STARTING_STACK" \
   --low-card-rank "$LOW_CARD_RANK" \
   --high-card-rank "$HIGH_CARD_RANK" \
+  --regime-ab-streets "$REGIME_AB_STREETS" \
   --out-dir "$LOCAL_OUT" \
   "${EXTRA_ARGS[@]}" &
 
