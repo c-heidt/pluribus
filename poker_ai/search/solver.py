@@ -188,6 +188,7 @@ def solve(
     ctx: SubgameContext,
     cfg: SolverConfig,
     warm_start: Optional[SolverState] = None,
+    regime_override: Optional[str] = None,
 ) -> SearchResult:
     """Search ``root_env`` and return the bot's strategy plus the solved state.
 
@@ -206,12 +207,29 @@ def solve(
     warm_start : SolverState, optional
         A prior state to re-search in place (reusing rows, growing widened
         nodes, carrying the freeze map).  ``None`` starts fresh.
+    regime_override : {'vector', 'mccfr'}, optional
+        Force the CFR regime instead of the ``_select_regime`` routing.  For
+        **A/B harnesses** (e.g. the calibration's turn regime comparison), where
+        the same root is solved under both regimes at equal budget to compare
+        results — both regimes are street-general, production just routes each
+        street to one of them.  ``None`` (default) uses the production routing, so
+        every existing caller is unchanged.  **OX-Search note:** the gadget root
+        (``cfg.beta`` set) lives only in the vector regime, so forcing ``'mccfr'``
+        with ``beta`` set would silently solve the *vanilla* tree (no gadget); the
+        caller must not do that (the calibration gates the A/B off when ``beta`` is
+        set).  With ``auto_budget`` on, the structural budget still derives the
+        per-stage count from ``ctx`` (not the override); the A/B path forces
+        ``auto_budget=False`` so the two regimes run an identical per-replica count.
 
     Returns
     -------
     SearchResult
     """
-    regime = _select_regime(ctx)
+    if regime_override is not None and regime_override not in ("vector", "mccfr"):
+        raise ValueError(
+            f"regime_override must be 'vector', 'mccfr', or None; got {regime_override!r}."
+        )
+    regime = regime_override if regime_override is not None else _select_regime(ctx)
     workers = resolve_workers(getattr(cfg, "workers", 1))
     # Structural iteration budget (§6.5): replace ``max_iterations`` with the
     # per-replica count derived from the subgame's structure — vector = per-stage
