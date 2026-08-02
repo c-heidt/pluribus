@@ -1144,7 +1144,7 @@ def _cli():
                   help="Ladder top (the value-gap REFERENCE) = hi * (production budget); "
                        ">1 so the reference sits ABOVE the convergence estimate. Higher = "
                        "more trustworthy reference but a slower deepest solve.")
-    @click.option("--ladder-max", default=40_000, type=int, show_default=True,
+    @click.option("--ladder-max", default=50_000, type=int, show_default=True,
                   help="Hard cap on the top rung (bounds the single longest solve's wall on "
                        "a time-limited box); the reference is min(ladder-max, hi*budget).")
     @click.option("--thresholds", default="20,10,5", show_default=True,

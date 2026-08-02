@@ -64,7 +64,7 @@ SPREAD_K=${SPREAD_K:-1.5}                  # spread-relative convergence: bar = 
 LADDER_POINTS=${LADDER_POINTS:-7}          # rungs per cell, clustered around its production budget
 LADDER_LO=${LADDER_LO:-0.5}                # ladder min = LO * production budget (feasible, near convergence)
 LADDER_HI=${LADDER_HI:-2.0}                # ladder top (value-gap REFERENCE) = HI * production budget (>1, above convergence)
-LADDER_MAX=${LADDER_MAX:-40000}            # hard cap on the top rung (bounds the single longest solve's wall)
+LADDER_MAX=${LADDER_MAX:-50000}            # hard cap on the top rung; 50k gives the deep multiway-flop cells (n4 prod 24k) a full 2xC=48k reference
 THRESHOLDS=${THRESHOLDS:-20,10,5}          # mbb value-gap (metric = hero root EV on the table)
 COLLECT_ITERS=${COLLECT_ITERS:-64}
 TABLE_POLICY=${TABLE_POLICY:-random}       # random → street/live-count coverage
