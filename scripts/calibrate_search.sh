@@ -28,7 +28,7 @@
 #SBATCH --ntasks=1
 #SBATCH --time=3:00:00
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=200000mb
+#SBATCH --mem=100000mb
 #SBATCH --signal=SIGTERM@120
 #SBATCH --mail-type=All
 
@@ -60,10 +60,10 @@ WORKERS=${WORKERS:-}                       # empty → SLURM_CPUS_PER_TASK-1 (pr
 COLLECT_HANDS=${COLLECT_HANDS:-400}
 PER_CELL_CAP=${PER_CELL_CAP:-3}
 REPS=${REPS:-3}                            # ≥3: averaging over reps lowers the MCCFR value-estimate noise floor
-MIN_ITERS=${MIN_ITERS:-250}                # bottom of both ladders
-VECTOR_MAX_ITERS=${VECTOR_MAX_ITERS:-500,800,2500,2500} # VECTOR ladder tops PER STREET (pf,flop,turn,river); flop is oracle-only + slow ~1.3 it/s
-MCCFR_MAX_ITERS=${MCCFR_MAX_ITERS:-8000,30000,12000,8000}  # MCCFR ladder tops PER STREET (pf,flop,turn,river); flop needs prod scale, river/turn converge faster
-LADDER_POINTS=${LADDER_POINTS:-7}
+LADDER_POINTS=${LADDER_POINTS:-7}          # rungs per cell, clustered around its production budget
+LADDER_LO=${LADDER_LO:-0.5}                # ladder min = LO * production budget (feasible, near convergence)
+LADDER_HI=${LADDER_HI:-2.0}                # ladder top (value-gap REFERENCE) = HI * production budget (>1, above convergence)
+LADDER_MAX=${LADDER_MAX:-40000}            # hard cap on the top rung (bounds the single longest solve's wall)
 THRESHOLDS=${THRESHOLDS:-20,10,5}          # mbb value-gap (metric = hero root EV on the table)
 COLLECT_ITERS=${COLLECT_ITERS:-64}
 TABLE_POLICY=${TABLE_POLICY:-random}       # random → street/live-count coverage
@@ -239,8 +239,7 @@ echo "  - Conditions:        $CONDITIONS"
 echo "  - Workers:           ${WORKERS:-(auto = SLURM_CPUS_PER_TASK-1)}"
 echo "  - CPUs:              ${SLURM_CPUS_PER_TASK:-(unset)}"
 echo "  - Collect hands:     $COLLECT_HANDS  (per-cell cap $PER_CELL_CAP, reps $REPS)"
-echo "  - Ladder (vector):   $MIN_ITERS..[$VECTOR_MAX_ITERS per street pf,flop,turn,river] x $LADDER_POINTS points"
-echo "  - Ladder (mccfr):    $MIN_ITERS..[$MCCFR_MAX_ITERS per street pf,flop,turn,river] x $LADDER_POINTS points"
+echo "  - Ladder:            per-cell [${LADDER_LO}..${LADDER_HI}]x production budget, $LADDER_POINTS pts, cap $LADDER_MAX"
 echo "  - Thresholds (mbb):  $THRESHOLDS"
 echo "  - Wall target (s):   ${WALL_TARGET:-(disabled)}"
 echo "  - Regime A/B:        $REGIME_AB_STREETS"
@@ -265,10 +264,10 @@ python -m evaluation.calibrate run \
   --collect-hands "$COLLECT_HANDS" \
   --per-cell-cap "$PER_CELL_CAP" \
   --reps "$REPS" \
-  --min-iters "$MIN_ITERS" \
-  --vector-max-iters "$VECTOR_MAX_ITERS" \
-  --mccfr-max-iters "$MCCFR_MAX_ITERS" \
   --ladder-points "$LADDER_POINTS" \
+  --ladder-lo "$LADDER_LO" \
+  --ladder-hi "$LADDER_HI" \
+  --ladder-max "$LADDER_MAX" \
   --thresholds "$THRESHOLDS" \
   --collect-iters "$COLLECT_ITERS" \
   --table-policy "$TABLE_POLICY" \

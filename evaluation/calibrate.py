@@ -67,6 +67,7 @@ from evaluation.runner import (
     play_hand,
 )
 from poker_ai.search.agent import SearchAgent
+from poker_ai.search.budget import iteration_budget
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.solver import _select_regime, solve
 from poker_ai.search.solver_state import SolverConfig
@@ -238,11 +239,25 @@ def collect_roots(
 # --------------------------------------------------------------------------- #
 # Phase 2 — sweep each root over an iteration ladder at the production W
 # --------------------------------------------------------------------------- #
-def _iteration_ladder(min_iters: int, max_iters: int, points: int) -> List[int]:
-    """A geometric ladder of per-replica budgets from ``min`` to ``max``."""
-    if max_iters <= min_iters or points < 2:
-        return [int(max_iters)]
-    raw = np.geomspace(int(min_iters), int(max_iters), int(points))
+def _ladder_around(center: int, points: int, *, lo: float, hi: float,
+                   ladder_max: int) -> List[int]:
+    """Geometric ladder CLUSTERED around a convergence estimate ``center``.
+
+    Spans ``[lo*center, hi*center]``.  ``hi > 1`` puts the top rung — the value-gap
+    REFERENCE — safely ABOVE the estimate, so the gap is measured against a (near-)
+    converged point rather than the estimate itself (a self-defeating reference); the
+    sweep can exceed the production ceiling to reach it.  ``lo < 1`` keeps the min
+    feasible (near the estimate, not a token 250 that nothing converges at).  The top is
+    capped at ``ladder_max`` to bound the single longest solve's wall (a 3 h SLURM box).
+    ``center`` is the cell's own production budget (``iteration_budget`` at W=1) — where
+    we believe it converges — so the ladder auto-adapts per street / n_live / regime.
+    """
+    center = max(1, int(center))
+    top = min(int(ladder_max), int(round(hi * center)))
+    bot = min(max(1, int(round(lo * center))), top)
+    if points < 2 or top <= bot:
+        return [top]
+    raw = np.geomspace(bot, top, int(points))
     return sorted({int(round(x)) for x in raw})
 
 
@@ -332,6 +347,15 @@ class SweepRow:
 
 
 # --- Sweep pool hooks (module-level ⇒ fork-inherited cleanly by the hand pool) ------
+# Rough per-(regime, street) throughput (it/s) — HU anchors from the calibration, only
+# used to ORDER the pool longest-first (never for correctness).  street: flop=1,turn=2,
+# river=3 (vector); mccfr also preflop=0.
+_LPT_THROUGHPUT = {
+    ("vector", 1): 1.3, ("vector", 2): 15.0, ("vector", 3): 186.0,
+    ("mccfr", 0): 150.0, ("mccfr", 1): 84.0, ("mccfr", 2): 158.0, ("mccfr", 3): 150.0,
+}
+
+
 def _sweep_setup(worker_id: int, shared: dict):
     """After fork: reopen the leaf-fleet LMDB (MDB_BAD_RSLOT), start a result list."""
     try:
@@ -410,6 +434,19 @@ def sweep_jobs(
                  for rep in range(reps) for t in job["ladder"]]
     if not all_specs:
         return []
+    # Longest-processing-time-first: hand out the most expensive solves FIRST so the deep
+    # 30k+ rungs overlap the bulk instead of trailing it on a few cores (the pool serves
+    # specs in list order).  Cost ~ budget / rough throughput; the throughput guess only
+    # affects ORDERING (utilisation), never correctness.
+    def _spec_cost(spec):
+        j, _si, _rep, t = spec
+        cell = jobs[j]["cell"]
+        regime = jobs[j].get("force_regime") or cell[1]
+        thr = _LPT_THROUGHPUT.get((regime, int(cell[2])), 80.0)
+        if regime == "mccfr" and int(cell[3]) > 2:
+            thr *= 2.0 / int(cell[3])  # multiway is slower per iteration
+        return t / max(1e-6, thr)
+    all_specs.sort(key=_spec_cost, reverse=True)
     shared = {
         "jobs": [(job["samples"], job.get("force_regime")) for job in jobs],
         "prod_cfg": prod_cfg, "base_seed": int(base_seed), "all_specs": all_specs,
@@ -814,8 +851,10 @@ def run_calibration(
     collect_hands: int,
     per_cell_cap: int,
     reps: int,
-    vector_ladders: Mapping[int, Sequence[int]],
-    mccfr_ladders: Mapping[int, Sequence[int]],
+    ladder_points: int,
+    ladder_lo: float,
+    ladder_hi: float,
+    ladder_max: int,
     thresholds: Sequence[float],
     collect_iters: int,
     table_policy: str,
@@ -831,17 +870,14 @@ def run_calibration(
     regime_ab_streets: Sequence[int] = (2,),
 ) -> Dict[str, object]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Regime- AND street-specific ladders, because they operate at very different scales:
-    # MCCFR only converges the HOT PATH (cold infosets fall back to the blueprint), so its
-    # metric is hero-root value STABILITY (self-referenced) NOT exploitability, and its
-    # ladder must reach the production budget to see where the played value flattens — but
-    # per street, because a flop (2 cards to come, ~746k infosets) needs far more than a
-    # river (board known, ~26k) that converges fast; a flat 30k ladder wastes huge wall on
-    # river/turn.  Vector is full-width and converges by ~1.3k, so its tops stay modest —
-    # and per-street too: the oracle-only flop-vector arm is ~1.3 it/s (a 2.5k top would be
-    # ~30 min/solve), so it gets a small top, while turn/river sit at ~2.5k.
-    top = max([int(list(l)[-1]) for l in vector_ladders.values()] +
-              [int(list(l)[-1]) for l in mccfr_ladders.values()])  # build/collect ceiling
+    # Each cell's ladder is CLUSTERED around its own convergence estimate — the cell's
+    # production budget (``iteration_budget`` at W=1) — with the reference rung above it
+    # (``ladder_hi>1``) and a feasible min (``ladder_lo<1``); see ``_ladder_around``.  This
+    # auto-adapts per street / n_live / regime (so vector and MCCFR, and each n_live, cluster
+    # around their OWN budget) — no hand-set per-street tops.  MCCFR only converges the HOT
+    # PATH (cold infosets fall back to blueprint), so its metric is hero-root value STABILITY
+    # (self-referenced) NOT exploitability; the reference above the estimate is what makes
+    # that gap meaningful rather than self-defeating.
 
     # The compiled search core is an env var read at IMPORT time (the kernels rebind
     # behind ``PLURIBUS_SEARCH_CORE`` when the search modules are imported), so it must
@@ -898,10 +934,13 @@ def run_calibration(
             "calibrate invocation from vanilla/DBR."
         )
     base_cfg = cond_cfgs[conditions[0]]
+    # Keep the PRODUCTION ``max_iterations`` (build_blueprint_session's default == the
+    # config ceiling): the per-cell ladder centre is that production budget, so this must
+    # NOT be widened to the ladder max (the sweep exceeds it per-solve via an explicit t).
     session = build_blueprint_session(
         base_cfg, blueprint_path=blueprint_path, lut_path=lut_path,
         use_decision_free_equity=use_decision_free_equity,
-        max_iterations=top, max_wall_seconds=1e9, workers=workers,
+        max_wall_seconds=1e9, workers=workers,
     )
     prod_cfg = session.solver_cfg
     resolved_workers = _resolved_workers(prod_cfg)
@@ -914,11 +953,12 @@ def run_calibration(
     # jobs in ONE cross-cell pool (below) so the whole box stays busy.  A job is a
     # (cell, samples, force_regime, ladder, ref_from) unit; the A/B adds a second
     # (mccfr) job on the same roots whose gap references the paired vector job.
-    def _mladder(street: int) -> Sequence[int]:
-        return mccfr_ladders.get(int(street), mccfr_ladders[max(mccfr_ladders)])
-
-    def _vladder(street: int) -> Sequence[int]:
-        return vector_ladders.get(int(street), vector_ladders[max(vector_ladders)])
+    def _ladder_for(ctx, regime_override) -> List[int]:
+        # Centre = the cell's production budget for THIS regime (regime_override forces it,
+        # so the A/B mccfr arm on a HU turn reads the mccfr budget, not the vector one).
+        center = iteration_budget(ctx, prod_cfg, workers=1, regime_override=regime_override)
+        return _ladder_around(int(center), ladder_points, lo=ladder_lo, hi=ladder_hi,
+                              ladder_max=ladder_max)
 
     jobs: List[dict] = []
     for condition in conditions:
@@ -943,18 +983,17 @@ def run_calibration(
         ab_on = bool(ab_streets) and getattr(prod_cfg, "beta", None) is None
         for cell, sample_list in samples.items():
             _cond, _regime, street, n_live = cell
+            ctx0 = sample_list[0].ctx  # all roots in a cell share street / n_live
             is_ab = (int(n_live) == 2 and int(street) in ab_streets)
             if ab_on and is_ab:
                 vidx = len(jobs)  # the paired vector job the mccfr job references
                 jobs.append(dict(cell=cell, samples=sample_list, force_regime="vector",
-                                 ladder=_vladder(street), ref_from=None))
+                                 ladder=_ladder_for(ctx0, "vector"), ref_from=None))
                 jobs.append(dict(cell=cell, samples=sample_list, force_regime="mccfr",
-                                 ladder=_mladder(street), ref_from=vidx))
+                                 ladder=_ladder_for(ctx0, "mccfr"), ref_from=vidx))
             else:
-                # Non-A/B: each cell on ITS production regime's (street-sized) ladder.
-                ladder = _mladder(street) if str(_regime) == "mccfr" else _vladder(street)
-                jobs.append(dict(cell=cell, samples=sample_list,
-                                 force_regime=None, ladder=ladder, ref_from=None))
+                jobs.append(dict(cell=cell, samples=sample_list, force_regime=None,
+                                 ladder=_ladder_for(ctx0, None), ref_from=None))
 
     n_solves = sum(len(j["samples"]) * reps * len(list(j["ladder"])) for j in jobs)
     logger.info("sweeping %d jobs (%d cells, %d solves) across %d cores in ONE pool",
@@ -977,11 +1016,11 @@ def run_calibration(
     summary_json = {
         "search_core": "on" if core_on else "off (PURE PYTHON — not production)",
         "workers": resolved_workers,
-        "vector_ladder_by_street": {
-            _STREET_NAME.get(st, st): list(l) for st, l in sorted(vector_ladders.items())
-        },
-        "mccfr_ladder_by_street": {
-            _STREET_NAME.get(st, st): list(l) for st, l in sorted(mccfr_ladders.items())
+        "ladder_design": {
+            "centre": "per-cell production budget (iteration_budget at W=1)",
+            "span": [ladder_lo, ladder_hi], "points": ladder_points, "max": ladder_max,
+            "note": "each cell's rungs cluster in [lo*centre, hi*centre]; the top rung "
+                    "(hi>1) is the value-gap reference, above the convergence estimate",
         },
         "metric": "value_gap_mbb",  # hero root EV (mbb): hot-path VALUE stability, not
                                     # exploitability (MCCFR converges only the hot path)
@@ -1076,22 +1115,18 @@ def _cli():
     @click.option("--reps", default=3, type=int, show_default=True,
                   help="Independent re-solve replicates per root; averaging over reps is "
                        "what lowers the MCCFR value-estimate noise floor, so keep ≥3.")
-    @click.option("--min-iters", default=250, type=int, show_default=True,
-                  help="Bottom of both per-replica ladders.")
-    @click.option("--vector-max-iters", default="500,800,2500,2500", show_default=True,
-                  help="PER-STREET tops of the VECTOR ladder (preflop,flop,turn,river; also "
-                       "the value-gap reference). Vector converges by ~1.3k so turn/river "
-                       "stay ~2.5k; the oracle-only flop-vector arm is ~1.3 it/s, so it gets "
-                       "a small top (preflop is unused — vector never runs there). A single "
-                       "int applies to every street.")
-    @click.option("--mccfr-max-iters", default="8000,30000,12000,8000", show_default=True,
-                  help="PER-STREET tops of the MCCFR ladder (preflop,flop,turn,river). The "
-                       "flop (2 cards to come, ~746k infosets) needs production scale (30k = "
-                       "mccfr_global_max); river/turn are smaller and converge faster, so a "
-                       "flat 30k there just burns wall. The MCCFR metric is hero-root value "
-                       "STABILITY (self-referenced), NOT exploitability (it converges only "
-                       "the hot path). A single int applies to every street.")
-    @click.option("--ladder-points", default=7, type=int, show_default=True)
+    @click.option("--ladder-points", default=7, type=int, show_default=True,
+                  help="Rungs per cell, clustered around its production budget.")
+    @click.option("--ladder-lo", default=0.5, type=float, show_default=True,
+                  help="Ladder min = lo * (cell production budget) — feasible, near the "
+                       "convergence estimate (not a token 250 nothing converges at).")
+    @click.option("--ladder-hi", default=2.0, type=float, show_default=True,
+                  help="Ladder top (the value-gap REFERENCE) = hi * (production budget); "
+                       ">1 so the reference sits ABOVE the convergence estimate. Higher = "
+                       "more trustworthy reference but a slower deepest solve.")
+    @click.option("--ladder-max", default=40_000, type=int, show_default=True,
+                  help="Hard cap on the top rung (bounds the single longest solve's wall on "
+                       "a time-limited box); the reference is min(ladder-max, hi*budget).")
     @click.option("--thresholds", default="20,10,5", show_default=True,
                   help="Value-gap convergence thresholds in mbb (hero root EV still on "
                   "the table); the middle one drives the suggested config.")
@@ -1125,18 +1160,9 @@ def _cli():
                             format="%(asctime)s %(levelname)s %(name)s: %(message)s")
         conditions = [c.strip() for c in o["conditions"].split(",") if c.strip()]
         thresholds = [float(x) for x in o["thresholds"].split(",") if x.strip()]
-        # Per-street ladder tops "pf,flop,turn,river" (a single int → all four streets).
-        def _ladders_by_street(spec, name):
-            tops = [int(x) for x in str(spec).split(",") if x.strip()]
-            if len(tops) == 1:
-                tops = tops * 4
-            if len(tops) != 4:
-                raise click.BadParameter(
-                    f"--{name} must be one int or four (preflop,flop,turn,river); got {spec!r}")
-            return {st: _iteration_ladder(o["min_iters"], top, o["ladder_points"])
-                    for st, top in enumerate(tops)}
-        vector_ladders = _ladders_by_street(o["vector_max_iters"], "vector-max-iters")
-        mccfr_ladders = _ladders_by_street(o["mccfr_max_iters"], "mccfr-max-iters")
+        if not (0 < o["ladder_lo"] < 1 < o["ladder_hi"]):
+            raise click.BadParameter("need 0 < --ladder-lo < 1 < --ladder-hi "
+                                     "(min below, reference above, the convergence estimate)")
         need_model = any(c.strip().lower() not in ("vanilla", "blueprint_only")
                          for c in conditions)
         model_spec = (ModelSpec(p_max=float(o["model_p_max"]),
@@ -1154,8 +1180,8 @@ def _cli():
             conditions=conditions, model_spec=model_spec,
             n_players=o["n_players"], workers=o["workers"],
             collect_hands=o["collect_hands"], per_cell_cap=o["per_cell_cap"],
-            reps=o["reps"], vector_ladders=vector_ladders, mccfr_ladders=mccfr_ladders,
-            thresholds=thresholds,
+            reps=o["reps"], ladder_points=o["ladder_points"], ladder_lo=o["ladder_lo"],
+            ladder_hi=o["ladder_hi"], ladder_max=o["ladder_max"], thresholds=thresholds,
             collect_iters=o["collect_iters"], table_policy=o["table_policy"],
             run_seed=o["run_seed"], big_blind=o["big_blind"],
             small_blind=o["small_blind"], starting_stack=o["starting_stack"],

@@ -57,7 +57,8 @@ def _is_vector(ctx: SubgameContext) -> bool:
     return len(ctx.ranges) == 2 and ctx.street_at_root in (2, 3)
 
 
-def iteration_budget(ctx: SubgameContext, cfg: SolverConfig, workers: int = 1) -> int:
+def iteration_budget(ctx: SubgameContext, cfg: SolverConfig, workers: int = 1,
+                     regime_override: "str | None" = None) -> int:
     """Per-replica iterations to run for the subgame ``ctx`` under ``cfg`` (§6.5).
 
     ``workers`` is the resolved replica count (:func:`resolve_workers`).  Returns
@@ -71,12 +72,19 @@ def iteration_budget(ctx: SubgameContext, cfg: SolverConfig, workers: int = 1) -
       work grows with W);
     - **MCCFR** — a global pooled budget split across replicas, so per-replica shrinks
       as ``workers`` grows (total work ~constant, wall drops with W).
+
+    ``regime_override`` (``"vector"`` / ``"mccfr"``) forces the regime instead of the
+    ``_select_regime`` routing — used by the calibration A/B, which solves the same root
+    under BOTH regimes and needs each regime's *own* production budget as the ladder
+    centre (the forced-mccfr HU-turn arm would otherwise read the vector budget).
     """
     if not getattr(cfg, "auto_budget", True):
         return cfg.max_iterations
 
     w = max(1, int(workers))
-    if _is_vector(ctx):
+    is_vec = (regime_override == "vector" if regime_override is not None
+              else _is_vector(ctx))
+    if is_vec:
         # Per-stage constant, indexed (flop, turn, river) = street 1, 2, 3.  Per
         # replica — NOT divided by workers.
         flop, turn, river = cfg.vector_budget_by_street
