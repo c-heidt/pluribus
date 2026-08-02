@@ -58,8 +58,9 @@ MODEL_P_MAX=${MODEL_P_MAX:-1.0}            # DBR arm (1.0 = naive best response)
 MODEL_ERROR=${MODEL_ERROR:-0.0}
 WORKERS=${WORKERS:-}                       # empty → SLURM_CPUS_PER_TASK-1 (production)
 COLLECT_HANDS=${COLLECT_HANDS:-400}
-PER_CELL_CAP=${PER_CELL_CAP:-3}
-REPS=${REPS:-3}                            # ≥3: averaging over reps lowers the MCCFR value-estimate noise floor
+PER_CELL_CAP=${PER_CELL_CAP:-4}
+REPS=${REPS:-4}                            # ≥4: averaging over reps lowers the MCCFR value-estimate noise floor
+SPREAD_K=${SPREAD_K:-1.5}                  # spread-relative convergence: bar = max(threshold, SPREAD_K * replica_spread)
 LADDER_POINTS=${LADDER_POINTS:-7}          # rungs per cell, clustered around its production budget
 LADDER_LO=${LADDER_LO:-0.5}                # ladder min = LO * production budget (feasible, near convergence)
 LADDER_HI=${LADDER_HI:-2.0}                # ladder top (value-gap REFERENCE) = HI * production budget (>1, above convergence)
@@ -73,7 +74,7 @@ SMALL_BLIND=${SMALL_BLIND:-50}
 STARTING_STACK=${STARTING_STACK:-10000}
 LOW_CARD_RANK=${LOW_CARD_RANK:-2}
 HIGH_CARD_RANK=${HIGH_CARD_RANK:-14}
-WALL_TARGET=${WALL_TARGET:-30}             # per-decision wall budget (s); drives the A/B head-to-head + flags over-budget cells (set empty to disable)
+WALL_TARGET=${WALL_TARGET:-150}            # per-decision wall budget (s); drives the A/B + flags over-budget cells. 150 is feasible under full-box load (v3: production searches take 40-330s at 8-98 it/s; 30 was unreachable). Set empty to disable.
 REGIME_AB_STREETS=${REGIME_AB_STREETS:-turn}  # HU vector-vs-MCCFR A/B streets: turn | flop,turn | none  (flop is SLOW: full-width vector flop ~1.3 it/s)
 
 # Permanent-FS destination for the two output files.
@@ -264,6 +265,7 @@ python -m evaluation.calibrate run \
   --collect-hands "$COLLECT_HANDS" \
   --per-cell-cap "$PER_CELL_CAP" \
   --reps "$REPS" \
+  --spread-k "$SPREAD_K" \
   --ladder-points "$LADDER_POINTS" \
   --ladder-lo "$LADDER_LO" \
   --ladder-hi "$LADDER_HI" \

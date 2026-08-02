@@ -539,6 +539,10 @@ class CellSummary:
     # also small — for a no-reference cell (HU flop / multiway, self-referenced gap) it is
     # the sole check that the flattened value is genuine, not a Monte-Carlo noise floor.
     replica_spread_mbb: float
+    # Effective convergence bar (mbb) = max(threshold, spread_k * replica_spread): the gap
+    # a cell must fall under to count as converged, raised to the noise floor so an
+    # unreachable sub-noise absolute threshold does not read as "never converged".
+    noise_floor_mbb: float
     suggested: Dict[str, Optional[int]]       # mbb threshold -> smallest converged budget
     n_samples: int
     workers: int
@@ -565,7 +569,8 @@ def _mean_ignoring_nan(vals: Sequence[float]) -> float:
 
 
 def summarize_cell(cell: Cell, rows: Sequence[SweepRow],
-                   thresholds: Sequence[float], big_blind: int = 100) -> CellSummary:
+                   thresholds: Sequence[float], big_blind: int = 100,
+                   spread_k: float = 1.5) -> CellSummary:
     ladder = sorted({r.per_replica for r in rows})
     gap_t = defaultdict(list)
     hot_t = defaultdict(list)
@@ -590,10 +595,6 @@ def summarize_cell(cell: Cell, rows: Sequence[SweepRow],
     top_wall = mean_wall[t_top]
     per_rep_it_s = (t_top / top_wall) if top_wall > 0 else float("nan")
     pooled_it_s = (float(np.mean(pooled_t[t_top])) / top_wall) if top_wall > 0 else float("nan")
-    # The suggestion search excludes the reference (top) budget: the gap there is 0 by
-    # construction, so "converged only at the reference" == did not converge.
-    below_ref = ladder[:-1]
-    suggested = {f"{thr:g}": _first_below(below_ref, mean_gap, thr) for thr in thresholds}
     n_samples = len({r.sample for r in rows})
     # Cross-replica disagreement at the top budget: within-sample std of the hero root
     # value across reps, averaged over samples (isolates MCCFR replica noise from the real
@@ -605,11 +606,23 @@ def summarize_cell(cell: Cell, rows: Sequence[SweepRow],
     within = [float(np.std(v, ddof=1)) for v in by_sample_val.values() if len(v) >= 2]
     replica_spread_mbb = (float(np.mean(within)) / big_blind * 1000.0
                           if within else float("nan"))
+    # Convergence bar is SPREAD-RELATIVE: a value gap below an absolute mbb threshold is
+    # unreachable when the Monte-Carlo noise floor exceeds it (an MCCFR cell with a 96-mbb
+    # replica spread can never dip under 10 mbb), so the effective bar is
+    # ``max(threshold, spread_k * replica_spread)`` — "gap has fallen into the noise".  For
+    # a deterministic cell (river vector, spread≈0) it collapses back to the absolute
+    # threshold.  The suggestion search excludes the reference (top) budget (gap 0 there by
+    # construction, so "converged only at the reference" == did not converge).
+    below_ref = ladder[:-1]
+    noise_floor = (spread_k * replica_spread_mbb
+                   if not np.isnan(replica_spread_mbb) else 0.0)
+    suggested = {f"{thr:g}": _first_below(below_ref, mean_gap, max(float(thr), noise_floor))
+                 for thr in thresholds}
     return CellSummary(
         cell=cell, ladder=ladder, mean_value_gap_mbb=mean_gap, mean_hot_l1=mean_hot,
         argmax_stability=amatch, mean_l1=mean_l1, mean_wall=mean_wall,
         throughput_it_s=per_rep_it_s, pooled_it_s=pooled_it_s,
-        replica_spread_mbb=replica_spread_mbb,
+        replica_spread_mbb=replica_spread_mbb, noise_floor_mbb=noise_floor,
         suggested=suggested, n_samples=n_samples, workers=w,
     )
 
@@ -856,6 +869,7 @@ def run_calibration(
     ladder_hi: float,
     ladder_max: int,
     thresholds: Sequence[float],
+    spread_k: float = 1.5,
     collect_iters: int,
     table_policy: str,
     run_seed: int,
@@ -1005,7 +1019,7 @@ def run_calibration(
     by_cell: Dict[Cell, List[SweepRow]] = defaultdict(list)
     for r in all_rows:
         by_cell[r.cell].append(r)
-    summaries = [summarize_cell(c, rs, thresholds, big_blind=big_blind)
+    summaries = [summarize_cell(c, rs, thresholds, big_blind=big_blind, spread_k=spread_k)
                  for c, rs in by_cell.items()]
 
     # Emit — default suggestion uses the middle threshold.
@@ -1035,6 +1049,7 @@ def run_calibration(
                 "n_samples": s.n_samples, "throughput_it_s": s.throughput_it_s,
                 "pooled_it_s": s.pooled_it_s,
                 "replica_spread_mbb": s.replica_spread_mbb,  # noise-floor check on the gap
+                "noise_floor_mbb": s.noise_floor_mbb,        # effective convergence bar (mbb)
                 "mean_value_gap_mbb": {str(t): s.mean_value_gap_mbb[t] for t in s.ladder},
                 "argmax_stability": {str(t): s.argmax_stability[t] for t in s.ladder},
                 "mean_hot_l1": {str(t): s.mean_hot_l1[t] for t in s.ladder},
@@ -1110,11 +1125,16 @@ def _cli():
                   help="Solver replicas per search (default: SLURM_CPUS_PER_TASK-1).")
     @click.option("--collect-hands", default=400, type=int, show_default=True,
                   help="Hands played to harvest representative roots.")
-    @click.option("--per-cell-cap", default=3, type=int, show_default=True,
+    @click.option("--per-cell-cap", default=4, type=int, show_default=True,
                   help="Roots kept per (condition, regime, street, n_live) cell.")
-    @click.option("--reps", default=3, type=int, show_default=True,
+    @click.option("--reps", default=4, type=int, show_default=True,
                   help="Independent re-solve replicates per root; averaging over reps is "
-                       "what lowers the MCCFR value-estimate noise floor, so keep ≥3.")
+                       "what lowers the MCCFR value-estimate noise floor, so keep ≥4.")
+    @click.option("--spread-k", default=1.5, type=float, show_default=True,
+                  help="Spread-relative convergence: a cell counts as converged when its "
+                       "value gap falls below max(threshold, spread-k * replica_spread) — "
+                       "i.e. into its Monte-Carlo noise floor, since a sub-noise absolute "
+                       "mbb threshold is unreachable. 0 restores pure absolute thresholds.")
     @click.option("--ladder-points", default=7, type=int, show_default=True,
                   help="Rungs per cell, clustered around its production budget.")
     @click.option("--ladder-lo", default=0.5, type=float, show_default=True,
@@ -1182,6 +1202,7 @@ def _cli():
             collect_hands=o["collect_hands"], per_cell_cap=o["per_cell_cap"],
             reps=o["reps"], ladder_points=o["ladder_points"], ladder_lo=o["ladder_lo"],
             ladder_hi=o["ladder_hi"], ladder_max=o["ladder_max"], thresholds=thresholds,
+            spread_k=o["spread_k"],
             collect_iters=o["collect_iters"], table_policy=o["table_policy"],
             run_seed=o["run_seed"], big_blind=o["big_blind"],
             small_blind=o["small_blind"], starting_stack=o["starting_stack"],
