@@ -43,8 +43,9 @@ def _ctx_for(street, n_players):
 # --------------------------------------------------------------------------- #
 
 # Only turn/river are vector now — a HU flop root has two future chance nodes left
-# and routes to sampled MCCFR (see ``test_hu_flop_uses_mccfr_budget`` below).
-@pytest.mark.parametrize("street,expected", [(2, 1000), (3, 500)])
+# and routes to sampled MCCFR (see ``test_hu_flop_uses_mccfr_budget`` below).  Turn and
+# river both sit at the calibration knee (1350).
+@pytest.mark.parametrize("street,expected", [(2, 1350), (3, 1350)])
 def test_vector_budget_is_per_stage_constant(street, expected):
     cfg = _cfg(auto_budget=True)
     assert iteration_budget(_ctx_for(street, 2), cfg) == expected
@@ -54,24 +55,26 @@ def test_hu_flop_uses_mccfr_budget():
     """HU flop is no longer vector: its budget is the MCCFR global pool (÷ workers),
     not the vector per-stage constant (1500).  Mirrors ``_select_regime``."""
     cfg = _cfg(auto_budget=True, max_iterations=1_000_000)
-    ctx = _ctx_for(1, 2)                                    # HU flop
-    assert iteration_budget(ctx, cfg, workers=1) == 6000   # global = 3000 * 2 live
-    assert iteration_budget(ctx, cfg, workers=6) == 1000   # ceil(6000 / 6), split by W
+    ctx = _ctx_for(1, 2)                                     # HU flop
+    assert iteration_budget(ctx, cfg, workers=1) == 12000    # global = 6000 (flop base) * 2 live
+    assert iteration_budget(ctx, cfg, workers=6) == 2000     # ceil(12000 / 6), split by W
 
 
 def test_vector_budget_is_independent_of_workers():
     """Full-width vector: each replica needs the whole horizon → not divided by W."""
     cfg = _cfg(auto_budget=True)
     for w in (1, 6, 63):
-        assert iteration_budget(_ctx_for(3, 2), cfg, workers=w) == 500  # river
+        assert iteration_budget(_ctx_for(3, 2), cfg, workers=w) == 1350  # river
 
 
 @pytest.mark.parametrize("n_players,expected_global", [(2, 6000), (3, 9000), (6, 18000)])
 def test_mccfr_global_budget_scales_with_players(n_players, expected_global):
-    # workers=1 → per-replica == the global pooled budget (= 3000 * n_live, clamped).
+    # workers=1 → per-replica == the global pooled budget (= base[street] * n_live,
+    # clamped).  Uses the preflop base (3000) so the n_live scaling is clean and
+    # unclamped; the per-street *base* differentiation is covered by
+    # ``test_mccfr_budget_is_per_street``.
     cfg = _cfg(auto_budget=True, max_iterations=1_000_000)
-    street = 0 if n_players == 2 else 1
-    assert iteration_budget(_ctx_for(street, n_players), cfg, workers=1) == expected_global
+    assert iteration_budget(_ctx_for(0, n_players), cfg, workers=1) == expected_global
 
 
 def test_mccfr_global_budget_splits_across_workers():
@@ -104,7 +107,7 @@ def test_mccfr_learning_floor_kicks_in_at_high_worker_counts():
 
 def test_mccfr_global_clamped_to_min_and_max():
     cfg = _cfg(auto_budget=True, max_iterations=1_000_000)
-    # 2 players * 3000 = 6000 == the floor; 20 players * 3000 = 60000 → max 30000.
+    # preflop 2 players * 3000 = 6000 == the min; flop 20 players * 6000 = 120000 → max 30000.
     assert iteration_budget(_ctx_for(0, 2), cfg, workers=1) == 6000
     assert iteration_budget(_ctx_for(1, 20), cfg, workers=1) == 30000
 
@@ -164,7 +167,7 @@ def test_solve_runs_the_structural_budget():
     res = solve(env, ctx, _cfg(auto_budget=True, max_iterations=5000,
                                max_wall_seconds=1e9, workers=_WORKERS))
     assert res.regime == "vector"
-    assert res.iterations_run == 500 * _WORKERS  # river budget (500) per replica
+    assert res.iterations_run == 1350 * _WORKERS  # river budget (1350) per replica
     assert res.stop_reason == "iteration_cap"
 
 
@@ -218,7 +221,7 @@ def test_vector_river_budget_reaches_low_exploitability(_seeded):
     res = solve(env, ctx, _cfg(auto_budget=True, max_iterations=5000,
                                max_wall_seconds=1e9, discount_interval=100,
                                workers=_WORKERS))
-    assert res.regime == "vector" and res.iterations_run == 500 * _WORKERS
+    assert res.regime == "vector" and res.iterations_run == 1350 * _WORKERS
 
     expl = exploitability(sub, _solver_sigma(res.state, env, sub))
     assert expl < 0.03 * scale, f"river budget under-converged: expl={expl:.4f}"

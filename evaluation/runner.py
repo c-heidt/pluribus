@@ -1177,8 +1177,8 @@ def build_blueprint_session(
     blueprint_path: str,
     lut_path: str,
     use_decision_free_equity: bool = True,
-    max_iterations: int = 5_000,
-    max_wall_seconds: float = 60.0,
+    max_iterations: int = 30_000,   # absolute ceiling ≥ mccfr_global_max (not a throttle)
+    max_wall_seconds: float = 300.0,  # loose backstop; production sets per-street walls
     workers: Optional[int] = None,
     bias_multiplier: float = 5.0,
     pickle_dir: bool = False,
@@ -1388,8 +1388,12 @@ def _cli():
         "--high-card-rank", default=14, type=int, show_default=True,
         help="Deck high rank (inclusive).",
     )
-    @click.option("--max-iterations", default=5_000, type=int, show_default=True)
-    @click.option("--max-wall-seconds", default=10.0, type=float, show_default=True)
+    @click.option("--max-iterations", default=30_000, type=int, show_default=True,
+                  help="Absolute per-replica ceiling (≥ mccfr_global_max); the structural "
+                       "budget is the primary stop and this only clips it in pathology.")
+    @click.option("--max-wall-seconds", default=300.0, type=float, show_default=True,
+                  help="Loose per-search wall backstop; production sets per-street walls "
+                       "from calibration (max_wall_seconds_by_street).")
     @click.option("--workers", default=None, type=int, help="Solver replicas (§6.7, "
                   "≤6 on this host).")
     @click.option(

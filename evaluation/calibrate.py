@@ -336,17 +336,25 @@ def _sweep_setup(worker_id: int, shared: dict):
     """After fork: reopen the leaf-fleet LMDB (MDB_BAD_RSLOT), start a result list."""
     try:
         from poker_ai.search.parallel import _reopen_leaf_fleet_lmdb
-        if shared["samples"]:
-            _reopen_leaf_fleet_lmdb(shared["samples"][0].ctx)
+        for samples, _fr in shared["jobs"]:
+            if samples:
+                _reopen_leaf_fleet_lmdb(samples[0].ctx)
+                break
     except Exception:  # pragma: no cover - reopen is best-effort
         pass
     return {"results": []}
 
 
 def _sweep_process(spec_idx: int, state: dict, shared: dict) -> None:
-    """Solve one ``(sample, rep, budget)`` at search ``workers=1`` (the deployment model)."""
-    si, rep, t = shared["specs"][spec_idx]
-    s = shared["samples"][si]
+    """Solve one ``(job, sample, rep, budget)`` at search ``workers=1`` (deployment model).
+
+    The seed is ``base + 1000*si + rep`` — job-independent by design, so the A/B pair
+    (vector + mccfr jobs over the *same* roots) draws the same seeds it would in a
+    sequential per-cell sweep → byte-identical results to the un-pooled version.
+    """
+    j, si, rep, t = shared["all_specs"][spec_idx]
+    samples, force_regime = shared["jobs"][j]
+    s = samples[si]
     seed = shared["base_seed"] + 1000 * si + rep
     env_t = copy.deepcopy(s.env)
     ctx_t = dataclasses.replace(s.ctx, rng=np.random.default_rng(seed))
@@ -354,9 +362,9 @@ def _sweep_process(spec_idx: int, state: dict, shared: dict) -> None:
         shared["prod_cfg"], auto_budget=False, max_iterations=int(t),
         workers=1, max_wall_seconds=1e9,
     )
-    res = solve(env_t, ctx_t, cfg_t, regime_override=shared["force_regime"])
+    res = solve(env_t, ctx_t, cfg_t, regime_override=force_regime)
     state["results"].append((
-        si, rep, int(t), _root_sigma(res, s), res.root_value,
+        j, si, rep, int(t), _root_sigma(res, s), res.root_value,
         int(res.iterations_run), float(res.wall_seconds), str(res.stop_reason),
     ))
 
@@ -365,100 +373,114 @@ def _sweep_teardown(state: dict):
     return state["results"]
 
 
-def sweep_cell(
-    samples: Sequence[RootSample],
+def sweep_jobs(
+    jobs: Sequence[dict],
     prod_cfg: SolverConfig,
     *,
     pool_workers: int,
-    ladder: Sequence[int],
     reps: int,
     base_seed: int,
     big_blind: int,
-    force_regime: Optional[str] = None,
-    ref_values: Optional[Dict[Tuple[int, int], Optional[float]]] = None,
-) -> Tuple[List[SweepRow], Dict[Tuple[int, int], Optional[float]]]:
-    """Re-solve each root at every ladder budget, one solve per core at **search W=1**.
+) -> List[SweepRow]:
+    """Solve EVERY ``(job, sample, rep, budget)`` in ONE core-parallel pool.
 
-    The solves fan out across ``pool_workers`` cores via the single-core hand pool
-    (:func:`evaluation.hand_pool.run_index_pool`), each running the search at
-    ``workers=1`` — the **deployment model** (one hand per core, no nested pool).  So
-    the wall each solve reports **is** the honest per-search cost under that model, and
-    the sweep itself is core-parallel.  Each solve forces ``auto_budget=False`` +
-    ``max_iterations = t`` + a huge wall cap, so the loop always completes the budget
-    and the wall is never clipped.
+    Pooling across cells — instead of one pool per cell — is what keeps all cores busy:
+    a cell's cheap low-budget solves backfill the cores freed while another cell's 30k
+    top rung is still running (per-cell pools left ~85% of the box idle during each
+    cell's deepest rung).  Each solve runs the search at ``workers=1`` (the deployment
+    model, one hand per core, no nested pool), forcing ``auto_budget=False`` +
+    ``max_iterations = t`` + a huge wall cap so the wall each reports is the honest
+    per-search cost and the budget always completes.
 
-    The **primary** convergence signal is the hero's root-value gap (mbb) vs a top-budget
-    reference — a value (equilibrium-invariant, hot-path-weighted).  Hot-action L1 +
-    argmax-stability are played-decision diagnostics; full-policy L1 is a column only.
-
-    ``force_regime`` overrides the production regime routing (the turn A/B solves the
-    same roots under both).  ``ref_values`` (keyed ``(sample, rep)``) supplies the
-    value-gap reference so MCCFR's gap is measured against the *vector-exact* ground
-    truth; ``None`` ⇒ each ``(sample, rep)`` self-references its own top budget.  Returns
-    ``(rows, computed_ref_values)`` so the caller feeds the vector refs into the MCCFR
-    pass.  (Strategy diagnostics always self-reference — cross-regime mixtures aren't
-    comparable.)
+    A **job** = ``{cell, samples, force_regime, ladder, ref_from}``.  ``force_regime``
+    overrides regime routing (the A/B solves the same roots under both).  ``ref_from``
+    (a job index, or ``None``) sets the value-gap reference: the A/B mccfr job points at
+    its paired *vector* job so its gap is measured against the vector-exact value; every
+    other job self-references its own top budget.  The reference is resolved in
+    post-processing (solves don't depend on it), which is what lets all jobs share one
+    pool.  The **primary** convergence signal is the hero root-value gap (mbb, hot-path);
+    hot-L1 + argmax-stability are diagnostics; full-policy L1 is a column only.
     """
     from evaluation.hand_pool import run_index_pool
 
-    ladder = list(ladder)
-    t_ref = ladder[-1]
-    specs = [(si, rep, t) for si in range(len(samples))
-             for rep in range(reps) for t in ladder]
-    if not specs:
-        return [], {}
-    shared = {"samples": samples, "prod_cfg": prod_cfg, "base_seed": int(base_seed),
-              "force_regime": force_regime, "specs": specs}
+    jobs = list(jobs)
+    all_specs = [(j, si, rep, int(t))
+                 for j, job in enumerate(jobs)
+                 for si in range(len(job["samples"]))
+                 for rep in range(reps) for t in job["ladder"]]
+    if not all_specs:
+        return []
+    shared = {
+        "jobs": [(job["samples"], job.get("force_regime")) for job in jobs],
+        "prod_cfg": prod_cfg, "base_seed": int(base_seed), "all_specs": all_specs,
+    }
     payloads = run_index_pool(
-        n_workers=min(int(pool_workers), len(specs)) or 1,
+        n_workers=min(int(pool_workers), len(all_specs)) or 1,
         setup=_sweep_setup, process=_sweep_process, teardown=_sweep_teardown,
-        shared=shared, target=len(specs),
+        shared=shared, target=len(all_specs),
     )
-    # Parent-side LMDB reopen after the fork (MDB_BAD_RSLOT), mirroring run_parallel —
-    # the parent solves/collects more roots after this returns.
+    # Parent-side LMDB reopen after the fork (MDB_BAD_RSLOT), mirroring run_parallel.
     try:
         from poker_ai.search.parallel import _reopen_leaf_fleet_lmdb
-        if samples:
-            _reopen_leaf_fleet_lmdb(samples[0].ctx)
+        for job in jobs:
+            if job["samples"]:
+                _reopen_leaf_fleet_lmdb(job["samples"][0].ctx)
+                break
     except Exception:  # pragma: no cover
         pass
 
-    # Gather the per-solve results keyed (sample, rep, budget).
-    by: Dict[Tuple[int, int, int], tuple] = {}
+    # Demux results per job, keyed (sample, rep, budget).
+    by_job: Dict[int, Dict[Tuple[int, int, int], tuple]] = defaultdict(dict)
     for pl in payloads:
-        for (si, rep, t, sig, val, iters, wall, stop) in (pl or []):
-            by[(si, rep, t)] = (sig, val, iters, wall, stop)
+        for (j, si, rep, t, sig, val, iters, wall, stop) in (pl or []):
+            by_job[j][(si, rep, t)] = (sig, val, iters, wall, stop)
 
+    # First pass: each job's own top-budget value per (sample, rep) — the self-reference
+    # and the A/B mccfr job's cross-reference source.
+    job_refs: Dict[int, Dict[Tuple[int, int], Optional[float]]] = {}
+    for j, job in enumerate(jobs):
+        t_ref = list(job["ladder"])[-1]
+        by = by_job.get(j, {})
+        job_refs[j] = {
+            (si, rep): (by.get((si, rep, t_ref)) or (None,) * 2)[1]
+            for si in range(len(job["samples"])) for rep in range(reps)
+        }
+
+    # Second pass: build rows (now that every job's reference value is known).
     rows: List[SweepRow] = []
-    computed_refs: Dict[Tuple[int, int], Optional[float]] = {}
-    for si, s in enumerate(samples):
-        for rep in range(reps):
-            top = by.get((si, rep, t_ref))
-            ref_sig = top[0] if top is not None else None
-            computed_refs[(si, rep)] = top[1] if top is not None else None
-            # Value-gap reference: a supplied (cross-regime, vector-exact) value if given,
-            # else this regime's own top-budget value (self-convergence).
-            ref_val = (ref_values.get((si, rep)) if ref_values is not None
-                       else computed_refs[(si, rep)])
-            row_regime = force_regime if force_regime is not None else s.regime
-            for t in ladder:
-                g = by.get((si, rep, t))
-                if g is None:
-                    continue
-                sig, val, iters, wall, stop = g
-                l1 = (float(np.abs(sig - ref_sig).sum())
-                      if sig is not None and ref_sig is not None else float("nan"))
-                rows.append(SweepRow(
-                    condition=s.condition, regime=row_regime, street=s.street,
-                    n_live=s.n_live, per_replica=int(t), workers=1,
-                    pooled_iters=int(iters), wall_seconds=float(wall), stop_reason=stop,
-                    sample=si, rep=rep,
-                    value_gap_mbb=_value_gap_mbb(val, ref_val, big_blind),
-                    root_value=(float(val) if val is not None else float("nan")),
-                    hot_l1=_hot_l1(sig, ref_sig), argmax_match=_argmax_match(sig, ref_sig),
-                    l1_to_ref=l1,
-                ))
-    return rows, computed_refs
+    for j, job in enumerate(jobs):
+        ladder = list(job["ladder"])
+        t_ref = ladder[-1]
+        by = by_job.get(j, {})
+        samples = job["samples"]
+        force_regime = job.get("force_regime")
+        ref_from = job.get("ref_from")
+        ref_values = job_refs[ref_from] if ref_from is not None else None
+        for si, s in enumerate(samples):
+            for rep in range(reps):
+                top = by.get((si, rep, t_ref))
+                ref_sig = top[0] if top is not None else None
+                ref_val = (ref_values.get((si, rep)) if ref_values is not None
+                           else job_refs[j][(si, rep)])
+                row_regime = force_regime if force_regime is not None else s.regime
+                for t in ladder:
+                    g = by.get((si, rep, t))
+                    if g is None:
+                        continue
+                    sig, val, iters, wall, stop = g
+                    l1 = (float(np.abs(sig - ref_sig).sum())
+                          if sig is not None and ref_sig is not None else float("nan"))
+                    rows.append(SweepRow(
+                        condition=s.condition, regime=row_regime, street=s.street,
+                        n_live=s.n_live, per_replica=int(t), workers=1,
+                        pooled_iters=int(iters), wall_seconds=float(wall), stop_reason=stop,
+                        sample=si, rep=rep,
+                        value_gap_mbb=_value_gap_mbb(val, ref_val, big_blind),
+                        root_value=(float(val) if val is not None else float("nan")),
+                        hot_l1=_hot_l1(sig, ref_sig), argmax_match=_argmax_match(sig, ref_sig),
+                        l1_to_ref=l1,
+                    ))
+    return rows
 
 
 # --------------------------------------------------------------------------- #
@@ -475,6 +497,11 @@ class CellSummary:
     mean_wall: Dict[int, float]               # seconds at `workers`
     throughput_it_s: float                    # per-replica it/s at the top budget
     pooled_it_s: float                        # pooled it/s at the top budget
+    # Top-budget cross-replica root-value std (mbb): within-sample std across reps,
+    # averaged over samples.  A LOW value gap is only trustworthy convergence if THIS is
+    # also small — for a no-reference cell (HU flop / multiway, self-referenced gap) it is
+    # the sole check that the flattened value is genuine, not a Monte-Carlo noise floor.
+    replica_spread_mbb: float
     suggested: Dict[str, Optional[int]]       # mbb threshold -> smallest converged budget
     n_samples: int
     workers: int
@@ -501,7 +528,7 @@ def _mean_ignoring_nan(vals: Sequence[float]) -> float:
 
 
 def summarize_cell(cell: Cell, rows: Sequence[SweepRow],
-                   thresholds: Sequence[float]) -> CellSummary:
+                   thresholds: Sequence[float], big_blind: int = 100) -> CellSummary:
     ladder = sorted({r.per_replica for r in rows})
     gap_t = defaultdict(list)
     hot_t = defaultdict(list)
@@ -531,10 +558,21 @@ def summarize_cell(cell: Cell, rows: Sequence[SweepRow],
     below_ref = ladder[:-1]
     suggested = {f"{thr:g}": _first_below(below_ref, mean_gap, thr) for thr in thresholds}
     n_samples = len({r.sample for r in rows})
+    # Cross-replica disagreement at the top budget: within-sample std of the hero root
+    # value across reps, averaged over samples (isolates MCCFR replica noise from the real
+    # between-root spread).  Needs ≥2 reps to be defined.
+    by_sample_val: Dict[int, List[float]] = defaultdict(list)
+    for r in rows:
+        if r.per_replica == t_top and not np.isnan(r.root_value):
+            by_sample_val[r.sample].append(r.root_value)
+    within = [float(np.std(v, ddof=1)) for v in by_sample_val.values() if len(v) >= 2]
+    replica_spread_mbb = (float(np.mean(within)) / big_blind * 1000.0
+                          if within else float("nan"))
     return CellSummary(
         cell=cell, ladder=ladder, mean_value_gap_mbb=mean_gap, mean_hot_l1=mean_hot,
         argmax_stability=amatch, mean_l1=mean_l1, mean_wall=mean_wall,
         throughput_it_s=per_rep_it_s, pooled_it_s=pooled_it_s,
+        replica_spread_mbb=replica_spread_mbb,
         suggested=suggested, n_samples=n_samples, workers=w,
     )
 
@@ -776,7 +814,8 @@ def run_calibration(
     collect_hands: int,
     per_cell_cap: int,
     reps: int,
-    ladder: Sequence[int],
+    vector_ladders: Mapping[int, Sequence[int]],
+    mccfr_ladders: Mapping[int, Sequence[int]],
     thresholds: Sequence[float],
     collect_iters: int,
     table_policy: str,
@@ -792,7 +831,17 @@ def run_calibration(
     regime_ab_streets: Sequence[int] = (2,),
 ) -> Dict[str, object]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    top = int(ladder[-1])
+    # Regime- AND street-specific ladders, because they operate at very different scales:
+    # MCCFR only converges the HOT PATH (cold infosets fall back to the blueprint), so its
+    # metric is hero-root value STABILITY (self-referenced) NOT exploitability, and its
+    # ladder must reach the production budget to see where the played value flattens — but
+    # per street, because a flop (2 cards to come, ~746k infosets) needs far more than a
+    # river (board known, ~26k) that converges fast; a flat 30k ladder wastes huge wall on
+    # river/turn.  Vector is full-width and converges by ~1.3k, so its tops stay modest —
+    # and per-street too: the oracle-only flop-vector arm is ~1.3 it/s (a 2.5k top would be
+    # ~30 min/solve), so it gets a small top, while turn/river sit at ~2.5k.
+    top = max([int(list(l)[-1]) for l in vector_ladders.values()] +
+              [int(list(l)[-1]) for l in mccfr_ladders.values()])  # build/collect ceiling
 
     # The compiled search core is an env var read at IMPORT time (the kernels rebind
     # behind ``PLURIBUS_SEARCH_CORE`` when the search modules are imported), so it must
@@ -861,7 +910,17 @@ def run_calibration(
         workers=1, max_wall_seconds=1e9,
     )
 
-    all_rows: List[SweepRow] = []
+    # Collect roots for EVERY condition first, building the full job list, then sweep all
+    # jobs in ONE cross-cell pool (below) so the whole box stays busy.  A job is a
+    # (cell, samples, force_regime, ladder, ref_from) unit; the A/B adds a second
+    # (mccfr) job on the same roots whose gap references the paired vector job.
+    def _mladder(street: int) -> Sequence[int]:
+        return mccfr_ladders.get(int(street), mccfr_ladders[max(mccfr_ladders)])
+
+    def _vladder(street: int) -> Sequence[int]:
+        return vector_ladders.get(int(street), vector_ladders[max(vector_ladders)])
+
+    jobs: List[dict] = []
     for condition in conditions:
         # Per-arm config from ``for_condition`` (guards enforced): OX ⇒ beta set,
         # no model; DBR ⇒ model, no beta; vanilla ⇒ neither.
@@ -873,55 +932,42 @@ def run_calibration(
             n_hands=collect_hands, per_cell_cap=per_cell_cap, run_seed=run_seed,
         )
         # Regime A/B: solve HU roots on the ``regime_ab_streets`` under BOTH regimes.
-        # Runs **per condition** (this loop is inside the conditions loop; the cell key
-        # carries the condition), so vanilla AND each DBR arm get their own comparison —
-        # the decision can legitimately flip for DBR, because the model clamp
-        # concentrates the opponent's effective range/strategy, which changes both the
+        # Per condition (the cell key carries the condition), so vanilla AND each DBR arm
+        # get their own comparison — the decision can legitimately flip for DBR, because
+        # the model clamp concentrates the opponent's effective range, changing both the
         # full-range settlement cost (vector) and the sampling variance (MCCFR).  Vector
-        # is exact-per-iteration on every HU postflop street (flop samples the
-        # (turn,river) completion, turn the river), so vector@top is the shared exact
-        # reference both regimes' gaps are measured against.  Disabled when OX-Search is
-        # on (``beta`` set): the gadget root exists solely in the vector regime, so an
-        # MCCFR solve would silently drop it — those streets stay vector-only.
-        # NOTE: the HU **flop** A/B is SLOW (full-width vector flop ~1.3 it/s, the very
-        # reason production routes it to MCCFR) — pair it with a small ladder.
+        # is exact-per-iteration on every HU postflop street, so vector@top is the shared
+        # exact reference both regimes' gaps are measured against.  Disabled under
+        # OX-Search (``beta`` set): the gadget root exists solely in the vector regime.
         ab_streets = set(int(s) for s in regime_ab_streets)
         ab_on = bool(ab_streets) and getattr(prod_cfg, "beta", None) is None
         for cell, sample_list in samples.items():
             _cond, _regime, street, n_live = cell
             is_ab = (int(n_live) == 2 and int(street) in ab_streets)
             if ab_on and is_ab:
-                logger.info("regime A/B on cell %s (%d roots): vector (exact ref) + "
-                            "mccfr vs it", cell, len(sample_list))
-                # Vector FIRST — it produces the exact shared reference; MCCFR is then
-                # measured against it (distance-to-truth).  Which regime is *production*
-                # for this street only matters to suggest_config (via _production_regime).
-                vec_rows, vec_refs = sweep_cell(
-                    sample_list, prod_cfg, pool_workers=resolved_workers, ladder=ladder,
-                    reps=reps, base_seed=run_seed, big_blind=big_blind,
-                    force_regime="vector",
-                )
-                mc_rows, _ = sweep_cell(
-                    sample_list, prod_cfg, pool_workers=resolved_workers, ladder=ladder,
-                    reps=reps, base_seed=run_seed, big_blind=big_blind,
-                    force_regime="mccfr", ref_values=vec_refs,
-                )
-                all_rows.extend(vec_rows)
-                all_rows.extend(mc_rows)
-                continue
-            logger.info("sweeping cell %s (%d roots) search W=1 over %d cores, ladder %s",
-                        cell, len(sample_list), resolved_workers, ladder)
-            rows, _ = sweep_cell(
-                sample_list, prod_cfg, pool_workers=resolved_workers,
-                ladder=ladder, reps=reps, base_seed=run_seed, big_blind=big_blind,
-            )
-            all_rows.extend(rows)
+                vidx = len(jobs)  # the paired vector job the mccfr job references
+                jobs.append(dict(cell=cell, samples=sample_list, force_regime="vector",
+                                 ladder=_vladder(street), ref_from=None))
+                jobs.append(dict(cell=cell, samples=sample_list, force_regime="mccfr",
+                                 ladder=_mladder(street), ref_from=vidx))
+            else:
+                # Non-A/B: each cell on ITS production regime's (street-sized) ladder.
+                ladder = _mladder(street) if str(_regime) == "mccfr" else _vladder(street)
+                jobs.append(dict(cell=cell, samples=sample_list,
+                                 force_regime=None, ladder=ladder, ref_from=None))
+
+    n_solves = sum(len(j["samples"]) * reps * len(list(j["ladder"])) for j in jobs)
+    logger.info("sweeping %d jobs (%d cells, %d solves) across %d cores in ONE pool",
+                len(jobs), len({j["cell"] for j in jobs}), n_solves, resolved_workers)
+    all_rows = sweep_jobs(jobs, prod_cfg, pool_workers=resolved_workers, reps=reps,
+                          base_seed=run_seed, big_blind=big_blind)
 
     # Aggregate.
     by_cell: Dict[Cell, List[SweepRow]] = defaultdict(list)
     for r in all_rows:
         by_cell[r.cell].append(r)
-    summaries = [summarize_cell(c, rs, thresholds) for c, rs in by_cell.items()]
+    summaries = [summarize_cell(c, rs, thresholds, big_blind=big_blind)
+                 for c, rs in by_cell.items()]
 
     # Emit — default suggestion uses the middle threshold.
     thr_default = sorted(thresholds)[len(thresholds) // 2]
@@ -931,8 +977,14 @@ def run_calibration(
     summary_json = {
         "search_core": "on" if core_on else "off (PURE PYTHON — not production)",
         "workers": resolved_workers,
-        "ladder": list(ladder),
-        "metric": "value_gap_mbb",  # primary convergence signal (hero root EV, mbb)
+        "vector_ladder_by_street": {
+            _STREET_NAME.get(st, st): list(l) for st, l in sorted(vector_ladders.items())
+        },
+        "mccfr_ladder_by_street": {
+            _STREET_NAME.get(st, st): list(l) for st, l in sorted(mccfr_ladders.items())
+        },
+        "metric": "value_gap_mbb",  # hero root EV (mbb): hot-path VALUE stability, not
+                                    # exploitability (MCCFR converges only the hot path)
         "thresholds_mbb": list(thresholds),
         "suggested_config": {
             k: (list(v) if isinstance(v, tuple) else v) for k, v in config.items()
@@ -943,6 +995,7 @@ def run_calibration(
                 "street": _STREET_NAME.get(s.cell[2], s.cell[2]), "n_live": s.cell[3],
                 "n_samples": s.n_samples, "throughput_it_s": s.throughput_it_s,
                 "pooled_it_s": s.pooled_it_s,
+                "replica_spread_mbb": s.replica_spread_mbb,  # noise-floor check on the gap
                 "mean_value_gap_mbb": {str(t): s.mean_value_gap_mbb[t] for t in s.ladder},
                 "argmax_stability": {str(t): s.argmax_stability[t] for t in s.ladder},
                 "mean_hot_l1": {str(t): s.mean_hot_l1[t] for t in s.ladder},
@@ -1020,12 +1073,25 @@ def _cli():
                   help="Hands played to harvest representative roots.")
     @click.option("--per-cell-cap", default=3, type=int, show_default=True,
                   help="Roots kept per (condition, regime, street, n_live) cell.")
-    @click.option("--reps", default=2, type=int, show_default=True,
-                  help="Independent re-solve replicates per root (tames MCCFR noise).")
-    @click.option("--min-iters", default=250, type=int, show_default=True)
-    @click.option("--max-iters", default=4000, type=int, show_default=True,
-                  help="Top of the per-replica ladder (also the value-gap reference budget).")
-    @click.option("--ladder-points", default=6, type=int, show_default=True)
+    @click.option("--reps", default=3, type=int, show_default=True,
+                  help="Independent re-solve replicates per root; averaging over reps is "
+                       "what lowers the MCCFR value-estimate noise floor, so keep ≥3.")
+    @click.option("--min-iters", default=250, type=int, show_default=True,
+                  help="Bottom of both per-replica ladders.")
+    @click.option("--vector-max-iters", default="500,800,2500,2500", show_default=True,
+                  help="PER-STREET tops of the VECTOR ladder (preflop,flop,turn,river; also "
+                       "the value-gap reference). Vector converges by ~1.3k so turn/river "
+                       "stay ~2.5k; the oracle-only flop-vector arm is ~1.3 it/s, so it gets "
+                       "a small top (preflop is unused — vector never runs there). A single "
+                       "int applies to every street.")
+    @click.option("--mccfr-max-iters", default="8000,30000,12000,8000", show_default=True,
+                  help="PER-STREET tops of the MCCFR ladder (preflop,flop,turn,river). The "
+                       "flop (2 cards to come, ~746k infosets) needs production scale (30k = "
+                       "mccfr_global_max); river/turn are smaller and converge faster, so a "
+                       "flat 30k there just burns wall. The MCCFR metric is hero-root value "
+                       "STABILITY (self-referenced), NOT exploitability (it converges only "
+                       "the hot path). A single int applies to every street.")
+    @click.option("--ladder-points", default=7, type=int, show_default=True)
     @click.option("--thresholds", default="20,10,5", show_default=True,
                   help="Value-gap convergence thresholds in mbb (hero root EV still on "
                   "the table); the middle one drives the suggested config.")
@@ -1059,7 +1125,18 @@ def _cli():
                             format="%(asctime)s %(levelname)s %(name)s: %(message)s")
         conditions = [c.strip() for c in o["conditions"].split(",") if c.strip()]
         thresholds = [float(x) for x in o["thresholds"].split(",") if x.strip()]
-        ladder = _iteration_ladder(o["min_iters"], o["max_iters"], o["ladder_points"])
+        # Per-street ladder tops "pf,flop,turn,river" (a single int → all four streets).
+        def _ladders_by_street(spec, name):
+            tops = [int(x) for x in str(spec).split(",") if x.strip()]
+            if len(tops) == 1:
+                tops = tops * 4
+            if len(tops) != 4:
+                raise click.BadParameter(
+                    f"--{name} must be one int or four (preflop,flop,turn,river); got {spec!r}")
+            return {st: _iteration_ladder(o["min_iters"], top, o["ladder_points"])
+                    for st, top in enumerate(tops)}
+        vector_ladders = _ladders_by_street(o["vector_max_iters"], "vector-max-iters")
+        mccfr_ladders = _ladders_by_street(o["mccfr_max_iters"], "mccfr-max-iters")
         need_model = any(c.strip().lower() not in ("vanilla", "blueprint_only")
                          for c in conditions)
         model_spec = (ModelSpec(p_max=float(o["model_p_max"]),
@@ -1077,7 +1154,8 @@ def _cli():
             conditions=conditions, model_spec=model_spec,
             n_players=o["n_players"], workers=o["workers"],
             collect_hands=o["collect_hands"], per_cell_cap=o["per_cell_cap"],
-            reps=o["reps"], ladder=ladder, thresholds=thresholds,
+            reps=o["reps"], vector_ladders=vector_ladders, mccfr_ladders=mccfr_ladders,
+            thresholds=thresholds,
             collect_iters=o["collect_iters"], table_policy=o["table_policy"],
             run_seed=o["run_seed"], big_blind=o["big_blind"],
             small_blind=o["small_blind"], starting_stack=o["starting_stack"],

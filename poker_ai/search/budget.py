@@ -87,8 +87,9 @@ def iteration_budget(ctx: SubgameContext, cfg: SolverConfig, workers: int = 1) -
         # floor (so a replica still learns properly at large W — the effective global
         # then rises to floor × W).  Both the per-player base and the floor are indexed
         # by ``street_at_root`` (0=preflop … 3=river): a deep multiway flop needs more
-        # sampled work than a river.  At the 64-core target the per-street *floor* is
-        # what binds (global/63 < floor for every street/live-count).
+        # sampled work than a river.  Under per-hand parallelism (production eval: one
+        # hand per core, search ``workers=1``) ``global / 1`` ≫ the floor, so the GLOBAL
+        # budget binds; the floor binds only under within-search parallelism (W>1).
         n_live = max(2, len(ctx.ranges))
         street = ctx.street_at_root
         global_budget = cfg.mccfr_global_per_player_by_street[street] * n_live

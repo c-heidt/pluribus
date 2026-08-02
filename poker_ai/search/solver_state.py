@@ -49,16 +49,20 @@ class SolverConfig:
     """
 
     leaf: "LeafConfig"
-    # Defaults tuned for a 6-player game on a ~48-core node, early-testing grade
-    # (not paper-accurate).  At ``LeafConfig.n_rollouts == 1`` an MCCFR iteration is
-    # ~35 ms on a multiway flop and ~5 ms on late/heads-up subgames, so wall time —
-    # not the iteration cap — is still the binding stop: within ``max_wall_seconds``
-    # a replica reaches ~285 (flop) to ~2000 (late) iterations, and ``max_iterations``
-    # stays a generous, effectively-inert safety cap.  (Cutting rollouts 8→1 banks
-    # as ~5× more iterations at the same wall — better hole coverage — rather than a
-    # shorter wall; lower ``max_wall_seconds`` if you want turnaround over coverage.)
-    max_iterations: int = 5_000
-    max_wall_seconds: float = 20.0  # per-search wall backstop (the binding stop)
+    # ``max_iterations`` is the ABSOLUTE per-replica hard ceiling.  The structural
+    # budget (:mod:`poker_ai.search.budget`) is the *primary* stop; this only clips it
+    # in pathology, so it MUST sit at or above ``mccfr_global_max`` (the largest
+    # structural budget any subgame can request).  Otherwise it silently throttles the
+    # budget below where MCCFR converges — the pre-2026-08 bug, where a 5_000 cap capped
+    # every HU-flop / multiway search regardless of the per-street numbers below.  It
+    # doubles as the pinned iteration count when ``auto_budget`` is off (tests/digests).
+    max_iterations: int = 30_000  # == mccfr_global_max: a true ceiling, not a throttle
+    # LOOSE per-search wall backstop, NOT the primary stop: sized above the deepest
+    # structural budget's wall cost so it does not clip the iteration budget in normal
+    # operation — it only catches a genuinely stuck subgame.  The real per-round wall/
+    # quality trade-off is ``max_wall_seconds_by_street`` below, which the calibration
+    # sizes to each round's structural budget under the deployment model.
+    max_wall_seconds: float = 300.0
     # Per-street wall backstop (preflop, flop, turn, river) — the wall cap varies wildly
     # by round (a river solve is seconds, a full-width turn solve can be minutes), so the
     # calibration measures one cap per round under the deployment model (1 hand / core,
@@ -98,12 +102,16 @@ class SolverConfig:
     # verbatim (every existing test / pinned digest that sets an explicit iteration
     # count is unchanged); production turns it on in ``build_blueprint_session``.
     auto_budget: bool = True
-    # Vector regime (heads-up flop/turn/river): **full-width**, so iterations-to-
-    # converge is driven by tree *depth* (streets left to resolve), not the infoset
-    # count — a per-stage constant ``(flop, turn, river)``.  The 200-buckets/street
-    # infoset counts (~746k flop / ~89k turn / ~26k river) only bound the per-iteration
-    # wall (flop ≈ 1500 it × 746k rows ≈ tens of s/replica — the paper's 1–33 s).
-    vector_budget_by_street: tuple = (1500, 1000, 500)  # (flop, turn, river)
+    # Vector regime (heads-up TURN/RIVER in production; the flop entry is used only when
+    # vector is driven directly for the oracle / calibration A-B — a real HU flop routes
+    # to MCCFR).  **Full-width**, so iterations-to-converge is driven by tree *depth*, not
+    # the infoset count — a per-stage constant ``(flop, turn, river)``.  Turn/river are
+    # the 2026-08 calibration value-gap knees (river 10-mbb ≈ 1320; turn's self-
+    # convergence knee ≈ 1320, past which returns flatten); flop (off the production path)
+    # keeps a depth-appropriate 1500.  The 200-buckets/street infoset counts (~746k flop /
+    # ~89k turn / ~26k river) bound only the per-iteration *wall* (river ≈ 1350 it × 26k
+    # rows ≈ ~8 s/replica; turn ≈ 1350 × 89k ≈ ~90 s).
+    vector_budget_by_street: tuple = (1500, 1350, 1350)  # (flop[oracle-only], turn, river)
     # MCCFR regime (multiway, or heads-up pre-flop): **sampled**, and only the HOT PATH
     # needs to converge — rarely-reached infosets fall back to the blueprint via the
     # ``blueprint_prior_kappa`` shrinkage — so the budget is a **GLOBAL** (pooled-over-
@@ -119,19 +127,25 @@ class SolverConfig:
     # ``global = base[street] * n_live``, clamped to ``[min, max]`` then split across
     # the W replicas.  Per-street because a deep multiway flop needs far more sampled
     # work to cover its hot path than a river.  Indexed by ``street_at_root``
-    # (0=preflop … 3=river).  Defaults are the old flat 3000 for every street (an
-    # un-tuned starting point — recalibrate per street on the multiway blueprint via
-    # the calibration harness).
-    mccfr_global_per_player_by_street: tuple = (3000, 3000, 3000, 3000)
-    mccfr_global_min: int = 6000
-    mccfr_global_max: int = 30000
+    # (0=preflop … 3=river).  SHAPED by the 200-bucket subgame infoset counts
+    # (flop ~746k ≫ turn ~89k > river ~26k; HU-preflop ~8k) so flop gets the most: HU
+    # flop — the dominant MCCFR case (~70% of searches) — resolves to ``6000 * 2 =
+    # 12000`` it/replica at ``workers=1``, ~2.4× the old 5_000 throttle the 2026-08
+    # calibration showed it needs to pass.  These are infoset-SHAPED starting points,
+    # NOT fitted: MCCFR did not converge within that calibration ladder, so the
+    # absolutes await a best-response-gap rerun on a ~30k-deep ladder — but the ordering
+    # and the ceiling are now correct (previously flat 3000 + a 5_000 cap flattened both).
+    mccfr_global_per_player_by_street: tuple = (3000, 6000, 4000, 3000)  # pf, flop, turn, river
+    mccfr_global_min: int = 6000    # smallest sensible pooled work (HU preflop = 3000 * 2)
+    mccfr_global_max: int = 30000   # largest sensible pooled work; == max_iterations ceiling
     # Per-replica **learning floor**, per street: every replica runs at least this many
     # iterations so it learns properly even when the global budget divided by a large
     # ``workers`` would otherwise starve it (an under-learned replica pollutes the
-    # merged average).  On the 64-core target this floor is what actually **binds** —
-    # ``global / 63`` falls below it for every street and live-count — so this tuple is
-    # the primary per-street budget dial *at cluster scale* (the per-street global above
-    # governs low-W runs and the n_live scaling).  Indexed by ``street_at_root``.
+    # merged average).  This binds ONLY under within-search parallelism (``workers`` > 1,
+    # where ``global / W`` can fall below it).  Production evaluation runs one hand per
+    # core with search ``workers=1`` (per-hand parallelism), so ``global / 1`` ≫ the floor
+    # and the GLOBAL budget binds, not this — the floor is a safety net for the W>1 path
+    # only.  Indexed by ``street_at_root``.
     mccfr_min_per_replica_by_street: tuple = (750, 750, 750, 750)
     # OX-Search safety parameter β (Approach B, PO-CES-HU; Ge et al. ICML 2024,
     # Thm 4.6: ``exp(σ₂ˢ) − exp(σ) ≤ Δ/β``).  ``None`` → OX-Search is OFF and the
