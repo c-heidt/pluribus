@@ -106,7 +106,7 @@ def _solve_mccfr():
         ctx = _ctx(env, seed=_RNG_SEED)
         cfg = SolverConfig(
             leaf=ctx.leaf, max_iterations=_N_ITERS, max_wall_seconds=60.0,
-            discount_interval=20, workers=1,
+            discount_interval=20,
         )
         res = solve(env, ctx, cfg)
         assert res.regime == "mccfr", res.regime
@@ -123,7 +123,7 @@ def _solve_vector():
     ctx = _ctx(env, seed=_RNG_SEED)
     cfg = SolverConfig(
         leaf=ctx.leaf, max_iterations=_N_ITERS, max_wall_seconds=60.0,
-        discount_interval=20, workers=1,
+        discount_interval=20,
     )
     res = solve(env, ctx, cfg)
     assert res.regime == "vector", res.regime

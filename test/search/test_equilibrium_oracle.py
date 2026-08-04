@@ -159,7 +159,7 @@ def test_vector_regime_reaches_equilibrium(_seeded):
     ctx = _ctx(env, ranges=ranges, seed=7)
     cfg = SolverConfig(
         leaf=ctx.leaf, max_iterations=2000, max_wall_seconds=90.0,
-        discount_interval=200, workers=1,
+        discount_interval=200,
     )
     res = solve(env, ctx, cfg)
     assert res.state.vstrat, "expected the vector regime to be selected for HU river"
@@ -211,7 +211,7 @@ def test_mccfr_regime_reaches_equilibrium(_seeded):
     ctx = _ctx(env, ranges=ranges, seed=11)
     cfg = SolverConfig(
         leaf=ctx.leaf, max_iterations=20000, max_wall_seconds=120.0,
-        discount_interval=2000, workers=1,
+        discount_interval=2000,
     )
 
     state = SolverState.empty()
@@ -562,7 +562,7 @@ def test_vector_flop_cluster_keyed_matches_oracle_losslessly(_seeded):
     ctx = _ctx(env, ranges=ranges, seed=7)
     cfg = SolverConfig(
         leaf=ctx.leaf, max_iterations=3000, max_wall_seconds=600.0,
-        discount_interval=200, workers=1,
+        discount_interval=200,
     )
     # Drive the vector regime directly (the router now sends a HU flop to MCCFR).
     state = SolverState.empty()
@@ -633,7 +633,7 @@ def test_mccfr_flop_reaches_equilibrium(_seeded):
     ctx = _ctx(env, ranges=ranges, seed=7)
     cfg = SolverConfig(
         leaf=ctx.leaf, max_iterations=20000, max_wall_seconds=600.0,
-        discount_interval=2000, workers=1,
+        discount_interval=2000,
     )
     res = solve(env, ctx, cfg)
     assert res.regime == "mccfr", f"expected MCCFR routing for a HU flop, got {res.regime}"
@@ -732,7 +732,7 @@ def test_dbr_with_perfect_model_beats_vanilla_vs_the_opponent(_seeded):
     ctx_dbr = dataclasses.replace(ctx_van, models={1: _FoldHeavyModel()})
     cfg = SolverConfig(
         leaf=ctx_van.leaf, max_iterations=3000, max_wall_seconds=600.0,
-        discount_interval=300, workers=1, auto_budget=False,
+        discount_interval=300, auto_budget=False,
     )
     p_van = _solver_flop_sigma(_drive_vector_flop(env, ctx_van, cfg), env, sub)
     p_dbr = _solver_flop_sigma(_drive_vector_flop(env, ctx_dbr, cfg), env, sub)
@@ -807,7 +807,7 @@ def test_vector_turn_cluster_keyed_matches_oracle_losslessly(_seeded):
     ctx = _ctx(env, ranges=ranges, seed=7)
     cfg = SolverConfig(
         leaf=ctx.leaf, max_iterations=8000, max_wall_seconds=120.0,
-        discount_interval=200, workers=1,
+        discount_interval=200,
     )
     res = solve(env, ctx, cfg)
     assert res.state.vstrat, "expected the vector regime for a HU turn subgame"

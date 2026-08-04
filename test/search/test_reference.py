@@ -35,7 +35,7 @@ _STREET_NAME = {0: "pre_flop", 1: "flop", 2: "turn", 3: "river"}
 
 
 def _cfg(ctx):
-    return SolverConfig(leaf=ctx.leaf, max_iterations=1, max_wall_seconds=1e9, workers=1)
+    return SolverConfig(leaf=ctx.leaf, max_iterations=1, max_wall_seconds=1e9)
 
 
 def _scale(sub) -> float:

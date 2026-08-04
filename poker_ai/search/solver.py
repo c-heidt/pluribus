@@ -25,12 +25,7 @@ from typing import Any, Optional
 from poker_ai.search.budget import iteration_budget
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.mccfr import _MCCFRSolver
-from poker_ai.search.parallel import (
-    plan_workers,
-    resolve_workers,
-    run_loop,
-    run_parallel,
-)
+from poker_ai.search.parallel import run_loop
 from poker_ai.search.policy import SearchPolicy
 from poker_ai.search.solver_state import SearchStats, SolverConfig, SolverState
 from poker_ai.search.vector import _VectorSolver, ox_enter_prob
@@ -168,12 +163,7 @@ def config_fingerprint(
         "solver": {
             "max_iterations": cfg.max_iterations,
             "max_wall_seconds": cfg.max_wall_seconds,
-            "max_wall_seconds_by_street": (
-                list(cfg.max_wall_seconds_by_street)
-                if getattr(cfg, "max_wall_seconds_by_street", None) is not None else None
-            ),
             "discount_interval": cfg.discount_interval,
-            "workers": cfg.workers,
             "beta": getattr(cfg, "beta", None),
         },
         "leaf": {
@@ -234,66 +224,34 @@ def solve(
             f"regime_override must be 'vector', 'mccfr', or None; got {regime_override!r}."
         )
     regime = regime_override if regime_override is not None else _select_regime(ctx)
-    workers = resolve_workers(getattr(cfg, "workers", 1))
-    # Structural iteration budget (§6.5): replace ``max_iterations`` with the
-    # per-replica count derived from the subgame's structure — vector = per-stage
-    # constant (each full-width replica needs the whole learning horizon); MCCFR = a
-    # global pooled budget split across the ``workers`` replicas (per-replica =
-    # ceil(global/workers), so more workers shorten the wall at ~constant total work).
-    # The primary, machine-independent stop; the original ``max_iterations`` stays the
-    # absolute per-replica ceiling.  ``auto_budget=False`` leaves it untouched.
-    cfg = dataclasses.replace(cfg, max_iterations=iteration_budget(ctx, cfg, workers))
-    # Per-street wall backstop: resolve the round's cap from ``street_at_root`` when the
-    # calibration supplied a per-street tuple, else keep the flat ``max_wall_seconds``.
-    # ``None`` ⇒ byte-identical to before (no wall change).  Indexed 0=preflop … 3=river.
-    by_street = getattr(cfg, "max_wall_seconds_by_street", None)
-    if by_street is not None:
-        st = int(ctx.street_at_root)
-        if not (0 <= st < len(by_street)):
-            raise ValueError(
-                f"max_wall_seconds_by_street has {len(by_street)} entries but "
-                f"street_at_root={st}; expected one per street (preflop..river)."
-            )
-        cfg = dataclasses.replace(cfg, max_wall_seconds=float(by_street[st]))
-    # Both regimes parallelize the same way (§6.7 row 11): W independent replicas,
-    # merged once.  The vector regime is chance-sampled (one river per iteration),
-    # so its replicas draw independent river substreams and summing their regrets
-    # multiplies the effective samples per river by W — directly buying back the
-    # per-river sampling variance.  (No nested intra-replica parallelism: the
-    # showdown is ~25% of an iteration and fine-grained, so replica-level scaling
-    # of the whole iteration dominates — see §6.7.)
+    # Structural iteration budget (§6.5): replace ``max_iterations`` with the per-replica
+    # count derived from the subgame's structure — vector = per-stage constant, MCCFR =
+    # ``base[street] * n_live``.  The primary, machine-independent stop; the original
+    # ``max_iterations`` stays the absolute ceiling.  ``auto_budget=False`` leaves it
+    # untouched.
+    cfg = dataclasses.replace(cfg, max_iterations=iteration_budget(ctx, cfg))
 
-    if workers > 1:
-        # Parallel: W independent replicas, merged once at the end (§6.7 row 11).
-        # The base seed is drawn from ctx.rng so a given (ctx.rng state, workers)
-        # is reproducible; the staggered traverser rotation balances across the
-        # live players (len(ctx.ranges)).
-        base_seed = int(ctx.rng.integers(0, 2 ** 63 - 1))
-        plan = plan_workers(workers, len(ctx.ranges), base_seed=base_seed)
-        state, iterations, wall, stop_reason, stats = run_parallel(
-            root_env, ctx, cfg, warm_start, plan, regime
-        )
+    # One serial search (production runs one hand per core — per-hand parallelism — so a
+    # single search never forks a replica pool).
+    state = warm_start if warm_start is not None else SolverState.empty()
+    if warm_start is not None:
+        # Re-search: the reused state carries the prior solve's cumulative counters —
+        # zero them so this invocation's stats are its own (§9.1).
+        state.reset_counters()
+    if regime == "vector":
+        solver = _VectorSolver(root_env, state, ctx, cfg, ctx.rng)
     else:
-        # Serial: the original single-thread loop — bit-for-bit unchanged.
-        state = warm_start if warm_start is not None else SolverState.empty()
-        if warm_start is not None:
-            # Re-search: the reused state carries the prior solve's cumulative
-            # counters — zero them so this invocation's stats are its own (§9.1).
-            state.reset_counters()
-        if regime == "vector":
-            solver = _VectorSolver(root_env, state, ctx, cfg, ctx.rng)
-        else:
-            solver = _MCCFRSolver(root_env, state, ctx, cfg, ctx.rng)
-        start = time.perf_counter()
-        iterations, stop_reason = run_loop(solver, state, cfg)
-        # The MCCFR regime walks ``root_env`` in place (reseat per iteration) rather
-        # than deepcopying it, so rewind it to pristine — solve() must not mutate
-        # ``root_env`` (warm re-search reuses it).  The vector regime walks via
-        # make/undo balance (or a separate FastState) and already leaves it clean.
-        if regime != "vector":
-            solver.restore_root()
-        wall = time.perf_counter() - start
-        stats = state.stats_snapshot()
+        solver = _MCCFRSolver(root_env, state, ctx, cfg, ctx.rng)
+    start = time.perf_counter()
+    iterations, stop_reason = run_loop(solver, state, cfg)
+    # The MCCFR regime walks ``root_env`` in place (reseat per iteration) rather than
+    # deepcopying it, so rewind it to pristine — solve() must not mutate ``root_env``
+    # (warm re-search reuses it).  The vector regime walks via make/undo balance (or a
+    # separate FastState) and already leaves it clean.
+    if regime != "vector":
+        solver.restore_root()
+    wall = time.perf_counter() - start
+    stats = state.stats_snapshot()
 
     # OX-Search saturation metric (Approach B): read off the solved/merged state's
     # opt-out row, and only in the regime that runs the gadget.  Non-None is the

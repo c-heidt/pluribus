@@ -36,6 +36,12 @@
 #   sbatch --export=ALL,WORKSPACE=/path/to/ws,RUN_ID=2026-07-01_6max_mix,\
 #     BLUEPRINT_PATH=/path/to/blueprint scripts/evaluation.sh
 #
+#   Paired multi-arm sanity test (search vs pure blueprint), one submission:
+#   sbatch --export=ALL,WORKSPACE=...,RUN_ID=sanity,BLUEPRINT_PATH=...,\
+#     CONDITIONS=vanilla,blueprint_only,MAX_HANDS=3000,N_PLAYERS=2 scripts/evaluation.sh
+#   → both arms share one db + run-seed (CRN-paired on deck_seed), each under its own
+#     run-id; a paired summary is printed at the end.
+#
 #SBATCH --job-name=pluribus-eval
 #SBATCH --output=logs/evaluation-%j.out
 #SBATCH --error=logs/evaluation-%j_error.out
@@ -69,13 +75,46 @@ RUN_SEED=${RUN_SEED:-0}
 TABLE_POLICY=${TABLE_POLICY:-all_blueprint}       # all_blueprint | random | fixed
 FIXED_SEATS=${FIXED_SEATS:-}                       # JSON map, only for TABLE_POLICY=fixed
 TIME_BUDGET_HOURS=${TIME_BUDGET_HOURS:-71.5}
+
+# Experiment arms (docs/evaluation.md §10.1).  A comma-separated list runs each arm
+# in turn into the SAME node-local db, so the summary pairs them on deck_seed (CRN).
+# Each arm gets its own per-arm run-id — the resume cursor is keyed per run_id, so a
+# shared id would make later arms skip every hand.  A single value = the classic
+# one-arm run.  Model-free arms: vanilla | blueprint_only | OX (or OX(beta=X)).  A
+# DBR arm (e.g. 'DBR(p_max=0.8)') additionally consumes the MODEL_* knobs below.
+#   e.g. CONDITIONS=vanilla,blueprint_only  — the search-vs-pure-blueprint sanity test.
+CONDITIONS=${CONDITIONS:-vanilla}
+# Paired fixed hand count (§10.1).  When set it is the SOLE stop criterion (every arm
+# covers hand_index 0..MAX_HANDS-1 → CRN-paired) and TIME_BUDGET_HOURS is ignored.
+# Leave empty for the time-budgeted sweep.  A vanilla/DBR/OX comparison REQUIRES it.
+MAX_HANDS=${MAX_HANDS:-}
+# DBR model knobs — consumed ONLY by a DBR(...) arm; model-free arms never receive
+# them (a DBR arm with MODEL_P_MAX unset aborts rather than silently running vanilla).
+MODEL_P_MAX=${MODEL_P_MAX:-}
+MODEL_ERROR=${MODEL_ERROR:-0.0}
+MODEL_CONFIDENCE=${MODEL_CONFIDENCE:-1.0}
+MODEL_SEED=${MODEL_SEED:-0}
+# Auto-run the paired CRN summary over the permanent snapshot once all arms finish.
+SUMMARIZE=${SUMMARIZE:-true}
 N_PLAYERS=${N_PLAYERS:-6}
 BIG_BLIND=${BIG_BLIND:-100}
 SMALL_BLIND=${SMALL_BLIND:-50}
 STARTING_STACK=${STARTING_STACK:-10000}
-MAX_ITERATIONS=${MAX_ITERATIONS:-5000}
-MAX_WALL_SECONDS=${MAX_WALL_SECONDS:-10.0}
-WORKERS=${WORKERS:-}                               # solver replicas (§6.7); empty → auto
+# The single absolute per-replica iteration CEILING — NOT a throttle: the
+# structural budget (poker_ai/search/budget.py) is the primary stop and this only
+# clips it in pathology, so it must sit at/above the deepest structural budget any
+# subgame requests (multiway flop clamps at 30000).  The old 5000 here silently
+# capped every HU-flop / multiway MCCFR search far below convergence.
+MAX_ITERATIONS=${MAX_ITERATIONS:-30000}
+# Loose per-search wall backstop (seconds).  Sized above the DEEPEST shipped search's
+# wall cost so it never clips the iteration budget in normal operation and only
+# catches a genuinely stuck subgame.  From the 2026-08 (v4) calibration: the deepest
+# is multiway flop MCCFR at the 30000 clamp — 30000 / 38.19 it_s ≈ 786 s under
+# 63-worker load — and the calibration's own flop backstop is 993 s; 1000 clears both
+# with margin at every N_PLAYERS.  (A per-street tuple is NOT used here: the
+# calibration measured only HU vector turn/river, whose tiny river cap 16 s would
+# butcher multiway river MCCFR at ~130 s.)  The old 10.0 here cut every search but river.
+MAX_WALL_SECONDS=${MAX_WALL_SECONDS:-1000.0}
 # AIVAT variance-reduced strength estimate (§10.2).  ON by default — it fills
 # games.aivat_value (the summary auto-switches its strength CI onto it) at extra
 # per-hand cost that stays in the experiment budget, off the search hot path, and
@@ -353,7 +392,9 @@ fi
 # the permanent snapshot before node-local scratch is torn down.
 
 echo "Starting evaluation with:"
-echo "  - Run id:                 $RUN_ID"
+echo "  - Run id (base):          $RUN_ID"
+echo "  - Conditions:             $CONDITIONS"
+echo "  - Max hands (paired):     ${MAX_HANDS:-(time-budgeted)}"
 echo "  - Run seed:               $RUN_SEED"
 echo "  - Table policy:           $TABLE_POLICY"
 echo "  - Time budget (hours):    $TIME_BUDGET_HOURS"
@@ -362,7 +403,6 @@ echo "  - Big/small blind:        $BIG_BLIND / $SMALL_BLIND"
 echo "  - Starting stack:         $STARTING_STACK"
 echo "  - Max iterations:         $MAX_ITERATIONS"
 echo "  - Max wall seconds:       $MAX_WALL_SECONDS"
-echo "  - Workers:                ${WORKERS:-(auto)}"
 echo "  - AIVAT:                  $AIVAT (hole samples: $AIVAT_HOLE_SAMPLES)"
 echo "  - Sync interval (hands):  $SYNC_INTERVAL_HANDS"
 echo "  - Sync interval (mins):   $SYNC_INTERVAL_MINUTES"
@@ -376,9 +416,8 @@ echo "  - Node-local db:          $LOCAL_DB_PATH"
 echo "  - Permanent snapshot:     $PERM_SNAPSHOT"
 echo "  - CPUs:                   ${SLURM_CPUS_PER_TASK:-(unset)}"
 
-# Build optional flags
+# Build optional flags shared by every arm.
 EXTRA_ARGS=()
-[ -n "$WORKERS" ]      && EXTRA_ARGS+=(--workers "$WORKERS")
 [ -n "$FIXED_SEATS" ]  && EXTRA_ARGS+=(--fixed-seats "$FIXED_SEATS")
 # AIVAT (§10.2): a boolean --aivat/--no-aivat flag + the belief-sample count.
 if [ "$AIVAT" = "true" ]; then
@@ -387,48 +426,122 @@ else
   EXTRA_ARGS+=(--no-aivat)
 fi
 
-# Run the runner in the background so this shell can forward slurm's grace-period
-# SIGTERM to the python process (same pattern as training.sh: a batch job's signal
-# goes to the bash wrapper, not its foreground child; without forwarding the runner
-# never sees SIGTERM and is SIGKILL'd with no chance to write the final snapshot).
-python -m evaluation.runner run \
-  --run-id "$RUN_ID" \
-  --run-seed "$RUN_SEED" \
-  --db-path "$LOCAL_DB_PATH" \
-  --sync-path "$PERM_SNAPSHOT" \
-  --sync-interval-hands "$SYNC_INTERVAL_HANDS" \
-  --sync-interval-minutes "$SYNC_INTERVAL_MINUTES" \
-  --blueprint-path "$BLUEPRINT_PATH" \
-  --lut-path "$LUT_PATH" \
-  --table-policy "$TABLE_POLICY" \
-  --time-budget-hours "$TIME_BUDGET_HOURS" \
-  --n-players "$N_PLAYERS" \
-  --big-blind "$BIG_BLIND" \
-  --small-blind "$SMALL_BLIND" \
-  --starting-stack "$STARTING_STACK" \
-  --max-iterations "$MAX_ITERATIONS" \
-  --max-wall-seconds "$MAX_WALL_SECONDS" \
-  "${EXTRA_ARGS[@]}" &
-RUNNER_PID=$!
+# Stop criterion, shared by every arm: a fixed paired hand count (MAX_HANDS) makes
+# every arm cover hand_index 0..MAX_HANDS-1 (CRN-paired, time budget ignored by the
+# runner); otherwise the classic time budget.
+STOP_ARGS=()
+if [ -n "$MAX_HANDS" ]; then
+  STOP_ARGS+=(--max-hands "$MAX_HANDS")
+  echo "Paired mode: $MAX_HANDS hands per arm (TIME_BUDGET_HOURS ignored)."
+else
+  STOP_ARGS+=(--time-budget-hours "$TIME_BUDGET_HOURS")
+fi
 
+# Signal forwarding: slurm's grace-period SIGTERM goes to this bash wrapper, not its
+# child (same pattern as training.sh).  Forward it to whichever arm is running and
+# stop the loop so no further arms start — the running arm writes its final VACUUM
+# INTO before the EXIT trap tears down node-local scratch.
+CURRENT_PID=""
+STOP_REQUESTED=0
 _forward_signal() {
   local sig=$1
-  echo "[batch] received SIG${sig} — forwarding to runner (pid=${RUNNER_PID})"
-  kill -"${sig}" "${RUNNER_PID}" 2>/dev/null || true
+  STOP_REQUESTED=1
+  if [ -n "$CURRENT_PID" ]; then
+    echo "[batch] received SIG${sig} — forwarding to runner (pid=${CURRENT_PID})"
+    kill -"${sig}" "${CURRENT_PID}" 2>/dev/null || true
+  fi
 }
 trap '_forward_signal TERM' TERM
 trap '_forward_signal INT' INT
 
-# `wait` returns when interrupted by a signal (after running the trap), even if the
-# child is still running.  Loop until the child has actually exited so the EXIT trap
-# (which tears down WORK_DIR) only fires after the runner's final VACUUM INTO.
-set +e
-while true; do
-  wait "${RUNNER_PID}"
-  EXIT_CODE=$?
-  kill -0 "${RUNNER_PID}" 2>/dev/null || break
+# Run one arm in the background and block (via a signal-resilient wait loop) until it
+# exits.  All arms write the SAME node-local db and sync to the SAME permanent
+# snapshot; only --run-id and --condition (and the DBR model knobs) differ.
+run_arm() {
+  local cond=$1 arm_run_id=$2
+  shift 2                                   # remaining args = per-arm model flags
+  python -m evaluation.runner run \
+    --run-id "$arm_run_id" \
+    --condition "$cond" \
+    --run-seed "$RUN_SEED" \
+    --db-path "$LOCAL_DB_PATH" \
+    --sync-path "$PERM_SNAPSHOT" \
+    --sync-interval-hands "$SYNC_INTERVAL_HANDS" \
+    --sync-interval-minutes "$SYNC_INTERVAL_MINUTES" \
+    --blueprint-path "$BLUEPRINT_PATH" \
+    --lut-path "$LUT_PATH" \
+    --table-policy "$TABLE_POLICY" \
+    --n-players "$N_PLAYERS" \
+    --big-blind "$BIG_BLIND" \
+    --small-blind "$SMALL_BLIND" \
+    --starting-stack "$STARTING_STACK" \
+    --max-iterations "$MAX_ITERATIONS" \
+    --max-wall-seconds "$MAX_WALL_SECONDS" \
+    "${STOP_ARGS[@]}" "${EXTRA_ARGS[@]}" "$@" &
+  CURRENT_PID=$!
+  local code
+  set +e
+  # `wait` returns when interrupted by a signal (after running the trap), even if the
+  # child is still running.  Loop until the child has actually exited.
+  while true; do
+    wait "${CURRENT_PID}"
+    code=$?
+    kill -0 "${CURRENT_PID}" 2>/dev/null || break
+  done
+  set -e
+  CURRENT_PID=""
+  return "$code"
+}
+
+# One arm per condition (comma-separated CONDITIONS), into the shared db.
+IFS=',' read -ra COND_ARR <<< "$CONDITIONS"
+MULTI=0
+[ "${#COND_ARR[@]}" -gt 1 ] && MULTI=1
+EXIT_CODE=0
+for raw_cond in "${COND_ARR[@]}"; do
+  cond="$(echo "$raw_cond" | xargs)"        # trim surrounding whitespace
+  [ -z "$cond" ] && continue
+
+  # Per-arm run-id: base id + a filesystem-safe slug of the condition, so arms in one
+  # db never share a run_id (which would make later arms resume-skip every hand).  A
+  # single-condition run keeps the plain base id (backward compatible).
+  arm_run_id="$RUN_ID"
+  if [ "$MULTI" -eq 1 ]; then
+    arm_slug="$(echo "$cond" | tr -c 'A-Za-z0-9' '_' | sed -E 's/_+/_/g; s/^_//; s/_$//')"
+    arm_run_id="${RUN_ID}__${arm_slug}"
+  fi
+
+  # A DBR arm consumes the model knobs; model-free arms must NOT receive them.
+  ARM_ARGS=()
+  case "$(echo "$cond" | tr '[:upper:]' '[:lower:]')" in
+    dbr*)
+      if [ -z "$MODEL_P_MAX" ]; then
+        echo "ERROR: condition '$cond' is a DBR arm but MODEL_P_MAX is unset." >&2
+        exit 1
+      fi
+      ARM_ARGS+=(--model-p-max "$MODEL_P_MAX" --model-error "$MODEL_ERROR" \
+                 --model-confidence "$MODEL_CONFIDENCE" --model-seed "$MODEL_SEED")
+      ;;
+  esac
+
+  echo "=== Arm: condition='$cond'  run-id='$arm_run_id' ==="
+  run_arm "$cond" "$arm_run_id" "${ARM_ARGS[@]}"
+  code=$?
+  [ "$code" -ne 0 ] && EXIT_CODE=$code
+  if [ "$STOP_REQUESTED" -eq 1 ]; then
+    echo "[batch] stop requested — not starting further arms."
+    break
+  fi
 done
-set -e
 
 echo "Evaluation finished (exit ${EXIT_CODE}). Permanent snapshot: $PERM_SNAPSHOT"
+
+# Paired CRN summary over the permanent snapshot (search − blueprint advantage, etc.).
+# Best-effort: a summary failure never overrides the run's own exit code.
+if [ "$SUMMARIZE" = "true" ] && [ -f "$PERM_SNAPSHOT" ]; then
+  echo "=== Summary ($PERM_SNAPSHOT) ==="
+  python -m evaluation.summarize "$PERM_SNAPSHOT" || \
+    echo "[batch] summary step failed (non-fatal)."
+fi
+
 exit "${EXIT_CODE}"

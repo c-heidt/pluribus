@@ -974,10 +974,6 @@ def run_evaluation_parallel(
     cfg = session.config
     _validate_config(cfg)
     fingerprint = config_fingerprint(session.solver_cfg, cfg.fingerprint_table_policy())
-    # One hand per core ⇒ force search workers=1 (no nested fork; deeper undivided MCCFR).
-    session = dataclasses.replace(
-        session, solver_cfg=dataclasses.replace(session.solver_cfg, workers=1)
-    )
     # Completed-set resume cursor (dynamic out-of-order completion ⇒ max+1 is unsafe).
     tlog = ExperimentLog.open(os.fspath(target_db_path))
     try:
@@ -1190,9 +1186,13 @@ def build_blueprint_session(
     blueprint_path: str,
     lut_path: str,
     use_decision_free_equity: bool = True,
-    max_iterations: int = 30_000,   # absolute ceiling ≥ mccfr_global_max (not a throttle)
-    max_wall_seconds: float = 300.0,  # loose backstop; production sets per-street walls
-    workers: Optional[int] = None,
+    max_iterations: int = 30_000,   # the single absolute per-replica ceiling (not a throttle)
+    # Loose per-search wall backstop.  Sized above the DEEPEST shipped search's wall
+    # cost (multiway flop MCCFR at the 30000 clamp ≈ 786 s under 63-worker load; the
+    # v4 calibration's flop backstop is 993 s) so it never clips the structural budget
+    # in normal operation.  Flat, NOT per-street: the calibration measured only the HU
+    # vector turn/river, and its 16 s river cap would butcher multiway MCCFR river.
+    max_wall_seconds: float = 1000.0,
     bias_multiplier: float = 5.0,
     pickle_dir: bool = False,
 ) -> EvalSession:
@@ -1241,7 +1241,7 @@ def build_blueprint_session(
         )
     if use_cache:
         # Mirror the whole index into the shm cache ONCE in the parent, after the
-        # warm-start restore and before ``run_parallel`` forks — children inherit
+        # warm-start restore and before the per-hand pool forks — children inherit
         # the fork-shared mmaps and CoreTables reads pure-shm (no LMDB on the hot
         # path).  Fail loud if the mirror is incomplete: the in-core reader has no
         # LMDB fallback, so a short cache would silently serve uniform strategies.
@@ -1259,12 +1259,11 @@ def build_blueprint_session(
     # ``discount_interval`` and ``auto_budget`` are NOT set here — they propagate
     # from ``SolverConfig``'s own defaults (poker_ai/search/solver_state.py), the
     # single source of truth.  Only the leaf and the genuine run-knobs
-    # (``max_iterations`` / ``max_wall_seconds`` / ``workers``) are supplied.
+    # (``max_iterations`` / ``max_wall_seconds``) are supplied.
     solver_cfg = SolverConfig(
         leaf=leaf,
         max_iterations=max_iterations,
         max_wall_seconds=max_wall_seconds,
-        workers=workers,
         beta=cfg.beta,          # OX-Search gadget (Approach B); None ⇒ off (vanilla/DBR)
     )
     return EvalSession(
@@ -1402,13 +1401,13 @@ def _cli():
         help="Deck high rank (inclusive).",
     )
     @click.option("--max-iterations", default=30_000, type=int, show_default=True,
-                  help="Absolute per-replica ceiling (≥ mccfr_global_max); the structural "
-                       "budget is the primary stop and this only clips it in pathology.")
-    @click.option("--max-wall-seconds", default=300.0, type=float, show_default=True,
-                  help="Loose per-search wall backstop; production sets per-street walls "
-                       "from calibration (max_wall_seconds_by_street).")
-    @click.option("--workers", default=None, type=int, help="Solver replicas (§6.7, "
-                  "≤6 on this host).")
+                  help="The single absolute per-replica ceiling; the structural budget "
+                       "is the primary stop and this only clips it in pathology.")
+    @click.option("--max-wall-seconds", default=1000.0, type=float, show_default=True,
+                  help="Loose per-search wall backstop (s). Sized above the deepest "
+                       "shipped search (multiway flop MCCFR at the 30000 clamp ≈ 786 s "
+                       "under load; v4 calibration flop backstop 993 s) so it never "
+                       "clips the structural budget in normal operation.")
     @click.option(
         "--aivat/--no-aivat",
         default=False,
@@ -1484,18 +1483,18 @@ def _cli():
         "--parallel-workers",
         default=None,
         type=int,
-        help="Number of hands to play concurrently, one per core (search runs at "
-        "workers=1 inside — no nested pool).  Default (unset) = auto (cpu-1).  This is "
-        "the DEFAULT execution mode: hands are i.i.d. + seeded by index, so it is "
-        "bit-reproducible vs sequential and packs the box (most hands fold pre-flop). "
-        "Ignored under --sequential; --workers (search W) is ignored unless --sequential.",
+        help="Number of hands to play concurrently, one per core (each hand runs one "
+        "serial search).  Default (unset) = auto (cpu-1).  This is the DEFAULT execution "
+        "mode: hands are i.i.d. + seeded by index, so it is bit-reproducible vs "
+        "sequential and packs the box (most hands fold pre-flop).  Ignored under "
+        "--sequential.",
     )
     @click.option(
         "--sequential",
         is_flag=True,
         default=False,
-        help="Force the old one-hand-at-a-time loop (search parallelism via --workers) "
-        "instead of the default per-hand parallel runner.",
+        help="Force the one-hand-at-a-time loop instead of the default per-hand parallel "
+        "runner (a slower reference/debug path; the search is serial either way).",
     )
     def run(**opts):
         """Play a time-budgeted evaluation run, logging one transaction per hand."""
@@ -1572,12 +1571,12 @@ def _cli():
             lut_path=opts["lut_path"],
             max_iterations=opts["max_iterations"],
             max_wall_seconds=opts["max_wall_seconds"],
-            workers=opts["workers"],
         )
         if not opts["sequential"]:
-            # DEFAULT: per-hand parallel — one hand per core, search workers=1.  Workers
-            # write their own node-local DBs, merged into ``db_path`` with disjoint id
-            # ranges, then synced.  Bit-reproducible vs sequential (hands seeded by index).
+            # DEFAULT: per-hand parallel — one hand per core, one serial search each.
+            # Workers write their own node-local DBs, merged into ``db_path`` with
+            # disjoint id ranges, then synced.  Bit-reproducible vs sequential (hands
+            # seeded by index).
             from poker_ai.search.parallel import resolve_workers
             n_workers = resolve_workers(opts["parallel_workers"])
             stop_event = _install_sigterm_stop_event()

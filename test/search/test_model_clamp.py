@@ -89,7 +89,7 @@ def test_empty_models_is_bitwise_identical(env_fn, regime):
         if models is not None:
             ctx = __import__("dataclasses").replace(ctx, models=models)
         res = solve(env, ctx, _cfg(auto_budget=False, max_iterations=40,
-                                   max_wall_seconds=1e9, workers=1))
+                                   max_wall_seconds=1e9))
         assert res.regime == regime
         return _digest(res.state)
 
@@ -103,7 +103,7 @@ def test_empty_models_leaves_cache_untouched(env_fn):
     reads or writes it — counters stay at zero."""
     env = env_fn()
     res = solve(env, _ctx(env, seed=7), _cfg(auto_budget=False, max_iterations=20,
-                                             max_wall_seconds=1e9, workers=1))
+                                             max_wall_seconds=1e9))
     cache = res.state.model_sigma_cache
     assert len(cache) == 0
     assert cache.hits == 0 and cache.misses == 0

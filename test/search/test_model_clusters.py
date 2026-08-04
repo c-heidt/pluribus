@@ -76,7 +76,7 @@ def test_cached_model_rows_match_their_cluster(root):
     model = _ClusterCodedModel()
     res = solve(env, _modeled(_ctx(env, seed=7), {1: model}),
                 _cfg(auto_budget=False, max_iterations=25,
-                     max_wall_seconds=1e9, workers=1))
+                     max_wall_seconds=1e9))
 
     cache = res.state.model_sigma_cache
     assert len(cache) > 0, "the clamp never ran"
@@ -109,7 +109,7 @@ def test_distinct_clusters_get_distinct_rows():
     env = _real_lut_env(2)
     res = solve(env, _modeled(_ctx(env, seed=7), {1: _ClusterCodedModel()}),
                 _cfg(auto_budget=False, max_iterations=25,
-                     max_wall_seconds=1e9, workers=1))
+                     max_wall_seconds=1e9))
 
     cache = res.state.model_sigma_cache
     multi = 0
@@ -133,5 +133,5 @@ def test_model_queried_at_many_distinct_info_sets():
     model = _ClusterCodedModel()
     solve(env, _modeled(_ctx(env, seed=7), {1: model}),
           _cfg(auto_budget=False, max_iterations=25,
-               max_wall_seconds=1e9, workers=1))
+               max_wall_seconds=1e9))
     assert len({bytes(s) for s in model.seen}) > 1

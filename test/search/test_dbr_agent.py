@@ -49,7 +49,7 @@ def test_seeded_solve_with_models_is_reproducible(env_fn, regime):
         env = env_fn()
         ctx = _modeled(_ctx(env, seed=7), {1: _RecordingModel(c=0.4)})
         res = solve(env, ctx, _cfg(auto_budget=False, max_iterations=30,
-                                   max_wall_seconds=1e9, workers=1))
+                                   max_wall_seconds=1e9))
         assert res.regime == regime
         return _digest(res.state)
 
@@ -69,7 +69,7 @@ def test_model_rows_are_first_draw_only():
     model = _RecordingModel(c=0.5)
     ctx = _modeled(_ctx(env, seed=7), {1: model})
     res = solve(env, ctx, _cfg(auto_budget=False, max_iterations=40,
-                               max_wall_seconds=1e9, workers=1))
+                               max_wall_seconds=1e9))
 
     cache = res.state.model_sigma_cache
     filled_total = sum(int(cache[k][2].sum()) for k in cache)
@@ -89,11 +89,11 @@ def test_models_change_the_solve():
     env = _real_lut_env(3)
     base = solve(env, _ctx(env, seed=7),
                  _cfg(auto_budget=False, max_iterations=30,
-                      max_wall_seconds=1e9, workers=1))
+                      max_wall_seconds=1e9))
     env2 = _real_lut_env(3)
     clamped = solve(env2, _modeled(_ctx(env2, seed=7), {1: _RecordingModel(c=1.0)}),
                     _cfg(auto_budget=False, max_iterations=30,
-                         max_wall_seconds=1e9, workers=1))
+                         max_wall_seconds=1e9))
     assert _digest(base.state) != _digest(clamped.state)
 
 
@@ -163,7 +163,7 @@ def test_solve_reports_the_same_regime_when_modeled():
     env = _real_lut_env(3)
     res = solve(env, _modeled(_ctx(env, seed=7), {1: _RecordingModel()}),
                 _cfg(auto_budget=False, max_iterations=10,
-                     max_wall_seconds=1e9, workers=1))
+                     max_wall_seconds=1e9))
     assert res.regime == "vector"
 
 
@@ -231,7 +231,7 @@ def test_modeled_solve_runs_under_the_search_core(monkeypatch, env_fn, regime):
     model = _RecordingModel(c=0.6)
     res = solve(env, _modeled(_ctx(env, seed=7), {1: model}),
                 _cfg(auto_budget=False, max_iterations=12,
-                     max_wall_seconds=1e9, workers=1))
+                     max_wall_seconds=1e9))
     assert res.regime == regime
     assert model.seen, "the clamp never queried the model under the core"
     assert len(res.state.model_sigma_cache) > 0
@@ -257,12 +257,12 @@ def test_unmodeled_solve_still_uses_the_core(monkeypatch):
 
     plain = _VectorSolver(env, SolverState(), _ctx(env, seed=7),
                           _cfg(auto_budget=False, max_iterations=2,
-                               max_wall_seconds=1e9, workers=1),
+                               max_wall_seconds=1e9),
                           np.random.default_rng(0))
     modeled = _VectorSolver(env, SolverState(),
                             _modeled(_ctx(env, seed=7), {1: _RecordingModel()}),
                             _cfg(auto_budget=False, max_iterations=2,
-                                 max_wall_seconds=1e9, workers=1),
+                                 max_wall_seconds=1e9),
                             np.random.default_rng(0))
     assert plain._walk_env is not env, "baseline lost the compiled walk"
     assert modeled._walk_env is not env, "modeled solve lost the compiled walk"

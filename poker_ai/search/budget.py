@@ -22,23 +22,19 @@ Two regimes, sized on different principles (they differ by design, §6.5):
 - **MCCFR** (multiway, or the heads-up pre-flop root) is **sampled**, and only the
   **hot path** must converge — rarely-reached infosets fall back to the blueprint via
   the ``blueprint_prior_kappa`` shrinkage, so they need no search refinement.  Its
-  budget is a **GLOBAL** pooled iteration count (total across all W replicas), *split*
-  among them — ``per_replica = max(min_per_replica, ceil(global / workers))`` — so more
-  workers shorten the wall at ~constant total work, down to a per-replica *learning
-  floor* (below which a starved replica would pollute the merged average, so the
-  effective global rises to ``floor × workers``).  The merged average pools every
-  replica's samples, so bounding *total* sampled work is what matters; the global count
-  grows ~linearly with the live-player count (bigger hot path), **not** the exponential
-  full-tree size.
-  (Vector, being full-width, cannot be split this way — each replica needs the whole
-  learning horizon — so it stays a per-replica constant.)
+  per-replica budget grows ~linearly with the live-player count (a bigger hot path),
+  **not** the exponential full-tree size: ``base[street] × n_live``, clamped to
+  ``max_iterations``.
+
+Both regimes yield a **per-replica** count.  Production always runs a single replica
+(``workers=1`` — one hand per core, per-hand parallelism), so the budget IS the work.
+Extra replicas would only add samples to the merged average (variance reduction); they
+never divide the budget.
 
 The regime split mirrors :func:`poker_ai.search.solver._select_regime` exactly.
 """
 
 from __future__ import annotations
-
-from math import ceil
 
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.solver_state import SolverConfig
@@ -57,21 +53,21 @@ def _is_vector(ctx: SubgameContext) -> bool:
     return len(ctx.ranges) == 2 and ctx.street_at_root in (2, 3)
 
 
-def iteration_budget(ctx: SubgameContext, cfg: SolverConfig, workers: int = 1,
+def iteration_budget(ctx: SubgameContext, cfg: SolverConfig,
                      regime_override: "str | None" = None) -> int:
     """Per-replica iterations to run for the subgame ``ctx`` under ``cfg`` (§6.5).
 
-    ``workers`` is the resolved replica count (:func:`resolve_workers`).  Returns
-    ``cfg.max_iterations`` verbatim when ``cfg.auto_budget`` is off (the escape hatch
-    for tests that pin an exact iteration count).  Otherwise returns the structural
-    per-replica budget for the selected regime, clamped to at most
-    ``cfg.max_iterations`` (the absolute per-replica ceiling) and at least 1:
+    Returns ``cfg.max_iterations`` verbatim when ``cfg.auto_budget`` is off (the escape
+    hatch for tests that pin an exact iteration count).  Otherwise returns the
+    structural **per-replica** budget for the selected regime, clamped to at most
+    ``cfg.max_iterations`` (the absolute ceiling) and at least 1:
 
-    - **vector** — a per-stage constant, *independent of* ``workers`` (each full-width
-      replica needs the whole learning horizon; more workers reduce variance, so total
-      work grows with W);
-    - **MCCFR** — a global pooled budget split across replicas, so per-replica shrinks
-      as ``workers`` grows (total work ~constant, wall drops with W).
+    - **vector** — a per-stage constant indexed (flop, turn, river);
+    - **MCCFR** — ``base[street] × n_live`` (the hot path grows ~linearly with the live
+      players), clamped to ``max_iterations``.
+
+    Both are per-replica: production runs one replica (``workers=1``); extra replicas
+    only reduce variance, they never divide the budget.
 
     ``regime_override`` (``"vector"`` / ``"mccfr"``) forces the regime instead of the
     ``_select_regime`` routing — used by the calibration A/B, which solves the same root
@@ -81,29 +77,17 @@ def iteration_budget(ctx: SubgameContext, cfg: SolverConfig, workers: int = 1,
     if not getattr(cfg, "auto_budget", True):
         return cfg.max_iterations
 
-    w = max(1, int(workers))
     is_vec = (regime_override == "vector" if regime_override is not None
               else _is_vector(ctx))
     if is_vec:
-        # Per-stage constant, indexed (flop, turn, river) = street 1, 2, 3.  Per
-        # replica — NOT divided by workers.
+        # Per-stage constant, indexed (flop, turn, river) = street 1, 2, 3.
         flop, turn, river = cfg.vector_budget_by_street
         budget = {1: flop, 2: turn, 3: river}[ctx.street_at_root]
     else:
-        # Global pooled budget (hot-path, ~linear in live players), split across the W
-        # replicas → per-replica = ceil(global / workers), but never below the learning
-        # floor (so a replica still learns properly at large W — the effective global
-        # then rises to floor × W).  Both the per-player base and the floor are indexed
-        # by ``street_at_root`` (0=preflop … 3=river): a deep multiway flop needs more
-        # sampled work than a river.  Under per-hand parallelism (production eval: one
-        # hand per core, search ``workers=1``) ``global / 1`` ≫ the floor, so the GLOBAL
-        # budget binds; the floor binds only under within-search parallelism (W>1).
+        # Hot-path budget, ~linear in the live-player count (a deep multiway flop needs
+        # more sampled work than a river).  base indexed by ``street_at_root``
+        # (0=preflop … 3=river).
         n_live = max(2, len(ctx.ranges))
-        street = ctx.street_at_root
-        global_budget = cfg.mccfr_global_per_player_by_street[street] * n_live
-        global_budget = max(cfg.mccfr_global_min,
-                            min(cfg.mccfr_global_max, global_budget))
-        floor = cfg.mccfr_min_per_replica_by_street[street]
-        budget = max(floor, ceil(global_budget / w))
+        budget = cfg.mccfr_per_player_by_street[ctx.street_at_root] * n_live
 
     return max(1, min(int(budget), int(cfg.max_iterations)))

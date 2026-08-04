@@ -48,8 +48,7 @@ def _agent(models=None, seed=0):
     return SearchAgent(
         leaf_policies=_policies(),
         blueprint_policy=_policies()["none"],
-        solver_cfg=_cfg(auto_budget=False, max_iterations=4, max_wall_seconds=1e9,
-                        workers=1),
+        solver_cfg=_cfg(auto_budget=False, max_iterations=4, max_wall_seconds=1e9),
         rng=np.random.default_rng(seed),
         models=models,
     )

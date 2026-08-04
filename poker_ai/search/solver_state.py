@@ -49,40 +49,26 @@ class SolverConfig:
     """
 
     leaf: "LeafConfig"
-    # ``max_iterations`` is the ABSOLUTE per-replica hard ceiling.  The structural
-    # budget (:mod:`poker_ai.search.budget`) is the *primary* stop; this only clips it
-    # in pathology, so it MUST sit at or above ``mccfr_global_max`` (the largest
-    # structural budget any subgame can request).  Otherwise it silently throttles the
-    # budget below where MCCFR converges — the pre-2026-08 bug, where a 5_000 cap capped
-    # every HU-flop / multiway search regardless of the per-street numbers below.  It
-    # doubles as the pinned iteration count when ``auto_budget`` is off (tests/digests).
-    max_iterations: int = 30_000  # == mccfr_global_max: a true ceiling, not a throttle
-    # LOOSE per-search wall backstop, NOT the primary stop: sized above the deepest
-    # structural budget's wall cost so it does not clip the iteration budget in normal
-    # operation — it only catches a genuinely stuck subgame.  The real per-round wall/
-    # quality trade-off is ``max_wall_seconds_by_street`` below, which the calibration
-    # sizes to each round's structural budget under the deployment model.
+    # ``max_iterations`` is the ABSOLUTE per-replica hard ceiling and the SINGLE upper
+    # bound on the structural budget (:mod:`poker_ai.search.budget`) — the primary stop
+    # is the structural budget itself, and this only clips it in pathology (e.g. a deep
+    # multiway flop that would otherwise request more).  Set below where MCCFR converges
+    # it silently throttles every HU-flop / multiway search — the pre-2026-08 bug, where
+    # a 5_000 cap capped them regardless of the per-street numbers below.  It doubles as
+    # the pinned iteration count when ``auto_budget`` is off (tests/digests).
+    max_iterations: int = 30_000  # the one ceiling; a true bound, not a throttle
+    # LOOSE per-search wall backstop, NOT the primary stop: a single flat cap sized
+    # above the DEEPEST shipped search's wall cost so it does not clip the iteration
+    # budget in normal operation — it only catches a genuinely stuck subgame.  Flat (not
+    # per-street): the 2026-08 calibration measured only the HU vector turn/river, whose
+    # tiny river cap would butcher multiway river MCCFR; the eval path sizes this to the
+    # multiway-flop worst case (~1000 s, see evaluation/runner.py).
     max_wall_seconds: float = 300.0
-    # Per-street wall backstop (preflop, flop, turn, river) — the wall cap varies wildly
-    # by round (a river solve is seconds, a full-width turn solve can be minutes), so the
-    # calibration measures one cap per round under the deployment model (1 hand / core,
-    # search ``workers=1``) and emits this tuple.  ``None`` (default) ⇒ the flat
-    # ``max_wall_seconds`` is used for every street, so every existing caller / test /
-    # pinned digest is byte-identical.  When set, ``solve`` resolves the cap from
-    # ``ctx.street_at_root`` (0=preflop … 3=river).
-    max_wall_seconds_by_street: "tuple | None" = None
     # Linear-CFR discount cadence.  Kept well below the per-replica iteration count
     # of the *expensive* subgames (multiway flop ~285/replica) so the discount fires
     # several times there — at the old 100 it barely engaged on those (and never at
     # n_rollouts=8, ~50 iters/replica).  Cheap late subgames just discount more often.
     discount_interval: int = 10
-    # Parallel search (§6.7 row 11).  ``None`` → resolve to a cpu-based default
-    # (cpu_count-1, SLURM-aware) — the sanctioned way to spend the wall budget is W
-    # independent replicas merged once, so on a 48-core node this fans out to ~47
-    # replicas.  ``1`` → the serial loop (bit-for-bit identical to the pre-parallel
-    # solver); ``>1`` → that many independent MCCFR replicas, merged once at the end
-    # (:meth:`SolverState.accumulate`).  See :mod:`poker_ai.search.parallel`.
-    workers: "int | None" = None
     # Blueprint-prior shrinkage strength (§6.6).  At read time a solved row's
     # strategy is pulled toward the blueprint by weight ``kappa / (mass + kappa)``,
     # where ``mass`` is the row's reach-weighted cumulative-strategy sum.  Genuinely
@@ -98,55 +84,40 @@ class SolverConfig:
     # is derived from the subgame's *structure*, which is machine-independent (unlike a
     # wall cap) and known up front.  ``poker_ai.search.budget.iteration_budget`` reads
     # these; ``max_iterations`` is the absolute safety ceiling and ``max_wall_seconds``
-    # a loose backstop.  **Off by default** so a flat ``max_iterations`` is honoured
-    # verbatim (every existing test / pinned digest that sets an explicit iteration
-    # count is unchanged); production turns it on in ``build_blueprint_session``.
+    # a loose backstop.  **On by default** so every production solve (search + eval) is
+    # driven by the structural budget without the caller having to opt in.  The tests /
+    # pinned digests that need a fixed iteration count set ``auto_budget=False``
+    # explicitly, and then a flat ``max_iterations`` is honoured verbatim.
     auto_budget: bool = True
     # Vector regime (heads-up TURN/RIVER in production; the flop entry is used only when
     # vector is driven directly for the oracle / calibration A-B — a real HU flop routes
     # to MCCFR).  **Full-width**, so iterations-to-converge is driven by tree *depth*, not
-    # the infoset count — a per-stage constant ``(flop, turn, river)``.  Turn/river are
-    # the 2026-08 calibration value-gap knees (river 10-mbb ≈ 1320; turn's self-
-    # convergence knee ≈ 1320, past which returns flatten); flop (off the production path)
+    # the infoset count — a per-stage constant ``(flop, turn, river)``.  Turn/river are the
+    # 2026-08 calibration (v4) value-gap convergence points: turn resolved at 1350, river at
+    # 850 (the 10-mbb bar; river spread≈0 so it is exact).  Flop (off the production path)
     # keeps a depth-appropriate 1500.  The 200-buckets/street infoset counts (~746k flop /
-    # ~89k turn / ~26k river) bound only the per-iteration *wall* (river ≈ 1350 it × 26k
-    # rows ≈ ~8 s/replica; turn ≈ 1350 × 89k ≈ ~90 s).
-    vector_budget_by_street: tuple = (1500, 1350, 1350)  # (flop[oracle-only], turn, river)
+    # ~89k turn / ~26k river) bound only the per-iteration *wall* (river ≈ 90 it/s under
+    # load; turn ≈ 8 it/s → ~170 s at 1350).
+    vector_budget_by_street: tuple = (1500, 1350, 850)  # (flop[oracle-only], turn, river)
     # MCCFR regime (multiway, or heads-up pre-flop): **sampled**, and only the HOT PATH
     # needs to converge — rarely-reached infosets fall back to the blueprint via the
-    # ``blueprint_prior_kappa`` shrinkage — so the budget is a **GLOBAL** (pooled-over-
-    # all-W-replicas) iteration count, split among the replicas: per-replica =
-    # ``ceil(global / workers)``.  More workers ⇒ **shorter wall at ~constant total
-    # work**, because the merged average pools every replica's samples so what matters
-    # is bounding the *total* sampled work — unlike the full-width vector regime, whose
-    # replicas each need the whole per-replica learning horizon (so vector stays a
-    # per-replica constant, not divided).  The global budget grows ~linearly with the
-    # live-player count (bigger hot path); clamped to ``[min, max]``.
+    # ``blueprint_prior_kappa`` shrinkage.  The per-replica budget is ``base[street] *
+    # n_live`` (the hot path grows ~linearly with the live-player count, NOT the
+    # exponential full-tree size), clamped to ``max_iterations``.  Per-replica, like
+    # vector: production runs one replica (``workers=1``, one hand per core); more
+    # replicas would only add samples, never divide the budget.
     #
-    # Per-street (preflop, flop, turn, river) base pooled work **per live player** —
-    # ``global = base[street] * n_live``, clamped to ``[min, max]`` then split across
-    # the W replicas.  Per-street because a deep multiway flop needs far more sampled
-    # work to cover its hot path than a river.  Indexed by ``street_at_root``
-    # (0=preflop … 3=river).  SHAPED by the 200-bucket subgame infoset counts
-    # (flop ~746k ≫ turn ~89k > river ~26k; HU-preflop ~8k) so flop gets the most: HU
-    # flop — the dominant MCCFR case (~70% of searches) — resolves to ``6000 * 2 =
-    # 12000`` it/replica at ``workers=1``, ~2.4× the old 5_000 throttle the 2026-08
-    # calibration showed it needs to pass.  These are infoset-SHAPED starting points,
-    # NOT fitted: MCCFR did not converge within that calibration ladder, so the
-    # absolutes await a best-response-gap rerun on a ~30k-deep ladder — but the ordering
-    # and the ceiling are now correct (previously flat 3000 + a 5_000 cap flattened both).
-    mccfr_global_per_player_by_street: tuple = (3000, 6000, 4000, 3000)  # pf, flop, turn, river
-    mccfr_global_min: int = 6000    # smallest sensible pooled work (HU preflop = 3000 * 2)
-    mccfr_global_max: int = 30000   # largest sensible pooled work; == max_iterations ceiling
-    # Per-replica **learning floor**, per street: every replica runs at least this many
-    # iterations so it learns properly even when the global budget divided by a large
-    # ``workers`` would otherwise starve it (an under-learned replica pollutes the
-    # merged average).  This binds ONLY under within-search parallelism (``workers`` > 1,
-    # where ``global / W`` can fall below it).  Production evaluation runs one hand per
-    # core with search ``workers=1`` (per-hand parallelism), so ``global / 1`` ≫ the floor
-    # and the GLOBAL budget binds, not this — the floor is a safety net for the W>1 path
-    # only.  Indexed by ``street_at_root``.
-    mccfr_min_per_replica_by_street: tuple = (750, 750, 750, 750)
+    # Per-street base **per live player**, indexed by ``street_at_root`` (0=preflop …
+    # 3=river) — a deep multiway flop needs far more sampled work than a river.  SHAPED
+    # by the 200-bucket subgame infoset counts (flop ~746k ≫ turn ~89k > river ~26k;
+    # HU-preflop ~8k) so flop gets the most: HU flop — the dominant MCCFR case (~70% of
+    # searches) — resolves to ``6000 * 2 = 12000`` it/replica.  These are infoset-SHAPED
+    # starting points, NOT fitted: MCCFR did not converge within the 2026-08 (v4)
+    # calibration ladder (flop value-gap 174 mbb at 12000 vs 104 at the suggested 19049),
+    # so the absolutes await a best-response-gap rerun on a deeper ladder — but the
+    # ordering and the ceiling are correct (previously flat 3000 + a 5_000 cap flattened
+    # both).
+    mccfr_per_player_by_street: tuple = (3000, 6000, 4000, 3000)  # pf, flop, turn, river
     # OX-Search safety parameter β (Approach B, PO-CES-HU; Ge et al. ICML 2024,
     # Thm 4.6: ``exp(σ₂ˢ) − exp(σ) ≤ Δ/β``).  ``None`` → OX-Search is OFF and the
     # vector solve is byte-for-byte the vanilla/DBR path (no gadget root, no opt-out
@@ -228,24 +199,6 @@ class SearchStats:
     def cache_misses(self) -> int:
         """Both caches' misses, for the ``decisions.cache_misses`` column."""
         return self.legal_at_misses + self.leaf_cache_misses
-
-    def combined_with(self, other: "SearchStats") -> "SearchStats":
-        """Sum two snapshots (parallel replicas, §6.7 row 11).
-
-        Additive counters (visits, hits/misses, cache sizes) sum; ``unique_pubkeys``
-        does **not** — distinct-key counts overlap across replicas that walk the
-        same tree, so the caller sets it from the merged state's ``legal_at``.
-        """
-        merged = SearchStats(
-            node_count=self.node_count + other.node_count,
-            unique_pubkeys=max(self.unique_pubkeys, other.unique_pubkeys),
-            legal_at_hits=self.legal_at_hits + other.legal_at_hits,
-            legal_at_misses=self.legal_at_misses + other.legal_at_misses,
-            leaf_cache_hits=self.leaf_cache_hits + other.leaf_cache_hits,
-            leaf_cache_misses=self.leaf_cache_misses + other.leaf_cache_misses,
-            leaf_cache_size=self.leaf_cache_size + other.leaf_cache_size,
-        )
-        return merged
 
 
 @dataclass
@@ -338,77 +291,6 @@ class SolverState:
         if hasattr(self.leaf_value_cache, "hits"):
             self.leaf_value_cache.hits = 0
             self.leaf_value_cache.misses = 0
-
-    @classmethod
-    def accumulate(
-        cls,
-        states: Sequence["SolverState"],
-        *,
-        baseline: "SolverState | None" = None,
-    ) -> "SolverState":
-        """Fold independent-replica tables into one merged state (§6.7 row 11).
-
-        Each parallel replica runs the full traverser rotation over its own
-        seeded substream and returns its :class:`SolverState`; this folds them into
-        a single state by **summing** the cumulative ``vregret`` / ``vstrat``
-        matrices over the union of public keys.  Rows for a given key share a shape
-        because the legal set is a deterministic function of ``public_key`` and every
-        replica inherits the same warm-start widening, so the per-key arrays add
-        directly.  ``average_sigma`` normalises the summed ``vstrat`` per node, so the
-        merged average policy is a valid reach-weighted average over all
-        ``W × iterations``.
-
-        ``baseline`` is the warm-start state every replica was seeded from (``None``
-        for a fresh search).  When given it is added **exactly once** and each
-        replica contributes only its delta over it (``replica − baseline``) —
-        otherwise the shared warm-start regrets would be counted ``W`` times.  Its
-        ``frozen`` rows (pinned actual hands) and node structure carry through.  The
-        per-search ``leaf_value_cache`` is dropped (recomputed on demand).
-
-        Note: a replica also discounts the baseline rows along with its own
-        accumulation, so ``replica − baseline`` is only approximately the replica's
-        fresh contribution under Linear-CFR; the fresh-search path (no baseline) is
-        exact, and a warm re-search is a short refinement where the drift is small.
-        """
-        _TABLES = ("vregret", "vstrat")
-        out = cls()
-        if baseline is not None:
-            for pk, legal in baseline.legal_at.items():
-                out.legal_at[pk] = legal
-            for pk, actor in baseline.actor_at.items():
-                out.actor_at[pk] = actor
-            out.vrow_space.update(baseline.vrow_space)
-            out.frozen = {k: v.copy() for k, v in baseline.frozen.items()}
-            for name in _TABLES:
-                dst = getattr(out, name)
-                for key, row in getattr(baseline, name).items():
-                    dst[key] = row.copy()
-        for st in states:
-            for pk, legal in st.legal_at.items():
-                out.legal_at.setdefault(pk, legal)
-            for pk, actor in st.actor_at.items():
-                out.actor_at.setdefault(pk, actor)
-            for pk, rs in st.vrow_space.items():
-                out.vrow_space.setdefault(pk, rs)
-            for name in _TABLES:
-                dst = getattr(out, name)
-                base = getattr(baseline, name) if baseline is not None else None
-                for key, row in getattr(st, name).items():
-                    b = base.get(key) if base is not None else None
-                    delta = row - b if b is not None else row
-                    acc = dst.get(key)
-                    if acc is None:
-                        dst[key] = delta.copy()
-                    else:
-                        acc += delta
-        # Root-value estimate: pool the replicas' linearly-weighted sums (summing
-        # num + den merges their per-iteration estimates into one pooled linear
-        # average).  The baseline is a *prior* search's estimate, so it is NOT added —
-        # each replica already reset these to zero and accrues only this search's work.
-        for st in states:
-            out.root_value_num += st.root_value_num
-            out.root_value_den += st.root_value_den
-        return out
 
     # ------------------------------------------------------------------
     # Node registration (+ warm-start widening)

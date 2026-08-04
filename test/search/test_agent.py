@@ -47,7 +47,7 @@ def _cfg(leaf, iters=20, kappa=0.0) -> SolverConfig:
     # tests check).  The shrinkage itself is covered by test_blueprint_prior_shrinkage.
     return SolverConfig(
         leaf=leaf, max_iterations=iters, max_wall_seconds=30.0, discount_interval=20,
-        workers=1, blueprint_prior_kappa=kappa,
+        blueprint_prior_kappa=kappa,
     )
 
 

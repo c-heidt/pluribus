@@ -170,7 +170,7 @@ def _hero_on_flop(seed=0, low=11, high=14, stacks=(300, 300)):
     env = _flop_env(low=low, high=high, stacks=stacks, seed=seed)
     leaf = LeafConfig(policies=_policies(), n_rollouts=1)
     cfg = SolverConfig(leaf=leaf, max_iterations=4, max_wall_seconds=30.0,
-                       discount_interval=20, workers=1)
+                       discount_interval=20)
     hero_seat = env.player_i
     hero = SearchAgent(_policies(), UniformPolicy(), cfg, np.random.default_rng(seed))
     hero.on_hand_start(env, hero_seat)

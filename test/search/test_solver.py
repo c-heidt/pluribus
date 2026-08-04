@@ -55,7 +55,7 @@ from test.search._helpers import (  # noqa: E402  (shared test builders)
 def _cfg(env_ctx, *, iters=60, discount=20) -> SolverConfig:
     return SolverConfig(
         leaf=env_ctx.leaf, max_iterations=iters, max_wall_seconds=30.0,
-        discount_interval=discount, workers=1,
+        discount_interval=discount,
     )
 
 
@@ -111,7 +111,7 @@ class TestRegimeSelect:
         assert _select_regime(ctx) == regime
         cfg = SolverConfig(
             leaf=ctx.leaf, max_iterations=30_000, max_wall_seconds=1e-6,
-            discount_interval=200, workers=1, auto_budget=True,
+            discount_interval=200, auto_budget=True,
         )
         res = solve(env, ctx, cfg)
         assert res.stop_reason == "wall_cap", (regime, res.stop_reason)

@@ -25,8 +25,8 @@ and a :class:`CalibrationAgent` — a thin :class:`~poker_ai.search.agent.Search
 subclass — intercepts each searched decision to capture the *exact* production
 :class:`~poker_ai.search.context.SubgameContext` (ranges, models, regime routing,
 live-player count).  Those captured roots are then re-solved at a geometric ladder
-of per-replica budgets at the real worker count; the resulting per-cell curves yield
-a suggested ``mccfr_min_per_replica_by_street`` / ``vector_budget_by_street`` block.
+of per-replica budgets; the resulting per-cell curves yield a suggested
+``mccfr_per_player_by_street`` / ``vector_budget_by_street`` block.
 
 A **cell** is ``(condition, regime, street, n_live)`` — i.e. exactly the axes the
 budget keys on (``budget._is_vector`` + ``budget.iteration_budget``'s per-street /
@@ -69,6 +69,7 @@ from evaluation.runner import (
 from poker_ai.search.agent import SearchAgent
 from poker_ai.search.budget import iteration_budget
 from poker_ai.search.context import SubgameContext
+from poker_ai.search.parallel import resolve_workers
 from poker_ai.search.solver import _select_regime, solve
 from poker_ai.search.solver_state import SolverConfig
 
@@ -384,7 +385,7 @@ def _sweep_process(spec_idx: int, state: dict, shared: dict) -> None:
     ctx_t = dataclasses.replace(s.ctx, rng=np.random.default_rng(seed))
     cfg_t = dataclasses.replace(
         shared["prod_cfg"], auto_budget=False, max_iterations=int(t),
-        workers=1, max_wall_seconds=1e9,
+        max_wall_seconds=1e9,
     )
     res = solve(env_t, ctx_t, cfg_t, regime_override=force_regime)
     state["results"].append((
@@ -456,7 +457,7 @@ def sweep_jobs(
         setup=_sweep_setup, process=_sweep_process, teardown=_sweep_teardown,
         shared=shared, target=len(all_specs),
     )
-    # Parent-side LMDB reopen after the fork (MDB_BAD_RSLOT), mirroring run_parallel.
+    # Parent-side LMDB reopen after the pool fork (MDB_BAD_RSLOT).
     try:
         from poker_ai.search.parallel import _reopen_leaf_fleet_lmdb
         for job in jobs:
@@ -644,27 +645,25 @@ def _production_regime(street: int, n_live: int) -> str:
 
 
 def suggest_config(summaries: Sequence[CellSummary], *, threshold: float,
-                   default_mccfr: int = 750,
+                   default_mccfr_base: Tuple[int, int, int, int] = (3000, 6000, 4000, 3000),
                    default_vector: Tuple[int, int, int] = (1500, 1000, 500),
-                   wall_safety: float = 2.0
                    ) -> Dict[str, object]:
-    """Fold per-cell suggested budgets + per-street wall caps into a config block.
+    """Fold per-cell suggested budgets into a ``SolverConfig`` budget block.
 
-    MCCFR floor per street = the **max** over live-player counts of the per-cell
-    suggested per-replica budget (cover the slowest-converging live-count), rounded
-    up.  Vector per street from the heads-up vector cells.  Cells with no converged
-    suggestion at ``threshold`` (mbb value gap) keep the current default and are flagged.
+    Vector per street comes from the heads-up vector cells.  MCCFR ``base[street]`` is
+    the per-live-player budget: the suggested per-replica budget divided by the cell's
+    live-player count (production budget is ``base * n_live``), taken as the **max** over
+    live-player counts so the slowest-converging live-count is covered, rounded up.
+    Cells with no converged suggestion at ``threshold`` (mbb value gap) keep the current
+    default and are flagged.
 
-    ``max_wall_seconds_by_street`` (preflop, flop, turn, river) is the per-round **time
-    backstop** for the deployment (1 hand / core, search W=1): the measured per-search
-    wall at the suggested budget × ``wall_safety`` (so the iteration budget normally
-    binds and the wall only clips a pathological tail).  Streets with no converged /
-    measured cell get ``None`` — the caller keeps the flat ``max_wall_seconds`` there.
+    No wall cap is emitted: production uses a single flat ``max_wall_seconds`` backstop
+    (the per-street tuple was retired — the calibration only measured HU vector
+    turn/river, whose tiny river cap would clip multiway river MCCFR).
     """
     key = f"{threshold:g}"
     mccfr_by_street: Dict[int, int] = {}
     vector_by_street: Dict[int, int] = {}
-    wall_by_street: Dict[int, float] = {}
     unresolved: List[str] = []
     for s in summaries:
         _cond, regime, street, n_live = s.cell
@@ -679,17 +678,14 @@ def suggest_config(summaries: Sequence[CellSummary], *, threshold: float,
             )
             continue
         if regime == "mccfr":
-            mccfr_by_street[street] = max(mccfr_by_street.get(street, 0), int(val))
+            # Production budget is base * n_live, so back out the per-player base.
+            base = int(np.ceil(int(val) / max(2, int(n_live))))
+            mccfr_by_street[street] = max(mccfr_by_street.get(street, 0), base)
         elif regime == "vector":
             vector_by_street[street] = max(vector_by_street.get(street, 0), int(val))
-        # Per-street wall backstop: the measured W=1 wall at the suggested budget,
-        # max over live-counts (cover the slowest), scaled by the safety factor.
-        w_at_sugg = s.mean_wall.get(val)
-        if w_at_sugg is not None:
-            wall_by_street[street] = max(wall_by_street.get(street, 0.0), float(w_at_sugg))
 
-    mccfr_floor = [
-        _round_up(mccfr_by_street[st]) if st in mccfr_by_street else default_mccfr
+    mccfr_base = [
+        _round_up(mccfr_by_street[st]) if st in mccfr_by_street else default_mccfr_base[st]
         for st in (0, 1, 2, 3)
     ]
     # vector_budget_by_street is (flop, turn, river) = streets 1,2,3.
@@ -697,16 +693,9 @@ def suggest_config(summaries: Sequence[CellSummary], *, threshold: float,
         _round_up(vector_by_street[st]) if st in vector_by_street else default_vector[i]
         for i, st in enumerate((1, 2, 3))
     ]
-    # max_wall_seconds_by_street is (preflop, flop, turn, river) = streets 0..3; None
-    # where unmeasured/unconverged so the caller keeps its flat default there.
-    max_wall = tuple(
-        round(wall_by_street[st] * wall_safety, 2) if st in wall_by_street else None
-        for st in (0, 1, 2, 3)
-    )
     return {
         "threshold_mbb": threshold,
-        "mccfr_min_per_replica_by_street": tuple(mccfr_floor),
-        "max_wall_seconds_by_street": max_wall,
+        "mccfr_per_player_by_street": tuple(mccfr_base),
         "vector_budget_by_street": tuple(vector),
         "unresolved_cells": unresolved,
     }
@@ -827,7 +816,7 @@ def _print_report(summaries: Sequence[CellSummary], config: Dict[str, object],
     if wall_target is not None:
         print("-" * len(hdr))
         print(f"Wall target per decision: {wall_target:.2f}s — cells whose wall@sugg "
-              f"exceeds it need more workers, a lower budget, or heavier blueprint fallback.")
+              f"exceeds it need a lower budget or heavier blueprint fallback.")
         for s in summaries:
             sugg = s.suggested.get(key)
             wall_sugg = s.mean_wall.get(sugg) if sugg is not None else None
@@ -837,12 +826,10 @@ def _print_report(summaries: Sequence[CellSummary], config: Dict[str, object],
                       f"n_live={n_live}: wall@sugg={wall_sugg:.2f}s > {wall_target:.2f}s")
     print("\nSuggested SolverConfig block (value-gap threshold "
           f"{config['threshold_mbb']:g} mbb):")
-    print(f"    mccfr_min_per_replica_by_street = {config['mccfr_min_per_replica_by_street']}"
-          "   # (preflop, flop, turn, river)")
-    print(f"    vector_budget_by_street         = {config['vector_budget_by_street']}"
+    print(f"    mccfr_per_player_by_street = {config['mccfr_per_player_by_street']}"
+          "   # (preflop, flop, turn, river); budget = base * n_live")
+    print(f"    vector_budget_by_street    = {config['vector_budget_by_street']}"
           "   # (flop, turn, river)")
-    print(f"    max_wall_seconds_by_street      = {config['max_wall_seconds_by_street']}"
-          "   # (preflop, flop, turn, river); W=1 wall backstop, None=flat default")
     if config["unresolved_cells"]:
         print("  NOTE: did not converge below threshold within the ladder (kept default): "
               + ", ".join(config["unresolved_cells"]))
@@ -954,13 +941,15 @@ def run_calibration(
     session = build_blueprint_session(
         base_cfg, blueprint_path=blueprint_path, lut_path=lut_path,
         use_decision_free_equity=use_decision_free_equity,
-        max_wall_seconds=1e9, workers=workers,
+        max_wall_seconds=1e9,
     )
     prod_cfg = session.solver_cfg
-    resolved_workers = _resolved_workers(prod_cfg)
+    # ``workers`` here sizes the SWEEP's job pool (one core per concurrent solve), not
+    # search replicas — every search runs serially (the production deployment model).
+    resolved_workers = resolve_workers(workers)
     collect_cfg = dataclasses.replace(
         prod_cfg, auto_budget=False, max_iterations=int(collect_iters),
-        workers=1, max_wall_seconds=1e9,
+        max_wall_seconds=1e9,
     )
 
     # Collect roots for EVERY condition first, building the full job list, then sweep all
@@ -970,7 +959,7 @@ def run_calibration(
     def _ladder_for(ctx, regime_override) -> List[int]:
         # Centre = the cell's production budget for THIS regime (regime_override forces it,
         # so the A/B mccfr arm on a HU turn reads the mccfr budget, not the vector one).
-        center = iteration_budget(ctx, prod_cfg, workers=1, regime_override=regime_override)
+        center = iteration_budget(ctx, prod_cfg, regime_override=regime_override)
         return _ladder_around(int(center), ladder_points, lo=ladder_lo, hi=ladder_hi,
                               ladder_max=ladder_max)
 
@@ -1101,11 +1090,6 @@ def run_calibration(
     return summary_json
 
 
-def _resolved_workers(cfg: SolverConfig) -> int:
-    from poker_ai.search.parallel import resolve_workers
-    return resolve_workers(getattr(cfg, "workers", None))
-
-
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -1129,7 +1113,8 @@ def _cli():
     @click.option("--model-error", default=0.0, type=float, show_default=True)
     @click.option("--model-seed", default=0, type=int, show_default=True)
     @click.option("--workers", default=None, type=int,
-                  help="Solver replicas per search (default: SLURM_CPUS_PER_TASK-1).")
+                  help="Sweep pool size — concurrent solves, one core each; each search "
+                       "runs serially (default: SLURM_CPUS_PER_TASK-1).")
     @click.option("--collect-hands", default=400, type=int, show_default=True,
                   help="Hands played to harvest representative roots.")
     @click.option("--per-cell-cap", default=4, type=int, show_default=True,

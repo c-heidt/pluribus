@@ -32,7 +32,7 @@ if _core.CORE_AVAILABLE:
 def _cfg(leaf):
     return SolverConfig(
         leaf=leaf, max_iterations=200, max_wall_seconds=60.0,
-        discount_interval=50, workers=1,
+        discount_interval=50,
     )
 
 

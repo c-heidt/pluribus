@@ -49,7 +49,7 @@ def _stub_session(
     leaf = LeafConfig(policies=_policies(), n_rollouts=1)
     solver_cfg = SolverConfig(
         leaf=leaf, max_iterations=4, max_wall_seconds=30.0,
-        discount_interval=20, workers=1,   # serial → fast + deterministic
+        discount_interval=20,   # serial → fast + deterministic
     )
     lut = card_info_lut
     if lut is None:

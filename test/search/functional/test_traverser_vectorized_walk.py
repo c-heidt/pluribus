@@ -69,7 +69,7 @@ def _ctx(env, seed):
 
 def _cfg(ctx, iters):
     return SolverConfig(leaf=ctx.leaf, max_iterations=iters, max_wall_seconds=60.0,
-                        discount_interval=0, workers=1)
+                        discount_interval=0)
 
 
 def _run(env, ctx, iters):

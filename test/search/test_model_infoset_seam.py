@@ -215,7 +215,7 @@ def test_modeled_solve_is_byte_identical_across_engines(monkeypatch, env_fn, reg
         env = env_fn()
         ctx = _modeled(_ctx(env, seed=7), {1: _RecordingModel(c=0.6)})
         res = solve(env, ctx, _cfg(auto_budget=False, max_iterations=25,
-                                   max_wall_seconds=1e9, workers=1))
+                                   max_wall_seconds=1e9))
         assert res.regime == regime
         return _digest(res.state)
 
@@ -232,7 +232,7 @@ def test_modeled_vector_solve_keeps_the_compiled_walk(monkeypatch):
     env = _real_lut_env(3)
     solver = _VectorSolver(
         env, SolverState(), _modeled(_ctx(env, seed=7), {1: _RecordingModel()}),
-        _cfg(auto_budget=False, max_iterations=2, max_wall_seconds=1e9, workers=1),
+        _cfg(auto_budget=False, max_iterations=2, max_wall_seconds=1e9),
         np.random.default_rng(0),
     )
     assert solver._walk_env is not env, "modeled solve fell off the compiled walk"
@@ -247,7 +247,7 @@ def test_modeled_mccfr_solve_keeps_the_compiled_walk(monkeypatch):
     env = _real_lut_env(0)
     solver = _MCCFRSolver(
         env, SolverState(), _modeled(_ctx(env, seed=7), {1: _RecordingModel()}),
-        _cfg(auto_budget=False, max_iterations=2, max_wall_seconds=1e9, workers=1),
+        _cfg(auto_budget=False, max_iterations=2, max_wall_seconds=1e9),
         np.random.default_rng(0),
     )
     assert solver._use_core, "modeled MCCFR solve fell off the compiled walk"
@@ -271,7 +271,7 @@ def test_modeled_mccfr_solve_completes_and_clamps_under_the_core(monkeypatch):
     model = _RecordingModel(c=0.6)
     res = solve(env, _modeled(_ctx(env, seed=7), {1: model}),
                 _cfg(auto_budget=False, max_iterations=15,
-                     max_wall_seconds=1e9, workers=1))
+                     max_wall_seconds=1e9))
     assert res.regime == "mccfr"
     assert model.seen, "the clamp never queried the model under the core"
     assert len(res.state.model_sigma_cache) > 0
@@ -311,7 +311,7 @@ def test_root_cluster_is_not_built_without_models():
     env = _real_lut_env(0)
     solver = _MCCFRSolver(
         env, SolverState(), _ctx(env, seed=7),
-        _cfg(auto_budget=False, max_iterations=2, max_wall_seconds=1e9, workers=1),
+        _cfg(auto_budget=False, max_iterations=2, max_wall_seconds=1e9),
         np.random.default_rng(0),
     )
     assert solver._root_cluster is None

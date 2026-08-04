@@ -47,7 +47,7 @@ from test.search.test_equilibrium_oracle import (
 def _cfg(leaf, *, beta=None, iters=400, discount=10):
     return SolverConfig(
         leaf=leaf, beta=beta, max_iterations=iters, max_wall_seconds=1e9,
-        discount_interval=discount, workers=1, auto_budget=False,
+        discount_interval=discount, auto_budget=False,
     )
 
 
