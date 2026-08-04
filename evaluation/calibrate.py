@@ -995,8 +995,15 @@ def run_calibration(
         # OX-Search (``beta`` set): the gadget root exists solely in the vector regime.
         ab_streets = set(int(s) for s in regime_ab_streets)
         ab_on = bool(ab_streets) and getattr(prod_cfg, "beta", None) is None
+        # OX-Search (``beta`` set) only changes the VECTOR regime (the gadget root lives in
+        # HU turn/river vector); its MCCFR path is byte-identical to vanilla, so re-sweeping
+        # MCCFR cells here would just re-measure the vanilla budget.  So under OX we skip
+        # non-vector cells entirely and calibrate the gadget game's vector budgets only.
+        ox_on = getattr(prod_cfg, "beta", None) is not None
         for cell, sample_list in samples.items():
             _cond, _regime, street, n_live = cell
+            if ox_on and str(_regime) != "vector":
+                continue
             ctx0 = sample_list[0].ctx  # all roots in a cell share street / n_live
             is_ab = (int(n_live) == 2 and int(street) in ab_streets)
             if ab_on and is_ab:

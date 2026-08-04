@@ -53,7 +53,11 @@ LUT_PATH=${LUT_PATH:-"$WORKSPACE/exact"}
 
 # Calibration parameters (see `python -m evaluation.calibrate run --help`).
 N_PLAYERS=${N_PLAYERS:-4}
-CONDITIONS=${CONDITIONS:-vanilla,DBR}      # both share the tree → equal-budget check
+CONDITIONS=${CONDITIONS:-vanilla,DBR,OX}   # any of: vanilla | DBR | blueprint_only | OX | OX(beta=X).
+                                           # OX arms are auto-split into their OWN calibrate run (gadget = a
+                                           # different game tree, β must agree → cannot share a solver_cfg with
+                                           # vanilla/DBR) and calibrate VECTOR cells only (OX's MCCFR path == vanilla).
+                                           # Bare "OX" uses the code-default β (runner.DEFAULT_OX_BETA).
 MODEL_P_MAX=${MODEL_P_MAX:-1.0}            # DBR arm (1.0 = naive best response)
 MODEL_ERROR=${MODEL_ERROR:-0.0}
 WORKERS=${WORKERS:-}                       # empty → SLURM_CPUS_PER_TASK-1 (production)
@@ -249,42 +253,69 @@ echo "  - Search core:       ${PLURIBUS_SEARCH_CORE:-0}"
 echo "  - LUT / blueprint:   $LUT_PATH  |  $BLUEPRINT_PATH"
 echo "  - Output → perm:     $PERM_DIR"
 
-EXTRA_ARGS=()
-[ -n "$WORKERS" ]     && EXTRA_ARGS+=(--workers "$WORKERS")
-[ -n "$WALL_TARGET" ] && EXTRA_ARGS+=(--wall-target "$WALL_TARGET")
-
-# Background + forward SLURM's grace-period SIGTERM (same pattern as evaluation.sh),
-# so a wall-clock stop still hits the EXIT trap and copies partial output back.
-python -m evaluation.calibrate run \
-  --blueprint-path "$BLUEPRINT_PATH" \
-  --lut-path "$LUT_PATH" \
-  --n-players "$N_PLAYERS" \
-  --conditions "$CONDITIONS" \
-  --model-p-max "$MODEL_P_MAX" \
-  --model-error "$MODEL_ERROR" \
-  --collect-hands "$COLLECT_HANDS" \
-  --per-cell-cap "$PER_CELL_CAP" \
-  --reps "$REPS" \
-  --spread-k "$SPREAD_K" \
-  --ladder-points "$LADDER_POINTS" \
-  --ladder-lo "$LADDER_LO" \
-  --ladder-hi "$LADDER_HI" \
-  --ladder-max "$LADDER_MAX" \
-  --thresholds "$THRESHOLDS" \
-  --collect-iters "$COLLECT_ITERS" \
-  --table-policy "$TABLE_POLICY" \
-  --run-seed "$RUN_SEED" \
-  --big-blind "$BIG_BLIND" \
-  --small-blind "$SMALL_BLIND" \
-  --starting-stack "$STARTING_STACK" \
-  --low-card-rank "$LOW_CARD_RANK" \
-  --high-card-rank "$HIGH_CARD_RANK" \
-  --regime-ab-streets "$REGIME_AB_STREETS" \
-  --out-dir "$LOCAL_OUT" \
-  "${EXTRA_ARGS[@]}" &
-
-PY_PID=$!
-term() { echo "Forwarding SIGTERM to calibration (pid $PY_PID)"; kill -TERM "$PY_PID" 2>/dev/null || true; }
+# One calibrate invocation → its own out-dir.  Backgrounded + forwarding SLURM's
+# grace-period SIGTERM (same pattern as evaluation.sh) so a wall-clock stop still hits the
+# EXIT trap and copies partial output back.  ``CUR_PID`` is the child the trap signals.
+CUR_PID=""
+term() { [ -n "$CUR_PID" ] && { echo "Forwarding SIGTERM to calibration (pid $CUR_PID)"; kill -TERM "$CUR_PID" 2>/dev/null || true; }; }
 trap term TERM
-wait "$PY_PID"
+
+run_calibrate() {  # $1 = conditions, $2 = out-dir
+  local conds="$1" outdir="$2"
+  mkdir -p "$outdir"
+  local extra=()
+  [ -n "$WORKERS" ]     && extra+=(--workers "$WORKERS")
+  [ -n "$WALL_TARGET" ] && extra+=(--wall-target "$WALL_TARGET")
+  python -m evaluation.calibrate run \
+    --blueprint-path "$BLUEPRINT_PATH" \
+    --lut-path "$LUT_PATH" \
+    --n-players "$N_PLAYERS" \
+    --conditions "$conds" \
+    --model-p-max "$MODEL_P_MAX" \
+    --model-error "$MODEL_ERROR" \
+    --collect-hands "$COLLECT_HANDS" \
+    --per-cell-cap "$PER_CELL_CAP" \
+    --reps "$REPS" \
+    --spread-k "$SPREAD_K" \
+    --ladder-points "$LADDER_POINTS" \
+    --ladder-lo "$LADDER_LO" \
+    --ladder-hi "$LADDER_HI" \
+    --ladder-max "$LADDER_MAX" \
+    --thresholds "$THRESHOLDS" \
+    --collect-iters "$COLLECT_ITERS" \
+    --table-policy "$TABLE_POLICY" \
+    --run-seed "$RUN_SEED" \
+    --big-blind "$BIG_BLIND" \
+    --small-blind "$SMALL_BLIND" \
+    --starting-stack "$STARTING_STACK" \
+    --low-card-rank "$LOW_CARD_RANK" \
+    --high-card-rank "$HIGH_CARD_RANK" \
+    --regime-ab-streets "$REGIME_AB_STREETS" \
+    --out-dir "$outdir" \
+    "${extra[@]}" &
+  CUR_PID=$!
+  wait "$CUR_PID"
+  CUR_PID=""
+}
+
+# Split CONDITIONS: OX arms calibrate SEPARATELY (gadget = different tree, β must agree, so
+# they cannot share a solver_cfg with vanilla/DBR) into $PERM_DIR/ox; the rest run together.
+BASE_CONDS=""; OX_CONDS=""
+IFS=',' read -ra _CONDS <<< "$CONDITIONS"
+for c in "${_CONDS[@]}"; do
+  c_trim=$(echo "$c" | xargs); [ -z "$c_trim" ] && continue
+  case "$(echo "$c_trim" | tr '[:upper:]' '[:lower:]')" in
+    ox|ox\(*) OX_CONDS="${OX_CONDS:+$OX_CONDS,}$c_trim" ;;
+    *)        BASE_CONDS="${BASE_CONDS:+$BASE_CONDS,}$c_trim" ;;
+  esac
+done
+
+if [ -n "$BASE_CONDS" ]; then
+  echo "=== Base calibration ($BASE_CONDS) → $PERM_DIR ==="
+  run_calibrate "$BASE_CONDS" "$LOCAL_OUT"
+fi
+if [ -n "$OX_CONDS" ]; then
+  echo "=== OX-Search calibration ($OX_CONDS, vector cells only) → $PERM_DIR/ox ==="
+  run_calibrate "$OX_CONDS" "$LOCAL_OUT/ox"
+fi
 echo "Calibration finished; results in $PERM_DIR"

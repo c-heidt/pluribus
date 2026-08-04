@@ -27,8 +27,13 @@ def test_for_condition_ox_arm():
     assert _parse_ox_beta("OX(beta=0)") == 0.0
     assert _parse_ox_beta("ox(beta=1e2)") == 100.0
 
+    # A BARE 'OX' (no explicit β) takes the code default (paper-derived gadget mix).
+    from evaluation.runner import DEFAULT_OX_BETA
+    assert _parse_ox_beta("OX") == DEFAULT_OX_BETA
+    assert EvalConfig.for_condition("OX", run_id="r").beta == DEFAULT_OX_BETA
 
-def test_ox_arm_rejects_model_and_missing_beta():
+
+def test_ox_arm_rejects_model_and_malformed_beta():
     from evaluation.opponents import ModelSpec
 
     # OX consumes no DBR machinery — a model_spec on an OX arm is a wiring mistake.
@@ -36,9 +41,11 @@ def test_ox_arm_rejects_model_and_missing_beta():
         EvalConfig.for_condition(
             "OX(beta=1)", model_spec=ModelSpec(p_max=1.0), run_id="r"
         )
-    # A label without a parseable β must fail loudly, not silently disable the gadget.
-    with pytest.raises(ValueError):
-        EvalConfig.for_condition("OX", run_id="r")
+    # Bare 'OX' now defaults, but a label that LOOKS like a (botched) β spec is a typo
+    # and must fail loudly rather than silently defaulting.
+    for bad in ("OX(beta=)", "OX(3.0)"):
+        with pytest.raises(ValueError):
+            EvalConfig.for_condition(bad, run_id="r")
 
 
 def test_non_ox_arms_leave_beta_none():

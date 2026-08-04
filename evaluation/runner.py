@@ -117,23 +117,36 @@ import re as _re
 _OX_BETA_RE = _re.compile(r"beta\s*=\s*([0-9][0-9.eE+\-]*)")
 
 
+# Code default β for a bare 'OX' condition (safety param, Ge et al. 2024, Thm 4.6:
+# exp(σ') − exp(σ) ≤ Δ/β).  Chosen to reproduce the paper's OX-Search gadget mix: their
+# FHP setting (Appendix B) fixes the root entry weight 1/(kβ+1) = 1/51, i.e. kβ = 50.
+# `vector._ox_setup` uses the SAME formula with k = board-compatible root combos (LOSSLESS
+# root — see vector.py:243), which on HU turn/river is ≈ C(46,2)=1035 / C(45,2)=990 ≈ 1000,
+# so β = 50/k ≈ 0.05 gives that same 1/51 mix.  (The paper's literal β=0.125 came from their
+# 400-BUCKET k=400; our lossless k is ~2.5× larger, so a matching β is ~2.5× smaller.)
+DEFAULT_OX_BETA = 0.05
+
+
 def _parse_ox_beta(condition: str) -> float:
     """Extract ``β`` from an OX-Search condition label like ``'OX(beta=3.0)'``.
 
-    OX-Search requires a finite non-negative β (the safety parameter, Thm 4.6); a
-    label without a parseable ``beta=`` is a mistake, so raise rather than silently
-    disable the gadget.
+    OX-Search requires a finite non-negative β (the safety parameter, Thm 4.6).  A
+    **bare** ``'OX'`` takes the code default :data:`DEFAULT_OX_BETA`; but a label that
+    *looks* like a (botched) spec — parentheses or the word ``beta`` with no parseable
+    value — is a typo, so raise rather than silently defaulting.
     """
     m = _OX_BETA_RE.search(condition)
-    if m is None:
+    if m is not None:
+        beta = float(m.group(1))
+        if beta < 0.0:
+            raise ValueError(f"OX-Search beta must be >= 0, got {beta} in {condition!r}.")
+        return beta
+    if "(" in condition or "beta" in condition.lower():
         raise ValueError(
-            f"OX-Search condition {condition!r} has no 'beta=' — expected e.g. "
-            "'OX(beta=3.0)' (β = the adaptation-safety parameter)."
+            f"OX-Search condition {condition!r} has a malformed 'beta=' — expected e.g. "
+            f"'OX(beta=3.0)', or bare 'OX' for the default β={DEFAULT_OX_BETA}."
         )
-    beta = float(m.group(1))
-    if beta < 0.0:
-        raise ValueError(f"OX-Search beta must be >= 0, got {beta} in {condition!r}.")
-    return beta
+    return DEFAULT_OX_BETA
 
 
 @dataclass
