@@ -307,12 +307,20 @@ gains `seat_policies: Mapping[int, Mapping[BiasClass, Policy]]`, and
 `ModelPolicy` variants). The leaf-value cache key already carries profile+holes
 and `seat_policies` is search-static, so no key change is needed.
 
-### 5.5 Variance-reduced MCCFR (VR-MCCFR) — PROPOSED, DBR-only refinement
+### 5.5 Variance-reduced MCCFR (VR-MCCFR) — DBR-only refinement
 
-**Status: proposed, not built. Prototype-and-measure first.** A refinement that
-belongs to the *contribution* side (DBR / online exploitation), never to the
-baseline — it is gated off for vanilla, which stays byte-identical and
-paper-faithful.
+**Status: implemented (2026-08-05), off by default; measure on the next DBR
+calibration.** A refinement that belongs to the *contribution* side (DBR / online
+exploitation), never to the baseline — it is gated off for vanilla, which stays
+byte-identical and paper-faithful. Code:
+[vform.py](../poker_ai/search/vform.py) `vr_baseline_estimate` (the estimator),
+[mccfr.py](../poker_ai/search/mccfr.py) `_MCCFRSolver` (the opponent-node correction +
+per-node `_vbaseline`), `SolverConfig.variance_reduction` / `vr_baseline_decay`
+([solver_state.py](../poker_ai/search/solver_state.py)), and the calibration flag
+`--variance-reduction/--no-variance-reduction` ([evaluation/calibrate.py](../evaluation/calibrate.py),
+default on → the DBR condition uses it, vanilla/OX inert). Tests:
+[test/search/test_vr_mccfr.py](../test/search/test_vr_mccfr.py) (estimator unbiasedness +
+variance drop, DBR gate, vanilla byte-identity).
 
 **Motivation.** The search calibration shows the DBR MCCFR path is markedly noisier
 than vanilla — replica spread up 1.7–2.5× (turn-mccfr 194 vs 114 mbb; flop-mccfr 247
@@ -331,18 +339,24 @@ noise floor directly, without changing what DBR computes.
 **The method** — *Variance Reduction in Monte Carlo Counterfactual Regret Minimization
 (VR-MCCFR) using baselines*, **Schmid, Burch, Lanctot, Moravčík, Kadlec & Bowling, AAAI
 2019** (arXiv 1809.03057). A **baseline** `b(I,a)` — a running estimate of each action's
-value — acts as a control variate on the sampled counterfactual values. At a node where
-action `a*` was sampled with probability `q(a*)`, the value backed up is the
-**baseline-corrected** estimator
+value — acts as a control variate on the sampled counterfactual values. The general
+estimator reweights the sampled child by `1/q(a*)`; here the opponent is sampled
+**on-policy** from its own (clamped `σ̂`) strategy, i.e. `q = σ_opp`, and the traverser's
+value at an opponent node is the strategy-weighted expectation `Σ_a σ_opp(a)·v(I·a)`, so
+the `1/q` cancels and the backed-up estimator is the clean additive form the code uses
+(`vr_baseline_estimate`):
 
 ```
-û(I) = Σ_a b(I,a)  +  (û(I·a*) − b(I,a*)) / q(a*)
+v̂(I) = Σ_a σ_opp(a)·b(I,a)  +  (v(I·a*) − b(I,a*))
 ```
 
-The `Σ_a b(I,a)` term supplies every action's expected value from the baseline (the
-unsampled actions included); the second term adds only the sampled child's *deviation*
-from its baseline, reweighted by `1/q`. Update the baseline after the backup,
-`b(I,a*) ← b + α·(û(I·a*) − b)` (EMA), so it self-improves during the solve.
+The `Σ_a σ_opp(a)·b(I,a)` term supplies the strategy-weighted expected value from the
+baseline (unsampled actions included); the second term adds only the sampled child's
+*deviation* from its baseline. **No `1/q` blow-up**, and `b = 0` recovers the plain
+single-sample value exactly. Update the baseline after the backup,
+`b(I,a*) ← b + α·(v(I·a*) − b)` (EMA, `α = vr_baseline_decay`), so it self-improves during
+the solve; keeping the update *after* the estimate leaves `b` independent of the current
+sample.
 
 - **Unbiased for any baseline.** `E[(û(I·a*)−b)/q(a*)] = Σ_a q(a)(u(I·a)−b)/q(a) =
   Σ_a(u−b)`, which cancels `Σb` and leaves `Σ_a u(I·a) = u(I)`. So it converges to the

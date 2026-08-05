@@ -41,6 +41,7 @@ from poker_ai.search.vform import (
     node_sigma,
     regret_match_matrix,
     traverser_update,
+    vr_baseline_estimate,
 )
 
 # Search Cython core (Phase 2): when built AND ``PLURIBUS_SEARCH_CORE=1``, the
@@ -255,6 +256,17 @@ class _MCCFRSolver:
         self._val_iter = 0
         self._track_root_value = (self._my_seat in self._live_seats
                                   and self._my_combo is not None)
+
+        # VR-MCCFR baseline (opponent_modeling §5.5): a control variate on the sampled
+        # opponent-action counterfactual values.  DBR-only — gated on both the config
+        # flag and the presence of opponent models — so a vanilla solve (no models) is
+        # byte-identical regardless of the flag.  ``_vbaseline[pk]`` is a per-opponent-
+        # node ``(n_legal, n_combos)`` baseline, EMA-updated from observed child values
+        # and reset per search (fresh solve).  Unbiased for any baseline.
+        self._vr = (bool(getattr(cfg, "variance_reduction", False))
+                    and bool(getattr(ctx, "models", None)))
+        self._vr_decay = float(getattr(cfg, "vr_baseline_decay", 0.5))
+        self._vbaseline: Dict[object, np.ndarray] = {}
 
     def _make_walk_env(self, env):
         """The env the walk traverses this iteration: a fresh FastState adapter over
@@ -529,13 +541,34 @@ class _MCCFRSolver:
 
         if actor != p:
             # Opponent node: sample one action from its single sampled hole's row
-            # (external sampling); return the per-combo value unchanged, no update.
+            # (external sampling).  The traverser's per-combo value below is the
+            # opponent-strategy-weighted expectation ``Σ_a σ_opp(a)·v(·a)``; the sampled
+            # child ``v`` is an unbiased single-sample estimate of it.
             opp_ci = self._combo_index[tuple(sorted(holes[actor]))]
-            a_idx = sample_index(self.rng, sigma[opp_ci])
+            opp_row = sigma[opp_ci]                       # (n_legal,) opponent strategy
+            a_idx = sample_index(self.rng, opp_row)
             token = env.step_in_place(legal[a_idx], settle_winners=False)
             v = self._vchild(env, p, pi_p, holes, street)
             env.undo(token)
-            return v
+            if not self._vr:
+                return v
+            # VR-MCCFR baseline (opponent_modeling §5.5).  Sampling is ON-POLICY
+            # (q = σ_opp), so the baseline-corrected estimator reduces to the
+            # σ-weighted baseline expectation plus the sampled child's deviation from
+            # its baseline — no ``1/q`` blow-up.  Unbiased for ANY baseline:
+            #   E_a*[Σ_a σ(a)·b(a) + (v(·a*) − b(a*))] = Σ_a σ(a)·v(·a).
+            # ``b = 0`` (first visit) recovers the plain single-sample value exactly, so
+            # this only ever *reduces* variance as the baseline learns.  EMA-update the
+            # sampled action's baseline AFTER forming the estimate (keeps it independent
+            # of this sample → unbiased).  Both the returned value and — via the parent
+            # traverser node's ``child_vs`` — its regret update inherit the lower variance.
+            b = self._vbaseline.get(pk)
+            if b is None:
+                b = np.zeros((len(legal), self._n_combos), dtype=np.float64)
+                self._vbaseline[pk] = b
+            corrected = vr_baseline_estimate(opp_row, b, a_idx, v)
+            b[a_idx] += self._vr_decay * (v - b[a_idx])   # EMA-update after the estimate
+            return corrected
 
         # Traverser node: expand every action, weighting children by p's strategy.
         child_vs = np.empty((len(legal), self._n_combos), dtype=np.float64)

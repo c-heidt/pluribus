@@ -848,6 +848,7 @@ def run_calibration(
     model_spec: Optional[ModelSpec],
     n_players: int,
     workers: Optional[int],
+    variance_reduction: bool = True,
     collect_hands: int,
     per_cell_cap: int,
     reps: int,
@@ -944,6 +945,10 @@ def run_calibration(
         max_wall_seconds=1e9,
     )
     prod_cfg = session.solver_cfg
+    # VR-MCCFR (opponent_modeling §5.5): set the flag on the shared prod_cfg so every
+    # derived sweep cfg inherits it; it is gated on ``ctx.models`` inside the solver, so
+    # it only affects the DBR condition (vanilla/OX carry no models → byte-identical).
+    prod_cfg = dataclasses.replace(prod_cfg, variance_reduction=bool(variance_reduction))
     # ``workers`` here sizes the SWEEP's job pool (one core per concurrent solve), not
     # search replicas — every search runs serially (the production deployment model).
     resolved_workers = resolve_workers(workers)
@@ -1115,6 +1120,12 @@ def _cli():
     @click.option("--workers", default=None, type=int,
                   help="Sweep pool size — concurrent solves, one core each; each search "
                        "runs serially (default: SLURM_CPUS_PER_TASK-1).")
+    @click.option("--variance-reduction/--no-variance-reduction", default=True,
+                  show_default=True,
+                  help="VR-MCCFR baseline on the DBR MCCFR path (opponent_modeling §5.5). "
+                       "Gated on opponent models, so it only affects the DBR condition "
+                       "(vanilla/OX are byte-identical either way).  --no-variance-reduction "
+                       "reproduces the pre-VR behaviour for an A/B against an earlier run.")
     @click.option("--collect-hands", default=400, type=int, show_default=True,
                   help="Hands played to harvest representative roots.")
     @click.option("--per-cell-cap", default=4, type=int, show_default=True,
@@ -1191,6 +1202,7 @@ def _cli():
             blueprint_path=o["blueprint_path"], lut_path=o["lut_path"],
             conditions=conditions, model_spec=model_spec,
             n_players=o["n_players"], workers=o["workers"],
+            variance_reduction=o["variance_reduction"],
             collect_hands=o["collect_hands"], per_cell_cap=o["per_cell_cap"],
             reps=o["reps"], ladder_points=o["ladder_points"], ladder_lo=o["ladder_lo"],
             ladder_hi=o["ladder_hi"], ladder_max=o["ladder_max"], thresholds=thresholds,

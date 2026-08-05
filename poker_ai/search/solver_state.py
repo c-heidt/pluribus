@@ -126,6 +126,15 @@ class SolverConfig:
     # ``p̂``; larger β ⇒ safer (β is an upper bound; OX auto-balances).  Only the
     # heads-up turn/river **vector** regime consumes it; the MCCFR regime ignores it.
     beta: "float | None" = None
+    # VR-MCCFR variance reduction (opponent_modeling §5.5) — a control-variate baseline
+    # on the sampled opponent-action counterfactual values in the MCCFR walk.  DBR-only:
+    # it activates ONLY when this flag is set AND the subgame carries opponent models
+    # (``ctx.models``), so the vanilla/paper baseline is byte-for-byte untouched (no
+    # models ⇒ inert regardless of the flag).  Unbiased (same best response, less
+    # estimator variance).  ``vr_baseline_decay`` is the EMA weight on each new sample
+    # when updating the per-node baseline (0 ⇒ frozen at init, 1 ⇒ last-sample only).
+    variance_reduction: bool = False
+    vr_baseline_decay: float = 0.5
 
 
 class _CountingCache:

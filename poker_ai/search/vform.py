@@ -363,3 +363,29 @@ def traverser_update(regret, strat, sigma, child_vs, pi_p, frozen_combo, scatter
         scatter(regret, delta)
         scatter(strat, strat_delta)
     return v
+
+
+def vr_baseline_estimate(opp_strategy, baseline, sampled_action, sampled_value):
+    """On-policy VR-MCCFR baseline-corrected node value (opponent_modeling §5.5).
+
+    At an external-sampling **opponent** node the traverser's per-combo value is the
+    opponent-strategy-weighted expectation ``Σ_a σ(a)·v(·a)``, estimated from the ONE
+    sampled action.  Because sampling is on-policy (``q = σ``), the baseline-corrected
+    estimator has no ``1/q`` term — it is the σ-weighted baseline expectation plus the
+    sampled action's deviation from its baseline:
+
+        ``v̂ = Σ_a σ(a)·b(a) + (v(·a*) − b(a*))``
+
+    - ``opp_strategy`` ``(n_actions,)`` — the opponent's on-policy sampling row.
+    - ``baseline`` ``(n_actions, n_combos)`` — the per-action control-variate baseline
+      ``b`` (a running estimate of each action's per-combo value).
+    - ``sampled_action`` — the sampled action index ``a*``.
+    - ``sampled_value`` ``(n_combos,)`` — the observed value ``v(·a*)``.
+
+    **Unbiased for ANY baseline**: ``E_{a*~σ}[v̂] = Σ_a σ(a)·v(·a)`` (the ``Σσb`` term
+    cancels the sampled ``−b(a*)`` in expectation).  ``b = 0`` recovers the plain
+    single-sample value exactly, so the correction only ever *reduces* variance as the
+    baseline learns.  The caller EMA-updates ``b[a*]`` toward ``sampled_value`` AFTER
+    this call (keeping ``b`` independent of the current sample).
+    """
+    return opp_strategy @ baseline + (sampled_value - baseline[sampled_action])
