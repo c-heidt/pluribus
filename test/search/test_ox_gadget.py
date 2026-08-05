@@ -96,6 +96,25 @@ def test_ox_beta_zero_matches_belief_best_response(_seeded):
 
 
 # --------------------------------------------------------------------------- #
+# Gate: the OX iterate path records the calibration root-value signal.
+# --------------------------------------------------------------------------- #
+def test_ox_solve_records_root_value(_seeded):
+    """Regression: the gadget iterate path must accumulate the hero root-value signal
+    the calibration reads (``SearchResult.root_value``).  ``_iterate_ox`` previously
+    returned before ``_record_root_value`` ran, so every OX solve reported
+    ``root_value=None`` → the OX calibration's value_gap / replica_spread came back NaN
+    for every rung (``data/calibration_summary_ox.json``)."""
+    env, r0, r1, s0, s1 = _river_subgame(_seeded)
+    _install_lossless_lut(env)
+    ranges = {0: _normalize(r0), 1: _normalize(r1)}
+    ctx = _ctx(env, ranges=ranges, seed=7)
+    res = solve(env, ctx, _cfg(ctx.leaf, beta=0.5))
+    assert res.regime == "vector"
+    assert res.root_value is not None, "OX solve did not record a root value (still None)"
+    assert np.isfinite(res.root_value), f"OX root_value not finite: {res.root_value}"
+
+
+# --------------------------------------------------------------------------- #
 # Gate: β → ∞ makes the refined strategy belief-independent.
 # --------------------------------------------------------------------------- #
 @pytest.mark.slow

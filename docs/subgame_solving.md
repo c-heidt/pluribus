@@ -833,6 +833,61 @@ That settlement is pure waste here (its result is discarded), and skipping it cu
 the default `settle_winners=True` (it reads `env.payout`), and every other caller is
 unchanged. The vector regime has **no** continuation meta-game (terminal leaves only).
 
+#### Why the vector regime has lower variance (and when each wins)
+
+The two regimes differ not just in cost but in **how they take expectations**, and that
+difference — enumeration vs. sampling — is what makes vector the lower-variance solver
+where it is affordable, an effect that matters *most* precisely for opponent exploitation.
+
+- **Vector is full-width (enumeration).** Every iteration computes exact expected values
+  over *both players' entire ranges* and all opponent actions (the range-vs-range
+  `vector_payout` settlement). It samples no holes and no opponent trajectory, so it
+  carries essentially **no Monte-Carlo variance**; its only error is the deterministic
+  CFR iteration error (distance to equilibrium), which shrinks with iterations and has
+  **no noise floor**. A **river** subgame has zero future chance nodes, so a river vector
+  solve is *fully* deterministic — its cross-replica root-value spread is exactly **0**.
+  A **turn** subgame still samples the single remaining board card (the river), so it
+  carries a *small* residual variance — but only over one chance node, not the whole
+  trajectory.
+- **MCCFR is sampled.** It draws chance, opponent actions, and holes each iteration, so
+  its root-value estimate is a Monte-Carlo quantity whose standard error falls only as
+  **1/√T**. That is a genuine noise floor: a flat value gap is trustworthy convergence
+  only if the cross-replica spread is also small (this is exactly why the calibration
+  reports `replica_spread_mbb` alongside the value gap, §6.5 budget calibration).
+
+Empirically (2026-08 calibration, HU, 63-worker load): the turn value-gap-vs-exact at a
+matched ~150 s wall is **vector ≈ 138 mbb vs MCCFR ≈ 255 mbb** (vanilla) — the MCCFR
+number is the estimator sitting on its noise floor, and this is *why* production routes
+HU turn/river to vector rather than the (structurally valid) MCCFR alternative.
+
+**The exploitation twist.** The gap widens further under a best-response (opponent-model)
+solve. When the opponent is clamped to a fixed strategy, the search objective changes from
+"find the equilibrium" (a *flat* saddle — the value is spread evenly across many
+near-indifferent lines) to "maximally exploit this strategy" (an *extremal* peak — the
+value is concentrated in the few lines where the opponent is most exploitable, with more
+polarised pot outcomes). A tail-concentrated objective is intrinsically higher-variance to
+estimate by sampling: an MCCFR replica's value depends on whether *its* sampled
+trajectories reached those exploit lines. So the DBR calibration shows MCCFR
+`replica_spread` up **1.7–2.5×** vs vanilla (turn-mccfr 194 vs 114 mbb; flop-mccfr 247 vs
+98) and a *worse* value gap at every budget (turn-mccfr 425 vs 255 mbb) — while **vector
+is immune**, because enumeration computes the exact best-response value regardless of how
+tail-concentrated it is. Consequently the turn vector-vs-MCCFR gap widens from 138 vs 255
+(vanilla) to **131 vs 425** (DBR): the exact quantity that makes exploitation hard to
+*sample* is absent from the *enumerated* regime. Enumeration's advantage is largest exactly
+where sampling hurts most — deep, tail-driven exploitation.
+
+**The catch — why not enumerate everywhere.** Exactness is not free: full-width cost scales
+with the range/infoset count and the number of remaining chance nodes. Turn (one chance
+node) and river (none) are cheap enough to enumerate; the **flop has two chance nodes ahead
+→ full-width vector is ~1 it/s and does not scale**, and a **multiway** subgame is a
+*product* of ranges → infeasible. So the flop and all multiway subgames must use sampled
+MCCFR and accept the noise floor (the `vector_flop_regime_lever` decision, §6.5). The
+uncomfortable corollary for opponent exploitation: DBR's noisiest, least-converged regime
+is **flop MCCFR**, which is exactly the one place the lower-variance vector solver is *not*
+an affordable substitute — so there the mitigation is the average-strategy play + blueprint
+fallback (`blueprint_prior_kappa`, §6.6) rather than a regime switch, and raw budget is a
+weak lever (variance ~1/√T; see the budget-calibration notes).
+
 ### 6.6 Search-aware agent (`agent.py`)
 
 ```python

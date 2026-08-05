@@ -297,7 +297,11 @@ class _VectorSolver:
         opp_entry = (self._ox_c_expl * self._ox_phat
                      + self._ox_c_safe * q_enter) * self._ox_bc
         # Bot best-responds to the gadget-weighted opponent (bot regrets update here).
-        self._walk(self._walk_env, bot, self._reach[bot], opp_entry)
+        v_bot = self._walk(self._walk_env, bot, self._reach[bot], opp_entry)
+        # Calibration root-value signal: the bot's conditional EV vs the gadget-weighted
+        # opponent, normalised by the entry mass its walk actually used (the OX analogue
+        # of the vanilla ``_opp_mass``).  Pure side-effect; solve stays byte-identical.
+        self._record_root_value(bot, v_bot, opp_mass=float(opp_entry.sum()))
         # Opponent adapts; its per-combo subgame root value is the opt-out ENTER value.
         v_enter = self._walk(self._walk_env, opp, opp_entry, self._reach[bot])
         # Opt-out CFR update: ENTER → subgame CFV, OUT → CBV_ref; counterfactual weight
@@ -342,22 +346,29 @@ class _VectorSolver:
             self._record_root_value(s0, v0)
             self._record_root_value(s1, v1)
 
-    def _record_root_value(self, seat: int, v: np.ndarray) -> None:
+    def _record_root_value(self, seat: int, v: np.ndarray,
+                           opp_mass: "float | None" = None) -> None:
         """Accumulate the hero's linearly-weighted root-EV estimate (calibration).
 
-        Fires only for the bot's seat; ``v`` is the root per-combo counterfactual
-        value the walk just returned.  Linear (Linear-CFR-matching) weighting
-        downweights the noisy early iterates.  Dividing by the opponent reach mass
-        turns the counterfactual value into the played hand's conditional EV vs the
-        belief opponent (chips), so it is comparable across regimes and interpretable
-        in mbb.  A pure side-effect: reads one already-computed float, writes two
-        counters, and never advances the RNG or a table (solve stays byte-identical).
+        Fires only for the bot's seat holding a combo row; ``v`` is the root per-combo
+        counterfactual value the walk just returned.  Linear (Linear-CFR-matching)
+        weighting downweights the noisy early iterates.  Dividing by the opponent reach
+        mass **actually used in that walk** turns the counterfactual value into the
+        played hand's conditional EV (chips), so it is comparable across budgets and
+        interpretable in mbb.  ``opp_mass`` defaults to the fixed belief reach mass
+        ``self._opp_mass`` (vanilla/DBR); the OX gadget passes its per-iteration entry
+        mass (``opp_entry.sum()``) since that is the reach its bot walk was weighted by.
+        A pure side-effect: reads one already-computed float, writes two counters, and
+        never advances the RNG or a table (solve stays byte-identical).
         """
-        if seat != self._my_seat:
+        if seat != self._my_seat or self._my_combo is None:
+            return
+        om = self._opp_mass if opp_mass is None else opp_mass
+        if om is None or om <= 0.0:
             return
         self._val_iter += 1
         w = float(self._val_iter)
-        self.state.root_value_num += w * float(v[self._my_combo]) / self._opp_mass
+        self.state.root_value_num += w * float(v[self._my_combo]) / om
         self.state.root_value_den += w
 
     # ------------------------------------------------------------------
