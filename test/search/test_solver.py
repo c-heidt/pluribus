@@ -288,10 +288,9 @@ class TestSolveIntegration:
 
     def test_mccfr_solve_reaches_runout_terminals(self):
         # Smoke: an MCCFR preflop solve walks to real all-in runout terminals and
-        # completes.  (A preflop root forces the sampled-runout leaf mode — the
-        # decision-free equity flag is inert at ``street_at_root == 0``, §
-        # ``_leaf_mode`` — so the on/off comparison lives with the multiway MCCFR
-        # subgames, not this heads-up isolation fixture.)
+        # completes.  All-in terminals settle per-combo on the single force-dealt
+        # board (:meth:`PokerEnv.vector_payout_concrete`); the search reports only
+        # its regime (``mccfr`` / ``vector``), no leaf-mode sub-label.
         env = _preflop_env(seed=10)
         ctx_on = _ctx(env, seed=1)
         res = solve(env, ctx_on, _cfg(ctx_on, iters=20))

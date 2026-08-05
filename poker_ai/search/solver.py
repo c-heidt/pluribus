@@ -66,10 +66,6 @@ class SearchResult:
         on).  Logged per decision so calibration can group throughput/budget by the
         live-player count; distinct from the table-active ``num_live`` (all-in
         contestants keep a range here but are not table-active).
-    leaf_mode : str
-        Depth-limit leaf handling — ``'sampled_runout'`` | ``'decision_free'``
-        (MCCFR) or ``'exact_range'`` (vector).  Together ``(regime, leaf_mode)`` is
-        the "solver approach" the evaluation groups on (eval doc §6, §8).
     stop_reason : str
         Which cap ended the search: ``'iteration_cap'`` (ran the full structural
         iteration budget — the normal case) or ``'wall_cap'`` (the wall backstop
@@ -86,7 +82,6 @@ class SearchResult:
     wall_seconds: float
     regime: str
     n_live: int
-    leaf_mode: str
     stop_reason: str
     stats: SearchStats = field(default_factory=SearchStats)
     # OX-Search (Approach B, §11.3): the opt-out saturation metric (mean ENTER-prob
@@ -130,20 +125,6 @@ def _select_regime(ctx: SubgameContext) -> str:
         return "vector"
     return "mccfr"
 
-
-def _leaf_mode(regime: str, ctx: SubgameContext, cfg: SolverConfig) -> str:
-    """Depth-limit leaf handling for ``(regime, ctx, cfg)`` (eval doc §6).
-
-    The vector regime values leaves over the full range (``'exact_range'``).  MCCFR
-    scores decision-free all-in terminals either by the exact board-average
-    (``'decision_free'``) or the paper's single sampled runout (``'sampled_runout'``)
-    — the exact path is forced off on a preflop root (``street_at_root == 0``)
-    regardless of the flag, because a 5-card runout blows past the exact path.
-    """
-    if regime == "vector":
-        return "exact_range"
-    use_equity = bool(cfg.leaf.use_decision_free_equity) and ctx.street_at_root != 0
-    return "decision_free" if use_equity else "sampled_runout"
 
 
 def config_fingerprint(
@@ -273,7 +254,6 @@ def solve(
         wall_seconds=wall,
         regime=regime,
         n_live=len(ctx.ranges),
-        leaf_mode=_leaf_mode(regime, ctx, cfg),
         stop_reason=stop_reason,
         stats=stats,
         ox_enter_prob=ox,

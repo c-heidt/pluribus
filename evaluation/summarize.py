@@ -409,20 +409,20 @@ def _query_range_health(con: sqlite3.Connection) -> dict:
 def _query_approach(con: sqlite3.Connection) -> dict:
     """Solver-approach usage mix + budget health + a routing correctness check (§8).
 
-    ``(regime, leaf_mode)`` is the approach.  Routing check: the vector regime must
-    fire only heads-up (``num_live == 2``) on flop/turn/river (subgame §6.5 — a HU
-    post-preflop subgame is "small/late", so all of it takes the vector path with
-    the future streets keyed by LUT cluster) — a mis-routed solver is a correctness
-    bug the usage mix alone would hide.  The check is scoped to that clearest
-    envelope; ``num_live IS NULL`` rows are not counted as violations (older rows
-    may not carry it).
+    ``regime`` (``mccfr`` | ``vector``) is the approach.  Routing check: the vector
+    regime must fire only heads-up (``num_live == 2``) on flop/turn/river (subgame
+    §6.5 — a HU post-preflop subgame is "small/late", so all of it takes the vector
+    path with the future streets keyed by LUT cluster) — a mis-routed solver is a
+    correctness bug the usage mix alone would hide.  The check is scoped to that
+    clearest envelope; ``num_live IS NULL`` rows are not counted as violations (older
+    rows may not carry it).
     """
     total = _scalar(con, "SELECT COUNT(*) FROM decisions WHERE searched = 1") or 0
     dcols = {r[1] for r in con.execute("PRAGMA table_info(decisions)")}
     approaches = _rows(
         con,
         """
-        SELECT regime, leaf_mode,
+        SELECT regime,
                COUNT(*)                                             AS searches,
                AVG(wall_seconds)                                    AS mean_wall,
                AVG(iterations)                                      AS mean_iters,
@@ -430,7 +430,7 @@ def _query_approach(con: sqlite3.Connection) -> dict:
                                                                     AS wallcap_rate
         FROM decisions
         WHERE searched = 1
-        GROUP BY regime, leaf_mode
+        GROUP BY regime
         ORDER BY searches DESC
         """,
     )
@@ -748,7 +748,7 @@ def _print_human(report: dict) -> str:
     L.append("SOLVER APPROACH  (share · mean wall · wall-cap rate · mean iters)")
     for a in ap["approaches"]:
         L.append(
-            f"  {str(a['regime']):<7} {str(a['leaf_mode'] or ''):<15} "
+            f"  {str(a['regime']):<7} "
             f"{_fmt(a['share'],'.0%'):>5}   {_fmt(a['mean_wall'],'.1f')}s   "
             f"{_fmt(a['wallcap_rate'],'.0%')} wall-cap   "
             f"{_fmt(a['mean_iters'],'.0f')} it"

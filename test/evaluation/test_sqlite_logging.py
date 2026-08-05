@@ -220,7 +220,7 @@ class TestWriters:
                 gid,
                 DecisionRow(
                     betting_stage="flop", regime="mccfr", searched=1,
-                    leaf_mode="decision_free", num_live=2, iterations=5000,
+                    num_live=2, iterations=5000,
                     wall_seconds=7.5, iters_per_sec=666.7, stop_reason="wall_cap",
                     node_count=1234, unique_pubkeys=42, cache_hits=900,
                     cache_misses=100, action_played="call",

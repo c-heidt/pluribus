@@ -265,7 +265,7 @@ class TestApproachAndSearch:
             gid = log.log_game(_game(0))
             # A vector search on the PREFLOP (the vector envelope is heads-up
             # flop/turn/river, §6.5 — preflop is always MCCFR) → routing violation.
-            self._dec(log, gid, regime="vector", leaf_mode="exact_range",
+            self._dec(log, gid, regime="vector",
                       betting_stage="preflop", num_live=2, stop_reason="iteration_cap",
                       wall_seconds=1.0, iterations=100, cache_hits=1, cache_misses=0)
         rep = build_report(log._con)
@@ -279,7 +279,7 @@ class TestApproachAndSearch:
             gid = log.log_game(_game(0))
             # Vector must be heads-up: a multiway (num_live != 2) vector search is a
             # routing violation even on an in-envelope street.
-            self._dec(log, gid, regime="vector", leaf_mode="exact_range",
+            self._dec(log, gid, regime="vector",
                       betting_stage="flop", num_live=3, stop_reason="wall_cap",
                       wall_seconds=2.0, iterations=9000, cache_hits=9, cache_misses=1)
         rep = build_report(log._con)
@@ -292,7 +292,7 @@ class TestApproachAndSearch:
         with log.game():
             gid = log.log_game(_game(0))
             for stage in ("flop", "turn", "river"):
-                self._dec(log, gid, regime="vector", leaf_mode="exact_range",
+                self._dec(log, gid, regime="vector",
                           betting_stage=stage, num_live=2, stop_reason="wall_cap",
                           wall_seconds=2.0, iterations=9000, cache_hits=9, cache_misses=1)
         rep = build_report(log._con)
@@ -307,7 +307,7 @@ class TestApproachAndSearch:
             gid = log.log_game(_game(0))
             # Three heavily-blueprint plays (>50%) + one pure-search play.
             for w in (0.9, 0.8, 0.7, 0.0):
-                self._dec(log, gid, regime="mccfr", leaf_mode="blueprint",
+                self._dec(log, gid, regime="mccfr",
                           betting_stage="flop", num_live=2, stop_reason="wall_cap",
                           wall_seconds=1.0, iterations=100, cache_hits=1, cache_misses=0,
                           blueprint_weight=w)
@@ -324,11 +324,11 @@ class TestApproachAndSearch:
             # Two searched (both wall_cap) + one blueprint (unsearched) decision.
             self._dec(log, gid, stop_reason="wall_cap", wall_seconds=10.0,
                       iterations=5000, iters_per_sec=500.0,
-                      cache_hits=90, cache_misses=10, leaf_mode="sampled_runout",
+                      cache_hits=90, cache_misses=10,
                       num_live=3)
             self._dec(log, gid, stop_reason="wall_cap", wall_seconds=12.0,
                       iterations=6000, iters_per_sec=500.0,
-                      cache_hits=90, cache_misses=10, leaf_mode="sampled_runout",
+                      cache_hits=90, cache_misses=10,
                       num_live=3)
             self._dec(log, gid, regime="blueprint", searched=0)
         rep = build_report(log._con)

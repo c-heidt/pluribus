@@ -195,14 +195,14 @@ class TestRun:
             run_evaluation(log=log, session=session, max_hands=6)
             rows = _rows(
                 log._con,
-                "SELECT regime, leaf_mode, stop_reason, node_count, unique_pubkeys, "
+                "SELECT regime, stop_reason, node_count, unique_pubkeys, "
                 "cache_hits, iterations, action_dist FROM decisions WHERE searched=1"
             )
         finally:
             log.close()
         # Some searched decisions should exist (rounds 2-4 always solve HU).
         if rows:
-            for regime, leaf_mode, stop, nodes, pks, hits, iters, dist in rows:
+            for regime, stop, nodes, pks, hits, iters, dist in rows:
                 assert regime in ("mccfr", "vector")
                 assert stop in ("iteration_cap", "wall_cap")
                 assert nodes is not None and pks is not None

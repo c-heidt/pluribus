@@ -82,7 +82,7 @@ def test_ox_enter_prob_round_trips(tmp_path):
                 gid,
                 DecisionRow(
                     betting_stage="turn", regime="vector", searched=1,
-                    leaf_mode="exact_range", num_live=2, n_live=2,
+                    num_live=2, n_live=2,
                     action_played="call", ox_enter_prob=0.42,
                 ),
             )
@@ -90,7 +90,7 @@ def test_ox_enter_prob_round_trips(tmp_path):
                 gid,
                 DecisionRow(
                     betting_stage="turn", regime="vector", searched=1,
-                    leaf_mode="exact_range", num_live=2, n_live=2,
+                    num_live=2, n_live=2,
                     action_played="call",            # vanilla: ox_enter_prob defaults None
                 ),
             )

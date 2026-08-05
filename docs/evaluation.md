@@ -234,10 +234,7 @@ CREATE TABLE decisions (
     decision_id     INTEGER PRIMARY KEY,
     game_id         INTEGER NOT NULL REFERENCES games(game_id),
     betting_stage   TEXT    NOT NULL,      -- preflop/flop/turn/river
-    regime          TEXT    NOT NULL,      -- 'mccfr' | 'vector' | 'blueprint'
-    leaf_mode       TEXT,                  -- 'sampled_runout' | 'decision_free' | 'exact_range' | NULL
-    -- (regime, leaf_mode) IS the solver approach: mccfr+sampled_runout ('mc'),
-    -- mccfr+decision_free ('mc decision-free'), vector+exact_range ('vectorized').
+    regime          TEXT    NOT NULL,      -- 'mccfr' | 'vector' | 'blueprint' — IS the solver approach
     searched        INTEGER NOT NULL,      -- 0/1: did search fire, or blueprint play?
     is_research     INTEGER,               -- 1 if a re-search triggered by an off-tree action
     num_live        INTEGER,               -- players still in the hand (multiway vs HU slicing)
@@ -522,12 +519,12 @@ GROUP BY regime;
 SQLite has no native percentile function.)
 
 **Solver approach — which one runs, how often, and is it behaving.**
-`(regime, leaf_mode)` is the approach (§6). Two things: the **usage mix** and a light
-**health signal** that each approach is doing what it should — no deep quality
+`regime` (`mccfr` | `vector`) is the approach (§6). Two things: the **usage mix** and a
+light **health signal** that each approach is doing what it should — no deep quality
 ranking.
 
 ```sql
-SELECT regime, leaf_mode,
+SELECT regime,
        COUNT(*)                                   AS searches,
        CAST(COUNT(*) AS REAL)
          / (SELECT COUNT(*) FROM decisions WHERE searched=1) AS share,      -- usage mix
@@ -536,7 +533,7 @@ SELECT regime, leaf_mode,
        AVG(stop_reason = 'wall_cap')              AS wallcap_rate           -- budget health
 FROM decisions
 WHERE searched = 1
-GROUP BY regime, leaf_mode
+GROUP BY regime
 ORDER BY searches DESC;
 ```
 
@@ -638,8 +635,8 @@ Ordered so each step yields something usable before the next.
    `leaf_value_cache`, `runout_cache` — none track hits today) and a `node_count` /
    `unique_pubkeys` tally in the walk. Add a `config_fingerprint` hash over
    `SolverConfig` + `LeafConfig` + `table_policy`. Surface the already-computed
-   `SearchResult.wall_seconds` / `iterations_run`, and the per-decision `stop_reason`
-   / `leaf_mode`. *done*
+   `SearchResult.wall_seconds` / `iterations_run`, and the per-decision `stop_reason`.
+   *done*
 2. **The SQLite sink.** A small `evaluation/logging` module owning the DB
    connection: `open(path)` (applies the WAL / `synchronous` pragmas and creates
    the schema in §6), `log_game(...)`, `log_seats(...)`, `log_decision(...)`,

@@ -108,7 +108,6 @@ CREATE TABLE IF NOT EXISTS decisions (
     game_id         INTEGER NOT NULL REFERENCES games(game_id),
     betting_stage   TEXT    NOT NULL,
     regime          TEXT    NOT NULL,
-    leaf_mode       TEXT,
     searched        INTEGER NOT NULL,
     is_research     INTEGER,
     num_live        INTEGER,
@@ -249,7 +248,7 @@ class SeatRow:
 class DecisionRow:
     """One hero search invocation (§6 ``decisions``).
 
-    ``(regime, leaf_mode)`` is the solver approach; the solver-run block is what
+    ``regime`` is the solver approach; the solver-run block is what
     :class:`~poker_ai.search.solver.SearchResult` / ``SearchStats`` surface (§9.1)
     — the caller unpacks them here so this module keeps no search dependency.
     ``exploitability`` / ``game_value`` stay NULL until that evaluator exists.
@@ -258,7 +257,6 @@ class DecisionRow:
     betting_stage: str
     regime: str                                  # 'mccfr' | 'vector' | 'blueprint'
     searched: int                                # 0/1: search fired, or blueprint
-    leaf_mode: Optional[str] = None
     is_research: Optional[int] = None            # 1 if an off-tree re-search
     num_live: Optional[int] = None               # table-active seats at the node
     n_live: Optional[int] = None                 # live ranges the solver sized on (searched rows)
