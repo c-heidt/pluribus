@@ -886,7 +886,11 @@ uncomfortable corollary for opponent exploitation: DBR's noisiest, least-converg
 is **flop MCCFR**, which is exactly the one place the lower-variance vector solver is *not*
 an affordable substitute — so there the mitigation is the average-strategy play + blueprint
 fallback (`blueprint_prior_kappa`, §6.6) rather than a regime switch, and raw budget is a
-weak lever (variance ~1/√T; see the budget-calibration notes).
+weak lever (variance ~1/√T; see the budget-calibration notes). The one way to attack the
+MCCFR noise floor *directly* — without changing the equilibrium it converges to, and gated
+DBR-only so the vanilla baseline stays byte-identical — is a variance-reduction baseline on
+the sampled counterfactual values (VR-MCCFR, Schmid et al. 2019); proposed and reasoned in
+[opponent_modeling.md](opponent_modeling.md) §5.5.
 
 ### 6.6 Search-aware agent (`agent.py`)
 

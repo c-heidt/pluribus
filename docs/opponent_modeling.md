@@ -307,6 +307,99 @@ gains `seat_policies: Mapping[int, Mapping[BiasClass, Policy]]`, and
 `ModelPolicy` variants). The leaf-value cache key already carries profile+holes
 and `seat_policies` is search-static, so no key change is needed.
 
+### 5.5 Variance-reduced MCCFR (VR-MCCFR) — PROPOSED, DBR-only refinement
+
+**Status: proposed, not built. Prototype-and-measure first.** A refinement that
+belongs to the *contribution* side (DBR / online exploitation), never to the
+baseline — it is gated off for vanilla, which stays byte-identical and
+paper-faithful.
+
+**Motivation.** The search calibration shows the DBR MCCFR path is markedly noisier
+than vanilla — replica spread up 1.7–2.5× (turn-mccfr 194 vs 114 mbb; flop-mccfr 247
+vs 98), and a worse value gap at every budget
+([subgame_solving.md](subgame_solving.md) §6.5, "Why the vector regime has lower
+variance"). The cause is structural, not a bug: clamping the opponent turns the search
+objective from *finding an equilibrium* (a flat saddle — value spread evenly across
+near-indifferent lines) into *maximally exploiting a fixed strategy* (an extremal peak —
+value concentrated in the few most-exploitable lines, with more polarised pots). A
+tail-concentrated value is intrinsically higher-variance to estimate by Monte-Carlo
+sampling. Vector avoids this by enumerating rather than sampling, but the flop and all
+multiway subgames cannot be enumerated (cost) and must use sampled MCCFR — so DBR's
+noisiest regime is exactly the one with no vector substitute. VR-MCCFR attacks that
+noise floor directly, without changing what DBR computes.
+
+**The method** — *Variance Reduction in Monte Carlo Counterfactual Regret Minimization
+(VR-MCCFR) using baselines*, **Schmid, Burch, Lanctot, Moravčík, Kadlec & Bowling, AAAI
+2019** (arXiv 1809.03057). A **baseline** `b(I,a)` — a running estimate of each action's
+value — acts as a control variate on the sampled counterfactual values. At a node where
+action `a*` was sampled with probability `q(a*)`, the value backed up is the
+**baseline-corrected** estimator
+
+```
+û(I) = Σ_a b(I,a)  +  (û(I·a*) − b(I,a*)) / q(a*)
+```
+
+The `Σ_a b(I,a)` term supplies every action's expected value from the baseline (the
+unsampled actions included); the second term adds only the sampled child's *deviation*
+from its baseline, reweighted by `1/q`. Update the baseline after the backup,
+`b(I,a*) ← b + α·(û(I·a*) − b)` (EMA), so it self-improves during the solve.
+
+- **Unbiased for any baseline.** `E[(û(I·a*)−b)/q(a*)] = Σ_a q(a)(u(I·a)−b)/q(a) =
+  Σ_a(u−b)`, which cancels `Σb` and leaves `Σ_a u(I·a) = u(I)`. So it converges to the
+  *same* best response as plain MCCFR — VR changes the estimator's variance, never its
+  fixed point. This is what keeps the comparison fair: it is not "juicing" DBR, it is
+  estimating the same quantity with less noise.
+- **Why the variance falls.** The only random term is `(û(I·a*)−b(I,a*))/q(a*)`; when
+  `b ≈ u` it is ≈ 0. A perfect baseline gives an exact estimate; even a crude
+  running-mean baseline typically cuts variance by 1–2 orders of magnitude (ibid.). The
+  reduction is largest on high-variance, tail-concentrated lines — precisely the exploit
+  branches that drive the DBR spread.
+
+**Two synergies specific to DBR:**
+
+1. **The clamp makes the sampling distribution known and fixed.** At opponent nodes
+   `q(a) = σ̂(a)` — not a moving CFR strategy (§5.2 is where `σ̂` enters the walk). Vanilla
+   VR-MCCFR chases a sampling distribution that shifts every iteration; here the
+   correction's `1/q` denominator is stable, so the reduction is cleaner and typically
+   larger.
+2. **A natural baseline already exists: the blueprint CFVs.** Warm-start `b` from the
+   blueprint value at each infoset. Early iterations then get reduction immediately
+   (before the running mean has learned), degrading gracefully to the bootstrapped
+   estimate on the exploit lines where DBR's value diverges from the blueprint — exactly
+   where the bootstrap earns its keep.
+
+**Where it lands (no Cython changes).** The MCCFR value backup is Python/numpy (`vform`);
+the compiled core only moves state and evaluates the leaf, so VR is added entirely in the
+Python layer:
+
+- `SolverState` gains a `vbaseline` table (per `public_key`, `(n_combos, n_actions)`,
+  the same shape as `vregret`; traverser-vectorized so the correction is elementwise),
+  DBR-gated. It is a *value* estimate, so it is **not** swept by `state.discount`
+  (unlike the regret / strategy-sum tables). It persists in `SolverState`, so a
+  within-round re-search inherits a warm baseline for free.
+- The `mccfr.py` walk applies the correction + EMA update at each **sampled** node
+  (opponent action, chance); the traverser's own nodes expand all actions, so they carry
+  no correction (only propagate corrected children).
+- Gated on `cfg.variance_reduction` (or auto-on when `ctx.models` is non-empty). **Off ⇒
+  byte-identical** to today — the vanilla digest is unchanged, guarded by the same
+  empty-models discipline as the rest of §5.
+
+**Estimated overhead.** Per iteration ≈ **+15–25%** (a baseline sum + correction + EMA
+update, the same array shapes already touched for regret matching). Iterations to a given
+value gap: **materially fewer** (VR's 1–2 orders of magnitude variance reduction; DBR's
+high-variance regime has large headroom) — so wall-to-convergence is expected
+**neutral-to-faster** despite the per-iteration cost, while the `replica_spread` (the
+direct target) drops **≈2–5×+**. These are literature-guided estimates; the honest way to
+pin them is a minimal prototype (blueprint-warm-started EMA baseline, DBR-gated) measured
+plain-vs-VR at matched seeds on the 20-card DBR fixture, comparing `replica_spread` and
+value-gap-vs-budget.
+
+**Thesis framing.** Vanilla stays the untouched paper baseline; the online DBR
+contribution becomes two layers — opponent modeling to *find* the exploit (§4–§5), and
+variance-reduced search to *realize* it reliably (this §5.5). Because VR is unbiased, the
+DBR-vs-baseline comparison stays fair (same estimand, less estimator noise), on top of the
+already-fair CRN pairing + AIVAT at the eval layer (§7).
+
 ## 6. Agent integration (`agent.py`) and regime gating
 
 ### 6.1 Construction
