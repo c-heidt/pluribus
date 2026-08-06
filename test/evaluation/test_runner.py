@@ -414,9 +414,8 @@ class TestConfigValidation:
         {"n_players": 1},
         {"table_policy": "nonsense"},
         {"table_policy": "fixed"},                       # no fixed_seats
-        {"table_policy": "fixed", "fixed_seats": {0: "bp"}},   # incomplete map
-        {"table_policy": "fixed",
-         "fixed_seats": {0: "bp", 1: "bp", 2: "who?"}},        # bad label
+        {"table_policy": "fixed", "fixed_seats": ["bp"]},      # wrong length (n_players=3 needs 2)
+        {"table_policy": "fixed", "fixed_seats": ["bp", "who?"]},   # bad label
     ])
     def test_bad_config_fails_fast(self, tmp_path, kw):
         session = _stub_session(**kw)          # helper defaults n_players=3
@@ -441,7 +440,9 @@ class TestConfigValidation:
             log.close()
 
     def test_fixed_policy_assigns_and_logs_per_seat(self, tmp_path):
-        fixed = {0: "bp", 1: "bp_raise", 2: "bp_call"}
+        # Ordered opponent identities (n_players - 1 = 2), not a seat→label map: the
+        # identities stick with the opponents, only the hero's seat rotates.
+        fixed = ["bp_raise", "bp_call"]
         session = _stub_session(table_policy="fixed", fixed_seats=fixed, n_players=3)
         log = ExperimentLog.open(tmp_path / "run.sqlite")
         try:
@@ -452,11 +453,14 @@ class TestConfigValidation:
                 "JOIN game_seats s ON s.game_id=g.game_id ORDER BY g.hand_index, s.seat")
         finally:
             log.close()
+        by_hand = collections.defaultdict(dict)
         for hero_seat, seat, label in rows:
-            if seat == hero_seat:
-                assert label == "hero"
-            else:
-                assert label == fixed[seat]              # fixed by seat, per doc §10.1
+            by_hand[hero_seat][seat] = label
+        for hero_seat, seat_labels in by_hand.items():
+            assert seat_labels[hero_seat] == "hero"
+            non_hero = [seat_labels[s] for s in sorted(seat_labels) if s != hero_seat]
+            # Both identities present every hand; seat order is shuffled per hand.
+            assert sorted(non_hero) == sorted(fixed)
 
 
 # --------------------------------------------------------------------------- #

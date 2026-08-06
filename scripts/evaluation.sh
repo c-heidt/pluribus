@@ -48,7 +48,7 @@
 #SBATCH --partition=cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=72:00:00
+#SBATCH --time=10:00:00
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=200000mb
 #SBATCH --signal=SIGTERM@300
@@ -73,7 +73,9 @@ fi
 RUN_ID=${RUN_ID:-"eval-${SLURM_JOB_ID:-$$}"}
 RUN_SEED=${RUN_SEED:-0}
 TABLE_POLICY=${TABLE_POLICY:-all_blueprint}       # all_blueprint | random | fixed
-FIXED_SEATS=${FIXED_SEATS:-}                       # JSON map, only for TABLE_POLICY=fixed
+FIXED_SEATS=${FIXED_SEATS:-}                       # JSON array of n_players-1 opponent
+                                                    # identities, only for TABLE_POLICY=fixed
+                                                    # e.g. '["bp_fold","bp_call","bp_raise"]'
 TIME_BUDGET_HOURS=${TIME_BUDGET_HOURS:-71.5}
 
 # Experiment arms (docs/evaluation.md §10.1).  A comma-separated list runs each arm

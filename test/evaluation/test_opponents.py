@@ -52,18 +52,54 @@ class TestAssignSeats:
         assert a[0] == HERO_LABEL
         assert all(a[s] in OPPONENT_LABELS for s in range(1, 6))
 
-    def test_fixed_uses_map_and_ignores_hero_seat_entry(self):
-        fixed = {0: "bp", 1: "bp_call", 2: "bp_raise", 3: "bp_fold", 4: "bp",
-                 5: "bp_call"}
+    def test_fixed_assigns_all_identities_to_non_hero_seats(self):
+        fixed = ["bp", "bp_call", "bp_raise", "bp_fold", "bp"]
         labels = assign_seats("fixed", hero_seat=3, n_players=6,
                               rng=np.random.default_rng(0), fixed_seats=fixed)
-        assert labels[3] == HERO_LABEL                 # hero's own entry ignored
-        assert labels[0] == "bp" and labels[2] == "bp_raise"
+        assert labels[3] == HERO_LABEL
+        # Every identity is present among the non-hero seats (order is shuffled
+        # per hand, see test_fixed_shuffles_seat_order_per_hand below).
+        assert sorted(labels[s] for s in range(6) if s != 3) == sorted(fixed)
 
-    def test_fixed_missing_seat_raises(self):
+    def test_fixed_identities_stick_to_opponents_as_hero_rotates(self):
+        # Like real poker: only 3 identities needed for a 4-player game, and every
+        # opponent plays every hand — just from a different seat as the hero moves.
+        fixed = ["bp_fold", "bp_call", "bp_raise"]
+        for hero_seat in range(4):
+            labels = assign_seats("fixed", hero_seat=hero_seat, n_players=4,
+                                  rng=np.random.default_rng(0), fixed_seats=fixed)
+            assert labels[hero_seat] == HERO_LABEL
+            opp_labels = [labels[s] for s in range(4) if s != hero_seat]
+            assert sorted(opp_labels) == sorted(fixed)  # all 3 present every hand
+
+    def test_fixed_shuffles_seat_order_per_hand(self):
+        # The physical seat each identity lands in is randomized (via the per-hand
+        # rng), not pinned to ascending order — so seat/position never systematically
+        # correlates with a given bias across the sample.
+        fixed = ["bp_fold", "bp_call", "bp_raise", "bp"]
+        orders = {
+            tuple(assign_seats("fixed", 0, 5, np.random.default_rng(seed),
+                               fixed_seats=fixed)[s] for s in range(1, 5))
+            for seed in range(10)
+        }
+        assert len(orders) > 1                          # varies across hands
+        assert all(sorted(o) == sorted(fixed) for o in orders)  # always complete
+
+    def test_fixed_reproducible_given_same_rng(self):
+        fixed = ["bp_fold", "bp_call", "bp_raise"]
+        a = assign_seats("fixed", 1, 4, np.random.default_rng(7), fixed_seats=fixed)
+        b = assign_seats("fixed", 1, 4, np.random.default_rng(7), fixed_seats=fixed)
+        assert a == b
+
+    def test_fixed_wrong_length_raises(self):
         with pytest.raises(ValueError):
             assign_seats("fixed", 0, 3, np.random.default_rng(0),
-                        fixed_seats={1: "bp"})          # seat 2 missing
+                        fixed_seats=["bp"])          # n_players=3 needs 2 labels
+
+    def test_fixed_unknown_label_raises(self):
+        with pytest.raises(ValueError):
+            assign_seats("fixed", 0, 3, np.random.default_rng(0),
+                        fixed_seats=["bp", "who?"])
 
     def test_unknown_policy_raises(self):
         with pytest.raises(ValueError):

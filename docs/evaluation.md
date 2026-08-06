@@ -727,7 +727,11 @@ it in `game_seats`:
 
 - `all_blueprint` — all five unaltered `bp`.
 - `random` — each seat draws i.i.d. from {`bp`, `bp_fold`, `bp_call`, `bp_raise`}.
-- `fixed` — an explicit seat→variant map.
+- `fixed` — an ordered list of `n_players - 1` opponent identities, one per
+  opponent (e.g. `["bp_fold", "bp_call", "bp_raise"]` for a 4-player game). Every
+  opponent plays every hand; which physical seat each identity lands in is
+  reshuffled per hand (hero-independent, reproducible/CRN-paired the same way as
+  `random`), so table position never confounds a given bias.
 
 You choose the policy per experiment run; the schema captures whatever was assigned,
 so analysis slices by opponent type regardless of the policy.

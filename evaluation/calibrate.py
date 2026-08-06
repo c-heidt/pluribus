@@ -57,6 +57,7 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from evaluation.aivat import AivatAccumulator, LeafValue, _preserve_global_random
 from evaluation.opponents import HERO_LABEL, ModelSpec
 from evaluation.runner import (
     EvalConfig,
@@ -238,6 +239,275 @@ def collect_roots(
 
 
 # --------------------------------------------------------------------------- #
+# Phase 1' — CONSTRUCT roots directly (deterministic, full cell coverage)
+# --------------------------------------------------------------------------- #
+def _target_cells(n_players: int) -> List[Tuple[int, int]]:
+    """The ``(street, n_live)`` grid the sweep should cover for an ``n_players`` game.
+
+    Pre-flop starts with everyone in (one cell at ``n_live == n_players``); each
+    post-flop street can be reached with any live count from heads-up up to the full
+    table.  The regime (vector vs mccfr) is *derived* per constructed root, not chosen
+    here, so ``(turn, 2)`` becomes a vector cell and ``(flop, 3)`` an mccfr cell.
+    """
+    cells = [(0, n_players)]
+    for street in (1, 2, 3):                       # flop, turn, river
+        for n_live in range(2, n_players + 1):
+            cells.append((street, n_live))
+    return cells
+
+
+def _uniform_range(env) -> np.ndarray:
+    """No-information belief: uniform over board-compatible combos, normalised.
+
+    The production belief (``RangeTracker.snapshot``) is a board-masked, sum-1 weight
+    vector over ``combo_cards``; this is its maximum-entropy stand-in.  Approximate by
+    design (§ construction) — the iteration budget depends on the subgame's structural
+    size, not the exact opponent range."""
+    combo_cards = env.combo_cards
+    n = combo_cards.shape[0]
+    community = [int(c) for c in env.community_cards]
+    if community:
+        board = np.asarray(community, dtype=combo_cards.dtype)
+        bc = ~(np.isin(combo_cards[:, 0], board) | np.isin(combo_cards[:, 1], board))
+    else:
+        bc = np.ones(n, dtype=bool)
+    w = bc.astype(np.float64)
+    s = w.sum()
+    return (w / s) if s > 0 else np.full(n, 1.0 / n, dtype=np.float64)
+
+
+def _drive_to(env, hero_seat: int, target_street: int, n_live: int,
+              max_steps: int = 400) -> bool:
+    """Drive ``env`` down a passive scripted line to ``hero``'s decision on
+    ``target_street`` with exactly ``n_live`` seats still in.
+
+    Pre-flop, fold ``n_players - n_live`` non-hero seats (never the hero); everyone
+    else plays the cheapest stay-in action (check, else call).  No raises are ever
+    made, so each round is a single pass and the hero always reaches its turn.
+    Returns ``True`` iff the env is now non-terminal with the hero to act on
+    ``target_street`` (the constructed root); ``False`` on any degenerate line."""
+    to_fold = env.n_players - n_live
+    steps = 0
+    while not env.is_terminal and steps < max_steps:
+        steps += 1
+        if env.betting_round == target_street and env.player_i == hero_seat:
+            return True
+        seat = env.player_i
+        legal = [a for a in env.legal_actions if a is not None]
+        if not legal:
+            return False
+        if (env.betting_round == 0 and to_fold > 0 and seat != hero_seat
+                and "fold" in legal):
+            env.step_in_place("fold")
+            to_fold -= 1
+            continue
+        act = next((a for a in ("check", "call") if a in legal), None)
+        if act is None:                            # facing a bet with no passive reply
+            if seat == hero_seat:                  # the hero must never fold itself out
+                act = next((a for a in ("call", "all_in", "check") if a in legal),
+                           legal[0])
+            else:
+                act = "fold" if "fold" in legal else legal[0]
+        env.step_in_place(act)
+    return (not env.is_terminal and env.betting_round == target_street
+            and env.player_i == hero_seat)
+
+
+def _construct_one(session: EvalSession, cfg: EvalConfig, collect_cfg: SolverConfig,
+                   condition: str, street: int, n_live: int, run_seed: int,
+                   idx: int) -> Optional[RootSample]:
+    """Build ONE deterministic root for cell ``(street, n_live)`` (seed = ``idx``)."""
+    deck_seed, _a, hero_ss, _o, table_ss, _v = derive_seeds(run_seed, idx)
+    hero_seat = idx % cfg.n_players
+    np.random.seed(deck_seed)                      # engine deals off global np.random
+    env = session.new_env()
+    seat_labels = assign_seats(
+        cfg.table_policy, hero_seat, cfg.n_players,
+        np.random.default_rng(table_ss), cfg.fixed_seats,
+    )
+    # Hero excludes its own seat from the model map, exactly as ``on_hand_start`` does.
+    models = {int(s): m for s, m in session.build_models(seat_labels).items()
+              if int(s) != hero_seat}
+    if not _drive_to(env, hero_seat, street, n_live):
+        return None
+    live = [s for s in range(cfg.n_players) if env.players[s].is_active]
+    if len(live) != n_live or hero_seat not in live:
+        return None
+    uni = _uniform_range(env)
+    ranges = {s: uni.copy() for s in live}
+    folded = {s: uni.copy() for s in range(cfg.n_players)
+              if not env.players[s].is_active}
+    my_hole = tuple(int(c) for c in env.players[hero_seat].cards)
+    ctx = SubgameContext.from_runtime(
+        env, hero_seat, my_hole, ranges, folded, collect_cfg.leaf,
+        np.random.default_rng(hero_ss), models=models,
+    )
+    legal = [a for a in env.legal_actions if a is not None]
+    if not legal:
+        return None
+    try:
+        hr = int(env.combo_index[tuple(sorted(my_hole))])
+    except KeyError:                               # pragma: no cover - defensive
+        return None
+    regime = _select_regime(ctx)
+    return RootSample(condition, regime, int(street), int(len(ranges)),
+                      copy.deepcopy(env), ctx, env.public_key, hr, list(legal))
+
+
+def construct_roots(
+    session: EvalSession,
+    cfg: EvalConfig,
+    collect_cfg: SolverConfig,
+    condition: str,
+    *,
+    per_cell: int,
+    run_seed: int,
+) -> Dict[Cell, List[RootSample]]:
+    """CONSTRUCT ``per_cell`` roots for EVERY ``(street, n_live)`` cell, deterministically.
+
+    Playing hands under-samples rare production spots — multiway and heads-up
+    turn/river are a tiny fraction of hands — so a sampled sweep starves those cells
+    (and the vector-vs-mccfr A/B never fires without HU turn/river roots).  Instead we
+    build each situation directly: a fresh seeded deal driven down a passive line
+    (:func:`_drive_to`) to the target street and live count, with maximum-entropy
+    (uniform, board-masked) beliefs.  Deterministic per ``(run_seed, street, n_live,
+    k)``; the roots are approximate (not the production belief distribution) but carry
+    the right ``(street, n_live, regime)`` structure, which is what the iteration
+    budget is calibrated on.  Same cell/regime routing (:func:`_select_regime`) and
+    :class:`RootSample` shape as :func:`collect_roots`, so the sweep is unchanged."""
+    n_players = int(cfg.n_players)
+    out: Dict[Cell, List[RootSample]] = defaultdict(list)
+    for street, n_live in _target_cells(n_players):
+        for k in range(per_cell):
+            idx = (street * (n_players + 1) + n_live) * per_cell + k
+            try:
+                sample = _construct_one(session, cfg, collect_cfg, condition,
+                                        street, n_live, run_seed, idx)
+            except Exception:  # a single bad construction must not abort the grid
+                logger.exception("root construction failed (street=%s n_live=%s k=%s)",
+                                 street, n_live, k)
+                sample = None
+            if sample is not None:
+                out[sample.cell].append(sample)
+    logger.info("constructed %d roots across %d cells (condition=%s)",
+                sum(len(v) for v in out.values()), len(out), condition)
+    return dict(out)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1'' — low-variance root value via AIVAT (§ calibration variance)
+# --------------------------------------------------------------------------- #
+class _BeliefTracker:
+    """Minimal ``RangeTracker`` stand-in exposing the ctx belief to AIVAT's sampler.
+
+    :meth:`LeafValue._sample_joint` reads ``hero.tracker.snapshot()`` /
+    ``folded_snapshot()`` for the per-seat opponent ranges; the calibration has no
+    live agent, so we hand it the ctx's frozen ``ranges`` / ``folded_ranges``."""
+
+    def __init__(self, ranges, folded) -> None:
+        self._live = {int(s): np.asarray(w, dtype=np.float64) for s, w in ranges.items()}
+        self._folded = {int(s): np.asarray(w, dtype=np.float64)
+                        for s, w in (folded or {}).items()}
+
+    def snapshot(self):
+        return self._live
+
+    def folded_snapshot(self):
+        return self._folded
+
+
+class _CalibHero:
+    """The ``hero`` interface AIVAT's :class:`LeafValue` needs (seat, hole, belief)."""
+
+    def __init__(self, ctx) -> None:
+        self.my_seat = int(ctx.my_seat)
+        self.my_hole = tuple(int(c) for c in ctx.my_hole)
+        self.tracker = _BeliefTracker(ctx.ranges, getattr(ctx, "folded_ranges", {}))
+
+
+def _blueprint_none(ctx):
+    """The unbiased (``"none"``) leaf policy — the blueprint used off the solved tree."""
+    pols = ctx.leaf.policies
+    return pols.get("none") or next(iter(pols.values()))
+
+
+def _aligned_probs(policy, env, hole, legal: List[str]) -> np.ndarray:
+    """Blueprint action distribution for ``hole`` at ``env``, aligned to ``legal``."""
+    state = env.policy_state_for(tuple(int(c) for c in hole), for_blueprint=True)
+    p = np.asarray(policy.strategy(state, "none"), dtype=np.float64)
+    idx = {a: j for j, a in enumerate(state.legal_actions)}
+    out = np.zeros(len(legal), dtype=np.float64)
+    for j, a in enumerate(legal):
+        if a in idx:
+            out[j] = p[idx[a]]
+    s = out.sum()
+    return out / s if s > 0 else np.full(len(legal), 1.0 / len(legal))
+
+
+def aivat_root_value(res, root_env, ctx, *, rollouts: int, hole_samples: int,
+                     rng: np.random.Generator) -> Optional[float]:
+    """AIVAT estimate of the hero's root EV under the SOLVED strategy ``res``.
+
+    Replaces the solver's raw internal accumulator (``res.root_value``, a high-variance
+    single-combo MC estimate) with a control-variate estimate of the SAME quantity — the
+    hero's chip EV playing the solved σ from the root against its belief-sampled
+    opponents.  Each of ``rollouts`` playouts samples every seat's hole (hero fixed,
+    others from the ctx belief), plays the subgame to a terminal with every actor on the
+    solved policy (blueprint off the solved tree), folds an AIVAT control-variate term at
+    each action node (:meth:`AivatAccumulator.correct_action`) and the exact runout
+    chance-correction at all-in terminals (``max_runout_cards=5`` also covers a pre-flop
+    all-in, ``runout_cap`` bounding its Monte-Carlo board sample).  The average is far
+    lower variance than the internal counter, so the calibration's value gap carries the
+    convergence signal instead of the noise floor.  ``None`` if nothing evaluated."""
+    pol = (res.average_policy if getattr(res, "ox_enter_prob", None) is not None
+           else res.policy)
+    legal_at = res.state.legal_at
+    combo_index = root_env.combo_index
+    hero_seat = int(ctx.my_seat)
+    root_street = int(ctx.street_at_root)
+    lv = LeafValue(_CalibHero(ctx), ctx.leaf, rng, n_hole_samples=int(hole_samples))
+    bp = _blueprint_none(ctx)
+
+    def _one_rollout() -> float:
+        holes = lv._sample_joint(root_env)          # hero fixed, others from belief
+        env = root_env.with_hole_cards(holes)
+        acc = AivatAccumulator(hero_seat, lv, rng, max_runout_cards=5, runout_cap=256)
+        guard = 0
+        while not env.is_terminal and guard < 400:
+            guard += 1
+            legal = [a for a in env.legal_actions if a is not None]
+            if not legal:
+                break
+            actor = int(env.player_i)
+            pk = env.public_key
+            # The solved σ is externally readable ONLY at the root street (combo-keyed);
+            # future-street nodes are cluster-keyed internals (the bot re-solves each
+            # street — here the continuation is the blueprint, matching the depth-limit
+            # leaf).  So consult the search only on the root street + a covered node.
+            if int(env.betting_round) == root_street and pk in legal_at:
+                hr = combo_index[tuple(sorted(int(c) for c in holes[actor]))]
+                probs = np.asarray(pol.strategy_for(pk, hr, legal), dtype=np.float64)
+                s = probs.sum()
+                probs = probs / s if s > 0 else np.full(len(legal), 1.0 / len(legal))
+            else:
+                probs = _aligned_probs(bp, env, holes[actor], legal)
+            action = legal[int(rng.choice(len(legal), p=probs))]
+            # child_values reads env (via an internal with_hole_cards copy) without
+            # mutating it, so the pre-action env IS a valid env_before — no deep copy.
+            acc.correct_action(env, actor, action, legal, probs)
+            env.step_in_place(action)
+        return float(acc.finalize(env))
+
+    # The env deals boards off the GLOBAL numpy RNG (with_hole_cards shuffle +
+    # step_in_place runouts), so pin it from ``rng`` and restore on exit (CRN-safe):
+    # same ``rng`` ⇒ identical playouts ⇒ deterministic value.
+    with _preserve_global_random():
+        np.random.seed(int(rng.integers(0, 2**31 - 1)))
+        vals = [_one_rollout() for _ in range(int(rollouts))]
+    return float(np.mean(vals)) if vals else None
+
+
+# --------------------------------------------------------------------------- #
 # Phase 2 — sweep each root over an iteration ladder at the production W
 # --------------------------------------------------------------------------- #
 def _ladder_around(center: int, points: int, *, lo: float, hi: float,
@@ -388,8 +658,24 @@ def _sweep_process(spec_idx: int, state: dict, shared: dict) -> None:
         max_wall_seconds=1e9,
     )
     res = solve(env_t, ctx_t, cfg_t, regime_override=force_regime)
+    # Root value for the convergence metric.  The vector regime's internal value is
+    # enumeration-EXACT (near-zero variance), so keep it; the MCCFR regime's is a noisy
+    # single-combo MC estimate, so replace it with the low-variance AIVAT estimate of the
+    # SAME quantity (opt-in ``aivat_value``; the blueprint-continuation proxy's bias
+    # cancels in the value gap, and the reduced estimator noise collapses replica_spread).
+    row_regime = force_regime if force_regime is not None else s.regime
+    root_value = res.root_value
+    if shared.get("aivat_value") and str(row_regime) == "mccfr":
+        av = aivat_root_value(
+            res, env_t, ctx_t,
+            rollouts=int(shared["aivat_rollouts"]),
+            hole_samples=int(shared["aivat_hole_samples"]),
+            rng=np.random.default_rng(seed * 7 + 1),
+        )
+        if av is not None:
+            root_value = av
     state["results"].append((
-        j, si, rep, int(t), _root_sigma(res, s), res.root_value,
+        j, si, rep, int(t), _root_sigma(res, s), root_value,
         int(res.iterations_run), float(res.wall_seconds), str(res.stop_reason),
     ))
 
@@ -406,6 +692,9 @@ def sweep_jobs(
     reps: int,
     base_seed: int,
     big_blind: int,
+    aivat_value: bool = False,
+    aivat_rollouts: int = 12,
+    aivat_hole_samples: int = 8,
 ) -> List[SweepRow]:
     """Solve EVERY ``(job, sample, rep, budget)`` in ONE core-parallel pool.
 
@@ -451,6 +740,8 @@ def sweep_jobs(
     shared = {
         "jobs": [(job["samples"], job.get("force_regime")) for job in jobs],
         "prod_cfg": prod_cfg, "base_seed": int(base_seed), "all_specs": all_specs,
+        "aivat_value": bool(aivat_value), "aivat_rollouts": int(aivat_rollouts),
+        "aivat_hole_samples": int(aivat_hole_samples),
     }
     payloads = run_index_pool(
         n_workers=min(int(pool_workers), len(all_specs)) or 1,
@@ -849,6 +1140,10 @@ def run_calibration(
     n_players: int,
     workers: Optional[int],
     variance_reduction: bool = True,
+    construct_roots_mode: bool = True,
+    aivat_value: bool = True,
+    aivat_rollouts: int = 12,
+    aivat_hole_samples: int = 8,
     collect_hands: int,
     per_cell_cap: int,
     reps: int,
@@ -974,11 +1269,20 @@ def run_calibration(
         # no model; DBR ⇒ model, no beta; vanilla ⇒ neither.
         cond_cfg = cond_cfgs[condition]
         session = dataclasses.replace(session, config=cond_cfg)
-        logger.info("collecting roots for condition=%s", condition)
-        samples = collect_roots(
-            session, cond_cfg, collect_cfg, condition,
-            n_hands=collect_hands, per_cell_cap=per_cell_cap, run_seed=run_seed,
-        )
+        if construct_roots_mode:
+            # CONSTRUCT roots (deterministic, full cell coverage) — the default, so
+            # rare multiway / HU-turn/river cells are never starved by sampling.
+            logger.info("constructing roots for condition=%s", condition)
+            samples = construct_roots(
+                session, cond_cfg, collect_cfg, condition,
+                per_cell=per_cell_cap, run_seed=run_seed,
+            )
+        else:
+            logger.info("collecting roots (sampled play) for condition=%s", condition)
+            samples = collect_roots(
+                session, cond_cfg, collect_cfg, condition,
+                n_hands=collect_hands, per_cell_cap=per_cell_cap, run_seed=run_seed,
+            )
         # Regime A/B: solve HU roots on the ``regime_ab_streets`` under BOTH regimes.
         # Per condition (the cell key carries the condition), so vanilla AND each DBR arm
         # get their own comparison — the decision can legitimately flip for DBR, because
@@ -1014,7 +1318,9 @@ def run_calibration(
     logger.info("sweeping %d jobs (%d cells, %d solves) across %d cores in ONE pool",
                 len(jobs), len({j["cell"] for j in jobs}), n_solves, resolved_workers)
     all_rows = sweep_jobs(jobs, prod_cfg, pool_workers=resolved_workers, reps=reps,
-                          base_seed=run_seed, big_blind=big_blind)
+                          base_seed=run_seed, big_blind=big_blind,
+                          aivat_value=aivat_value, aivat_rollouts=aivat_rollouts,
+                          aivat_hole_samples=aivat_hole_samples)
 
     # Aggregate.
     by_cell: Dict[Cell, List[SweepRow]] = defaultdict(list)
@@ -1031,6 +1337,13 @@ def run_calibration(
     summary_json = {
         "search_core": "on" if core_on else "off (PURE PYTHON — not production)",
         "workers": resolved_workers,
+        # Whether VR-MCCFR (opponent_modeling §5.5) was active this run — DBR-only, so
+        # it affects only modeled MCCFR cells; recorded so a run is self-documenting
+        # (comparing a VR-on vs VR-off summary is meaningless without knowing which).
+        "variance_reduction": bool(variance_reduction),
+        # Low-variance root value via AIVAT for the MCCFR cells (vector stays exact).
+        "aivat_value": {"enabled": bool(aivat_value), "rollouts": int(aivat_rollouts),
+                        "hole_samples": int(aivat_hole_samples)} if aivat_value else False,
         "ladder_design": {
             "centre": "per-cell production budget (iteration_budget at W=1)",
             "span": [ladder_lo, ladder_hi], "points": ladder_points, "max": ladder_max,
@@ -1126,8 +1439,26 @@ def _cli():
                        "Gated on opponent models, so it only affects the DBR condition "
                        "(vanilla/OX are byte-identical either way).  --no-variance-reduction "
                        "reproduces the pre-VR behaviour for an A/B against an earlier run.")
+    @click.option("--construct-roots/--sample-roots", default=True, show_default=True,
+                  help="Root source. --construct-roots (default) BUILDS one root per "
+                       "(street, n_live) cell directly — deterministic, full coverage, "
+                       "so rare multiway / HU-turn/river cells are never starved (uniform "
+                       "board-masked beliefs; approximate but structurally exact). "
+                       "--sample-roots harvests roots by playing --collect-hands hands.")
+    @click.option("--aivat-value/--internal-value", default=True, show_default=True,
+                  help="Root-value estimator for the convergence metric.  --aivat-value "
+                       "(default) replaces the MCCFR cells' noisy internal accumulator with "
+                       "a low-variance AIVAT estimate (control variates + exact runout) of "
+                       "the same root EV, so replica_spread reflects convergence not MC "
+                       "noise; the enumeration-exact VECTOR cells keep their internal value. "
+                       "--internal-value reproduces the pre-AIVAT (raw) metric.")
+    @click.option("--aivat-rollouts", default=12, type=int, show_default=True,
+                  help="Playouts per solve for the AIVAT root-value estimate.")
+    @click.option("--aivat-hole-samples", default=8, type=int, show_default=True,
+                  help="Opponent-hole belief draws per AIVAT baseline node (higher = "
+                       "tighter control variate, more compute).")
     @click.option("--collect-hands", default=400, type=int, show_default=True,
-                  help="Hands played to harvest representative roots.")
+                  help="Hands played to harvest roots when --sample-roots is set.")
     @click.option("--per-cell-cap", default=4, type=int, show_default=True,
                   help="Roots kept per (condition, regime, street, n_live) cell.")
     @click.option("--reps", default=4, type=int, show_default=True,
@@ -1203,6 +1534,9 @@ def _cli():
             conditions=conditions, model_spec=model_spec,
             n_players=o["n_players"], workers=o["workers"],
             variance_reduction=o["variance_reduction"],
+            construct_roots_mode=o["construct_roots"],
+            aivat_value=o["aivat_value"], aivat_rollouts=o["aivat_rollouts"],
+            aivat_hole_samples=o["aivat_hole_samples"],
             collect_hands=o["collect_hands"], per_cell_cap=o["per_cell_cap"],
             reps=o["reps"], ladder_points=o["ladder_points"], ladder_lo=o["ladder_lo"],
             ladder_hi=o["ladder_hi"], ladder_max=o["ladder_max"], thresholds=thresholds,

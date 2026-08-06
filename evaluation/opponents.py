@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -213,7 +213,7 @@ def assign_seats(
     hero_seat: int,
     n_players: int,
     rng: np.random.Generator,
-    fixed_seats: Optional[Mapping[int, str]] = None,
+    fixed_seats: Optional[Sequence[str]] = None,
 ) -> Dict[int, str]:
     """Map every seat to an agent label for one hand (doc §10.1).
 
@@ -223,8 +223,13 @@ def assign_seats(
     - ``all_blueprint`` — every opponent is the unaltered ``bp``.
     - ``random`` — each opponent seat draws i.i.d. from the four variants (via
       ``rng`` for per-hand reproducibility).
-    - ``fixed`` — an explicit seat→label map (``fixed_seats``); the hero's own seat
-      entry, if present, is ignored since the hero occupies it this hand.
+    - ``fixed`` — an ordered list of exactly ``n_players - 1`` opponent identities
+      (``fixed_seats``), one per opponent — like real poker, where the players keep
+      their identity and only the hero's table position rotates hand to hand. Every
+      opponent is present (and each keeps its own bias) on every hand; WHICH physical
+      seat each identity lands in is reshuffled per hand (via ``rng``, hero-independent
+      and reproducible/CRN-paired same as ``random``), so an identity's table position
+      — and any interaction between position and bias — doesn't confound the sample.
 
     The schema records whatever is assigned, so analysis slices by opponent type
     regardless of the policy.
@@ -240,17 +245,19 @@ def assign_seats(
     elif table_policy == "fixed":
         if fixed_seats is None:
             raise ValueError("table_policy='fixed' requires fixed_seats")
-        for s in opp_seats:
-            if s not in fixed_seats:
-                raise ValueError(
-                    f"table_policy='fixed' missing a label for seat {s} "
-                    f"(hero at {hero_seat})"
-                )
-            label = fixed_seats[s]
-            if label not in LABEL_TO_BIAS:
-                raise ValueError(
-                    f"fixed_seats[{s}]={label!r} is not a known opponent label"
-                )
+        if len(fixed_seats) != len(opp_seats):
+            raise ValueError(
+                f"fixed_seats must list exactly {len(opp_seats)} opponent "
+                f"identities (one per non-hero seat), got {len(fixed_seats)}"
+            )
+        bad = [l for l in fixed_seats if l not in LABEL_TO_BIAS]
+        if bad:
+            raise ValueError(
+                f"fixed_seats contains unknown labels {bad}; expected one of "
+                f"{OPPONENT_LABELS}"
+            )
+        shuffled = [fixed_seats[i] for i in rng.permutation(len(fixed_seats))]
+        for s, label in zip(opp_seats, shuffled):
             labels[s] = label
     else:
         raise ValueError(

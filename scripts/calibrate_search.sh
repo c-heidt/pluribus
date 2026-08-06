@@ -26,7 +26,7 @@
 #SBATCH --partition=cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=3:00:00
+#SBATCH --time=4:00:00   # 4p full grid: multiway-flop cells (n_live=3,4) dominate — ~2.5h typical, headroom for the deep-rung tail
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=100000mb
 #SBATCH --signal=SIGTERM@120

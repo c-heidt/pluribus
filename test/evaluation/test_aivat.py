@@ -96,7 +96,7 @@ class _FakeTerminal:
     def terminal_board_len(self):
         return self._board_len
 
-    def runout_equity(self, *, rng=None):
+    def runout_equity(self, *, rng=None, cap=5000):
         return self._runout
 
 
@@ -142,7 +142,7 @@ class TestAccumulatorArithmetic:
         # A pre-flop all-in (board_len=0 → 5 cards to come) must NOT sample boards:
         # runout_equity is never called; the hand keeps only its action corrections.
         class _Boom(_FakeTerminal):
-            def runout_equity(self, *, rng=None):
+            def runout_equity(self, *, rng=None, cap=5000):
                 raise AssertionError("runout_equity must not run for a preflop all-in")
 
         acc = AivatAccumulator(0, _FakeValue({}), np.random.default_rng(0))
@@ -153,7 +153,7 @@ class TestAccumulatorArithmetic:
         # A pre-flop all-in (board_len=0 → 5 cards to come) must NOT call the
         # (5000-board) runout_equity; it keeps only the action-node corrections.
         class _Boom(_FakeTerminal):
-            def runout_equity(self, *, rng=None):
+            def runout_equity(self, *, rng=None, cap=5000):
                 raise AssertionError("runout_equity must not run for a preflop all-in")
 
         acc = AivatAccumulator(0, _FakeValue({}), np.random.default_rng(0))

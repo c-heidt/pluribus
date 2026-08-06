@@ -325,11 +325,19 @@ class AivatAccumulator:
     ``u(z) − Σ action_terms − chance_term``.
     """
 
-    def __init__(self, hero_seat: int, value_fn: LeafValue, rng: np.random.Generator) -> None:
+    def __init__(self, hero_seat: int, value_fn: LeafValue, rng: np.random.Generator,
+                 *, max_runout_cards: int = _MAX_RUNOUT_CARDS,
+                 runout_cap: int = 5000) -> None:
         self._hero_seat = int(hero_seat)
         self._v = value_fn
         self._rng = rng
         self._sum_terms = 0.0
+        # Terminal all-in runout chance-correction reach.  Default 2 (flop/turn all-ins,
+        # ``C(deck, <=2)`` under the exact cap) — the played-game default, unchanged.  The
+        # calibration raises it to 5 so a PRE-FLOP all-in is also Rao-Blackwellised, with
+        # ``runout_cap`` bounding the Monte-Carlo board sample so the cost stays modest.
+        self._max_runout_cards = int(max_runout_cards)
+        self._runout_cap = int(runout_cap)
 
     def correct_action(
         self,
@@ -373,20 +381,20 @@ class AivatAccumulator:
         chance_term = 0.0
         if terminal_env.is_decision_free and self._cheap_runout(terminal_env):
             with _preserve_global_random():
-                eq = terminal_env.runout_equity(rng=self._rng)
+                eq = terminal_env.runout_equity(rng=self._rng, cap=self._runout_cap)
             chance_term = hero_delta - float(eq[self._hero_seat])
         return hero_delta - self._sum_terms - chance_term
 
-    @staticmethod
-    def _cheap_runout(terminal_env: PokerEnv) -> bool:
-        """Whether the terminal all-in's runout is on ``runout_equity``'s exact path.
+    def _cheap_runout(self, terminal_env: PokerEnv) -> bool:
+        """Whether the terminal all-in's runout is worth the chance correction.
 
-        True iff at most ``_MAX_RUNOUT_CARDS`` board cards remain (a flop/turn all-in
-        — ``C(deck, ≤2)`` is always under the enumeration cap).  A pre-flop all-in (0
-        board cards ⇒ 5 to come) returns False, and an unknown board length is
-        treated as expensive (skip) — the safe default.
+        True iff at most ``self._max_runout_cards`` board cards remain.  At the default
+        (2) only flop/turn all-ins qualify (``C(deck, ≤2)`` under the exact enumeration
+        cap); raising it to 5 also admits a pre-flop all-in, whose 5-card runout
+        ``runout_equity`` Monte-Carlo samples (bounded by ``runout_cap``).  An unknown
+        board length is treated as expensive (skip) — the safe default.
         """
         board_len = terminal_env.terminal_board_len
         if board_len is None:
             return False
-        return (5 - int(board_len)) <= _MAX_RUNOUT_CARDS
+        return (5 - int(board_len)) <= self._max_runout_cards

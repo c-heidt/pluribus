@@ -54,7 +54,7 @@ import os
 import time
 import traceback
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -186,7 +186,11 @@ class EvalConfig:
     # ``SolverConfig`` built by :func:`build_blueprint_session`.
     beta: Optional[float] = None
     table_policy: str = "all_blueprint"       # all_blueprint | random | fixed
-    fixed_seats: Optional[Dict[int, str]] = None   # required for table_policy='fixed'
+    # required for table_policy='fixed': an ordered list of exactly n_players - 1
+    # opponent identities (e.g. ["bp_fold", "bp_call", "bp_raise"]), one per
+    # opponent — like real poker, opponents keep their identity and only the
+    # hero's seat rotates (see evaluation.opponents.assign_seats).
+    fixed_seats: Optional[Sequence[str]] = None
     time_budget_hours: float = 1.0            # wall-clock budget; 0 → unbounded
     # Paired mode (§10.1): a fixed hand count for this run.  When set it is the
     # sole stop criterion — the wall-clock ``time_budget_hours`` is ignored — so
@@ -720,12 +724,15 @@ def _validate_config(cfg: EvalConfig) -> None:
     if cfg.table_policy == "fixed":
         if not cfg.fixed_seats:
             raise ValueError("table_policy='fixed' requires fixed_seats")
-        # The hero rotates through every seat, so a fixed map must label all of
-        # them (the hero's own seat entry is ignored on the hands it occupies it).
-        missing = [s for s in range(cfg.n_players) if s not in cfg.fixed_seats]
-        if missing:
-            raise ValueError(f"fixed_seats is missing labels for seats {missing}")
-        bad = {s: l for s, l in cfg.fixed_seats.items() if l not in OPPONENT_LABELS}
+        # One identity per opponent, like real poker: the hero's seat rotates, the
+        # opponents keep their identity (evaluation.opponents.assign_seats).
+        n_opponents = cfg.n_players - 1
+        if len(cfg.fixed_seats) != n_opponents:
+            raise ValueError(
+                f"fixed_seats must list exactly {n_opponents} opponent identities "
+                f"(n_players - 1), got {len(cfg.fixed_seats)}"
+            )
+        bad = [l for l in cfg.fixed_seats if l not in OPPONENT_LABELS]
         if bad:
             raise ValueError(
                 f"fixed_seats has unknown labels {bad}; expected {OPPONENT_LABELS}"
@@ -1369,9 +1376,11 @@ def _cli():
     @click.option(
         "--fixed-seats",
         default=None,
-        help='For --table-policy=fixed: JSON seat→label map covering every seat, '
-        'e.g. \'{"0":"bp","1":"bp_raise","2":"bp_call","3":"bp","4":"bp_fold",'
-        '"5":"bp"}\'.',
+        help="For --table-policy=fixed: JSON array of exactly n_players - 1 "
+        'opponent identities, one per opponent, e.g. \'["bp_fold","bp_call",'
+        '"bp_raise"]\' for a 4-player game. Every opponent plays every hand; the '
+        "hero's seat rotates and each hand's opponent-to-seat placement is "
+        "reshuffled, so table position never confounds a given bias.",
     )
     @click.option("--time-budget-hours", default=1.0, type=float, show_default=True)
     @click.option(
@@ -1494,7 +1503,7 @@ def _cli():
         """Play a time-budgeted evaluation run, logging one transaction per hand."""
         fixed_seats = None
         if opts["fixed_seats"]:
-            fixed_seats = {int(k): v for k, v in json.loads(opts["fixed_seats"]).items()}
+            fixed_seats = json.loads(opts["fixed_seats"])
         # Experiment arm: a DBR (modeled) arm is signalled by --model-p-max.  Guard
         # the easy mistake — a modeled-looking --condition with no p_max would
         # silently run as vanilla Pluribus (search, no model), i.e. a mislabeled
