@@ -480,7 +480,7 @@ def _capture_hero_decision(
     # decision past a depth-limit leaf, or an off-tree line): the bot then played the
     # blueprint fallback, so the decision is logged as a blueprint play — never the
     # search's regime over a uniform guess.
-    played_legal, played_probs, searched, blueprint_weight = hero.play_distribution(env)
+    played_legal, played_probs, searched = hero.play_distribution(env)
     if searched:
         res = hero.last_search
         wall = float(res.wall_seconds)
@@ -505,9 +505,6 @@ def _capture_hero_decision(
             cache_misses=int(stats.cache_misses),
             action_played=action,
             action_dist=_dist_json(played_legal, played_probs),
-            # How much blueprint prior the search read was shrunk toward at this
-            # (covered) node — 0.0 when well-trained, →1 when starved (§8).
-            blueprint_weight=float(blueprint_weight),
             # 1 iff a modeled solve produced this play (DBR) — the
             # coverage flag the summary restricts the exploitation slice to (§9 A7).
             modeled_decision=1 if hero.has_models else 0,
@@ -517,11 +514,10 @@ def _capture_hero_decision(
             ox_enter_prob=res.ox_enter_prob,
         )
 
-    # Blueprint play — round 1 (no search), or the search-miss / failed-solve
-    # fallback (the bot played the blueprint at this node).  ``blueprint_weight``
-    # is 1.0 here (a pure-blueprint play), so the column reads uniformly across
-    # both the full fallback and the shrinkage.  ``modeled_decision`` is 0: a
-    # blueprint play consulted no model, even in a DBR hand.
+    # Blueprint play — round 1 (no search), or the search-miss / failed-solve hard
+    # fallback (the bot played the blueprint at this node).  ``searched=0`` IS the
+    # fallback signal.  ``modeled_decision`` is 0: a blueprint play consulted no
+    # model, even in a DBR hand.
     return DecisionRow(
         betting_stage=stage,
         regime="blueprint",
@@ -532,7 +528,6 @@ def _capture_hero_decision(
         hero_stack=hero_stack,
         action_played=action,
         action_dist=_dist_json(played_legal, played_probs),
-        blueprint_weight=float(blueprint_weight),
         modeled_decision=0,
     )
 
@@ -548,7 +543,7 @@ def _hero_played_dist(
     cover this node).  This is the ``π`` AIVAT corrects with (§10.2) and it matches
     the logged ``decisions.action_dist`` because both come from the same method.
     """
-    legal, probs, _, _ = hero.play_distribution(env)
+    legal, probs, _ = hero.play_distribution(env)
     return legal, probs
 
 

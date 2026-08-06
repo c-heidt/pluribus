@@ -299,24 +299,6 @@ class TestApproachAndSearch:
         assert rep["approach"]["routing_ok"] is True
         assert rep["approach"]["routing_violations"] == 0
 
-    def test_blueprint_prior_metrics_and_flag(self, db):
-        # Over covered (searched) decisions, the summary reports how much the played
-        # read was shrunk toward the blueprint, and flags an over-frequent fallback.
-        log, _ = db
-        with log.game():
-            gid = log.log_game(_game(0))
-            # Three heavily-blueprint plays (>50%) + one pure-search play.
-            for w in (0.9, 0.8, 0.7, 0.0):
-                self._dec(log, gid, regime="mccfr",
-                          betting_stage="flop", num_live=2, stop_reason="wall_cap",
-                          wall_seconds=1.0, iterations=100, cache_hits=1, cache_misses=0,
-                          blueprint_weight=w)
-        rep = build_report(log._con)
-        ap = rep["approach"]
-        assert ap["blueprint_weight_mean"] == pytest.approx((0.9 + 0.8 + 0.7) / 4)
-        assert ap["blueprint_heavy_rate"] == pytest.approx(3 / 4)   # 3 of 4 > 0.5
-        assert "blueprint_prior_bound" in {f["key"] for f in rep["flags"]}  # 75% > 20%
-
     def test_search_cost_and_budget_flag(self, db):
         log, _ = db
         with log.game():

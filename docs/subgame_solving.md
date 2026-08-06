@@ -884,8 +884,8 @@ node) and river (none) are cheap enough to enumerate; the **flop has two chance 
 MCCFR and accept the noise floor (the `vector_flop_regime_lever` decision, §6.5). The
 uncomfortable corollary for opponent exploitation: DBR's noisiest, least-converged regime
 is **flop MCCFR**, which is exactly the one place the lower-variance vector solver is *not*
-an affordable substitute — so there the mitigation is the average-strategy play + blueprint
-fallback (`blueprint_prior_kappa`, §6.6) rather than a regime switch, and raw budget is a
+an affordable substitute — so there the mitigation is the average-strategy play + the
+blueprint fallback on uncovered nodes (§6.6) rather than a regime switch, and raw budget is a
 weak lever (variance ~1/√T; see the budget-calibration notes). The one way to attack the
 MCCFR noise floor *directly* — without changing the equilibrium it converges to, and gated
 DBR-only so the vanilla baseline stays byte-identical — is a variance-reduction baseline on
@@ -945,23 +945,19 @@ Lifecycle (Algorithm 2):
      `last_search.policy` (final iteration) at the actual hand's row — **no solve
      here**. Record the σ used into `last_search.state.frozen` for that infoset.
 
-   **Blueprint-prior shrinkage.** Off-path infosets are, by construction,
-   reached with low probability, so their reach-weighted training mass is tiny —
-   the final-iteration row there is near-uniform (few regret updates) and the
-   average is one-sample noise. Rather than play (or believe) that under-trained
-   row, the read seam shrinks σ toward the blueprint by
-   `w = kappa / (mass + kappa)`, where `mass = SolverState.mass(key)` is the row's
-   cumulative-strategy sum. A genuinely trained row (mass in the hundreds–
-   thousands) is essentially untouched (`w ≈ 0`); a starved row (mass ≈ 0.01)
-   falls back almost entirely to the blueprint — a strictly better default than
-   uniform, and the production analog of "fill untrained infosets from an oracle."
-   The blend is applied at the agent seam (which holds the blueprint + env), so it
-   covers **both** solver regimes through the shared `SearchPolicy` reader, on both
-   the played final-iterate and the belief-update average. `kappa`
-   (`SolverConfig.blueprint_prior_kappa`, default 5; `0` disables) sits in the
-   empirical bimodal gap between noise and genuine mass. The mixed-in weight is
-   logged per decision (`decisions.blueprint_weight`, §evaluation) so an
-   over-frequent fallback — search adding little over the prior — is visible.
+   **Blueprint fallback (hard failures only).** The blueprint is used at play
+   time **only** when the search produced no usable strategy for the node — round 1
+   with no search, a failed solve (`last_search is None`), or a node the solved tree
+   does not contain (a decision past a depth-limit leaf, or an off-tree line neither
+   injected nor translatable). In those cases the bot plays the blueprint
+   (`searched=False`) rather than a uniform guess. On a **covered** node the played
+   σ is the raw search read, with no blend toward the blueprint: traverser-vectorized
+   MCCFR updates every root-street combo on every iteration, so covered rows are
+   trained by construction, and mixing the prior in only degraded well-converged
+   (including genuinely near-indifferent) rows. An earlier reach-weighted-mass
+   shrinkage (`kappa / (mass + kappa)`) was removed — `mass` scaled as
+   `iterations/n_combos`, so it measured prior reach, not convergence, and fired on
+   essentially every covered decision regardless of training.
 4. **`on_observed_action`** — append to `pending_actions`. On rounds 2–4, if the
    action was off-tree (the runtime injected it), **re-search the same root** with
    `warm_start=self.last_search.state`; the frozen rows keep the bot's

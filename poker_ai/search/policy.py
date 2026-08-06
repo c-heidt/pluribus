@@ -388,14 +388,3 @@ class SearchPolicy:
         else:
             out[:] = 1.0 / n
         return out
-
-    def mass(self, public_key, hand_row: int) -> float:
-        """Reach-weighted cumulative-strategy mass at ``(public_key, hand_row)``.
-
-        The search's confidence at this infoset — see :meth:`SolverState.mass`.
-        Regime-agnostic (reads whichever of ``strat_sum`` / ``vstrat`` the solving
-        regime wrote); the agent uses it to weight the blueprint-prior shrinkage.
-        Read whether or not ``use_average`` — the *average* mass is the trained-ness
-        signal even when the played strategy is the final iterate.
-        """
-        return self._state.mass((public_key, hand_row))

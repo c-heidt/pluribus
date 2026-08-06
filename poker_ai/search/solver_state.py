@@ -69,15 +69,6 @@ class SolverConfig:
     # several times there — at the old 100 it barely engaged on those (and never at
     # n_rollouts=8, ~50 iters/replica).  Cheap late subgames just discount more often.
     discount_interval: int = 10
-    # Blueprint-prior shrinkage strength (§6.6).  At read time a solved row's
-    # strategy is pulled toward the blueprint by weight ``kappa / (mass + kappa)``,
-    # where ``mass`` is the row's reach-weighted cumulative-strategy sum.  Genuinely
-    # trained rows (mass in the hundreds–thousands) are essentially untouched; barely
-    # reached off-path rows (mass ~0.01, one-sample noise) fall back almost entirely
-    # to the blueprint instead of a near-uniform under-trained guess.  ``kappa`` sits
-    # in the empirical bimodal gap between noise and genuine mass.  ``0.0`` disables
-    # the shrinkage (pure search rows, the pre-shrinkage behaviour).
-    blueprint_prior_kappa: float = 5.0
     # Structural iteration budget (§6.5) — the *primary* stop.  A real subgame is far
     # too large for any single sampled replica to reach a tight equilibrium online, so
     # there is **no online convergence test**; instead the per-subgame iteration count
@@ -100,8 +91,8 @@ class SolverConfig:
     # load; turn ≈ 8 it/s → ~170 s at 1350).
     vector_budget_by_street: tuple = (1500, 1350, 850)  # (flop[oracle-only], turn, river)
     # MCCFR regime (multiway, or heads-up pre-flop): **sampled**, and only the HOT PATH
-    # needs to converge — rarely-reached infosets fall back to the blueprint via the
-    # ``blueprint_prior_kappa`` shrinkage.  The per-replica budget is ``base[street] *
+    # needs to converge — infosets the solved tree never covers fall back to the
+    # blueprint at play time (a hard fallback, no blend).  The per-replica budget is ``base[street] *
     # n_live`` (the hot path grows ~linearly with the live-player count, NOT the
     # exponential full-tree size), clamped to ``max_iterations``.  Per-replica, like
     # vector: production runs one replica (``workers=1``, one hand per core); more
@@ -468,23 +459,6 @@ class SolverState:
         if total <= 0.0:
             return None
         return (row / total).astype(np.float32)
-
-    def mass(self, key: Key) -> float:
-        """Reach-weighted cumulative-strategy mass at ``key`` (0.0 if unaccumulated).
-
-        This is the un-normalised denominator of :meth:`average_sigma` — the
-        row's ``vstrat`` combo-row sum.  It is
-        the search's *confidence* at this infoset: high on the on-path rows it
-        trained full-width, near-zero on barely-reached off-path rows.  The read
-        seam (:class:`SearchPolicy` / :class:`~poker_ai.search.agent.SearchAgent`)
-        uses it to shrink the strategy toward the blueprint.  Combo-keyed
-        (root-street) reads only, mirroring :meth:`average_sigma`; a cluster-keyed
-        future-street node is internal to the solve and never read here.
-        """
-        mat = self.vstrat.get(key[0])
-        if mat is None or self.vrow_space.get(key[0]) == "cluster":
-            return 0.0
-        return float(mat[key[1]].sum())
 
     # ------------------------------------------------------------------
     # Instrumentation snapshot (eval doc §9.1)

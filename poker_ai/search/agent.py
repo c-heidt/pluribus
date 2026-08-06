@@ -46,27 +46,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _align_to(probs: np.ndarray, from_actions, legal: List[str]) -> np.ndarray:
-    """Remap ``probs`` (aligned to ``from_actions``) onto ``legal`` by action string.
-
-    Mirrors :meth:`SearchPolicy.strategy_for`'s remap: an action in ``legal`` absent
-    from ``from_actions`` gets zero mass; the result is renormalised over ``legal``
-    (uniform if nothing overlaps).  Lets a blueprint row (its own legal order) blend
-    against a search row aligned to the env's ``legal`` set.
-    """
-    idx = {a: j for j, a in enumerate(from_actions)}
-    out = np.zeros(len(legal), dtype=np.float64)
-    for j, a in enumerate(legal):
-        if a in idx:
-            out[j] = probs[idx[a]]
-    s = out.sum()
-    if s > 0.0:
-        out /= s
-    elif legal:
-        out[:] = 1.0 / len(legal)
-    return out
-
-
 class SearchAgent:
     """Real-time-search play agent (§6.6)."""
 
@@ -256,7 +235,7 @@ class SearchAgent:
         came from the search, pins the actual-hand row into the freeze map so a
         within-round re-search keeps it fixed (§5).
         """
-        legal, prob, searched, _ = self.play_distribution(env)
+        legal, prob, searched = self.play_distribution(env)
         action = self._sample(prob, legal)
         if searched:
             # Freeze the actual-hand row at the (normalised) mixed σ just played —
@@ -268,77 +247,26 @@ class SearchAgent:
             st.frozen[(pk, hr)] = prob
         return action
 
-    def _blueprint_probs(
-        self, env: PokerEnv, hole, legal: List[str], *, public=None
-    ) -> np.ndarray:
-        """Blueprint action distribution for ``hole`` at ``env``, aligned to ``legal``.
-
-        ``public`` (the cached :meth:`PokerEnv.policy_public_fields`) is threaded
-        through when the caller sweeps many combos at one node (the belief update),
-        so only the per-combo ``info_set`` is recomputed.
-        """
-        if public is not None:
-            state = env.policy_state_for(hole, for_blueprint=True, public=public)
-        else:
-            state = env.policy_state_for(hole, for_blueprint=True)
-        bp = np.asarray(self._blueprint.strategy(state, "none"), dtype=np.float64)
-        return _align_to(bp, state.legal_actions, legal)
-
-    def _shrink_to_blueprint(
-        self, search_probs: np.ndarray, mass: float, blueprint_fn
-    ) -> Tuple[np.ndarray, float]:
-        """Pull ``search_probs`` toward the blueprint by weight ``kappa/(mass+kappa)`` (§6.6).
-
-        ``mass`` is the search's reach-weighted confidence at this infoset
-        (:meth:`SolverState.mass`).  A well-trained row (large ``mass``) is left
-        essentially untouched; a barely-reached off-path row (``mass`` ~ one-sample
-        noise) falls back almost entirely to the blueprint rather than the
-        near-uniform under-trained search row.  ``blueprint_fn`` is a thunk so the
-        blueprint read (an env-state build + LMDB lookup) is skipped whenever the
-        blueprint weight is negligible.  ``kappa == 0`` disables the shrinkage.
-
-        Returns ``(blended_probs, weight_applied)`` — ``weight_applied`` is the
-        blueprint mass actually mixed in (0.0 when disabled or negligible), the
-        per-decision signal the evaluation logs so an over-frequent fallback is
-        visible (``decisions.blueprint_weight``).
-        """
-        kappa = float(getattr(self._cfg, "blueprint_prior_kappa", 0.0))
-        probs = np.asarray(search_probs, dtype=np.float64)
-        if kappa <= 0.0:
-            return probs, 0.0
-        w_bp = kappa / (mass + kappa)
-        if w_bp < 1e-3:                        # blueprint contributes < 0.1%
-            return probs, 0.0
-        bp = blueprint_fn()
-        out = (1.0 - w_bp) * probs + w_bp * bp
-        s = out.sum()
-        return (out / s, w_bp) if s > 0.0 else (probs, 0.0)
-
     def play_distribution(
         self, env: PokerEnv
-    ) -> Tuple[List[str], np.ndarray, bool, float]:
-        """The exact ``(legal, probs, searched, blueprint_weight)`` the bot plays at ``env``.
+    ) -> Tuple[List[str], np.ndarray, bool]:
+        """The exact ``(legal, probs, searched)`` the bot plays at ``env``.
 
         The single source of truth for the played σ — shared by :meth:`act` and the
         runner's decision logging / AIVAT correction, which must agree with what was
-        actually played.  Returns the searched **final-iteration** strategy for the
-        bot's actual hand (``searched=True``) only when the search covers this node;
-        otherwise falls back to the blueprint (``searched=False``).
+        actually played.  Returns the searched strategy for the bot's actual hand
+        (``searched=True``) whenever the search covers this node; the played σ is the
+        raw search read, no blend toward the blueprint (a covered row is trained —
+        traverser-vectorized MCCFR updates every root-street combo every iteration).
 
-        ``blueprint_weight`` is the fraction of blueprint prior mixed into the played
-        distribution: ``1.0`` on the full fallback below (pure blueprint), and the
-        shrinkage weight ``kappa/(mass+kappa)`` on a covered-but-under-trained search
-        read (0.0 when the search row is well-trained or shrinkage is disabled).  The
-        evaluation logs it per decision so an over-frequent fallback to the blueprint
-        — the search adding little over the prior — is visible (§8).
-
-        The blueprint fallback fires whenever the search produced **no** usable
-        strategy for this decision — round 1 with no search, a failed solve
-        (``last_search is None``), or a node the solved tree does not contain: a
+        The blueprint fallback fires **only** on a hard failure — the search produced
+        **no** usable strategy for this decision: round 1 with no search, a failed
+        solve (``last_search is None``), or a node the solved tree does not contain: a
         decision *past a depth-limit leaf* (the multiway within-round gap), or an
         off-tree line neither injected nor translatable (``_solved_public_key``'s
         key absent from ``legal_at``).  In every such case the bot plays the
-        blueprint rather than a uniform guess over its legal actions (§6.6).
+        blueprint (``searched=False``) rather than a uniform guess over its legal
+        actions (§6.6).
         """
         if self.last_search is not None:
             pk = self._solved_public_key(env)
@@ -358,20 +286,12 @@ class SearchAgent:
                 )
                 total = prob.sum()
                 prob = prob / total if total > 0 else np.full(len(legal), 1.0 / len(legal))
-                # Shrink the played final-iterate toward the blueprint at under-trained
-                # nodes (the average mass is the trained-ness signal even though we
-                # play the final iterate).  Negligible for well-trained rows.
-                prob, w_bp = self._shrink_to_blueprint(
-                    prob,
-                    self.last_search.policy.mass(pk, hr),
-                    lambda: self._blueprint_probs(env, self.my_hole, legal),
-                )
-                return legal, prob, True, w_bp
+                return legal, prob, True
         # Blueprint fallback (no search, failed solve, or a node the search does
         # not cover) — play the blueprint, never a uniform guess.
         state = env.policy_state_for(self.my_hole, for_blueprint=True)
         prob = np.asarray(self._blueprint.strategy(state, "none"), dtype=np.float64)
-        return list(state.legal_actions), prob, False, 1.0
+        return list(state.legal_actions), prob, False
 
     # ----------------------------------------------------------------- #
     # Public mechanism (a chip-aware runner may also call this directly)
@@ -479,25 +399,9 @@ class SearchAgent:
             pk = self._solved_public_key(env_before)
             legal = [a for a in env_before.legal_actions if a is not None]
             avg = self.last_search.average_policy
-            # Same blueprint-prior shrinkage as play, per combo: a noisy off-path
-            # average must not corrupt the next search's opponent-range belief.  The
-            # blueprint read is combo-keyed, so the public fields are cached once.
-            combo_cards = env_before.combo_cards
-            public = env_before.policy_public_fields()
 
             def sigma(h: int) -> np.ndarray:
-                s = np.asarray(avg.strategy_for(pk, h, legal), dtype=np.float64)
-                blended, _ = self._shrink_to_blueprint(
-                    s,
-                    avg.mass(pk, h),
-                    lambda: self._blueprint_probs(
-                        env_before,
-                        tuple(int(c) for c in combo_cards[h]),
-                        legal,
-                        public=public,
-                    ),
-                )
-                return blended
+                return np.asarray(avg.strategy_for(pk, h, legal), dtype=np.float64)
 
             return sigma
 

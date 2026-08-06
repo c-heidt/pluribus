@@ -127,7 +127,6 @@ CREATE TABLE IF NOT EXISTS decisions (
     action_dist     TEXT,
     exploitability  REAL,
     game_value      REAL,
-    blueprint_weight REAL,
     modeled_decision INTEGER,
     ox_enter_prob   REAL      -- OX-Search opt-out saturation; NULL off the gadget
 );
@@ -275,7 +274,6 @@ class DecisionRow:
     action_dist: Optional[str] = None            # JSON: root action distribution
     exploitability: Optional[float] = None
     game_value: Optional[float] = None
-    blueprint_weight: Optional[float] = None     # blueprint-prior mass mixed in (§8)
     modeled_decision: Optional[int] = None       # 1 iff a modeled solve produced this play (A7)
     ox_enter_prob: Optional[float] = None        # OX-Search opt-out saturation; None off the gadget
 
@@ -383,8 +381,6 @@ class ExperimentLog:
         # per-terminal scalar-evaluator mix that the vectorized walk no longer
         # produces; the columns are gone from the DDL and left untouched where an
         # older DB already has them, since ``asdict``-driven inserts simply skip them.)
-        if "blueprint_weight" not in dhave:  # blueprint-prior shrinkage (§8)
-            con.execute("ALTER TABLE decisions ADD COLUMN blueprint_weight REAL")
         if "modeled_decision" not in dhave:  # v4 → v5 (A7 coverage flag)
             con.execute("ALTER TABLE decisions ADD COLUMN modeled_decision INTEGER")
         if "n_live" not in dhave:  # v5 → v6 (calibration axis)

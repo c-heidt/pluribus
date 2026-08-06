@@ -40,7 +40,6 @@ THRESHOLDS = {
     "fire_rate_silent": 0.01,       # overall fire rate below → "search silent"
     "collapse_high": 0.05,          # resolved collapse rate above → "high collapse"
     "resolved_thin": 0.05,          # resolved fraction below → "thin resolution"
-    "blueprint_heavy_high": 0.20,   # share of played searches >50% blueprint → "prior-bound"
 }
 
 _CI_Z = 1.96                        # normal-approx 95% CI multiplier (§8)
@@ -418,7 +417,6 @@ def _query_approach(con: sqlite3.Connection) -> dict:
     rows may not carry it).
     """
     total = _scalar(con, "SELECT COUNT(*) FROM decisions WHERE searched = 1") or 0
-    dcols = {r[1] for r in con.execute("PRAGMA table_info(decisions)")}
     approaches = _rows(
         con,
         """
@@ -443,30 +441,11 @@ def _query_approach(con: sqlite3.Connection) -> dict:
         "AND (betting_stage NOT IN ('flop', 'turn', 'river') "
         "     OR (num_live IS NOT NULL AND num_live != 2))",
     ) or 0
-    # Blueprint-prior health (§8): over covered (``searched = 1``) decisions, how much
-    # the played search read was shrunk toward the blueprint.  A high mean or heavy
-    # rate means the search is adding little over the prior at the nodes it played —
-    # under-trained rows, or ``kappa`` set too aggressively.  ``blueprint_weight`` is a
-    # v5 column; legacy DBs lack it, so report ``None`` rather than crash.
-    bp_mean = bp_heavy = None
-    if "blueprint_weight" in dcols and total:
-        bp_mean = _scalar(
-            con,
-            "SELECT AVG(blueprint_weight) FROM decisions "
-            "WHERE searched = 1 AND blueprint_weight IS NOT NULL",
-        )
-        bp_heavy = _scalar(
-            con,
-            "SELECT AVG(CASE WHEN blueprint_weight > 0.5 THEN 1.0 ELSE 0.0 END) "
-            "FROM decisions WHERE searched = 1 AND blueprint_weight IS NOT NULL",
-        )
     return {
         "approaches": approaches,
         "total_searched": int(total),
         "routing_violations": int(routing_violations),
         "routing_ok": routing_violations == 0,
-        "blueprint_weight_mean": bp_mean,
-        "blueprint_heavy_rate": bp_heavy,
     }
 
 
@@ -624,16 +603,6 @@ def _evaluate_flags(report: dict) -> List[dict]:
                        "fired outside heads-up flop/turn/river",
         })
 
-    # prior-bound — the search often plays a mostly-blueprint mix at the nodes it
-    # covers (starved rows, or kappa too aggressive): search is adding little there.
-    bh = report["approach"].get("blueprint_heavy_rate")
-    if bh is not None and bh > T["blueprint_heavy_high"]:
-        flags.append({
-            "level": "warn", "key": "blueprint_prior_bound",
-            "message": f"{bh:.0%} of played searches were >50% blueprint prior — "
-                       "search adds little over the blueprint at those nodes",
-        })
-
     # thin resolution — range metrics rest on very few showdowns (weak evidence).
     rf = report["range_quality"]["overall"]["resolved_frac"]
     if rf is not None and rf < T["resolved_thin"]:
@@ -754,11 +723,6 @@ def _print_human(report: dict) -> str:
             f"{_fmt(a['mean_iters'],'.0f')} it"
         )
     L.append(f"  routing check: {'OK ✓' if ap['routing_ok'] else 'VIOLATIONS ✗'}")
-    if ap.get("blueprint_weight_mean") is not None:
-        L.append(
-            f"  blueprint prior: mean weight {_fmt(ap['blueprint_weight_mean'],'.1%')} · "
-            f"heavy (>50%) {_fmt(ap['blueprint_heavy_rate'],'.1%')} of played searches"
-        )
 
     L.append("")
     L.append("SEARCH COST / BUDGET")

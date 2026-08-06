@@ -20,8 +20,8 @@ Two regimes, sized on different principles (they differ by design, §6.5):
   paper's 1–33 s envelope).
 
 - **MCCFR** (multiway, or the heads-up pre-flop root) is **sampled**, and only the
-  **hot path** must converge — rarely-reached infosets fall back to the blueprint via
-  the ``blueprint_prior_kappa`` shrinkage, so they need no search refinement.  Its
+  **hot path** must converge — nodes the solved tree never covers fall back to the
+  blueprint at play time (a hard fallback, no blend), so they need no search refinement.  Its
   per-replica budget grows ~linearly with the live-player count (a bigger hot path),
   **not** the exponential full-tree size: ``base[street] × n_live``, clamped to
   ``max_iterations``.
