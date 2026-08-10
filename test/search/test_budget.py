@@ -91,6 +91,36 @@ def test_mccfr_budget_is_per_street():
     assert iteration_budget(_ctx_for(3, 4), cfg) == 12000   # river base 3000 * 4 live
 
 
+def _ctx_with_models(street, n_players):
+    """A ``_ctx_for`` carrying a (dummy) opponent model ⇒ the DBR path."""
+    base = _ctx_for(street, n_players)
+    return SubgameContext(
+        my_seat=base.my_seat, my_hole=base.my_hole, ranges=base.ranges,
+        folded_ranges={}, board_compatible=base.board_compatible,
+        street_at_root=street, depth_limit=None, leaf=base.leaf,
+        rng=np.random.default_rng(0), models={1: object()})
+
+
+def test_dbr_budget_scale_is_models_only():
+    """The ``dbr_mccfr_scale`` lifts the MCCFR budget ONLY when the subgame carries
+    opponent models (DBR); vanilla (no models) is byte-for-byte the paper baseline."""
+    cfg = _cfg(auto_budget=True, max_iterations=1_000_000, dbr_mccfr_scale=1.5)
+    # HU flop: vanilla 6000*2 = 12000; DBR ×1.5 = 18000.
+    assert iteration_budget(_ctx_for(1, 2), cfg) == 12000
+    assert iteration_budget(_ctx_with_models(1, 2), cfg) == 18000
+    # A scale of 1.0 (or the vanilla context) leaves the budget identical.
+    cfg1 = _cfg(auto_budget=True, max_iterations=1_000_000, dbr_mccfr_scale=1.0)
+    assert iteration_budget(_ctx_with_models(1, 2), cfg1) == 12000
+
+
+def test_dbr_budget_scale_still_clamped_to_ceiling():
+    """The DBR scale never escapes the single ``max_iterations`` ceiling: a 4-way flop
+    (6000*4 = 24000, ×1.5 = 36000) caps at 30000."""
+    cfg = _cfg(auto_budget=True, max_iterations=30_000, dbr_mccfr_scale=1.5)
+    assert iteration_budget(_ctx_with_models(1, 4), cfg) == 30_000
+    assert iteration_budget(_ctx_for(1, 4), cfg) == 24_000          # vanilla, unclamped
+
+
 def test_auto_budget_off_returns_flat_max_iterations():
     cfg = _cfg(auto_budget=False, max_iterations=77)
     assert iteration_budget(_ctx_for(1, 2), cfg) == 77

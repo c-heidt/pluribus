@@ -57,7 +57,7 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from evaluation.aivat import AivatAccumulator, LeafValue, _preserve_global_random
+from evaluation.aivat import LeafValue, _preserve_global_random
 from evaluation.opponents import HERO_LABEL, ModelSpec
 from evaluation.runner import (
     EvalConfig,
@@ -395,10 +395,10 @@ def construct_roots(
 
 
 # --------------------------------------------------------------------------- #
-# Phase 1'' — low-variance root value via AIVAT (§ calibration variance)
+# Phase 1'' — low-variance root value via COMMON RANDOM NUMBERS (§ calibration variance)
 # --------------------------------------------------------------------------- #
 class _BeliefTracker:
-    """Minimal ``RangeTracker`` stand-in exposing the ctx belief to AIVAT's sampler.
+    """Minimal ``RangeTracker`` stand-in exposing the ctx belief to the hole sampler.
 
     :meth:`LeafValue._sample_joint` reads ``hero.tracker.snapshot()`` /
     ``folded_snapshot()`` for the per-seat opponent ranges; the calibration has no
@@ -417,7 +417,7 @@ class _BeliefTracker:
 
 
 class _CalibHero:
-    """The ``hero`` interface AIVAT's :class:`LeafValue` needs (seat, hole, belief)."""
+    """The ``hero`` interface :class:`LeafValue`'s sampler needs (seat, hole, belief)."""
 
     def __init__(self, ctx) -> None:
         self.my_seat = int(ctx.my_seat)
@@ -444,34 +444,50 @@ def _aligned_probs(policy, env, hole, legal: List[str]) -> np.ndarray:
     return out / s if s > 0 else np.full(len(legal), 1.0 / len(legal))
 
 
-def aivat_root_value(res, root_env, ctx, *, rollouts: int, hole_samples: int,
-                     rng: np.random.Generator) -> Optional[float]:
-    """AIVAT estimate of the hero's root EV under the SOLVED strategy ``res``.
+def crn_root_value(res, root_env, ctx, *, worlds: int,
+                   seed: int) -> Optional[float]:
+    """Common-random-numbers estimate of the hero's root EV under the SOLVED σ ``res``.
 
-    Replaces the solver's raw internal accumulator (``res.root_value``, a high-variance
-    single-combo MC estimate) with a control-variate estimate of the SAME quantity — the
-    hero's chip EV playing the solved σ from the root against its belief-sampled
-    opponents.  Each of ``rollouts`` playouts samples every seat's hole (hero fixed,
-    others from the ctx belief), plays the subgame to a terminal with every actor on the
-    solved policy (blueprint off the solved tree), folds an AIVAT control-variate term at
-    each action node (:meth:`AivatAccumulator.correct_action`) and the exact runout
-    chance-correction at all-in terminals (``max_runout_cards=5`` also covers a pre-flop
-    all-in, ``runout_cap`` bounding its Monte-Carlo board sample).  The average is far
-    lower variance than the internal counter, so the calibration's value gap carries the
-    convergence signal instead of the noise floor.  ``None`` if nothing evaluated."""
+    Replaces the MCCFR solver's raw internal accumulator (``res.root_value``, a
+    single-combo value against belief-*sampled* opponents) for the convergence metric.
+    The estimate averages the hero-seat chip result of playing the solved σ from the
+    root — blueprint continuation off the solved tree, matching the depth-limit leaf —
+    over ``worlds`` fixed *worlds*, each an opponent-hole draw plus a board runout drawn
+    from ``seed``.
+
+    The point is ``seed``: it is keyed to the ROOT only (the caller shares it across
+    replicas AND budgets), so every replica evaluates the SAME cards.  The card-outcome
+    variance that dominates a ~100 bb subgame becomes common-mode and cancels in
+    ``replica_spread`` and the value gap, leaving only the genuine strategy differences
+    the calibration is trying to measure — no control variate, no rollout averaging to
+    beat down (the internal accumulator's opponent sampling was the noise; CRN removes
+    it at the source).  ``None`` if nothing evaluated.
+
+    CRN robustness under a diverging σ: the worlds' opponent holes and per-world board
+    seeds are drawn UP FRONT from ``seed`` (before any trajectory), the betting actions
+    are sampled from a SEPARATE per-world stream, and the board (dealt off the GLOBAL
+    numpy RNG — ``with_hole_cards`` shuffle + ``step_in_place`` runout) is reseeded to
+    that fixed per-world seed.  So a replica whose actions diverge can never desync the
+    card stream: the two replicas still meet the identical holes and runout.  The whole
+    thing is wrapped to restore the caller's global stream (CRN-safe, deterministic)."""
     pol = (res.average_policy if getattr(res, "ox_enter_prob", None) is not None
            else res.policy)
     legal_at = res.state.legal_at
     combo_index = root_env.combo_index
     hero_seat = int(ctx.my_seat)
     root_street = int(ctx.street_at_root)
-    lv = LeafValue(_CalibHero(ctx), ctx.leaf, rng, n_hole_samples=int(hole_samples))
+    eval_rng = np.random.default_rng(int(seed))
+    lv = LeafValue(_CalibHero(ctx), ctx.leaf, eval_rng, n_hole_samples=1)
     bp = _blueprint_none(ctx)
+    n = max(1, int(worlds))
+    # Draw every world's opponent holes + board seed FIRST, off the shared eval stream,
+    # so nothing a divergent trajectory does downstream can perturb the cards.
+    joints = [lv._sample_joint(root_env) for _ in range(n)]         # hero fixed, others belief
+    board_seeds = [int(x) for x in eval_rng.integers(0, 2 ** 31 - 1, size=n)]
 
-    def _one_rollout() -> float:
-        holes = lv._sample_joint(root_env)          # hero fixed, others from belief
+    def _play(holes, board_seed: int) -> Optional[float]:
+        act_rng = np.random.default_rng(int(board_seed) ^ 0x9E3779B9)   # own stream (CRN)
         env = root_env.with_hole_cards(holes)
-        acc = AivatAccumulator(hero_seat, lv, rng, max_runout_cards=5, runout_cap=256)
         guard = 0
         while not env.is_terminal and guard < 400:
             guard += 1
@@ -480,10 +496,9 @@ def aivat_root_value(res, root_env, ctx, *, rollouts: int, hole_samples: int,
                 break
             actor = int(env.player_i)
             pk = env.public_key
-            # The solved σ is externally readable ONLY at the root street (combo-keyed);
+            # Solved σ is externally readable ONLY at the root street (combo-keyed);
             # future-street nodes are cluster-keyed internals (the bot re-solves each
-            # street — here the continuation is the blueprint, matching the depth-limit
-            # leaf).  So consult the search only on the root street + a covered node.
+            # street — here the continuation is the blueprint, as in the depth-limit leaf).
             if int(env.betting_round) == root_street and pk in legal_at:
                 hr = combo_index[tuple(sorted(int(c) for c in holes[actor]))]
                 probs = np.asarray(pol.strategy_for(pk, hr, legal), dtype=np.float64)
@@ -491,19 +506,16 @@ def aivat_root_value(res, root_env, ctx, *, rollouts: int, hole_samples: int,
                 probs = probs / s if s > 0 else np.full(len(legal), 1.0 / len(legal))
             else:
                 probs = _aligned_probs(bp, env, holes[actor], legal)
-            action = legal[int(rng.choice(len(legal), p=probs))]
-            # child_values reads env (via an internal with_hole_cards copy) without
-            # mutating it, so the pre-action env IS a valid env_before — no deep copy.
-            acc.correct_action(env, actor, action, legal, probs)
-            env.step_in_place(action)
-        return float(acc.finalize(env))
+            env.step_in_place(legal[int(act_rng.choice(len(legal), p=probs))])
+        return float(env.payout[hero_seat]) if env.is_terminal else None
 
-    # The env deals boards off the GLOBAL numpy RNG (with_hole_cards shuffle +
-    # step_in_place runouts), so pin it from ``rng`` and restore on exit (CRN-safe):
-    # same ``rng`` ⇒ identical playouts ⇒ deterministic value.
     with _preserve_global_random():
-        np.random.seed(int(rng.integers(0, 2**31 - 1)))
-        vals = [_one_rollout() for _ in range(int(rollouts))]
+        vals = []
+        for holes, bseed in zip(joints, board_seeds):
+            np.random.seed(bseed)          # fixed (CRN) hole shuffle + board runout for THIS world
+            v = _play(holes, bseed)
+            if v is not None:
+                vals.append(v)
     return float(np.mean(vals)) if vals else None
 
 
@@ -660,20 +672,22 @@ def _sweep_process(spec_idx: int, state: dict, shared: dict) -> None:
     res = solve(env_t, ctx_t, cfg_t, regime_override=force_regime)
     # Root value for the convergence metric.  The vector regime's internal value is
     # enumeration-EXACT (near-zero variance), so keep it; the MCCFR regime's is a noisy
-    # single-combo MC estimate, so replace it with the low-variance AIVAT estimate of the
-    # SAME quantity (opt-in ``aivat_value``; the blueprint-continuation proxy's bias
-    # cancels in the value gap, and the reduced estimator noise collapses replica_spread).
+    # single-combo value against sampled opponents, so replace it with the CRN estimate
+    # (opt-in ``crn_value``) — same root EV, but every replica evaluates the same fixed
+    # card-worlds so the sampling noise is common-mode and collapses replica_spread.
     row_regime = force_regime if force_regime is not None else s.regime
     root_value = res.root_value
-    if shared.get("aivat_value") and str(row_regime) == "mccfr":
-        av = aivat_root_value(
+    if shared.get("crn_value") and str(row_regime) == "mccfr":
+        # CRN seed keyed to the ROOT (sample) only — identical across reps AND budgets,
+        # so every replica evaluates the same cards and the sampling noise cancels in
+        # replica_spread / the value gap.  The vector cells keep their exact internal value.
+        cv = crn_root_value(
             res, env_t, ctx_t,
-            rollouts=int(shared["aivat_rollouts"]),
-            hole_samples=int(shared["aivat_hole_samples"]),
-            rng=np.random.default_rng(seed * 7 + 1),
+            worlds=int(shared["crn_worlds"]),
+            seed=(int(shared["base_seed"]) + 1) * 100003 + si,
         )
-        if av is not None:
-            root_value = av
+        if cv is not None:
+            root_value = cv
     state["results"].append((
         j, si, rep, int(t), _root_sigma(res, s), root_value,
         int(res.iterations_run), float(res.wall_seconds), str(res.stop_reason),
@@ -692,9 +706,8 @@ def sweep_jobs(
     reps: int,
     base_seed: int,
     big_blind: int,
-    aivat_value: bool = False,
-    aivat_rollouts: int = 12,
-    aivat_hole_samples: int = 8,
+    crn_value: bool = False,
+    crn_worlds: int = 32,
 ) -> List[SweepRow]:
     """Solve EVERY ``(job, sample, rep, budget)`` in ONE core-parallel pool.
 
@@ -740,8 +753,7 @@ def sweep_jobs(
     shared = {
         "jobs": [(job["samples"], job.get("force_regime")) for job in jobs],
         "prod_cfg": prod_cfg, "base_seed": int(base_seed), "all_specs": all_specs,
-        "aivat_value": bool(aivat_value), "aivat_rollouts": int(aivat_rollouts),
-        "aivat_hole_samples": int(aivat_hole_samples),
+        "crn_value": bool(crn_value), "crn_worlds": int(crn_worlds),
     }
     payloads = run_index_pool(
         n_workers=min(int(pool_workers), len(all_specs)) or 1,
@@ -1141,9 +1153,8 @@ def run_calibration(
     workers: Optional[int],
     variance_reduction: bool = True,
     construct_roots_mode: bool = True,
-    aivat_value: bool = True,
-    aivat_rollouts: int = 12,
-    aivat_hole_samples: int = 8,
+    crn_value: bool = True,
+    crn_worlds: int = 32,
     collect_hands: int,
     per_cell_cap: int,
     reps: int,
@@ -1319,8 +1330,7 @@ def run_calibration(
                 len(jobs), len({j["cell"] for j in jobs}), n_solves, resolved_workers)
     all_rows = sweep_jobs(jobs, prod_cfg, pool_workers=resolved_workers, reps=reps,
                           base_seed=run_seed, big_blind=big_blind,
-                          aivat_value=aivat_value, aivat_rollouts=aivat_rollouts,
-                          aivat_hole_samples=aivat_hole_samples)
+                          crn_value=crn_value, crn_worlds=crn_worlds)
 
     # Aggregate.
     by_cell: Dict[Cell, List[SweepRow]] = defaultdict(list)
@@ -1341,9 +1351,12 @@ def run_calibration(
         # it affects only modeled MCCFR cells; recorded so a run is self-documenting
         # (comparing a VR-on vs VR-off summary is meaningless without knowing which).
         "variance_reduction": bool(variance_reduction),
-        # Low-variance root value via AIVAT for the MCCFR cells (vector stays exact).
-        "aivat_value": {"enabled": bool(aivat_value), "rollouts": int(aivat_rollouts),
-                        "hole_samples": int(aivat_hole_samples)} if aivat_value else False,
+        # Low-variance root value via COMMON RANDOM NUMBERS for the MCCFR cells (the
+        # enumeration-exact vector cells keep their internal value): each replica of a
+        # root evaluates the SAME crn_worlds card-worlds, so the opponent/board sampling
+        # noise is common-mode and cancels in replica_spread / the value gap.
+        "crn_value": {"enabled": bool(crn_value), "worlds": int(crn_worlds)}
+        if crn_value else False,
         "ladder_design": {
             "centre": "per-cell production budget (iteration_budget at W=1)",
             "span": [ladder_lo, ladder_hi], "points": ladder_points, "max": ladder_max,
@@ -1445,18 +1458,19 @@ def _cli():
                        "so rare multiway / HU-turn/river cells are never starved (uniform "
                        "board-masked beliefs; approximate but structurally exact). "
                        "--sample-roots harvests roots by playing --collect-hands hands.")
-    @click.option("--aivat-value/--internal-value", default=True, show_default=True,
-                  help="Root-value estimator for the convergence metric.  --aivat-value "
+    @click.option("--crn-value/--internal-value", default=True, show_default=True,
+                  help="Root-value estimator for the convergence metric.  --crn-value "
                        "(default) replaces the MCCFR cells' noisy internal accumulator with "
-                       "a low-variance AIVAT estimate (control variates + exact runout) of "
-                       "the same root EV, so replica_spread reflects convergence not MC "
-                       "noise; the enumeration-exact VECTOR cells keep their internal value. "
-                       "--internal-value reproduces the pre-AIVAT (raw) metric.")
-    @click.option("--aivat-rollouts", default=12, type=int, show_default=True,
-                  help="Playouts per solve for the AIVAT root-value estimate.")
-    @click.option("--aivat-hole-samples", default=8, type=int, show_default=True,
-                  help="Opponent-hole belief draws per AIVAT baseline node (higher = "
-                       "tighter control variate, more compute).")
+                       "a COMMON-RANDOM-NUMBERS estimate: every replica of a root evaluates "
+                       "the solved σ over the SAME fixed card-worlds, so the opponent/board "
+                       "sampling noise is common-mode and cancels in replica_spread (leaving "
+                       "only genuine strategy differences).  The enumeration-exact VECTOR "
+                       "cells keep their internal value.  --internal-value reproduces the "
+                       "raw single-combo metric.")
+    @click.option("--crn-worlds", default=32, type=int, show_default=True,
+                  help="Fixed card-worlds (opponent holes + board runout) averaged per "
+                       "CRN root-value estimate; shared across replicas so the sampling "
+                       "noise cancels.  Higher = tighter absolute value, more compute.")
     @click.option("--collect-hands", default=400, type=int, show_default=True,
                   help="Hands played to harvest roots when --sample-roots is set.")
     @click.option("--per-cell-cap", default=4, type=int, show_default=True,
@@ -1535,8 +1549,7 @@ def _cli():
             n_players=o["n_players"], workers=o["workers"],
             variance_reduction=o["variance_reduction"],
             construct_roots_mode=o["construct_roots"],
-            aivat_value=o["aivat_value"], aivat_rollouts=o["aivat_rollouts"],
-            aivat_hole_samples=o["aivat_hole_samples"],
+            crn_value=o["crn_value"], crn_worlds=o["crn_worlds"],
             collect_hands=o["collect_hands"], per_cell_cap=o["per_cell_cap"],
             reps=o["reps"], ladder_points=o["ladder_points"], ladder_lo=o["ladder_lo"],
             ladder_hi=o["ladder_hi"], ladder_max=o["ladder_max"], thresholds=thresholds,

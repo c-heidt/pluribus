@@ -1,15 +1,17 @@
-"""Low-variance AIVAT root value for calibration (``calibrate.aivat_root_value``).
+"""Common-random-numbers root value for calibration (``calibrate.crn_root_value``).
 
 The sweep's convergence metric is the hero root-EV gap.  For MCCFR the solver's raw
-internal accumulator is a high-variance single-combo MC estimate; ``aivat_root_value``
-replaces it with a control-variate estimate of the SAME quantity — the hero's chip EV
-playing the solved σ from the root vs its belief-sampled opponents, with an AIVAT term
-at every action node and the exact runout chance-correction at all-in terminals.
+internal accumulator is a single-combo value against belief-*sampled* opponents; the
+opponent/board sampling is the dominant noise in a ~100 bb subgame.  ``crn_root_value``
+replaces it with an average of the hero's chip result of playing the solved σ over a
+fixed set of card-worlds keyed to a ``seed`` — so two replicas that share the seed (the
+sweep keys it to the ROOT, identical across replicas and budgets) evaluate the SAME
+cards, and that sampling noise is common-mode and cancels in replica_spread.
 
-These pin the mechanism (finite, deterministic per seed, uses the ctx belief), not the
-variance magnitude — that needs a trained blueprint, which the stub (uniform) lacks.
-Also covers the AIVAT ``max_runout_cards`` knob that lets the estimate cover a pre-flop
-all-in (enhancement 2), while the played-game default (2) stays unchanged.
+These tests pin the mechanism: finite, deterministic per seed, and — the property that
+makes the cancellation work — the value depends ONLY on the seed and the solved σ, never
+on ambient/global RNG state.  The stub (uniform) policy can't show the variance
+magnitude, only that the estimator is well-formed and CRN-safe.
 """
 
 import collections
@@ -17,9 +19,8 @@ import copy
 import dataclasses
 
 import numpy as np
-import pytest
 
-from evaluation.calibrate import aivat_root_value, construct_roots
+from evaluation.calibrate import crn_root_value, construct_roots
 from evaluation.runner import EvalConfig, EvalSession
 from poker_ai.search.leaf import LeafConfig
 from poker_ai.search.mccfr import _BIAS_CLASSES
@@ -61,27 +62,34 @@ def _solved_mccfr_root(street):
 
 def test_returns_finite_value():
     res, env, ctx = _solved_mccfr_root(street=1)          # flop mccfr HU
-    v = aivat_root_value(res, env, ctx, rollouts=12, hole_samples=6,
-                         rng=np.random.default_rng(1))
+    v = crn_root_value(res, env, ctx, worlds=16, seed=1)
     assert v is not None and np.isfinite(v)
 
 
 def test_deterministic_same_seed():
     res, env, ctx = _solved_mccfr_root(street=1)
-    a = aivat_root_value(res, env, ctx, rollouts=12, hole_samples=6,
-                         rng=np.random.default_rng(3))
-    b = aivat_root_value(res, env, ctx, rollouts=12, hole_samples=6,
-                         rng=np.random.default_rng(3))
+    a = crn_root_value(res, env, ctx, worlds=16, seed=3)
+    b = crn_root_value(res, env, ctx, worlds=16, seed=3)
     assert a == b
 
 
 def test_different_seed_differs():
     res, env, ctx = _solved_mccfr_root(street=1)
-    a = aivat_root_value(res, env, ctx, rollouts=12, hole_samples=6,
-                         rng=np.random.default_rng(1))
-    b = aivat_root_value(res, env, ctx, rollouts=12, hole_samples=6,
-                         rng=np.random.default_rng(2))
+    a = crn_root_value(res, env, ctx, worlds=16, seed=1)
+    b = crn_root_value(res, env, ctx, worlds=16, seed=2)
     assert a != b
+
+
+def test_ignores_ambient_randomness():
+    # The CRN property: the estimate depends ONLY on the seed (and σ), never on ambient
+    # global RNG state — which is exactly why sharing the seed across replicas cancels
+    # the sampling noise.  Perturbing the global stream between calls changes nothing.
+    res, env, ctx = _solved_mccfr_root(street=1)
+    a = crn_root_value(res, env, ctx, worlds=16, seed=5)
+    np.random.seed(999)
+    _ = np.random.random(1000)
+    b = crn_root_value(res, env, ctx, worlds=16, seed=5)
+    assert a == b
 
 
 def test_preserves_global_rng():
@@ -89,24 +97,5 @@ def test_preserves_global_rng():
     res, env, ctx = _solved_mccfr_root(street=1)
     np.random.seed(123)
     before = np.random.get_state()[1].copy()
-    aivat_root_value(res, env, ctx, rollouts=8, hole_samples=6,
-                     rng=np.random.default_rng(0))
+    crn_root_value(res, env, ctx, worlds=8, seed=0)
     assert np.array_equal(np.random.get_state()[1], before)
-
-
-# --------------------------------------------------------------------------- #
-# AIVAT runout-coverage knob (enhancement 2): max_runout_cards
-# --------------------------------------------------------------------------- #
-
-def test_aivat_max_runout_cards_default_unchanged():
-    from evaluation.aivat import AivatAccumulator, _MAX_RUNOUT_CARDS
-    acc = AivatAccumulator(0, object(), np.random.default_rng(0))
-    assert acc._max_runout_cards == _MAX_RUNOUT_CARDS == 2   # played-game default
-
-    class _T:
-        is_decision_free = True
-        terminal_board_len = 0                              # pre-flop all-in (5 to come)
-    assert acc._cheap_runout(_T()) is False                 # skipped at default
-
-    acc5 = AivatAccumulator(0, object(), np.random.default_rng(0), max_runout_cards=5)
-    assert acc5._cheap_runout(_T()) is True                 # covered when raised

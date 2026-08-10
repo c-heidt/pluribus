@@ -28,7 +28,7 @@
 #SBATCH --ntasks=1
 #SBATCH --time=4:00:00   # 4p full grid: multiway-flop cells (n_live=3,4) dominate — ~2.5h typical, headroom for the deep-rung tail
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=100000mb
+#SBATCH --mem=380000mb
 #SBATCH --signal=SIGTERM@120
 #SBATCH --mail-type=All
 
@@ -80,6 +80,8 @@ LOW_CARD_RANK=${LOW_CARD_RANK:-2}
 HIGH_CARD_RANK=${HIGH_CARD_RANK:-14}
 WALL_TARGET=${WALL_TARGET:-150}            # per-decision wall budget (s); drives the A/B + flags over-budget cells. 150 is feasible under full-box load (v3: production searches take 40-330s at 8-98 it/s; 30 was unreachable). Set empty to disable.
 REGIME_AB_STREETS=${REGIME_AB_STREETS:-turn}  # HU vector-vs-MCCFR A/B streets: turn | flop,turn | none  (flop is SLOW: full-width vector flop ~1.3 it/s)
+CRN_VALUE=${CRN_VALUE:-true}              # true → common-random-numbers root-EV metric on MCCFR cells (each replica evaluates the same fixed card-worlds → sampling noise cancels in replica_spread); false (--internal-value) = raw single-combo value. Matches the CLI default (true).
+CRN_WORLDS=${CRN_WORLDS:-32}              # fixed card-worlds averaged per CRN root value (shared across replicas)
 
 # Permanent-FS destination for the two output files.
 PERM_DIR=${PERM_DIR:-"$WORKSPACE/calibration/$RUN_ID"}
@@ -248,6 +250,7 @@ echo "  - Ladder:            per-cell [${LADDER_LO}..${LADDER_HI}]x production b
 echo "  - Thresholds (mbb):  $THRESHOLDS"
 echo "  - Wall target (s):   ${WALL_TARGET:-(disabled)}"
 echo "  - Regime A/B:        $REGIME_AB_STREETS"
+echo "  - CRN root value:    $CRN_VALUE  (worlds $CRN_WORLDS; false = raw internal MCCFR value)"
 echo "  - Table policy:      $TABLE_POLICY"
 echo "  - Search core:       ${PLURIBUS_SEARCH_CORE:-0}"
 echo "  - LUT / blueprint:   $LUT_PATH  |  $BLUEPRINT_PATH"
@@ -266,6 +269,7 @@ run_calibrate() {  # $1 = conditions, $2 = out-dir
   local extra=()
   [ -n "$WORKERS" ]     && extra+=(--workers "$WORKERS")
   [ -n "$WALL_TARGET" ] && extra+=(--wall-target "$WALL_TARGET")
+  if [ "$CRN_VALUE" = "true" ]; then extra+=(--crn-value --crn-worlds "$CRN_WORLDS"); else extra+=(--internal-value); fi
   python -m evaluation.calibrate run \
     --blueprint-path "$BLUEPRINT_PATH" \
     --lut-path "$LUT_PATH" \

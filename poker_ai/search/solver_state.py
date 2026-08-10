@@ -109,6 +109,16 @@ class SolverConfig:
     # ordering and the ceiling are correct (previously flat 3000 + a 5_000 cap flattened
     # both).
     mccfr_per_player_by_street: tuple = (3000, 6000, 4000, 3000)  # pf, flop, turn, river
+    # DBR-only MCCFR budget multiplier.  DBR's tail-driven exploitation objective inflates
+    # the sampled-value variance (opponent_modeling §5.5 / [[reference_vector_vs_mccfr_variance]]),
+    # so it needs more iterations than vanilla to reach the same VALUE convergence — the
+    # 2026-08 calibration showed the played DBR strategy still disagreeing by ~BB at the
+    # base budget.  Applied to ``base[street] * n_live`` ONLY when the subgame carries
+    # opponent models (``ctx.models`` non-empty), so the vanilla/paper baseline is
+    # byte-for-byte untouched (no models ⇒ inert).  Still clamped to ``max_iterations``
+    # (30k), so the deepest cell — 4-way flop, ``6000*4*1.5 = 36000`` — caps at the 30k
+    # ceiling (+25%) while shallower cells take the full scale (e.g. HU flop 12k → 18k).
+    dbr_mccfr_scale: float = 1.5
     # OX-Search safety parameter β (Approach B, PO-CES-HU; Ge et al. ICML 2024,
     # Thm 4.6: ``exp(σ₂ˢ) − exp(σ) ≤ Δ/β``).  ``None`` → OX-Search is OFF and the
     # vector solve is byte-for-byte the vanilla/DBR path (no gadget root, no opt-out

@@ -89,5 +89,10 @@ def iteration_budget(ctx: SubgameContext, cfg: SolverConfig,
         # (0=preflop … 3=river).
         n_live = max(2, len(ctx.ranges))
         budget = cfg.mccfr_per_player_by_street[ctx.street_at_root] * n_live
+        # DBR needs more iterations than vanilla for the same VALUE convergence (its
+        # tail-driven objective inflates the sampled-value variance), so scale UP only
+        # when the subgame carries opponent models.  Vanilla (no models) is byte-untouched.
+        if getattr(ctx, "models", None):
+            budget = budget * float(getattr(cfg, "dbr_mccfr_scale", 1.0))
 
     return max(1, min(int(budget), int(cfg.max_iterations)))

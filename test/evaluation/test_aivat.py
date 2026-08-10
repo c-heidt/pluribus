@@ -312,3 +312,20 @@ class TestAcceptance:
         b = _run(tmp_path, aivat=True, run_id="R2", n=20, seed=8)
         # Same seed → identical aivat_value and delta (deterministic AIVAT sampling).
         assert [(r[1], r[2]) for r in a] == [(r[1], r[2]) for r in b]
+
+
+# --------------------------------------------------------------------------- #
+# AIVAT runout-coverage knob: max_runout_cards
+# --------------------------------------------------------------------------- #
+
+def test_aivat_max_runout_cards_default_unchanged():
+    from evaluation.aivat import _MAX_RUNOUT_CARDS
+    acc = AivatAccumulator(0, object(), np.random.default_rng(0))
+    assert acc._max_runout_cards == _MAX_RUNOUT_CARDS == 2   # played-game default
+
+    class _T:
+        terminal_board_len = 0                              # pre-flop all-in (5 to come)
+    assert acc._cheap_runout(_T()) is False                 # skipped at default
+
+    acc5 = AivatAccumulator(0, object(), np.random.default_rng(0), max_runout_cards=5)
+    assert acc5._cheap_runout(_T()) is True                 # covered when raised

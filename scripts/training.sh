@@ -2,10 +2,21 @@
 # Slurm submission script to run training via the package CLI.
 # Usage:
 #   # Base blueprint (default):
-#   sbatch --export=ALL,WORKSPACE=/path/to/ws training.sh
+#   sbatch --export=ALL,WORKSPACE=/path/to/ws,GIT_REF=$(git rev-parse HEAD) training.sh
 #
 #   # Biased blueprint warm-started from a finished base run:
-#   sbatch --export=ALL,WORKSPACE=/path/to/ws,BIAS=fold,WARM_START=/path/to/base training.sh
+#   sbatch --export=ALL,WORKSPACE=/path/to/ws,GIT_REF=$(git rev-parse HEAD),BIAS=fold,WARM_START=/path/to/base training.sh
+#
+# GIT_REF pins the exact code the job runs.  Queued jobs can sit for a while
+# before Slurm actually starts them; without a pin the job just reads
+# PROJECT_DIR's live checkout when it finally starts, so a `git checkout` you
+# ran in PROJECT_DIR in the meantime — for something unrelated — gets trained
+# instead, silently.  The job resolves GIT_REF to a commit and runs out of a
+# private `git worktree` of exactly that commit (torn down at job exit), so
+# whatever you do in PROJECT_DIR afterward can never affect it.  Pass a
+# resolved SHA (as above, via `git rev-parse`) for a true, immutable pin; a
+# branch/tag name also works but is resolved when the job *starts*, so
+# commits pushed to it before then would still be picked up.
 # Propagate the submission environment directly instead of letting SLURM fall
 # back to login-shell retrieval (`--get-user-env`), which times out against
 # GetEnvTimeout on an overloaded login node and yields
@@ -30,11 +41,58 @@ set -euo pipefail
 
 # User-configurable
 CONDA_ENV=${CONDA_ENV:-pluribus}
+# PROJECT_DIR is only the SOURCE repo now — where GIT_REF is resolved from and
+# where logs/ lives.  The job itself runs out of a pinned worktree (CODE_DIR,
+# set up below), not PROJECT_DIR directly — see the GIT_REF note above.
 PROJECT_DIR=${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}
 if [ -z "${WORKSPACE:-}" ]; then
   echo "ERROR: WORKSPACE is not set. Export WORKSPACE=/path/to/workspace before submitting (e.g. sbatch --export=ALL,WORKSPACE=...)." >&2
   exit 1
 fi
+if [ -z "${GIT_REF:-}" ]; then
+  echo "ERROR: GIT_REF is not set. Pin the exact commit this job trains, e.g.:" >&2
+  echo "  sbatch --export=ALL,WORKSPACE=...,GIT_REF=\$(git rev-parse HEAD) training.sh" >&2
+  echo "A branch/tag name also works but is resolved when the job STARTS, not when" >&2
+  echo "you submit it — pass a resolved SHA for a true immutable pin." >&2
+  exit 1
+fi
+GIT_REF_SHA=$(git -C "$PROJECT_DIR" rev-parse --verify "${GIT_REF}^{commit}" 2>/dev/null) || {
+  echo "ERROR: GIT_REF='$GIT_REF' does not resolve to a commit in $PROJECT_DIR." >&2
+  exit 1
+}
+
+# Per-job private working directory under TMPDIR.  Cluster doc says always use
+# TMPDIR; whether TMPDIR is per-job or shared across concurrent users on the
+# same node is implementation-defined, so we isolate our staged data under a
+# job-specific subdirectory and tear the whole thing down on exit.  Everything
+# below (the pinned code checkout, LUT, LMDB, any future local artefacts)
+# hangs off WORK_DIR.
+WORK_DIR="${TMPDIR:?cluster requires TMPDIR to be set (do not fall back to /tmp)}/pluribus-${SLURM_JOB_ID:-$$}"
+mkdir -p "$WORK_DIR"
+
+# Cleanup: runs on any exit (clean or signalled).  Removes the job-private
+# working directory (pinned code checkout + any staged LUT/LMDB) and prunes
+# the now-stale worktree registration from PROJECT_DIR/.git — `rm -rf` alone
+# deletes the checkout without telling git, which would otherwise leave a
+# dangling entry under `.git/worktrees/`.  No safety-net rsync to persistent
+# storage — the python ``CheckpointManager`` mirrors the LMDB at every
+# checkpoint while the run is alive, so the persistent state after any crash
+# is exactly the most recent successful checkpoint (chunks + LMDB together).
+# Anything since that checkpoint is at most ``CHECKPOINT_INTERVAL`` of
+# training and is preferable to lose rather than risk a divergence between
+# persistent LMDB and chunks.
+trap '
+  rm -rf "$WORK_DIR"
+  git -C "$PROJECT_DIR" worktree prune >/dev/null 2>&1 || true
+' EXIT
+
+# Pinned code checkout: a private, detached `git worktree` of GIT_REF_SHA.
+# Detached (not a branch checkout) so it never collides with whatever branch
+# PROJECT_DIR or another concurrent job's worktree happens to have out.
+# Everything from here on runs out of CODE_DIR, not PROJECT_DIR.
+echo "Pinning code to commit $GIT_REF_SHA (GIT_REF=$GIT_REF)"
+git -C "$PROJECT_DIR" worktree add --detach "$WORK_DIR/code" "$GIT_REF_SHA"
+CODE_DIR="$WORK_DIR/code"
 
 # Training parameters (cycle-based options are counted in sync cycles = N * sync_interval iterations).
 #
@@ -121,7 +179,8 @@ export PLURIBUS_INDEX_CAPACITY=${PLURIBUS_INDEX_CAPACITY:-"67108864,268435456,26
 # (the golden trace digest is unchanged with kernels on) and fallback-retaining;
 # set 0 to force the pure-Python A/B baseline arm.  REQUIRES the shm index cache
 # above (pure-shm reads, no LMDB fallback) — already default-on — and the extension
-# to be BUILT on this node (preflight below).
+# built in this job's pinned checkout (preflight below builds it automatically
+# if missing).
 export PLURIBUS_CFR_CORE=${PLURIBUS_CFR_CORE:-1}
 # Developer override — normally UNSET.  A comma-separated kernel allow-list (or
 # ``all``) that A/B's individual kernels against their pure-Python oracles in
@@ -147,21 +206,50 @@ echo "Activating conda environment: $CONDA_ENV"
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate $CONDA_ENV
 
-cd "$PROJECT_DIR"
+cd "$CODE_DIR"
 
-# Preflight: when the compiled core is requested it MUST be built on this node.
-# CoreDriver imports the extension in each worker; a missing/stale .so would
-# otherwise surface as a worker crash mid-run. Fail here with the build command
-# instead. (Build once before submitting; do not build inside the job if
-# PROJECT_DIR is shared across concurrent jobs — the .so write would race.)
+# Preflight: when the compiled core is requested it MUST be built in this
+# job's pinned worktree (CODE_DIR) — the extension (.so) is a gitignored
+# build artefact, so a fresh worktree never starts out with one.  Unlike the
+# old shared-PROJECT_DIR model, CODE_DIR is private to this job (nothing else
+# can be building into it concurrently), so building it here is safe; build
+# it now rather than let CoreDriver hit a missing/stale .so as a worker crash
+# mid-run.
+#
+# The check below verifies the resolved module actually lives under CODE_DIR
+# rather than just "did the import succeed" — poker_ai/environment are an
+# editable pip install (a static package -> PROJECT_DIR path map), and that
+# map transparently serves any submodule PathFinder can't find locally
+# (including a not-yet-built .so) from PROJECT_DIR instead of failing.  A
+# bare import check would silently pass by picking up PROJECT_DIR's compiled
+# core — built against whatever .pyx happens to be checked out there, not the
+# pinned commit — and never trigger a build.  That defeats the pin for
+# exactly the piece (the compiled core) that matters most for byte-identical
+# determinism, so don't simplify this back to a plain import check.
 if [ "$PLURIBUS_CFR_CORE" = "1" ]; then
-  if ! python -c "import poker_ai._core._state, poker_ai._core._traverse" 2>/dev/null; then
-    echo "ERROR: PLURIBUS_CFR_CORE=1 but the compiled core is not importable." >&2
-    echo "       Build it on this node first:  python setup.py build_ext --inplace" >&2
-    echo "       (or set PLURIBUS_CFR_CORE=0 to run the pure-Python path)." >&2
-    exit 1
+  _core_built_locally() {
+    python - <<PY
+import sys
+try:
+    import poker_ai._core._state as _s, poker_ai._core._traverse as _t
+except ImportError:
+    sys.exit(1)
+code_dir = "$CODE_DIR"
+sys.exit(0 if (_s.__file__.startswith(code_dir) and _t.__file__.startswith(code_dir)) else 1)
+PY
+  }
+  if ! _core_built_locally; then
+    echo "Compiled core missing from this pinned checkout (or resolving to a stale" >&2
+    echo "copy elsewhere via the editable install) — building locally..."
+    python setup.py build_ext --inplace
+    if ! _core_built_locally; then
+      echo "ERROR: PLURIBUS_CFR_CORE=1 but the compiled core is still not resolving" >&2
+      echo "       to this pinned checkout after building." >&2
+      echo "       (or set PLURIBUS_CFR_CORE=0 to run the pure-Python path)." >&2
+      exit 1
+    fi
   fi
-  echo "Compiled CFR core present and importable."
+  echo "Compiled CFR core present and importable from the pinned checkout."
 fi
 
 # Preflight: the kernels must be ACTUALLY LIVE, not merely requested.  Each
@@ -221,15 +309,6 @@ if [ ! -f "$LUT_PATH/card_info_lut.joblib" ]; then
   echo "       not finish (or this is the legacy pickle-dir layout, unsupported here)." >&2
   exit 1
 fi
-
-# Per-job private working directory under TMPDIR.  Cluster doc says
-# always use TMPDIR; whether TMPDIR is per-job or shared across
-# concurrent users on the same node is implementation-defined, so we
-# isolate our staged data under a job-specific subdirectory and
-# tear the whole thing down on exit.  Everything below (LUT, LMDB,
-# any future local artefacts) hangs off WORK_DIR.
-WORK_DIR="${TMPDIR:?cluster requires TMPDIR to be set (do not fall back to /tmp)}/pluribus-${SLURM_JOB_ID:-$$}"
-mkdir -p "$WORK_DIR"
 
 # Stage the LUT to node-local fast scratch.  Without this, every river
 # memmap lookup that misses the page cache becomes a network-FS round
@@ -309,17 +388,8 @@ if [ "$STAGE_LMDB_LOCALLY" = "true" ]; then
   export PLURIBUS_LMDB_LOCAL_DIR="$LOCAL_LMDB_PATH"
 fi
 
-# Cleanup: runs on any exit (clean or signalled).  Just removes the
-# job-private working directory.  No safety-net rsync to persistent
-# storage — the python ``CheckpointManager`` mirrors the LMDB at
-# every checkpoint while the run is alive, so the persistent state
-# after any crash is exactly the most recent successful checkpoint
-# (chunks + LMDB together).  Anything since that checkpoint is at
-# most ``CHECKPOINT_INTERVAL`` of training and is preferable to lose
-# rather than risk a divergence between persistent LMDB and chunks.
-trap 'rm -rf "$WORK_DIR"' EXIT
-
 echo "Starting training with:"
+echo "  - Git ref:                     $GIT_REF (resolved $GIT_REF_SHA)"
 echo "  - Players:                     $N_PLAYERS"
 echo "  - Max runtime (hours):         $MAX_RUNTIME_HOURS"
 echo "  - Sync interval (iters):       $SYNC_INTERVAL"
