@@ -43,7 +43,9 @@ def _session(n_players, *, run_seed=7):
 
 
 def _expected_cells(n_players):
-    cells = {(0, n_players)}
+    # POST-FLOP only: pre-flop is played from the blueprint, never searched, so it is
+    # not calibrated (see ``calibrate._target_cells``).
+    cells = set()
     for street in (1, 2, 3):
         for n_live in range(2, n_players + 1):
             cells.add((street, n_live))
@@ -100,7 +102,9 @@ def test_regime_routing_hu_turn_river_is_vector():
     assert by_cell[(3, 2)] == "vector"                 # HU river
     assert by_cell[(1, 2)] == "mccfr"                  # HU flop stays MCCFR
     assert by_cell[(2, 3)] == "mccfr"                  # multiway turn
-    assert by_cell[(0, 4)] == "mccfr"                  # preflop
+    assert by_cell[(1, 4)] == "mccfr"                  # multiway flop
+    # Pre-flop is NOT calibrated (played from the blueprint, never searched).
+    assert not any(street == 0 for street, _ in by_cell)
 
 
 def test_vanilla_has_no_models():

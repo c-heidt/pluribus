@@ -1187,13 +1187,18 @@ def build_blueprint_session(
     blueprint_path: str,
     lut_path: str,
     use_decision_free_equity: bool = True,
-    max_iterations: int = 30_000,   # the single absolute per-replica ceiling (not a throttle)
-    # Loose per-search wall backstop.  Sized above the DEEPEST shipped search's wall
-    # cost (multiway flop MCCFR at the 30000 clamp ≈ 786 s under 63-worker load; the
-    # v4 calibration's flop backstop is 993 s) so it never clips the structural budget
-    # in normal operation.  Flat, NOT per-street: the calibration measured only the HU
-    # vector turn/river, and its 16 s river cap would butcher multiway MCCFR river.
-    max_wall_seconds: float = 1000.0,
+    max_iterations: int = 60_000,   # the single absolute per-replica ITERATION ceiling
+    # Absolute per-search WALL cap, one-worker translation of Pluribus's real-time budget:
+    # its 30 s TOP on a 22-core shared-table 6-player MCCFR search = 30*22 = 660 core-seconds
+    # of compute (its ~20 s average = 440).  One worker does that same work in 660 s of wall,
+    # so 660 s is our absolute per-search cap.  4-player is SMALLER than 6-player, so a 4p
+    # search needs no more than the 6p top ⇒ this is a safe ceiling most searches finish well
+    # under (like Pluribus's 20 s avg).  The structural iteration budget stays the PRIMARY
+    # stop; this only backstops a genuinely stuck solve.  The per-regime/per-street TIME
+    # profile is encoded in the ITERATION budgets themselves (below), sized so every cell
+    # finishes inside this cap at measured throughput — vector needs no special cap because
+    # its small structural budgets already stop it at ~6 s (river) / ~150 s (turn).
+    max_wall_seconds: float = 660.0,
     bias_multiplier: float = 5.0,
     pickle_dir: bool = False,
 ) -> EvalSession:

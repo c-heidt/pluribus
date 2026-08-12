@@ -211,6 +211,12 @@ def continuation_value_vector_fast(
             accum += fs.vector_payout_concrete(traverser_seat, combo_cards)
             for tok in reversed(tokens):
                 fs.undo(tok)
+    except ValueError:
+        # A malformed caller contract (e.g. profile missing an acting seat) is a
+        # real bug at the call site, not a fast-path/core hiccup — never mask it as
+        # "fell back to Python", which would silently re-run (and re-raise from) the
+        # Python path on a second RNG draw instead of failing fast on the first.
+        raise
     except Exception:
         logger.warning(
             "continuation_value_vector_fast fell back to the Python rollout after "

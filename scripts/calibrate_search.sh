@@ -26,9 +26,13 @@
 #SBATCH --partition=cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=4:00:00   # 4p full grid: multiway-flop cells (n_live=3,4) dominate — ~2.5h typical, headroom for the deep-rung tail
+#SBATCH --time=2:00:00   # sized for N_LIVE=2,3 (~54 core-h → ~1h wall at MAX_CONCURRENT_MULTIWAY=32). The n_live=4 slice is the expensive one (~116 core-h → ~3.5h; incl. the turn-n4 14.5 it/s outlier): when running N_LIVE=4, raise this to 5:00:00. Full grid would be ~4.5h.
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=380000mb
+# --mem: sized for MAX_CONCURRENT_MULTIWAY=32 (the ≤5h target).  ~32 * ~10 GB/multiway-solve
+# + lights + blueprint ≈ 340 GB (ESTIMATE — VERIFY real RSS on run 1 and tighten; if it comes
+# in well under, lower this for faster scheduling).  ≤5h and low RAM are in tension here: to
+# drop --mem you must lower K, which pushes the wall past 5h (K=16 ≈ 200 GB but ~9.5h).
+#SBATCH --mem=150000mb
 #SBATCH --signal=SIGTERM@120
 #SBATCH --mail-type=All
 
@@ -58,30 +62,43 @@ CONDITIONS=${CONDITIONS:-vanilla,DBR,OX}   # any of: vanilla | DBR | blueprint_o
                                            # different game tree, β must agree → cannot share a solver_cfg with
                                            # vanilla/DBR) and calibrate VECTOR cells only (OX's MCCFR path == vanilla).
                                            # Bare "OX" uses the code-default β (runner.DEFAULT_OX_BETA).
-MODEL_P_MAX=${MODEL_P_MAX:-1.0}            # DBR arm (1.0 = naive best response)
-MODEL_ERROR=${MODEL_ERROR:-0.0}
+# DBR model realism (opponent_modeling.md §3/§6.2).  A calibration on a PERFECT model
+# (error 0.0, p_max 1.0) is condition B1 — the exact-model, unconstrained "unsafe EV
+# ceiling", the sharpest/most-polarised exploitation and NOT what production runs.  We
+# calibrate the production DBR (Approach A) instead: an imperfect model at the default cap.
+MODEL_ERROR=${MODEL_ERROR:-0.2}           # target ℓ1 error of σ̂ vs the true strategy (0=exact; 0.2≈a 10pp
+                                          #   per-infoset action-frequency miss — a good-but-imperfect model;
+                                          #   0.3 is the more conservative choice).  Uniform proxy for the
+                                          #   street-graded realistic profile (low preflop→high river); the
+                                          #   schedule form (schedules.street_error) is not yet on the CLI.
+MODEL_P_MAX=${MODEL_P_MAX:-0.8}           # confidence cap (Approach A default).  1.0 = B1 naive-BR ceiling;
+                                          #   0.8 blends σ̃=c·σ̂+(1−c)·x, de-polarising the exploitation — the
+                                          #   biggest lever on the tail-driven variance we've been chasing.
 WORKERS=${WORKERS:-}                       # empty → SLURM_CPUS_PER_TASK-1 (production)
+MAX_CONCURRENT_MULTIWAY=${MAX_CONCURRENT_MULTIWAY:-32}  # peak-RAM cap: at most this many multiway (≥3 live) MCCFR solves run at once (biggest tables); cheap solves backfill the rest. Wall is heavy-bound ≈ (multiway core-hours ~152)/K → K=32 gives ~4.7h (≤5h). Uncapped (~52 concurrent) would front-load the RAM and likely exceed the node. Empty → no cap. Peak RAM ≈ K*multiway + (WORKERS-K)*light; size --mem to that. Lower K = less RAM but a longer wall (K=16→~9.5h).
 COLLECT_HANDS=${COLLECT_HANDS:-400}
+N_LIVE=${N_LIVE:-2,3}                      # live-player counts to calibrate; empty = all. '2,3' EXCLUDES the deep 4-player lines (~2/3 of the cost incl. the turn-n4 outlier) — run them later with N_LIVE=4. Lossless split: roots are seeded per (street, n_live, k). The grid is POST-FLOP only (preflop is played from the blueprint, never searched).
 PER_CELL_CAP=${PER_CELL_CAP:-4}
 REPS=${REPS:-4}                            # ≥4: averaging over reps lowers the MCCFR value-estimate noise floor
-SPREAD_K=${SPREAD_K:-1.5}                  # spread-relative convergence: bar = max(threshold, SPREAD_K * replica_spread)
+HOT_L1_TOL=${HOT_L1_TOL:-0.10}            # convergence: per-cell budget = smallest rung where MEAN hot_l1 (single-worker strategy self-distance vs its own top budget, averaged over the cell's solves) ≤ this. Cells that never settle are flagged → raise LADDER_HI/MAX.
 LADDER_POINTS=${LADDER_POINTS:-7}          # rungs per cell, clustered around its production budget
 LADDER_LO=${LADDER_LO:-0.5}                # ladder min = LO * production budget (feasible, near convergence)
 LADDER_HI=${LADDER_HI:-2.0}                # ladder top (value-gap REFERENCE) = HI * production budget (>1, above convergence)
-LADDER_MAX=${LADDER_MAX:-50000}            # hard cap on the top rung; 50k gives the deep multiway-flop cells (n4 prod 24k) a full 2xC=48k reference
-THRESHOLDS=${THRESHOLDS:-20,10,5}          # mbb value-gap (metric = hero root EV on the table)
+LADDER_MAX=${LADDER_MAX:-90000}            # hard cap on the top rung.  Prod DBR budgets (×2 scale) reach 40k (flop n4), ladder top = 2×C up to 80k — 90k brackets every cell with headroom (the self-reference the hot_l1 criterion needs)
 COLLECT_ITERS=${COLLECT_ITERS:-64}
-TABLE_POLICY=${TABLE_POLICY:-random}       # random → street/live-count coverage
+TABLE_POLICY=${TABLE_POLICY:-fixed}        # 'fixed' → deterministic table from FIXED_SEATS (no random seat-draw noise across cells); 'random' | 'all_blueprint' also allowed
+FIXED_SEATS=${FIXED_SEATS:-bp_fold,bp_call,bp_raise}  # ONE opponent per exploitable bias class (fold/call/raise) — exactly N_PLAYERS-1 for 4p; 'none'(bp) is the unbiased baseline, no leak to exploit, so it's excluded. Must have N_PLAYERS-1 entries.
+BIAS_MULTIPLIER=${BIAS_MULTIPLIER:-5.0}    # opponent leak strength (biased action prob ×this, renormalized). 1.0=no leak (nothing to exploit); ~20+=near-pure/degenerate (infeasible). 5.0 = established mid-strength (biased action ~2-3× baseline, still mixing).
 RUN_SEED=${RUN_SEED:-0}
 BIG_BLIND=${BIG_BLIND:-100}
 SMALL_BLIND=${SMALL_BLIND:-50}
 STARTING_STACK=${STARTING_STACK:-10000}
 LOW_CARD_RANK=${LOW_CARD_RANK:-2}
 HIGH_CARD_RANK=${HIGH_CARD_RANK:-14}
-WALL_TARGET=${WALL_TARGET:-150}            # per-decision wall budget (s); drives the A/B + flags over-budget cells. 150 is feasible under full-box load (v3: production searches take 40-330s at 8-98 it/s; 30 was unreachable). Set empty to disable.
+WALL_TARGET=${WALL_TARGET:-660}            # per-decision wall budget (s) for the REPORT (flags over-budget cells + the A/B comparison point). 660 = the production safety wall (Pluribus 30s*22-core translated to one worker), matching the 2026-08 budgets (binding cell flop-n4 ~657s). Set empty to disable.
 REGIME_AB_STREETS=${REGIME_AB_STREETS:-turn}  # HU vector-vs-MCCFR A/B streets: turn | flop,turn | none  (flop is SLOW: full-width vector flop ~1.3 it/s)
-CRN_VALUE=${CRN_VALUE:-true}              # true → common-random-numbers root-EV metric on MCCFR cells (each replica evaluates the same fixed card-worlds → sampling noise cancels in replica_spread); false (--internal-value) = raw single-combo value. Matches the CLI default (true).
-CRN_WORLDS=${CRN_WORLDS:-32}              # fixed card-worlds averaged per CRN root value (shared across replicas)
+CRN_VALUE=${CRN_VALUE:-false}            # DIAGNOSTIC ONLY (default off): the budget now comes from hot_l1 self-stability, no value estimate needed. true re-enables the CRN value-gap/replica-spread columns (extra compute).
+CRN_WORLDS=${CRN_WORLDS:-32}              # fixed card-worlds per CRN value estimate (only used when CRN_VALUE=true)
 
 # Permanent-FS destination for the two output files.
 PERM_DIR=${PERM_DIR:-"$WORKSPACE/calibration/$RUN_ID"}
@@ -244,14 +261,16 @@ echo "  - Run id:            $RUN_ID"
 echo "  - Players:           $N_PLAYERS"
 echo "  - Conditions:        $CONDITIONS"
 echo "  - Workers:           ${WORKERS:-(auto = SLURM_CPUS_PER_TASK-1)}"
+echo "  - Max concurrent mw: ${MAX_CONCURRENT_MULTIWAY:-(uncapped)}  (peak-RAM cap on multiway MCCFR solves)"
+echo "  - Live counts:       ${N_LIVE:-(all)}"
 echo "  - CPUs:              ${SLURM_CPUS_PER_TASK:-(unset)}"
 echo "  - Collect hands:     $COLLECT_HANDS  (per-cell cap $PER_CELL_CAP, reps $REPS)"
 echo "  - Ladder:            per-cell [${LADDER_LO}..${LADDER_HI}]x production budget, $LADDER_POINTS pts, cap $LADDER_MAX"
-echo "  - Thresholds (mbb):  $THRESHOLDS"
+echo "  - hot_l1 tol:        $HOT_L1_TOL  (budget = smallest rung with mean hot_l1 ≤ tol)"
 echo "  - Wall target (s):   ${WALL_TARGET:-(disabled)}"
 echo "  - Regime A/B:        $REGIME_AB_STREETS"
 echo "  - CRN root value:    $CRN_VALUE  (worlds $CRN_WORLDS; false = raw internal MCCFR value)"
-echo "  - Table policy:      $TABLE_POLICY"
+echo "  - Table policy:      $TABLE_POLICY  (seats: ${FIXED_SEATS:-n/a}; bias ×$BIAS_MULTIPLIER)"
 echo "  - Search core:       ${PLURIBUS_SEARCH_CORE:-0}"
 echo "  - LUT / blueprint:   $LUT_PATH  |  $BLUEPRINT_PATH"
 echo "  - Output → perm:     $PERM_DIR"
@@ -268,6 +287,7 @@ run_calibrate() {  # $1 = conditions, $2 = out-dir
   mkdir -p "$outdir"
   local extra=()
   [ -n "$WORKERS" ]     && extra+=(--workers "$WORKERS")
+  [ -n "$MAX_CONCURRENT_MULTIWAY" ] && extra+=(--max-concurrent-multiway "$MAX_CONCURRENT_MULTIWAY")
   [ -n "$WALL_TARGET" ] && extra+=(--wall-target "$WALL_TARGET")
   if [ "$CRN_VALUE" = "true" ]; then extra+=(--crn-value --crn-worlds "$CRN_WORLDS"); else extra+=(--internal-value); fi
   python -m evaluation.calibrate run \
@@ -280,14 +300,16 @@ run_calibrate() {  # $1 = conditions, $2 = out-dir
     --collect-hands "$COLLECT_HANDS" \
     --per-cell-cap "$PER_CELL_CAP" \
     --reps "$REPS" \
-    --spread-k "$SPREAD_K" \
+    --hot-l1-tol "$HOT_L1_TOL" \
     --ladder-points "$LADDER_POINTS" \
     --ladder-lo "$LADDER_LO" \
     --ladder-hi "$LADDER_HI" \
     --ladder-max "$LADDER_MAX" \
-    --thresholds "$THRESHOLDS" \
     --collect-iters "$COLLECT_ITERS" \
+    --n-live "$N_LIVE" \
     --table-policy "$TABLE_POLICY" \
+    --fixed-seats "$FIXED_SEATS" \
+    --bias-multiplier "$BIAS_MULTIPLIER" \
     --run-seed "$RUN_SEED" \
     --big-blind "$BIG_BLIND" \
     --small-blind "$SMALL_BLIND" \

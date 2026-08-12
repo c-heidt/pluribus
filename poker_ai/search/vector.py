@@ -214,6 +214,24 @@ class _VectorSolver:
         # gadget mix and adds the CBV_ref-anchored opt-out row (see :meth:`_ox_setup`).
         self._ox = getattr(cfg, "beta", None) is not None
         if self._ox:
+            # Defense in depth for the adaptation-safety guarantee (Thm 4.3): the
+            # in-subgame opponent must be a true regret-matching adversary, with the
+            # DBR model entering ONLY via the reach belief p̂ at the gadget root
+            # (docs/opponent_modeling.md Part II — no confidence/mixture machinery
+            # inside S). `_walk` calls `apply_model_clamp` unconditionally, so a
+            # populated `ctx.models` would silently blend the opponent's in-subgame
+            # strategy toward its model at every interior node, invalidating the
+            # safety proof with no crash. The production driver (runner.py's
+            # `EvalConfig.for_condition`) already rejects OX+model_spec combinations
+            # upstream — this raises here too so the invariant can't be silently
+            # violated by a future/alternate caller that skips that guard.
+            if getattr(ctx, "models", None):
+                raise ValueError(
+                    "OX-Search (cfg.beta set) requires ctx.models to be empty — the "
+                    "gadget's safety guarantee assumes a model-free adversarial "
+                    "opponent inside the subgame; got models for seats "
+                    f"{sorted(ctx.models)}."
+                )
             self._ox_setup()
 
     # ------------------------------------------------------------------

@@ -244,6 +244,16 @@ class SearchAgent:
             hr = self._hand_row(env)
             st = self.last_search.state
             st.legal_at.setdefault(pk, tuple(legal))
+            # `prob` is in `legal`'s (caller/live-env) order; every other reader and
+            # grower of `frozen` (SearchPolicy, SolverState._grow_rows) assumes a
+            # frozen row is in `legal_at[pk]`'s order. The two coincide today because
+            # both are deterministic functions of public state, but that's an
+            # invariant, not a guarantee — fail loudly rather than silently freezing
+            # a probability vector against the wrong action order.
+            assert tuple(legal) == st.legal_at[pk], (
+                f"frozen-row order mismatch at {pk!r}: caller order {legal!r} != "
+                f"legal_at order {st.legal_at[pk]!r}"
+            )
             st.frozen[(pk, hr)] = prob
         return action
 

@@ -240,11 +240,16 @@ cdef class FastState:
         s.n_players = n
         s.small_blind = int(env.small_blind)
         s.big_blind = int(env.big_blind)
-        s._low_card_rank = <int>env._low_card_rank
-        s._high_card_rank = <int>env._high_card_rank
+        # Kernel API boundary: read via PokerEnv's public properties, never its
+        # private attributes directly (the adapter marshals values in; a private
+        # attribute can gain normalization/clamping logic that a private read would
+        # silently bypass, drifting from PokerEnv without any byte-identity test
+        # catching it since a private-vs-private comparison would still agree).
+        s._low_card_rank = <int>env.low_card_rank
+        s._high_card_rank = <int>env.high_card_rank
         # ``None`` at a live decision-node root (the only place a solve constructs
         # a FastState); mirror PokerEnv's captured value defensively otherwise.
-        tbl = getattr(env, "_terminal_board_len", None)
+        tbl = env.terminal_board_len
         s._terminal_board_len = -1 if tbl is None else <int>tbl
 
         cdef int seat, k, si
@@ -263,7 +268,7 @@ cdef class FastState:
         board = [int(c) for c in env.deck.board_runout(5)]
         for k in range(5):
             s.board[k] = <int>board[k]
-        holes = [[int(c) for c in p._cards] for p in env.players]
+        holes = [[int(c) for c in p.cards] for p in env.players]
         for seat in range(n):
             s.hole[seat][0] = <int>holes[seat][0]
             s.hole[seat][1] = <int>holes[seat][1]

@@ -56,7 +56,10 @@ class SolverConfig:
     # it silently throttles every HU-flop / multiway search — the pre-2026-08 bug, where
     # a 5_000 cap capped them regardless of the per-street numbers below.  It doubles as
     # the pinned iteration count when ``auto_budget`` is off (tests/digests).
-    max_iterations: int = 30_000  # the one ceiling; a true bound, not a throttle
+    max_iterations: int = 60_000  # the one ceiling; a true bound, not a throttle (raised
+                                  # 2026-08 from 30k so the DBR deep-cell scale below can
+                                  # actually reach depth on HU flop / multiway; 4p vanilla
+                                  # is unaffected — its budgets are all ≤24k)
     # LOOSE per-search wall backstop, NOT the primary stop: a single flat cap sized
     # above the DEEPEST shipped search's wall cost so it does not clip the iteration
     # budget in normal operation — it only catches a genuinely stuck subgame.  Flat (not
@@ -64,11 +67,15 @@ class SolverConfig:
     # tiny river cap would butcher multiway river MCCFR; the eval path sizes this to the
     # multiway-flop worst case (~1000 s, see evaluation/runner.py).
     max_wall_seconds: float = 300.0
-    # Linear-CFR discount cadence.  Kept well below the per-replica iteration count
-    # of the *expensive* subgames (multiway flop ~285/replica) so the discount fires
-    # several times there — at the old 100 it barely engaged on those (and never at
-    # n_rollouts=8, ~50 iters/replica).  Cheap late subgames just discount more often.
-    discount_interval: int = 10
+    # Linear-CFR discount cadence.  Each firing scales EVERY vregret/vstrat matrix
+    # (O(table)), so under the 2026-08 structural budgets (10k-40k iters/solve) the old
+    # cadence of 10 fired 1000-4000 times per solve — a nontrivial runtime slice for a
+    # weighting profile that barely differs at these depths.  100 keeps the Linear-CFR
+    # weighting (piecewise k/(k+1), k = t/interval) with 10-400 firings per solve; even
+    # the smallest structural budget (vector river 850) still discounts 8 times.
+    # ⚠ Results-affecting (different discount points → different tables): golden digests
+    # regenerated for this change; the equilibrium oracle is the correctness gate.
+    discount_interval: int = 100
     # Structural iteration budget (§6.5) — the *primary* stop.  A real subgame is far
     # too large for any single sampled replica to reach a tight equilibrium online, so
     # there is **no online convergence test**; instead the per-subgame iteration count
@@ -108,17 +115,26 @@ class SolverConfig:
     # so the absolutes await a best-response-gap rerun on a deeper ladder — but the
     # ordering and the ceiling are correct (previously flat 3000 + a 5_000 cap flattened
     # both).
-    mccfr_per_player_by_street: tuple = (3000, 6000, 4000, 3000)  # pf, flop, turn, river
-    # DBR-only MCCFR budget multiplier.  DBR's tail-driven exploitation objective inflates
-    # the sampled-value variance (opponent_modeling §5.5 / [[reference_vector_vs_mccfr_variance]]),
-    # so it needs more iterations than vanilla to reach the same VALUE convergence — the
-    # 2026-08 calibration showed the played DBR strategy still disagreeing by ~BB at the
-    # base budget.  Applied to ``base[street] * n_live`` ONLY when the subgame carries
-    # opponent models (``ctx.models`` non-empty), so the vanilla/paper baseline is
-    # byte-for-byte untouched (no models ⇒ inert).  Still clamped to ``max_iterations``
-    # (30k), so the deepest cell — 4-way flop, ``6000*4*1.5 = 36000`` — caps at the 30k
-    # ceiling (+25%) while shallower cells take the full scale (e.g. HU flop 12k → 18k).
-    dbr_mccfr_scale: float = 1.5
+    #
+    # TIME-FEASIBILITY (2026-08): the per-regime/per-street time profile lives HERE, in the
+    # iteration budgets — ``max_wall_seconds`` is a pure safety knob, not a schedule.  Sized
+    # so the worst DBR cell (base * n_live * dbr_mccfr_scale) finishes inside ~660 s of
+    # single-worker wall at the measured v6 throughputs (Pluribus's 30 s * 22-core top =
+    # 660 core-seconds/search is the feasibility reference; 4p < 6p).  Flop base 5000:
+    # 4-way flop 40k @ ~61 it/s = ~660 s (the binding cell); HU flop 20k = ~560 s.
+    # ⚠ turn n_live=4 measured 14.5 it/s in v6 (~5x slower than turn n3 — suspect outlier);
+    # if that verifies, its 32k budget wall-trims at 660 s (~9.6k iters) and the turn base
+    # needs its own revisit — do NOT gut turn n2/n3 for one unverified number.
+    mccfr_per_player_by_street: tuple = (3000, 5000, 4000, 3000)  # pf, flop, turn, river
+    # DBR-only MCCFR budget multiplier.  DBR's tail-driven exploitation objective needs
+    # more iterations than vanilla to reach depth (opponent_modeling §5.5 /
+    # [[reference_vector_vs_mccfr_variance]]) — the 2026-08 calibration showed the DBR HU-flop
+    # strategy still moving (hot_l1 0.23) at 28k.  3.0 made calibration too expensive to fit
+    # a 5 h wall / node RAM, so 2.0 is the compromise.  Applied to ``base[street] * n_live``
+    # ONLY when the subgame carries opponent models (``ctx.models`` non-empty), so the
+    # vanilla/paper baseline is byte-for-byte untouched (no models ⇒ inert).  Clamped to
+    # ``max_iterations`` (60k): HU flop 10k→20000, preflop-4 12k→24000, 4-way flop 20k→40000.
+    dbr_mccfr_scale: float = 2.0
     # OX-Search safety parameter β (Approach B, PO-CES-HU; Ge et al. ICML 2024,
     # Thm 4.6: ``exp(σ₂ˢ) − exp(σ) ≤ Δ/β``).  ``None`` → OX-Search is OFF and the
     # vector solve is byte-for-byte the vanilla/DBR path (no gadget root, no opt-out

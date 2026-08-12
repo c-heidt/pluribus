@@ -60,7 +60,7 @@ def test_hu_flop_uses_mccfr_budget():
     ``_select_regime``."""
     cfg = _cfg(auto_budget=True, max_iterations=1_000_000)
     ctx = _ctx_for(1, 2)                                     # HU flop
-    assert iteration_budget(ctx, cfg) == 12000               # flop base 6000 * 2 live
+    assert iteration_budget(ctx, cfg) == 10000               # flop base 5000 * 2 live
 
 
 @pytest.mark.parametrize("n_players,expected", [(2, 6000), (3, 9000), (6, 18000)])
@@ -74,10 +74,10 @@ def test_mccfr_budget_scales_with_players(n_players, expected):
 
 def test_mccfr_clamped_to_max_iterations():
     """``max_iterations`` is the single ceiling: a deep multiway flop that would request
-    more (flop base 6000 * 20 live = 120000) is clamped down to it."""
+    more (flop base 5000 * 20 live = 100000) is clamped down to it."""
     cfg = _cfg(auto_budget=True, max_iterations=30_000)
     assert iteration_budget(_ctx_for(0, 2), cfg) == 6000           # 3000 * 2, unclamped
-    assert iteration_budget(_ctx_for(1, 20), cfg) == 30_000        # 6000 * 20 → ceiling
+    assert iteration_budget(_ctx_for(1, 20), cfg) == 30_000        # 5000 * 20 → ceiling
 
 
 def test_mccfr_budget_is_per_street():
@@ -105,18 +105,19 @@ def test_dbr_budget_scale_is_models_only():
     """The ``dbr_mccfr_scale`` lifts the MCCFR budget ONLY when the subgame carries
     opponent models (DBR); vanilla (no models) is byte-for-byte the paper baseline."""
     cfg = _cfg(auto_budget=True, max_iterations=1_000_000, dbr_mccfr_scale=1.5)
-    # HU flop: vanilla 6000*2 = 12000; DBR ×1.5 = 18000.
-    assert iteration_budget(_ctx_for(1, 2), cfg) == 12000
-    assert iteration_budget(_ctx_with_models(1, 2), cfg) == 18000
+    # HU flop: vanilla 5000*2 = 10000; DBR ×1.5 = 15000.
+    assert iteration_budget(_ctx_for(1, 2), cfg) == 10000
+    assert iteration_budget(_ctx_with_models(1, 2), cfg) == 15000
     # A scale of 1.0 (or the vanilla context) leaves the budget identical.
     cfg1 = _cfg(auto_budget=True, max_iterations=1_000_000, dbr_mccfr_scale=1.0)
-    assert iteration_budget(_ctx_with_models(1, 2), cfg1) == 12000
+    assert iteration_budget(_ctx_with_models(1, 2), cfg1) == 10000
 
 
 def test_dbr_budget_scale_still_clamped_to_ceiling():
     """The DBR scale never escapes the single ``max_iterations`` ceiling: a 4-way flop
-    (6000*4 = 24000, ×1.5 = 36000) caps at 30000."""
-    cfg = _cfg(auto_budget=True, max_iterations=30_000, dbr_mccfr_scale=1.5)
+    (6000*4 = 24000, ×1.5 = 36000 with an explicit pre-2026-08 base) caps at 30000."""
+    cfg = _cfg(auto_budget=True, max_iterations=30_000, dbr_mccfr_scale=1.5,
+               mccfr_per_player_by_street=(3000, 6000, 4000, 3000))
     assert iteration_budget(_ctx_with_models(1, 4), cfg) == 30_000
     assert iteration_budget(_ctx_for(1, 4), cfg) == 24_000          # vanilla, unclamped
 

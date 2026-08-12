@@ -241,19 +241,31 @@ def collect_roots(
 # --------------------------------------------------------------------------- #
 # Phase 1' — CONSTRUCT roots directly (deterministic, full cell coverage)
 # --------------------------------------------------------------------------- #
-def _target_cells(n_players: int) -> List[Tuple[int, int]]:
+def _target_cells(n_players: int,
+                  n_live_filter: Optional[Sequence[int]] = None) -> List[Tuple[int, int]]:
     """The ``(street, n_live)`` grid the sweep should cover for an ``n_players`` game.
 
-    Pre-flop starts with everyone in (one cell at ``n_live == n_players``); each
-    post-flop street can be reached with any live count from heads-up up to the full
+    **POST-FLOP ONLY.**  Pre-flop is not calibrated: the bot plays it from the blueprint
+    (Pluribus does the same — search starts on the flop), so a pre-flop search budget
+    would never be used.  ``mccfr_per_player_by_street[0]`` therefore keeps its default
+    and is simply never measured.
+
+    Each post-flop street can be reached with any live count from heads-up up to the full
     table.  The regime (vector vs mccfr) is *derived* per constructed root, not chosen
     here, so ``(turn, 2)`` becomes a vector cell and ``(flop, 3)`` an mccfr cell.
+
+    ``n_live_filter`` (``None`` ⇒ all) restricts the grid to those live counts, so an
+    expensive slice can be split into its own run — e.g. ``[2, 3]`` now and ``[4]``
+    later.  Splitting is LOSSLESS: each root's seed is keyed on ``(street, n_live, k)``
+    (see :func:`construct_roots`), not on its position in this list, so a cell yields
+    byte-identical roots whether or not the other cells ran alongside it.
     """
-    cells = [(0, n_players)]
-    for street in (1, 2, 3):                       # flop, turn, river
+    keep = None if n_live_filter is None else {int(x) for x in n_live_filter}
+    cells = []
+    for street in (1, 2, 3):                       # flop, turn, river (NO pre-flop)
         for n_live in range(2, n_players + 1):
             cells.append((street, n_live))
-    return cells
+    return [c for c in cells if keep is None or c[1] in keep]
 
 
 def _uniform_range(env) -> np.ndarray:
@@ -362,6 +374,7 @@ def construct_roots(
     *,
     per_cell: int,
     run_seed: int,
+    n_live_filter: Optional[Sequence[int]] = None,
 ) -> Dict[Cell, List[RootSample]]:
     """CONSTRUCT ``per_cell`` roots for EVERY ``(street, n_live)`` cell, deterministically.
 
@@ -377,7 +390,7 @@ def construct_roots(
     :class:`RootSample` shape as :func:`collect_roots`, so the sweep is unchanged."""
     n_players = int(cfg.n_players)
     out: Dict[Cell, List[RootSample]] = defaultdict(list)
-    for street, n_live in _target_cells(n_players):
+    for street, n_live in _target_cells(n_players, n_live_filter):
         for k in range(per_cell):
             idx = (street * (n_players + 1) + n_live) * per_cell + k
             try:
@@ -663,35 +676,42 @@ def _sweep_process(spec_idx: int, state: dict, shared: dict) -> None:
     samples, force_regime = shared["jobs"][j]
     s = samples[si]
     seed = shared["base_seed"] + 1000 * si + rep
-    env_t = copy.deepcopy(s.env)
-    ctx_t = dataclasses.replace(s.ctx, rng=np.random.default_rng(seed))
-    cfg_t = dataclasses.replace(
-        shared["prod_cfg"], auto_budget=False, max_iterations=int(t),
-        max_wall_seconds=1e9,
-    )
-    res = solve(env_t, ctx_t, cfg_t, regime_override=force_regime)
-    # Root value for the convergence metric.  The vector regime's internal value is
-    # enumeration-EXACT (near-zero variance), so keep it; the MCCFR regime's is a noisy
-    # single-combo value against sampled opponents, so replace it with the CRN estimate
-    # (opt-in ``crn_value``) — same root EV, but every replica evaluates the same fixed
-    # card-worlds so the sampling noise is common-mode and collapses replica_spread.
-    row_regime = force_regime if force_regime is not None else s.regime
-    root_value = res.root_value
-    if shared.get("crn_value") and str(row_regime) == "mccfr":
-        # CRN seed keyed to the ROOT (sample) only — identical across reps AND budgets,
-        # so every replica evaluates the same cards and the sampling noise cancels in
-        # replica_spread / the value gap.  The vector cells keep their exact internal value.
-        cv = crn_root_value(
-            res, env_t, ctx_t,
-            worlds=int(shared["crn_worlds"]),
-            seed=(int(shared["base_seed"]) + 1) * 100003 + si,
+    # Peak-RAM cap: multiway MCCFR solves hold the largest vregret/vstrat tables, so a
+    # semaphore bounds how many run at once (the cheap solves keep the other cores busy).
+    # ``None`` ⇒ no cap (every worker free-runs, the old behaviour).
+    sem = shared.get("mw_sem")
+    heavy = sem is not None and spec_idx in shared.get("heavy_idx", frozenset())
+    if heavy:
+        sem.acquire()
+    try:
+        env_t = copy.deepcopy(s.env)
+        ctx_t = dataclasses.replace(s.ctx, rng=np.random.default_rng(seed))
+        cfg_t = dataclasses.replace(
+            shared["prod_cfg"], auto_budget=False, max_iterations=int(t),
+            max_wall_seconds=1e9,
         )
-        if cv is not None:
-            root_value = cv
-    state["results"].append((
-        j, si, rep, int(t), _root_sigma(res, s), root_value,
-        int(res.iterations_run), float(res.wall_seconds), str(res.stop_reason),
-    ))
+        res = solve(env_t, ctx_t, cfg_t, regime_override=force_regime)
+        # Root value for the convergence metric — DIAGNOSTIC only now (the budget comes from
+        # hot_l1 self-stability).  The vector regime's internal value is enumeration-exact;
+        # the MCCFR regime's is a noisy single-combo value, optionally replaced by the CRN
+        # estimate (``crn_value``, off by default) for the diagnostic value-gap column.
+        row_regime = force_regime if force_regime is not None else s.regime
+        root_value = res.root_value
+        if shared.get("crn_value") and str(row_regime) == "mccfr":
+            cv = crn_root_value(
+                res, env_t, ctx_t,
+                worlds=int(shared["crn_worlds"]),
+                seed=(int(shared["base_seed"]) + 1) * 100003 + si,
+            )
+            if cv is not None:
+                root_value = cv
+        state["results"].append((
+            j, si, rep, int(t), _root_sigma(res, s), root_value,
+            int(res.iterations_run), float(res.wall_seconds), str(res.stop_reason),
+        ))
+    finally:
+        if heavy:
+            sem.release()
 
 
 def _sweep_teardown(state: dict):
@@ -708,6 +728,7 @@ def sweep_jobs(
     big_blind: int,
     crn_value: bool = False,
     crn_worlds: int = 32,
+    max_concurrent_multiway: Optional[int] = None,
 ) -> List[SweepRow]:
     """Solve EVERY ``(job, sample, rep, budget)`` in ONE core-parallel pool.
 
@@ -750,10 +771,45 @@ def sweep_jobs(
             thr *= 2.0 / int(cell[3])  # multiway is slower per iteration
         return t / max(1e-6, thr)
     all_specs.sort(key=_spec_cost, reverse=True)
+
+    def _is_multiway(spec):  # the RAM-heavy solves: multiway (>=3 live) MCCFR
+        j = spec[0]
+        cell = jobs[j]["cell"]
+        regime = jobs[j].get("force_regime") or cell[1]
+        return regime == "mccfr" and int(cell[3]) >= 3
+
+    # Peak-RAM cap.  Multiway MCCFR holds the biggest tables; front-loading (LPT) makes ALL
+    # workers grab them at once — the RAM spike.  With a cap we (1) spread the heavy specs
+    # evenly through the schedule so cheap solves stay available to backfill idle cores, and
+    # (2) gate the heavy solves through a semaphore so at most K run at once.  Peak RAM then
+    # ≈ K * (multiway solve) + (W-K) * (light solve), decoupled from the worker count — you
+    # keep throughput but request far less --mem.  ``None`` ⇒ no cap (unchanged behaviour).
+    mw_sem = None
+    heavy_idx: frozenset = frozenset()
+    if max_concurrent_multiway is not None:
+        heavy = [s for s in all_specs if _is_multiway(s)]
+        light = [s for s in all_specs if not _is_multiway(s)]
+        if heavy and light:
+            stride = max(1, len(light) // len(heavy))
+            ordered, li = [], 0
+            for hs in heavy:
+                ordered.extend(light[li:li + stride]); li += stride
+                ordered.append(hs)
+            ordered.extend(light[li:])
+            all_specs = ordered
+        heavy_idx = frozenset(i for i, s in enumerate(all_specs) if _is_multiway(s))
+        k = max(1, int(max_concurrent_multiway))
+        if heavy_idx:
+            import multiprocessing as _mp
+            try:
+                mw_sem = _mp.get_context("fork").Semaphore(k)
+            except ValueError:  # no fork (non-POSIX) — cap is a no-op there
+                mw_sem = None
     shared = {
         "jobs": [(job["samples"], job.get("force_regime")) for job in jobs],
         "prod_cfg": prod_cfg, "base_seed": int(base_seed), "all_specs": all_specs,
         "crn_value": bool(crn_value), "crn_worlds": int(crn_worlds),
+        "mw_sem": mw_sem, "heavy_idx": heavy_idx,
     }
     payloads = run_index_pool(
         n_workers=min(int(pool_workers), len(all_specs)) or 1,
@@ -831,9 +887,9 @@ def sweep_jobs(
 class CellSummary:
     cell: Cell
     ladder: List[int]
-    mean_value_gap_mbb: Dict[int, float]      # PRIMARY: value on the table (mbb) per budget
-    mean_hot_l1: Dict[int, float]             # hot-action L1 per budget (diagnostic)
-    argmax_stability: Dict[int, float]        # P(top action == reference) per budget
+    mean_value_gap_mbb: Dict[int, float]      # DIAGNOSTIC: value on the table (mbb) per budget
+    mean_hot_l1: Dict[int, float]             # PRIMARY: mean hot-action L1 vs own top budget per budget
+    argmax_stability: Dict[int, float]        # P(top action == reference) per budget (diagnostic)
     mean_l1: Dict[int, float]                 # legacy full-policy L1 per budget
     mean_wall: Dict[int, float]               # seconds at `workers`
     throughput_it_s: float                    # per-replica it/s at the top budget
@@ -842,23 +898,37 @@ class CellSummary:
     # averaged over samples.  A LOW value gap is only trustworthy convergence if THIS is
     # also small — for a no-reference cell (HU flop / multiway, self-referenced gap) it is
     # the sole check that the flattened value is genuine, not a Monte-Carlo noise floor.
-    replica_spread_mbb: float
-    # Effective convergence bar (mbb) = max(threshold, spread_k * replica_spread): the gap
-    # a cell must fall under to count as converged, raised to the noise floor so an
-    # unreachable sub-noise absolute threshold does not read as "never converged".
-    noise_floor_mbb: float
-    suggested: Dict[str, Optional[int]]       # mbb threshold -> smallest converged budget
+    replica_spread_mbb: float                 # DIAGNOSTIC ONLY (no longer drives the budget)
+    # PRIMARY OUTPUT: smallest single-worker budget at which the strategy has stopped moving
+    # (worst-case hot_l1 <= tol), EXCLUDING the top reference rung.  ``None`` ⇒ not converged
+    # within the ladder ⇒ raise LADDER_HI/MAX.  See :func:`summarize_cell`.
+    suggested_budget: Optional[int]
+    converged: bool                           # False ⇒ ladder too short (see suggested_budget)
+    hot_l1_tol: float
     n_samples: int
     workers: int
 
 
-def _first_below(ladder: Sequence[int], curve: Mapping[int, float], thr: float) -> Optional[int]:
-    """Smallest ladder budget whose mean value gap is below ``thr`` (mbb).
+def _first_at_or_below(
+    ladder: Sequence[int], curve: Mapping[int, float], tol: float
+) -> Optional[int]:
+    """Smallest ladder budget whose ``curve`` value is <= ``tol``.
 
-    ``ladder`` here EXCLUDES the reference (top) budget: the gap at the reference is
-    trivially 0 (it is compared against itself), so a cell that only "converges"
-    there has not actually converged — it returns ``None`` (unresolved), signalling
-    that ``--max-iters`` should be raised.
+    ``ladder`` here EXCLUDES the reference (top) budget: the self-distance at the reference
+    is trivially 0 (compared against itself), so a cell that only "settles" there has not
+    actually converged — returns ``None`` (unresolved), signalling that the ladder top
+    must be raised.
+    """
+    for t in ladder:
+        v = curve.get(t, float("nan"))
+        if not np.isnan(v) and v <= tol:
+            return t
+    return None
+
+
+def _first_below(ladder: Sequence[int], curve: Mapping[int, float], thr: float) -> Optional[int]:
+    """Smallest ladder budget whose value gap is strictly below ``thr`` (mbb) — DIAGNOSTIC
+    only now; the production budget comes from :func:`_first_at_or_below` on ``mean_hot_l1``.
     """
     for t in ladder:
         v = curve.get(t, float("nan"))
@@ -873,8 +943,13 @@ def _mean_ignoring_nan(vals: Sequence[float]) -> float:
 
 
 def summarize_cell(cell: Cell, rows: Sequence[SweepRow],
-                   thresholds: Sequence[float], big_blind: int = 100,
-                   spread_k: float = 1.5) -> CellSummary:
+                   hot_l1_tol: float = 0.10, big_blind: int = 100) -> CellSummary:
+    """Per-cell single-worker budget = smallest rung at which the strategy has stopped
+    moving.  The signal is MEAN ``hot_l1`` (each solve's hot-action strategy vs its OWN
+    top-budget strategy) averaged over the cell's solves.  Value gap / replica spread /
+    argmax are kept as diagnostics only; they no longer pick the budget (value is
+    payoff-leverage-noisy on deep cells, and replica spread is reproducibility, not
+    convergence)."""
     ladder = sorted({r.per_replica for r in rows})
     gap_t = defaultdict(list)
     hot_t = defaultdict(list)
@@ -900,9 +975,7 @@ def summarize_cell(cell: Cell, rows: Sequence[SweepRow],
     per_rep_it_s = (t_top / top_wall) if top_wall > 0 else float("nan")
     pooled_it_s = (float(np.mean(pooled_t[t_top])) / top_wall) if top_wall > 0 else float("nan")
     n_samples = len({r.sample for r in rows})
-    # Cross-replica disagreement at the top budget: within-sample std of the hero root
-    # value across reps, averaged over samples (isolates MCCFR replica noise from the real
-    # between-root spread).  Needs ≥2 reps to be defined.
+    # DIAGNOSTIC: top-budget cross-rep root-value std (no longer used to pick the budget).
     by_sample_val: Dict[int, List[float]] = defaultdict(list)
     for r in rows:
         if r.per_replica == t_top and not np.isnan(r.root_value):
@@ -910,24 +983,18 @@ def summarize_cell(cell: Cell, rows: Sequence[SweepRow],
     within = [float(np.std(v, ddof=1)) for v in by_sample_val.values() if len(v) >= 2]
     replica_spread_mbb = (float(np.mean(within)) / big_blind * 1000.0
                           if within else float("nan"))
-    # Convergence bar is SPREAD-RELATIVE: a value gap below an absolute mbb threshold is
-    # unreachable when the Monte-Carlo noise floor exceeds it (an MCCFR cell with a 96-mbb
-    # replica spread can never dip under 10 mbb), so the effective bar is
-    # ``max(threshold, spread_k * replica_spread)`` — "gap has fallen into the noise".  For
-    # a deterministic cell (river vector, spread≈0) it collapses back to the absolute
-    # threshold.  The suggestion search excludes the reference (top) budget (gap 0 there by
-    # construction, so "converged only at the reference" == did not converge).
+    # BUDGET: smallest rung (excluding the top reference) where the MEAN single-worker
+    # strategy has settled to within ``hot_l1_tol`` of its own top budget.  None ⇒ the
+    # strategy is still moving at the last real rung ⇒ ladder too short (raise LADDER_HI/MAX).
     below_ref = ladder[:-1]
-    noise_floor = (spread_k * replica_spread_mbb
-                   if not np.isnan(replica_spread_mbb) else 0.0)
-    suggested = {f"{thr:g}": _first_below(below_ref, mean_gap, max(float(thr), noise_floor))
-                 for thr in thresholds}
+    suggested_budget = _first_at_or_below(below_ref, mean_hot, float(hot_l1_tol))
     return CellSummary(
         cell=cell, ladder=ladder, mean_value_gap_mbb=mean_gap, mean_hot_l1=mean_hot,
         argmax_stability=amatch, mean_l1=mean_l1, mean_wall=mean_wall,
         throughput_it_s=per_rep_it_s, pooled_it_s=pooled_it_s,
-        replica_spread_mbb=replica_spread_mbb, noise_floor_mbb=noise_floor,
-        suggested=suggested, n_samples=n_samples, workers=w,
+        replica_spread_mbb=replica_spread_mbb,
+        suggested_budget=suggested_budget, converged=suggested_budget is not None,
+        hot_l1_tol=float(hot_l1_tol), n_samples=n_samples, workers=w,
     )
 
 
@@ -947,24 +1014,22 @@ def _production_regime(street: int, n_live: int) -> str:
     return "vector" if (int(n_live) == 2 and int(street) in (2, 3)) else "mccfr"
 
 
-def suggest_config(summaries: Sequence[CellSummary], *, threshold: float,
-                   default_mccfr_base: Tuple[int, int, int, int] = (3000, 6000, 4000, 3000),
+def suggest_config(summaries: Sequence[CellSummary],
+                   default_mccfr_base: Tuple[int, int, int, int] = (3000, 5000, 4000, 3000),
                    default_vector: Tuple[int, int, int] = (1500, 1000, 500),
                    ) -> Dict[str, object]:
     """Fold per-cell suggested budgets into a ``SolverConfig`` budget block.
 
-    Vector per street comes from the heads-up vector cells.  MCCFR ``base[street]`` is
-    the per-live-player budget: the suggested per-replica budget divided by the cell's
-    live-player count (production budget is ``base * n_live``), taken as the **max** over
-    live-player counts so the slowest-converging live-count is covered, rounded up.
-    Cells with no converged suggestion at ``threshold`` (mbb value gap) keep the current
-    default and are flagged.
+    Each cell's ``suggested_budget`` is the smallest single-worker budget at which the
+    strategy has stopped moving (worst-case ``hot_l1 <= tol``).  Vector per street comes
+    from the heads-up vector cells.  MCCFR ``base[street]`` is the per-live-player budget:
+    the suggested per-replica budget divided by the cell's live-player count (production
+    budget is ``base * n_live``), taken as the **max** over live-player counts so the
+    slowest-converging live-count is covered, rounded up.  Cells that never settled within
+    the ladder keep the current default and are flagged (raise LADDER_HI/MAX for those).
 
-    No wall cap is emitted: production uses a single flat ``max_wall_seconds`` backstop
-    (the per-street tuple was retired — the calibration only measured HU vector
-    turn/river, whose tiny river cap would clip multiway river MCCFR).
+    No wall cap is emitted: production uses a single flat ``max_wall_seconds`` backstop.
     """
-    key = f"{threshold:g}"
     mccfr_by_street: Dict[int, int] = {}
     vector_by_street: Dict[int, int] = {}
     unresolved: List[str] = []
@@ -974,7 +1039,7 @@ def suggest_config(summaries: Sequence[CellSummary], *, threshold: float,
         # (street, n_live) to) — they belong in the A/B report, not the prod budget.
         if regime != _production_regime(street, n_live):
             continue
-        val = s.suggested.get(key)
+        val = s.suggested_budget
         if val is None:
             unresolved.append(
                 f"{_STREET_NAME.get(street, street)}/{regime}/n_live={n_live}"
@@ -997,10 +1062,10 @@ def suggest_config(summaries: Sequence[CellSummary], *, threshold: float,
         for i, st in enumerate((1, 2, 3))
     ]
     return {
-        "threshold_mbb": threshold,
+        "hot_l1_tol": (summaries[0].hot_l1_tol if summaries else None),
         "mccfr_per_player_by_street": tuple(mccfr_base),
         "vector_budget_by_street": tuple(vector),
-        "unresolved_cells": unresolved,
+        "unresolved_cells": unresolved,  # never settled within the ladder → raise LADDER_HI/MAX
     }
 
 
@@ -1097,23 +1162,22 @@ def _print_report(summaries: Sequence[CellSummary], config: Dict[str, object],
         print("!! compiled search core is OFF — throughput/wall are PURE-PYTHON, "
               "NOT production. Re-run with PLURIBUS_SEARCH_CORE=1.")
     hdr = (f"{'condition':<10} {'regime':<7} {'street':<8} {'n_live':>6} "
-           f"{'W':>4} {'top_it':>7} {'it/s':>8} {'wall@top':>9} {'gap@top':>8} "
+           f"{'W':>4} {'top_it':>7} {'it/s':>8} {'wall@top':>9} {'hotL1@pen':>10} "
            f"{'sugg':>7} {'wall@sugg':>10}")
     print(hdr)
     print("-" * len(hdr))
-    key = f"{config['threshold_mbb']:g}"
     for s in sorted(summaries, key=lambda x: (x.cell[0], x.cell[1], x.cell[2], x.cell[3])):
         cond, regime, street, n_live = s.cell
         t_top = s.ladder[-1]
-        sugg = s.suggested.get(key)
+        sugg = s.suggested_budget
         wall_sugg = s.mean_wall.get(sugg) if sugg is not None else None
-        # Gap at the *penultimate* budget: gap@top is 0 by construction (self-compare),
-        # so the last-below-reference rung is what shows the residual value on the table.
+        # mean hot_l1 at the *penultimate* rung (the last real rung; @top is 0 by
+        # self-compare) — the residual "still moving" the criterion reads.
         t_pen = s.ladder[-2] if len(s.ladder) > 1 else t_top
-        gap_pen = s.mean_value_gap_mbb.get(t_pen, float("nan"))
+        hl1_pen = s.mean_hot_l1.get(t_pen, float("nan"))
         print(f"{cond:<10} {regime:<7} {_STREET_NAME.get(street, street):<8} "
               f"{n_live:>6} {s.workers:>4} {t_top:>7} {s.throughput_it_s:>8.1f} "
-              f"{s.mean_wall[t_top]:>9.2f} {gap_pen:>8.1f} "
+              f"{s.mean_wall[t_top]:>9.2f} {hl1_pen:>10.3f} "
               f"{(str(sugg) if sugg is not None else '>max'):>7} "
               f"{(f'{wall_sugg:.2f}' if wall_sugg is not None else '-'):>10}")
     if wall_target is not None:
@@ -1121,14 +1185,14 @@ def _print_report(summaries: Sequence[CellSummary], config: Dict[str, object],
         print(f"Wall target per decision: {wall_target:.2f}s — cells whose wall@sugg "
               f"exceeds it need a lower budget or heavier blueprint fallback.")
         for s in summaries:
-            sugg = s.suggested.get(key)
+            sugg = s.suggested_budget
             wall_sugg = s.mean_wall.get(sugg) if sugg is not None else None
             if wall_sugg is not None and wall_sugg > wall_target:
                 cond, regime, street, n_live = s.cell
                 print(f"  ! {cond}/{regime}/{_STREET_NAME.get(street, street)}/"
                       f"n_live={n_live}: wall@sugg={wall_sugg:.2f}s > {wall_target:.2f}s")
-    print("\nSuggested SolverConfig block (value-gap threshold "
-          f"{config['threshold_mbb']:g} mbb):")
+    print("\nSuggested SolverConfig block (hot_l1 tol "
+          f"{config['hot_l1_tol']}):")
     print(f"    mccfr_per_player_by_street = {config['mccfr_per_player_by_street']}"
           "   # (preflop, flop, turn, river); budget = base * n_live")
     print(f"    vector_budget_by_street    = {config['vector_budget_by_street']}"
@@ -1153,7 +1217,9 @@ def run_calibration(
     workers: Optional[int],
     variance_reduction: bool = True,
     construct_roots_mode: bool = True,
-    crn_value: bool = True,
+    n_live_filter: Optional[Sequence[int]] = None,
+    max_concurrent_multiway: Optional[int] = None,
+    crn_value: bool = False,
     crn_worlds: int = 32,
     collect_hands: int,
     per_cell_cap: int,
@@ -1162,10 +1228,11 @@ def run_calibration(
     ladder_lo: float,
     ladder_hi: float,
     ladder_max: int,
-    thresholds: Sequence[float],
-    spread_k: float = 1.5,
+    hot_l1_tol: float = 0.10,
     collect_iters: int,
     table_policy: str,
+    fixed_seats: Optional[Sequence[str]] = None,
+    bias_multiplier: float = 5.0,
     run_seed: int,
     big_blind: int,
     small_blind: int,
@@ -1224,6 +1291,7 @@ def run_calibration(
         return EvalConfig.for_condition(
             condition, model_spec=spec,
             run_id="calibrate", run_seed=run_seed, table_policy=table_policy,
+            fixed_seats=fixed_seats,
             n_players=n_players, big_blind=big_blind, small_blind=small_blind,
             starting_stack=starting_stack, low_card_rank=low_card_rank,
             high_card_rank=high_card_rank,
@@ -1248,7 +1316,7 @@ def run_calibration(
     session = build_blueprint_session(
         base_cfg, blueprint_path=blueprint_path, lut_path=lut_path,
         use_decision_free_equity=use_decision_free_equity,
-        max_wall_seconds=1e9,
+        max_wall_seconds=1e9, bias_multiplier=bias_multiplier,
     )
     prod_cfg = session.solver_cfg
     # VR-MCCFR (opponent_modeling §5.5): set the flag on the shared prod_cfg so every
@@ -1287,6 +1355,7 @@ def run_calibration(
             samples = construct_roots(
                 session, cond_cfg, collect_cfg, condition,
                 per_cell=per_cell_cap, run_seed=run_seed,
+                n_live_filter=n_live_filter,
             )
         else:
             logger.info("collecting roots (sampled play) for condition=%s", condition)
@@ -1294,6 +1363,11 @@ def run_calibration(
                 session, cond_cfg, collect_cfg, condition,
                 n_hands=collect_hands, per_cell_cap=per_cell_cap, run_seed=run_seed,
             )
+        if n_live_filter is not None:
+            # Enforce the live-count slice in BOTH root modes (construct_roots already
+            # skips the work; sampled play harvests whatever it hits).
+            keep = {int(x) for x in n_live_filter}
+            samples = {c: v for c, v in samples.items() if int(c[3]) in keep}
         # Regime A/B: solve HU roots on the ``regime_ab_streets`` under BOTH regimes.
         # Per condition (the cell key carries the condition), so vanilla AND each DBR arm
         # get their own comparison — the decision can legitimately flip for DBR, because
@@ -1330,42 +1404,48 @@ def run_calibration(
                 len(jobs), len({j["cell"] for j in jobs}), n_solves, resolved_workers)
     all_rows = sweep_jobs(jobs, prod_cfg, pool_workers=resolved_workers, reps=reps,
                           base_seed=run_seed, big_blind=big_blind,
-                          crn_value=crn_value, crn_worlds=crn_worlds)
+                          crn_value=crn_value, crn_worlds=crn_worlds,
+                          max_concurrent_multiway=max_concurrent_multiway)
 
     # Aggregate.
     by_cell: Dict[Cell, List[SweepRow]] = defaultdict(list)
     for r in all_rows:
         by_cell[r.cell].append(r)
-    summaries = [summarize_cell(c, rs, thresholds, big_blind=big_blind, spread_k=spread_k)
+    summaries = [summarize_cell(c, rs, hot_l1_tol=hot_l1_tol, big_blind=big_blind)
                  for c, rs in by_cell.items()]
 
-    # Emit — default suggestion uses the middle threshold.
-    thr_default = sorted(thresholds)[len(thresholds) // 2]
-    config = suggest_config(summaries, threshold=thr_default)
+    config = suggest_config(summaries)
 
     _write_rows_csv(all_rows, out_dir / "calibration_rows.csv")
     summary_json = {
         "search_core": "on" if core_on else "off (PURE PYTHON — not production)",
         "workers": resolved_workers,
+        "max_concurrent_multiway": max_concurrent_multiway,  # peak-RAM cap (None ⇒ uncapped)
+        # Live-count slice this run covered (None ⇒ the full grid).  A partial run's
+        # suggested_config keeps the DEFAULT budget for every street it did not measure.
+        "n_live_filter": list(n_live_filter) if n_live_filter else None,
         # Whether VR-MCCFR (opponent_modeling §5.5) was active this run — DBR-only, so
-        # it affects only modeled MCCFR cells; recorded so a run is self-documenting
-        # (comparing a VR-on vs VR-off summary is meaningless without knowing which).
+        # it affects only modeled MCCFR cells; recorded so a run is self-documenting.
         "variance_reduction": bool(variance_reduction),
-        # Low-variance root value via COMMON RANDOM NUMBERS for the MCCFR cells (the
-        # enumeration-exact vector cells keep their internal value): each replica of a
-        # root evaluates the SAME crn_worlds card-worlds, so the opponent/board sampling
-        # noise is common-mode and cancels in replica_spread / the value gap.
-        "crn_value": {"enabled": bool(crn_value), "worlds": int(crn_worlds)}
-        if crn_value else False,
+        # Opponent table this calibration exploited — recorded so a run is self-documenting
+        # (the DBR budget depends on WHO the hero models and how hard they leak).
+        "opponents": {
+            "table_policy": table_policy,
+            "fixed_seats": list(fixed_seats) if fixed_seats else None,
+            "bias_multiplier": float(bias_multiplier),
+        },
         "ladder_design": {
             "centre": "per-cell production budget (iteration_budget at W=1)",
             "span": [ladder_lo, ladder_hi], "points": ladder_points, "max": ladder_max,
-            "note": "each cell's rungs cluster in [lo*centre, hi*centre]; the top rung "
-                    "(hi>1) is the value-gap reference, above the convergence estimate",
+            "note": "each cell's rungs cluster in [lo*centre, hi*centre]; the top rung is "
+                    "the self-reference the hot_l1 convergence is measured against",
         },
-        "metric": "value_gap_mbb",  # hero root EV (mbb): hot-path VALUE stability, not
-                                    # exploitability (MCCFR converges only the hot path)
-        "thresholds_mbb": list(thresholds),
+        # CONVERGENCE = single-worker strategy self-stability: smallest budget where the
+        # MEAN hot_l1 (each solve's hot-action strategy vs its own top budget) <= tol.
+        # Value gap / replica spread are DIAGNOSTIC columns only (value is payoff-leverage-
+        # noisy on deep cells; replica spread is reproducibility, not convergence).
+        "metric": "mean_hot_l1",
+        "hot_l1_tol": float(hot_l1_tol),
         "suggested_config": {
             k: (list(v) if isinstance(v, tuple) else v) for k, v in config.items()
         },
@@ -1375,14 +1455,14 @@ def run_calibration(
                 "street": _STREET_NAME.get(s.cell[2], s.cell[2]), "n_live": s.cell[3],
                 "n_samples": s.n_samples, "throughput_it_s": s.throughput_it_s,
                 "pooled_it_s": s.pooled_it_s,
-                "replica_spread_mbb": s.replica_spread_mbb,  # noise-floor check on the gap
-                "noise_floor_mbb": s.noise_floor_mbb,        # effective convergence bar (mbb)
-                "mean_value_gap_mbb": {str(t): s.mean_value_gap_mbb[t] for t in s.ladder},
-                "argmax_stability": {str(t): s.argmax_stability[t] for t in s.ladder},
+                "suggested_budget": s.suggested_budget,
+                "converged": s.converged,
                 "mean_hot_l1": {str(t): s.mean_hot_l1[t] for t in s.ladder},
+                "argmax_stability": {str(t): s.argmax_stability[t] for t in s.ladder},
+                "mean_value_gap_mbb": {str(t): s.mean_value_gap_mbb[t] for t in s.ladder},
+                "replica_spread_mbb": s.replica_spread_mbb,  # diagnostic
                 "mean_l1": {str(t): s.mean_l1[t] for t in s.ladder},
                 "mean_wall_seconds": {str(t): s.mean_wall[t] for t in s.ladder},
-                "suggested": s.suggested,
             }
             for s in summaries
         ],
@@ -1446,6 +1526,19 @@ def _cli():
     @click.option("--workers", default=None, type=int,
                   help="Sweep pool size — concurrent solves, one core each; each search "
                        "runs serially (default: SLURM_CPUS_PER_TASK-1).")
+    @click.option("--n-live", default="", show_default=True,
+                  help="Comma list of live-player counts to calibrate (e.g. '2,3'); empty "
+                       "= all.  Splits an expensive grid into separate runs — the deep "
+                       "n_live=4 cells are ~2/3 of a 4p run's cost, so '2,3' now and '4' "
+                       "later is much cheaper to schedule.  LOSSLESS: each root's seed is "
+                       "keyed on (street, n_live, k), so a cell yields byte-identical roots "
+                       "either way.  (The grid is post-flop only — pre-flop is played from "
+                       "the blueprint, never searched.)")
+    @click.option("--max-concurrent-multiway", default=None, type=int,
+                  help="Peak-RAM cap: at most this many multiway (>=3 live) MCCFR solves — "
+                       "the biggest tables — run at once; cheap solves backfill the other "
+                       "cores.  Lets you keep --workers high but request far less --mem "
+                       "(peak ≈ K*multiway + (W-K)*light).  Default: no cap.")
     @click.option("--variance-reduction/--no-variance-reduction", default=True,
                   show_default=True,
                   help="VR-MCCFR baseline on the DBR MCCFR path (opponent_modeling §5.5). "
@@ -1458,19 +1551,14 @@ def _cli():
                        "so rare multiway / HU-turn/river cells are never starved (uniform "
                        "board-masked beliefs; approximate but structurally exact). "
                        "--sample-roots harvests roots by playing --collect-hands hands.")
-    @click.option("--crn-value/--internal-value", default=True, show_default=True,
-                  help="Root-value estimator for the convergence metric.  --crn-value "
-                       "(default) replaces the MCCFR cells' noisy internal accumulator with "
-                       "a COMMON-RANDOM-NUMBERS estimate: every replica of a root evaluates "
-                       "the solved σ over the SAME fixed card-worlds, so the opponent/board "
-                       "sampling noise is common-mode and cancels in replica_spread (leaving "
-                       "only genuine strategy differences).  The enumeration-exact VECTOR "
-                       "cells keep their internal value.  --internal-value reproduces the "
-                       "raw single-combo metric.")
+    @click.option("--crn-value/--internal-value", default=False, show_default=True,
+                  help="DIAGNOSTIC ONLY (default OFF).  The convergence budget now comes from "
+                       "strategy self-stability (worst-case hot_l1), which needs no value "
+                       "estimate — so the CRN value-estimator is off by default and no compute "
+                       "is spent on it.  --crn-value re-enables it purely for the diagnostic "
+                       "value-gap/replica-spread columns.")
     @click.option("--crn-worlds", default=32, type=int, show_default=True,
-                  help="Fixed card-worlds (opponent holes + board runout) averaged per "
-                       "CRN root-value estimate; shared across replicas so the sampling "
-                       "noise cancels.  Higher = tighter absolute value, more compute.")
+                  help="Fixed card-worlds per CRN value estimate (only used with --crn-value).")
     @click.option("--collect-hands", default=400, type=int, show_default=True,
                   help="Hands played to harvest roots when --sample-roots is set.")
     @click.option("--per-cell-cap", default=4, type=int, show_default=True,
@@ -1478,11 +1566,6 @@ def _cli():
     @click.option("--reps", default=4, type=int, show_default=True,
                   help="Independent re-solve replicates per root; averaging over reps is "
                        "what lowers the MCCFR value-estimate noise floor, so keep ≥4.")
-    @click.option("--spread-k", default=1.5, type=float, show_default=True,
-                  help="Spread-relative convergence: a cell counts as converged when its "
-                       "value gap falls below max(threshold, spread-k * replica_spread) — "
-                       "i.e. into its Monte-Carlo noise floor, since a sub-noise absolute "
-                       "mbb threshold is unreachable. 0 restores pure absolute thresholds.")
     @click.option("--ladder-points", default=7, type=int, show_default=True,
                   help="Rungs per cell, clustered around its production budget.")
     @click.option("--ladder-lo", default=0.5, type=float, show_default=True,
@@ -1495,14 +1578,29 @@ def _cli():
     @click.option("--ladder-max", default=50_000, type=int, show_default=True,
                   help="Hard cap on the top rung (bounds the single longest solve's wall on "
                        "a time-limited box); the reference is min(ladder-max, hi*budget).")
-    @click.option("--thresholds", default="20,10,5", show_default=True,
-                  help="Value-gap convergence thresholds in mbb (hero root EV still on "
-                  "the table); the middle one drives the suggested config.")
+    @click.option("--hot-l1-tol", default=0.10, type=float, show_default=True,
+                  help="Convergence tolerance: the per-cell budget is the smallest rung where "
+                       "the MEAN hot_l1 (each single-worker solve's hot-action strategy vs its "
+                       "own top budget, averaged over the cell's solves) <= this — i.e. the "
+                       "strategy has stopped moving. A cell that never gets there within the "
+                       "ladder is flagged (raise --ladder-hi/--ladder-max).")
     @click.option("--collect-iters", default=64, type=int, show_default=True,
                   help="Cheap per-solve budget used only to advance collection hands.")
     @click.option("--table-policy", default="random", show_default=True,
                   help="'random' mixes fold/call/raise bias for street/live-count "
                   "coverage; 'all_blueprint' | 'fixed' also allowed.")
+    @click.option("--fixed-seats", default="", show_default=True,
+                  help="Comma-separated opponent labels (bp/bp_fold/bp_call/bp_raise), "
+                       "exactly n_players-1, used only when --table-policy=fixed.  "
+                       "'bp_fold,bp_call,bp_raise' seats ONE opponent per exploitable "
+                       "bias class (4-player) — deterministic, full leak coverage, no "
+                       "random seat-draw noise across cells.")
+    @click.option("--bias-multiplier", default=5.0, type=float, show_default=True,
+                  help="Opponent leak strength: the biased action class's probability is "
+                       "scaled by this then renormalized.  1.0 = unbiased (nothing to "
+                       "exploit); very large ⇒ near-pure/degenerate opponent.  5.0 is the "
+                       "established mid-strength leak (biased action ~2-3x its baseline "
+                       "frequency, still mixing).")
     @click.option("--run-seed", default=0, type=int, show_default=True)
     @click.option("--big-blind", default=100, type=int, show_default=True)
     @click.option("--small-blind", default=50, type=int, show_default=True)
@@ -1527,7 +1625,6 @@ def _cli():
         logging.basicConfig(level=logging.INFO,
                             format="%(asctime)s %(levelname)s %(name)s: %(message)s")
         conditions = [c.strip() for c in o["conditions"].split(",") if c.strip()]
-        thresholds = [float(x) for x in o["thresholds"].split(",") if x.strip()]
         if not (0 < o["ladder_lo"] < 1 < o["ladder_hi"]):
             raise click.BadParameter("need 0 < --ladder-lo < 1 < --ladder-hi "
                                      "(min below, reference above, the convergence estimate)")
@@ -1543,18 +1640,29 @@ def _cli():
             _street_id[s.strip()] for s in ab_raw.split(",")
             if s.strip() and s.strip() in _street_id
         )
+        fixed_seats = tuple(
+            s.strip() for s in o["fixed_seats"].split(",") if s.strip()
+        ) or None
+        n_live_filter = tuple(
+            int(x) for x in o["n_live"].split(",") if x.strip()
+        ) or None
+        if n_live_filter and any(v < 2 or v > o["n_players"] for v in n_live_filter):
+            raise click.BadParameter(
+                f"--n-live values must be in [2, n_players={o['n_players']}], "
+                f"got {list(n_live_filter)}")
         run_calibration(
             blueprint_path=o["blueprint_path"], lut_path=o["lut_path"],
             conditions=conditions, model_spec=model_spec,
             n_players=o["n_players"], workers=o["workers"],
+            max_concurrent_multiway=o["max_concurrent_multiway"],
             variance_reduction=o["variance_reduction"],
-            construct_roots_mode=o["construct_roots"],
+            construct_roots_mode=o["construct_roots"], n_live_filter=n_live_filter,
             crn_value=o["crn_value"], crn_worlds=o["crn_worlds"],
             collect_hands=o["collect_hands"], per_cell_cap=o["per_cell_cap"],
             reps=o["reps"], ladder_points=o["ladder_points"], ladder_lo=o["ladder_lo"],
-            ladder_hi=o["ladder_hi"], ladder_max=o["ladder_max"], thresholds=thresholds,
-            spread_k=o["spread_k"],
+            ladder_hi=o["ladder_hi"], ladder_max=o["ladder_max"], hot_l1_tol=o["hot_l1_tol"],
             collect_iters=o["collect_iters"], table_policy=o["table_policy"],
+            fixed_seats=fixed_seats, bias_multiplier=o["bias_multiplier"],
             run_seed=o["run_seed"], big_blind=o["big_blind"],
             small_blind=o["small_blind"], starting_stack=o["starting_stack"],
             low_card_rank=o["low_card_rank"], high_card_rank=o["high_card_rank"],

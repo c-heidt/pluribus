@@ -260,9 +260,15 @@ class _MCCFRSolver:
         # VR-MCCFR baseline (opponent_modeling §5.5): a control variate on the sampled
         # opponent-action counterfactual values.  DBR-only — gated on both the config
         # flag and the presence of opponent models — so a vanilla solve (no models) is
-        # byte-identical regardless of the flag.  ``_vbaseline[pk]`` is a per-opponent-
-        # node ``(n_legal, n_combos)`` baseline, EMA-updated from observed child values
-        # and reset per search (fresh solve).  Unbiased for any baseline.
+        # byte-identical regardless of the flag.  ``_vbaseline[(p, pk)]`` is a per-
+        # traverser-per-opponent-node ``(n_legal, n_combos)`` baseline, EMA-updated from
+        # observed child values and reset per search (fresh solve).  Unbiased for any
+        # baseline.  Keyed by ``(p, pk)`` and not just ``pk``: with 3+ live seats the
+        # traverser rotates every iteration, and a bare ``pk`` node is "opponent" from
+        # more than one traverser's perspective — those are different value functions
+        # (different traverser's per-combo payoff) over the same combo-index space, so
+        # collapsing them into one baseline array would silently mix incompatible
+        # values instead of reducing variance.
         self._vr = (bool(getattr(cfg, "variance_reduction", False))
                     and bool(getattr(ctx, "models", None)))
         self._vr_decay = float(getattr(cfg, "vr_baseline_decay", 0.5))
@@ -562,10 +568,11 @@ class _MCCFRSolver:
             # sampled action's baseline AFTER forming the estimate (keeps it independent
             # of this sample → unbiased).  Both the returned value and — via the parent
             # traverser node's ``child_vs`` — its regret update inherit the lower variance.
-            b = self._vbaseline.get(pk)
+            bkey = (p, pk)
+            b = self._vbaseline.get(bkey)
             if b is None:
                 b = np.zeros((len(legal), self._n_combos), dtype=np.float64)
-                self._vbaseline[pk] = b
+                self._vbaseline[bkey] = b
             corrected = vr_baseline_estimate(opp_row, b, a_idx, v)
             b[a_idx] += self._vr_decay * (v - b[a_idx])   # EMA-update after the estimate
             return corrected
