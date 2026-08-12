@@ -26,13 +26,13 @@
 #SBATCH --partition=cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=2:00:00   # sized for N_LIVE=2,3 (~54 core-h → ~1h wall at MAX_CONCURRENT_MULTIWAY=32). The n_live=4 slice is the expensive one (~116 core-h → ~3.5h; incl. the turn-n4 14.5 it/s outlier): when running N_LIVE=4, raise this to 5:00:00. Full grid would be ~4.5h.
+#SBATCH --time=3:00:00   # sized for N_LIVE=2,3 (~54 core-h → ~1h wall at MAX_CONCURRENT_MULTIWAY=32). The n_live=4 slice is the expensive one (~116 core-h → ~3.5h; incl. the turn-n4 14.5 it/s outlier): when running N_LIVE=4, raise this to 5:00:00. Full grid would be ~4.5h.
 #SBATCH --cpus-per-task=64
 # --mem: sized for MAX_CONCURRENT_MULTIWAY=32 (the ≤5h target).  ~32 * ~10 GB/multiway-solve
 # + lights + blueprint ≈ 340 GB (ESTIMATE — VERIFY real RSS on run 1 and tighten; if it comes
 # in well under, lower this for faster scheduling).  ≤5h and low RAM are in tension here: to
 # drop --mem you must lower K, which pushes the wall past 5h (K=16 ≈ 200 GB but ~9.5h).
-#SBATCH --mem=150000mb
+#SBATCH --mem=200000mb
 #SBATCH --signal=SIGTERM@120
 #SBATCH --mail-type=All
 
@@ -75,7 +75,7 @@ MODEL_P_MAX=${MODEL_P_MAX:-0.8}           # confidence cap (Approach A default).
                                           #   0.8 blends σ̃=c·σ̂+(1−c)·x, de-polarising the exploitation — the
                                           #   biggest lever on the tail-driven variance we've been chasing.
 WORKERS=${WORKERS:-}                       # empty → SLURM_CPUS_PER_TASK-1 (production)
-MAX_CONCURRENT_MULTIWAY=${MAX_CONCURRENT_MULTIWAY:-32}  # peak-RAM cap: at most this many multiway (≥3 live) MCCFR solves run at once (biggest tables); cheap solves backfill the rest. Wall is heavy-bound ≈ (multiway core-hours ~152)/K → K=32 gives ~4.7h (≤5h). Uncapped (~52 concurrent) would front-load the RAM and likely exceed the node. Empty → no cap. Peak RAM ≈ K*multiway + (WORKERS-K)*light; size --mem to that. Lower K = less RAM but a longer wall (K=16→~9.5h).
+MAX_CONCURRENT_MULTIWAY=${MAX_CONCURRENT_MULTIWAY:-16}  # peak-RAM cap: at most this many multiway (≥3 live) MCCFR solves run at once (biggest tables); cheap solves backfill the rest. Wall is heavy-bound ≈ (multiway core-hours ~152)/K → K=32 gives ~4.7h (≤5h). Uncapped (~52 concurrent) would front-load the RAM and likely exceed the node. Empty → no cap. Peak RAM ≈ K*multiway + (WORKERS-K)*light; size --mem to that. Lower K = less RAM but a longer wall (K=16→~9.5h).
 COLLECT_HANDS=${COLLECT_HANDS:-400}
 N_LIVE=${N_LIVE:-2,3}                      # live-player counts to calibrate; empty = all. '2,3' EXCLUDES the deep 4-player lines (~2/3 of the cost incl. the turn-n4 outlier) — run them later with N_LIVE=4. Lossless split: roots are seeded per (street, n_live, k). The grid is POST-FLOP only (preflop is played from the blueprint, never searched).
 PER_CELL_CAP=${PER_CELL_CAP:-4}

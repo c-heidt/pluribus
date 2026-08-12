@@ -43,6 +43,18 @@ logger = logging.getLogger(__name__)
 _POOL_SHARED: dict = {}
 
 
+_HEALTH_POLL_S = 5.0
+"""How often :func:`run_index_pool` checks its workers for an abrupt death."""
+
+
+class WorkerDiedError(RuntimeError):
+    """A pool worker exited abnormally (e.g. SIGKILL from the OOM killer).
+
+    Raised instead of letting ``Pool.map`` block forever on a result that can never
+    arrive — a hang would waste the rest of the job's wall-clock allocation silently.
+    """
+
+
 def _worker(worker_id: int):
     """Run one worker: setup → pull-and-process loop → teardown; from _POOL_SHARED."""
     S = _POOL_SHARED
@@ -66,6 +78,19 @@ def _worker(worker_id: int):
     run_start: float = S["run_start"]
     stop_event = S["stop_event"]
 
+    try:
+        return _worker_loop(worker_id, setup, process, teardown, shared, counter, lock,
+                            target, skip, wall_budget_s, run_start, stop_event)
+    except BaseException:
+        # Log HERE, in the worker: a setup/teardown failure is re-raised in the parent by
+        # ``map_async.get()``, but only if it pickles — and an unpicklable exception would
+        # otherwise vanish, leaving the run to fail with no cause on record.
+        logger.exception("pool worker %d died", worker_id)
+        raise
+
+
+def _worker_loop(worker_id, setup, process, teardown, shared, counter, lock,
+                 target, skip, wall_budget_s, run_start, stop_event):
     state = setup(worker_id, shared)
     while True:
         if stop_event is not None and stop_event.is_set():
@@ -143,7 +168,35 @@ def run_index_pool(
     }
     try:
         with ctx.Pool(processes=n) as pool:
-            payloads = pool.map(_worker, range(n))
+            # FAIL FAST ON A DEAD WORKER.  ``Pool.map`` blocks until every task returns, and
+            # a worker killed OUTRIGHT (SIGKILL from the cgroup OOM killer — the usual death
+            # on a memory-capped node) raises no Python exception: its task's result simply
+            # never arrives, and ``Pool`` silently starts a replacement that has nothing left
+            # to pull.  The map would then hang until the job hits its wall-clock limit,
+            # burning the whole allocation at ~0% CPU and producing nothing.  So poll the
+            # ORIGINAL worker processes and abort loudly the moment one exits non-zero.
+            async_res = pool.map_async(_worker, range(n))
+            procs = list(getattr(pool, "_pool", []))    # private, but stable across 3.x
+            while not async_res.ready():
+                async_res.wait(_HEALTH_POLL_S)
+                if async_res.ready():
+                    break
+                dead = [p for p in procs
+                        if p.exitcode is not None and p.exitcode != 0]
+                if dead:
+                    detail = ", ".join(
+                        "pid %s exitcode %s%s" % (
+                            p.pid, p.exitcode,
+                            " (SIGKILL — typically the OOM killer)" if p.exitcode == -9
+                            else "")
+                        for p in dead)
+                    pool.terminate()
+                    raise WorkerDiedError(
+                        "%d of %d pool workers died mid-run: %s. Aborting instead of "
+                        "hanging (the lost task's result would never arrive). If this is "
+                        "SIGKILL, the node ran out of memory — lower the concurrency cap "
+                        "or raise the job's --mem." % (len(dead), n, detail))
+            payloads = async_res.get()
     finally:
         _POOL_SHARED = {}
     return payloads
