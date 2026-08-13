@@ -536,26 +536,117 @@ def crn_root_value(res, root_env, ctx, *, worlds: int,
 # --------------------------------------------------------------------------- #
 # Phase 2 — sweep each root over an iteration ladder at the production W
 # --------------------------------------------------------------------------- #
-def _ladder_around(center: int, points: int, *, lo: float, hi: float,
-                   ladder_max: int) -> List[int]:
-    """Geometric ladder CLUSTERED around a convergence estimate ``center``.
+def _ladder_wall_anchored(throughput_it_s: float, top_seconds: float, points: int,
+                          *, lo_frac: float) -> List[int]:
+    """Geometric ladder anchored at **the most iterations that fit in ``top_seconds``**.
 
-    Spans ``[lo*center, hi*center]``.  ``hi > 1`` puts the top rung — the value-gap
-    REFERENCE — safely ABOVE the estimate, so the gap is measured against a (near-)
-    converged point rather than the estimate itself (a self-defeating reference); the
-    sweep can exceed the production ceiling to reach it.  ``lo < 1`` keeps the min
-    feasible (near the estimate, not a token 250 that nothing converges at).  The top is
-    capped at ``ladder_max`` to bound the single longest solve's wall (a 3 h SLURM box).
-    ``center`` is the cell's own production budget (``iteration_budget`` at W=1) — where
-    we believe it converges — so the ladder auto-adapts per street / n_live / regime.
+    The old ladder was anchored on the production budget (``[0.5C, 2C]``), which wastes
+    most of its rungs: the 2026-08 vanilla calibration showed the low rungs are hopelessly
+    unconverged (hot_l1 0.5-0.8) and the answer always sits in the top half.  So instead:
+
+    - **top rung** ``T = top_seconds * throughput`` — the deepest solve that fits the wall
+      budget for this cell.  This is the reference the hot_l1 self-distance is measured
+      against, so it is as converged as the box can afford;
+    - **rungs walk DOWN from T** to ``lo_frac * T`` (default 0.35), i.e. the band where
+      hot_l1 actually crosses the 0.1-0.2 decision region — no compute spent on budgets
+      that are certainly unconverged.
+
+    ``top_seconds`` is per-cell: hard cells (flop, turn) get the full wall, easy ones
+    (river converges in seconds) get much less, so no compute is burned proving what is
+    already converged.
     """
-    center = max(1, int(center))
-    top = min(int(ladder_max), int(round(hi * center)))
-    bot = min(max(1, int(round(lo * center))), top)
+    top = max(1, int(round(float(throughput_it_s) * float(top_seconds))))
+    bot = min(max(1, int(round(lo_frac * top))), top)
     if points < 2 or top <= bot:
         return [top]
     raw = np.geomspace(bot, top, int(points))
     return sorted({int(round(x)) for x in raw})
+
+
+# --- Throughput probe (sets each cell's wall-anchored ladder top) ------------------
+def _probe_setup(worker_id: int, shared: dict):
+    try:
+        from poker_ai.search.parallel import _reopen_leaf_fleet_lmdb
+        for s in shared["probe_samples"]:
+            _reopen_leaf_fleet_lmdb(s.ctx)
+            break
+    except Exception:  # pragma: no cover
+        pass
+    return {"out": []}
+
+
+def _probe_process(idx: int, state: dict, shared: dict) -> None:
+    """Time ONE wall-bounded solve; record the cell's achieved iterations/second."""
+    s = shared["probe_samples"][idx % len(shared["probe_samples"])]
+    cfg = dataclasses.replace(
+        shared["prod_cfg"], auto_budget=False, max_iterations=10 ** 9,
+        max_wall_seconds=float(shared["probe_seconds"]),
+    )
+    env = copy.deepcopy(s.env)
+    ctx = dataclasses.replace(s.ctx, rng=np.random.default_rng(shared["base_seed"] + idx))
+    res = solve(env, ctx, cfg, regime_override=shared["probe_regimes"][
+        idx % len(shared["probe_samples"])])
+    if res.wall_seconds > 0:
+        state["out"].append((idx % len(shared["probe_samples"]),
+                             float(res.iterations_run) / float(res.wall_seconds)))
+
+
+def _probe_teardown(state: dict):
+    return state["out"]
+
+
+def probe_throughput(cell_samples: Sequence[tuple], prod_cfg: SolverConfig, *,
+                     seconds: float, workers: int, base_seed: int) -> Dict[int, float]:
+    """Measure it/s per cell by running short solves that SATURATE the box.
+
+    Throughput under a full box is materially lower than on an idle one (memory
+    bandwidth), and the ladder top is a *wall* target — so the probe must run loaded or
+    every top rung overshoots its budget.  Each of ``workers`` slots runs one
+    ``seconds``-bounded solve, round-robin over the cells, so total probe wall is ~one
+    ``seconds`` regardless of cell count; the per-cell **median** is returned.
+
+    ``cell_samples`` is ``[(sample, force_regime), ...]``, one entry per ladder to build.
+    """
+    from evaluation.hand_pool import run_index_pool
+
+    if not cell_samples:
+        return {}
+    shared = {
+        "probe_samples": [s for s, _r in cell_samples],
+        "probe_regimes": [r for _s, r in cell_samples],
+        "prod_cfg": prod_cfg, "probe_seconds": float(seconds),
+        "base_seed": int(base_seed),
+    }
+    n = max(len(cell_samples), int(workers))
+    payloads = run_index_pool(
+        n_workers=min(int(workers), n) or 1, setup=_probe_setup,
+        process=_probe_process, teardown=_probe_teardown, shared=shared, target=n,
+    )
+    by_cell: Dict[int, List[float]] = defaultdict(list)
+    for pl in payloads:
+        for (i, it_s) in (pl or []):
+            by_cell[i].append(it_s)
+    return {i: float(np.median(v)) for i, v in by_cell.items() if v}
+
+
+def _top_seconds_for(regime: str, street: int, mccfr_secs: Sequence[float],
+                     vector_secs: Sequence[float]) -> float:
+    """Wall budget for a ladder's TOP rung, per regime × street (flop, turn, river).
+
+    Data-driven from the 2026-08 vanilla calibration.  Two things drive it:
+
+    - **hard vs easy** — flop/turn are still moving at their production budgets (hot_l1
+      0.23-0.43) so they get the full wall; the river converges in seconds (mccfr n3:
+      hot_l1 0.06 at 9000 iters / 22 s), and giving it 600 s would only burn compute.
+    - **the ladder must BRACKET the convergence point** — otherwise a cell that settles
+      below the lowest rung reports that rung as its budget, a large over-estimate.  The
+      river cells settle at wildly different iteration counts by regime (vector 1071 vs
+      mccfr 9000), so per-street alone cannot bracket both: vector and MCCFR carry their
+      own tops.
+    """
+    secs = vector_secs if str(regime) == "vector" else mccfr_secs
+    flop, turn, river = secs
+    return float({1: flop, 2: turn, 3: river}.get(int(street), flop))
 
 
 def _root_sigma(res, s: RootSample) -> Optional[np.ndarray]:
@@ -905,6 +996,10 @@ class CellSummary:
     # within the ladder ⇒ raise LADDER_HI/MAX.  See :func:`summarize_cell`.
     suggested_budget: Optional[int]
     converged: bool                           # False ⇒ ladder too short (see suggested_budget)
+    # True ⇒ already converged at the LOWEST rung, so the real budget is below the ladder
+    # and ``suggested_budget`` is an OVER-estimate: lower this regime/street's
+    # ``ladder_top_seconds`` to bracket the crossing.  Not used for the emitted config.
+    below_ladder: bool
     hot_l1_tol: float
     n_samples: int
     workers: int
@@ -989,12 +1084,18 @@ def summarize_cell(cell: Cell, rows: Sequence[SweepRow],
     # strategy is still moving at the last real rung ⇒ ladder too short (raise LADDER_HI/MAX).
     below_ref = ladder[:-1]
     suggested_budget = _first_at_or_below(below_ref, mean_hot, float(hot_l1_tol))
+    # Already converged at the LOWEST rung ⇒ the real budget is somewhere below the ladder,
+    # so the lowest rung is an over-estimate, not the answer.  Flag it (``below_ladder``)
+    # rather than emitting a budget the data does not support; the fix is a smaller
+    # ``ladder_top_seconds`` for that regime/street so the ladder brackets the crossing.
+    below_ladder = bool(below_ref) and suggested_budget == below_ref[0]
     return CellSummary(
         cell=cell, ladder=ladder, mean_value_gap_mbb=mean_gap, mean_hot_l1=mean_hot,
         argmax_stability=amatch, mean_l1=mean_l1, mean_wall=mean_wall,
         throughput_it_s=per_rep_it_s, pooled_it_s=pooled_it_s,
         replica_spread_mbb=replica_spread_mbb,
         suggested_budget=suggested_budget, converged=suggested_budget is not None,
+        below_ladder=below_ladder,
         hot_l1_tol=float(hot_l1_tol), n_samples=n_samples, workers=w,
     )
 
@@ -1017,7 +1118,10 @@ def _production_regime(street: int, n_live: int) -> str:
 
 def suggest_config(summaries: Sequence[CellSummary],
                    default_mccfr_base: Tuple[int, int, int, int] = (3000, 5000, 4000, 3000),
-                   default_vector: Tuple[int, int, int] = (1500, 1000, 500),
+                   # MUST track SolverConfig.vector_budget_by_street — this is what an
+                   # UNRESOLVED cell falls back to, so a stale value here silently emits a
+                   # DOWNGRADE (it read (1500,1000,500) while production ran (1500,1350,850)).
+                   default_vector: Tuple[int, int, int] = (1500, 1350, 850),
                    ) -> Dict[str, object]:
     """Fold per-cell suggested budgets into a ``SolverConfig`` budget block.
 
@@ -1040,10 +1144,15 @@ def suggest_config(summaries: Sequence[CellSummary],
         # (street, n_live) to) — they belong in the A/B report, not the prod budget.
         if regime != _production_regime(street, n_live):
             continue
-        val = s.suggested_budget
+        # ``below_ladder`` ⇒ converged at the lowest rung, so this is an over-estimate, not
+        # a measurement: treat it as unresolved (keep the default) and flag it.
+        val = None if s.below_ladder else s.suggested_budget
         if val is None:
+            why = ("converges BELOW the ladder — lower this street's ladder_top_seconds"
+                   if s.below_ladder else
+                   "still moving at the top rung — raise this street's ladder_top_seconds")
             unresolved.append(
-                f"{_STREET_NAME.get(street, street)}/{regime}/n_live={n_live}"
+                f"{_STREET_NAME.get(street, street)}/{regime}/n_live={n_live} ({why})"
             )
             continue
         if regime == "mccfr":
@@ -1227,8 +1336,9 @@ def run_calibration(
     reps: int,
     ladder_points: int,
     ladder_lo: float,
-    ladder_hi: float,
-    ladder_max: int,
+    ladder_top_seconds: Sequence[float] = (600.0, 600.0, 60.0),
+    ladder_top_seconds_vector: Sequence[float] = (600.0, 600.0, 15.0),
+    probe_seconds: float = 30.0,
     hot_l1_tol: float = 0.10,
     collect_iters: int,
     table_policy: str,
@@ -1246,11 +1356,13 @@ def run_calibration(
     regime_ab_streets: Sequence[int] = (2,),
 ) -> Dict[str, object]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Each cell's ladder is CLUSTERED around its own convergence estimate — the cell's
-    # production budget (``iteration_budget`` at W=1) — with the reference rung above it
-    # (``ladder_hi>1``) and a feasible min (``ladder_lo<1``); see ``_ladder_around``.  This
-    # auto-adapts per street / n_live / regime (so vector and MCCFR, and each n_live, cluster
-    # around their OWN budget) — no hand-set per-street tops.  MCCFR only converges the HOT
+    # Each cell's ladder is WALL-ANCHORED: its top rung is the deepest solve that fits the
+    # cell's wall budget (``ladder_top_seconds``, measured by a box-saturating probe), and
+    # the rungs walk DOWN to ``ladder_lo * top`` — the band where hot_l1 crosses the 0.1-0.2
+    # decision region.  No compute is spent on the low budgets the 2026-08 vanilla run
+    # showed are certainly unconverged, and the reference rung is as converged as the box
+    # can afford.  Ladders are keyed (regime, street, n_live) and SHARED across conditions,
+    # so vanilla/DBR are compared on identical rungs.  MCCFR only converges the HOT
     # PATH (cold infosets fall back to blueprint), so its metric is hero-root value STABILITY
     # (self-referenced) NOT exploitability; the reference above the estimate is what makes
     # that gap meaningful rather than self-defeating.
@@ -1336,12 +1448,6 @@ def run_calibration(
     # jobs in ONE cross-cell pool (below) so the whole box stays busy.  A job is a
     # (cell, samples, force_regime, ladder, ref_from) unit; the A/B adds a second
     # (mccfr) job on the same roots whose gap references the paired vector job.
-    def _ladder_for(ctx, regime_override) -> List[int]:
-        # Centre = the cell's production budget for THIS regime (regime_override forces it,
-        # so the A/B mccfr arm on a HU turn reads the mccfr budget, not the vector one).
-        center = iteration_budget(ctx, prod_cfg, regime_override=regime_override)
-        return _ladder_around(int(center), ladder_points, lo=ladder_lo, hi=ladder_hi,
-                              ladder_max=ladder_max)
 
     jobs: List[dict] = []
     for condition in conditions:
@@ -1393,12 +1499,47 @@ def run_calibration(
             if ab_on and is_ab:
                 vidx = len(jobs)  # the paired vector job the mccfr job references
                 jobs.append(dict(cell=cell, samples=sample_list, force_regime="vector",
-                                 ladder=_ladder_for(ctx0, "vector"), ref_from=None))
+                                 ref_from=None))
                 jobs.append(dict(cell=cell, samples=sample_list, force_regime="mccfr",
-                                 ladder=_ladder_for(ctx0, "mccfr"), ref_from=vidx))
+                                 ref_from=vidx))
             else:
                 jobs.append(dict(cell=cell, samples=sample_list, force_regime=None,
-                                 ladder=_ladder_for(ctx0, None), ref_from=None))
+                                 ref_from=None))
+
+    # --- Wall-anchored ladders (one probe pass, shared by every condition) -----------
+    # The ladder is keyed on (regime, street, n_live) ONLY — conditions share it, so a
+    # vanilla/DBR comparison is made on identical rungs (and the probe runs once).
+    def _lkey(job) -> Tuple[str, int, int]:
+        cond, regime, street, n_live = job["cell"]
+        return (str(job.get("force_regime") or regime), int(street), int(n_live))
+
+    keys = sorted({_lkey(j) for j in jobs})
+    rep_for = {}
+    for j in jobs:
+        rep_for.setdefault(_lkey(j), (j["samples"][0], j.get("force_regime")))
+    logger.info("probing throughput for %d ladders (%.0fs, box-saturating)",
+                len(keys), probe_seconds)
+    thr_by_i = probe_throughput([rep_for[k] for k in keys], prod_cfg,
+                                seconds=probe_seconds, workers=resolved_workers,
+                                base_seed=run_seed)
+    ladders: Dict[Tuple[str, int, int], List[int]] = {}
+    for i, k in enumerate(keys):
+        regime, street, _n_live = k
+        thr = thr_by_i.get(i)
+        secs = _top_seconds_for(regime, street, ladder_top_seconds,
+                                ladder_top_seconds_vector)
+        if thr is None or thr <= 0:        # probe failed — fall back to the prod budget
+            top_iters = max(1, int(iteration_budget(rep_for[k][0].ctx, prod_cfg,
+                                                    regime_override=rep_for[k][1])))
+            ladders[k] = _ladder_wall_anchored(top_iters / max(1e-9, secs), secs,
+                                               ladder_points, lo_frac=ladder_lo)
+            logger.warning("ladder %s: probe failed, falling back to the production budget", k)
+        else:
+            ladders[k] = _ladder_wall_anchored(thr, secs, ladder_points, lo_frac=ladder_lo)
+        logger.info("ladder %-22s %6.1f it/s x %4.0fs -> top %d  rungs %s",
+                    str(k), thr or float("nan"), secs, ladders[k][-1], ladders[k])
+    for j in jobs:
+        j["ladder"] = ladders[_lkey(j)]
 
     n_solves = sum(len(j["samples"]) * reps * len(list(j["ladder"])) for j in jobs)
     logger.info("sweeping %d jobs (%d cells, %d solves) across %d cores in ONE pool",
@@ -1436,10 +1577,15 @@ def run_calibration(
             "bias_multiplier": float(bias_multiplier),
         },
         "ladder_design": {
-            "centre": "per-cell production budget (iteration_budget at W=1)",
-            "span": [ladder_lo, ladder_hi], "points": ladder_points, "max": ladder_max,
-            "note": "each cell's rungs cluster in [lo*centre, hi*centre]; the top rung is "
-                    "the self-reference the hot_l1 convergence is measured against",
+            "anchor": "wall-anchored: top rung = probed it/s * ladder_top_seconds",
+            "top_seconds_mccfr_flop_turn_river": list(ladder_top_seconds),
+            "top_seconds_vector_flop_turn_river": list(ladder_top_seconds_vector),
+            "probe_seconds": probe_seconds,
+            "lo_frac": ladder_lo, "points": ladder_points,
+            "ladders": {f"{r}/{s}/n{n}": v for (r, s, n), v in sorted(ladders.items())},
+            "note": "rungs walk down from the deepest solve that fits the cell's wall "
+                    "budget to lo_frac*top; the top rung is the self-reference the hot_l1 "
+                    "convergence is measured against.  Shared across conditions.",
         },
         # CONVERGENCE = single-worker strategy self-stability: smallest budget where the
         # MEAN hot_l1 (each solve's hot-action strategy vs its own top budget) <= tol.
@@ -1457,7 +1603,7 @@ def run_calibration(
                 "n_samples": s.n_samples, "throughput_it_s": s.throughput_it_s,
                 "pooled_it_s": s.pooled_it_s,
                 "suggested_budget": s.suggested_budget,
-                "converged": s.converged,
+                "converged": s.converged, "below_ladder": s.below_ladder,
                 "mean_hot_l1": {str(t): s.mean_hot_l1[t] for t in s.ladder},
                 "argmax_stability": {str(t): s.argmax_stability[t] for t in s.ladder},
                 "mean_value_gap_mbb": {str(t): s.mean_value_gap_mbb[t] for t in s.ladder},
@@ -1567,24 +1713,33 @@ def _cli():
     @click.option("--reps", default=4, type=int, show_default=True,
                   help="Independent re-solve replicates per root; averaging over reps is "
                        "what lowers the MCCFR value-estimate noise floor, so keep ≥4.")
-    @click.option("--ladder-points", default=7, type=int, show_default=True,
-                  help="Rungs per cell, clustered around its production budget.")
-    @click.option("--ladder-lo", default=0.5, type=float, show_default=True,
-                  help="Ladder min = lo * (cell production budget) — feasible, near the "
-                       "convergence estimate (not a token 250 nothing converges at).")
-    @click.option("--ladder-hi", default=2.0, type=float, show_default=True,
-                  help="Ladder top (the value-gap REFERENCE) = hi * (production budget); "
-                       ">1 so the reference sits ABOVE the convergence estimate. Higher = "
-                       "more trustworthy reference but a slower deepest solve.")
-    @click.option("--ladder-max", default=50_000, type=int, show_default=True,
-                  help="Hard cap on the top rung (bounds the single longest solve's wall on "
-                       "a time-limited box); the reference is min(ladder-max, hi*budget).")
+    @click.option("--ladder-points", default=6, type=int, show_default=True,
+                  help="Rungs per ladder, walking DOWN from the wall-anchored top.")
+    @click.option("--ladder-top-seconds", default="600,600,60", show_default=True,
+                  help="MCCFR per-street wall budget (flop,turn,river) for the ladder's TOP "
+                       "rung: top = probed it/s * this, i.e. the deepest solve that fits.  "
+                       "Hard cells (flop/turn — still moving at their production budgets) get "
+                       "the full wall; the river converges in seconds, so a big budget there "
+                       "only burns compute AND pushes the whole ladder above the crossing.")
+    @click.option("--ladder-top-seconds-vector", default="600,600,15", show_default=True,
+                  help="Same, for the VECTOR cells.  Separate because the regimes converge at "
+                       "very different iteration counts (2026-08: HU river vector settles at "
+                       "~1071 iters vs ~9000 for multiway river MCCFR), so one per-street "
+                       "value cannot bracket both.")
+    @click.option("--ladder-lo", default=0.35, type=float, show_default=True,
+                  help="Ladder min as a FRACTION OF THE TOP rung (not of the production "
+                       "budget).  0.35 spans the band where hot_l1 crosses 0.1-0.2; lower "
+                       "just re-measures budgets already known to be unconverged.")
+    @click.option("--probe-seconds", default=30.0, type=float, show_default=True,
+                  help="Wall-bounded probe solve per ladder that measures its it/s (sets the "
+                       "top rung).  Run box-saturating, so the throughput matches the loaded "
+                       "run rather than an idle-box overestimate.")
     @click.option("--hot-l1-tol", default=0.10, type=float, show_default=True,
                   help="Convergence tolerance: the per-cell budget is the smallest rung where "
                        "the MEAN hot_l1 (each single-worker solve's hot-action strategy vs its "
                        "own top budget, averaged over the cell's solves) <= this — i.e. the "
                        "strategy has stopped moving. A cell that never gets there within the "
-                       "ladder is flagged (raise --ladder-hi/--ladder-max).")
+                       "ladder is flagged (raise --ladder-top-seconds for that street).")
     @click.option("--collect-iters", default=64, type=int, show_default=True,
                   help="Cheap per-solve budget used only to advance collection hands.")
     @click.option("--table-policy", default="random", show_default=True,
@@ -1626,9 +1781,15 @@ def _cli():
         logging.basicConfig(level=logging.INFO,
                             format="%(asctime)s %(levelname)s %(name)s: %(message)s")
         conditions = [c.strip() for c in o["conditions"].split(",") if c.strip()]
-        if not (0 < o["ladder_lo"] < 1 < o["ladder_hi"]):
-            raise click.BadParameter("need 0 < --ladder-lo < 1 < --ladder-hi "
-                                     "(min below, reference above, the convergence estimate)")
+        if not (0 < o["ladder_lo"] < 1):
+            raise click.BadParameter("need 0 < --ladder-lo < 1 (a fraction of the top rung)")
+        def _secs(raw, flag):
+            v = tuple(float(x) for x in raw.split(",") if x.strip())
+            if len(v) != 3 or any(s <= 0 for s in v):
+                raise click.BadParameter(f"{flag} needs 3 positive values (flop,turn,river)")
+            return v
+        top_secs = _secs(o["ladder_top_seconds"], "--ladder-top-seconds")
+        top_secs_vec = _secs(o["ladder_top_seconds_vector"], "--ladder-top-seconds-vector")
         need_model = any(c.strip().lower() not in ("vanilla", "blueprint_only")
                          for c in conditions)
         model_spec = (ModelSpec(p_max=float(o["model_p_max"]),
@@ -1661,7 +1822,9 @@ def _cli():
             crn_value=o["crn_value"], crn_worlds=o["crn_worlds"],
             collect_hands=o["collect_hands"], per_cell_cap=o["per_cell_cap"],
             reps=o["reps"], ladder_points=o["ladder_points"], ladder_lo=o["ladder_lo"],
-            ladder_hi=o["ladder_hi"], ladder_max=o["ladder_max"], hot_l1_tol=o["hot_l1_tol"],
+            ladder_top_seconds=top_secs, ladder_top_seconds_vector=top_secs_vec,
+            probe_seconds=o["probe_seconds"],
+            hot_l1_tol=o["hot_l1_tol"],
             collect_iters=o["collect_iters"], table_policy=o["table_policy"],
             fixed_seats=fixed_seats, bias_multiplier=o["bias_multiplier"],
             run_seed=o["run_seed"], big_blind=o["big_blind"],

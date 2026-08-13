@@ -27,12 +27,12 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=3:00:00   # sized for N_LIVE=2,3 (~54 core-h → ~1h wall at MAX_CONCURRENT_MULTIWAY=32). The n_live=4 slice is the expensive one (~116 core-h → ~3.5h; incl. the turn-n4 14.5 it/s outlier): when running N_LIVE=4, raise this to 5:00:00. Full grid would be ~4.5h.
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=32
 # --mem: sized for MAX_CONCURRENT_MULTIWAY=32 (the ≤5h target).  ~32 * ~10 GB/multiway-solve
 # + lights + blueprint ≈ 340 GB (ESTIMATE — VERIFY real RSS on run 1 and tighten; if it comes
 # in well under, lower this for faster scheduling).  ≤5h and low RAM are in tension here: to
 # drop --mem you must lower K, which pushes the wall past 5h (K=16 ≈ 200 GB but ~9.5h).
-#SBATCH --mem=200000mb
+#SBATCH --mem=250000mb
 #SBATCH --signal=SIGTERM@120
 #SBATCH --mail-type=All
 
@@ -80,11 +80,12 @@ COLLECT_HANDS=${COLLECT_HANDS:-400}
 N_LIVE=${N_LIVE:-2,3}                      # live-player counts to calibrate; empty = all. '2,3' EXCLUDES the deep 4-player lines (~2/3 of the cost incl. the turn-n4 outlier) — run them later with N_LIVE=4. Lossless split: roots are seeded per (street, n_live, k). The grid is POST-FLOP only (preflop is played from the blueprint, never searched).
 PER_CELL_CAP=${PER_CELL_CAP:-4}
 REPS=${REPS:-4}                            # ≥4: averaging over reps lowers the MCCFR value-estimate noise floor
-HOT_L1_TOL=${HOT_L1_TOL:-0.10}            # convergence: per-cell budget = smallest rung where MEAN hot_l1 (single-worker strategy self-distance vs its own top budget, averaged over the cell's solves) ≤ this. Cells that never settle are flagged → raise LADDER_HI/MAX.
-LADDER_POINTS=${LADDER_POINTS:-7}          # rungs per cell, clustered around its production budget
-LADDER_LO=${LADDER_LO:-0.5}                # ladder min = LO * production budget (feasible, near convergence)
-LADDER_HI=${LADDER_HI:-2.0}                # ladder top (value-gap REFERENCE) = HI * production budget (>1, above convergence)
-LADDER_MAX=${LADDER_MAX:-90000}            # hard cap on the top rung.  Prod DBR budgets (×2 scale) reach 40k (flop n4), ladder top = 2×C up to 80k — 90k brackets every cell with headroom (the self-reference the hot_l1 criterion needs)
+HOT_L1_TOL=${HOT_L1_TOL:-0.10}            # convergence: per-cell budget = smallest rung where MEAN hot_l1 (single-worker strategy self-distance vs its own top budget, averaged over the cell's solves) ≤ this. Cells that never settle are flagged → raise that street LADDER_TOP_SECONDS.
+LADDER_POINTS=${LADDER_POINTS:-6}          # rungs per ladder, walking DOWN from the wall-anchored top
+LADDER_TOP_SECONDS=${LADDER_TOP_SECONDS:-600,600,60}          # MCCFR per-street (flop,turn,river) wall budget for the ladder TOP rung: top = probed it/s × this. Hard cells (flop/turn: hot_l1 0.23-0.43 at their production budgets) get the full 600s; river converged at ~9000 iters/22s so 60s brackets it without waste.
+LADDER_TOP_SECONDS_VECTOR=${LADDER_TOP_SECONDS_VECTOR:-600,600,15}  # same for VECTOR cells — separate because the regimes converge at very different iteration counts (HU river vector settles ~1071 iters vs ~9000 multiway river MCCFR), so one per-street value cannot bracket both.
+LADDER_LO=${LADDER_LO:-0.35}               # ladder min as a FRACTION OF THE TOP (not of the production budget) — 0.35 spans the band where hot_l1 crosses 0.1-0.2; lower rungs are known-unconverged and skipped
+PROBE_SECONDS=${PROBE_SECONDS:-30}         # box-saturating probe solve per ladder that measures its it/s (sets the top rung). Loaded, so throughput matches the real run instead of an idle-box overestimate.
 COLLECT_ITERS=${COLLECT_ITERS:-64}
 TABLE_POLICY=${TABLE_POLICY:-fixed}        # 'fixed' → deterministic table from FIXED_SEATS (no random seat-draw noise across cells); 'random' | 'all_blueprint' also allowed
 FIXED_SEATS=${FIXED_SEATS:-bp_fold,bp_call,bp_raise}  # ONE opponent per exploitable bias class (fold/call/raise) — exactly N_PLAYERS-1 for 4p; 'none'(bp) is the unbiased baseline, no leak to exploit, so it's excluded. Must have N_PLAYERS-1 entries.
@@ -96,7 +97,7 @@ STARTING_STACK=${STARTING_STACK:-10000}
 LOW_CARD_RANK=${LOW_CARD_RANK:-2}
 HIGH_CARD_RANK=${HIGH_CARD_RANK:-14}
 WALL_TARGET=${WALL_TARGET:-660}            # per-decision wall budget (s) for the REPORT (flags over-budget cells + the A/B comparison point). 660 = the production safety wall (Pluribus 30s*22-core translated to one worker), matching the 2026-08 budgets (binding cell flop-n4 ~657s). Set empty to disable.
-REGIME_AB_STREETS=${REGIME_AB_STREETS:-turn}  # HU vector-vs-MCCFR A/B streets: turn | flop,turn | none  (flop is SLOW: full-width vector flop ~1.3 it/s)
+REGIME_AB_STREETS=${REGIME_AB_STREETS:-none}  # HU vector-vs-MCCFR A/B streets: none | turn | flop,turn. OFF: HU turn is DECIDED = vector (production routing), so the mccfr arm would only measure the road not taken.
 CRN_VALUE=${CRN_VALUE:-false}            # DIAGNOSTIC ONLY (default off): the budget now comes from hot_l1 self-stability, no value estimate needed. true re-enables the CRN value-gap/replica-spread columns (extra compute).
 CRN_WORLDS=${CRN_WORLDS:-32}              # fixed card-worlds per CRN value estimate (only used when CRN_VALUE=true)
 
@@ -265,7 +266,7 @@ echo "  - Max concurrent mw: ${MAX_CONCURRENT_MULTIWAY:-(uncapped)}  (peak-RAM c
 echo "  - Live counts:       ${N_LIVE:-(all)}"
 echo "  - CPUs:              ${SLURM_CPUS_PER_TASK:-(unset)}"
 echo "  - Collect hands:     $COLLECT_HANDS  (per-cell cap $PER_CELL_CAP, reps $REPS)"
-echo "  - Ladder:            per-cell [${LADDER_LO}..${LADDER_HI}]x production budget, $LADDER_POINTS pts, cap $LADDER_MAX"
+echo "  - Ladder:            wall-anchored top = probe(${PROBE_SECONDS}s) x mccfr[${LADDER_TOP_SECONDS}]s/vector[${LADDER_TOP_SECONDS_VECTOR}]s (flop,turn,river), down to ${LADDER_LO}x top, $LADDER_POINTS pts"
 echo "  - hot_l1 tol:        $HOT_L1_TOL  (budget = smallest rung with mean hot_l1 ≤ tol)"
 echo "  - Wall target (s):   ${WALL_TARGET:-(disabled)}"
 echo "  - Regime A/B:        $REGIME_AB_STREETS"
@@ -303,8 +304,9 @@ run_calibrate() {  # $1 = conditions, $2 = out-dir
     --hot-l1-tol "$HOT_L1_TOL" \
     --ladder-points "$LADDER_POINTS" \
     --ladder-lo "$LADDER_LO" \
-    --ladder-hi "$LADDER_HI" \
-    --ladder-max "$LADDER_MAX" \
+    --ladder-top-seconds "$LADDER_TOP_SECONDS" \
+    --ladder-top-seconds-vector "$LADDER_TOP_SECONDS_VECTOR" \
+    --probe-seconds "$PROBE_SECONDS" \
     --collect-iters "$COLLECT_ITERS" \
     --n-live "$N_LIVE" \
     --table-policy "$TABLE_POLICY" \
