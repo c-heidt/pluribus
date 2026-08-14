@@ -52,6 +52,24 @@ from poker_ai.search.policy import BiasClass, BlueprintPolicy
 
 logger = logging.getLogger(__name__)
 
+_DECK_CACHE: dict = {}
+
+
+def _deck_for_combo_cards(combo_cards: np.ndarray) -> np.ndarray:
+    """Sorted-unique deck for ``combo_cards``, cached by array identity.
+
+    Safe because ``combo_cards`` always comes from ``environment.utils.
+    enumerate_combos``, an ``lru_cache(maxsize=None)`` — the same array
+    object is reused forever for a given deck, so its ``id()`` never gets
+    reassigned to a different deck within the process.
+    """
+    key = id(combo_cards)
+    deck = _DECK_CACHE.get(key)
+    if deck is None:
+        deck = np.unique(combo_cards)
+        _DECK_CACHE[key] = deck
+    return deck
+
 
 def _resolve_core_policy(policies, profile):
     """The shared ``BlueprintPolicy`` backing every acting seat's bias IF it exposes
@@ -167,8 +185,18 @@ def continuation_value_vector_fast(
     used = set(prefix)
     for i in range(n):
         used.update(int(c) for c in frontier_env.players[i].cards)
-    full_deck = [int(c) for c in np.unique(combo_cards)]
-    undealt = np.array([c for c in full_deck if c not in used], dtype=np.int64)
+    # ``frontier_env`` may be a plain ``PokerEnv`` or the core's
+    # ``FastMCCFRAdapter`` (no ``low_card_rank``/``high_card_rank`` of its
+    # own), but both expose ``combo_cards`` — and that array is a permanently
+    # cached, never-collected object per deck (``enumerate_combos`` is
+    # ``lru_cache(maxsize=None)``), so keying our own small cache off its
+    # identity is safe and avoids rebuilding + sorting the whole deck (via
+    # ``np.unique``) on every rollout.
+    full_deck = _deck_for_combo_cards(combo_cards)
+    used_arr = np.fromiter(used, dtype=np.int64, count=len(used))
+    excl_mask = np.zeros(full_deck.shape[0], dtype=bool)
+    excl_mask[np.searchsorted(full_deck, used_arr)] = True
+    undealt = full_deck[~excl_mask].astype(np.int64, copy=False)
 
     # Phase 4c in-core blueprint read (skips the per-decision PolicyState build +
     # Python ``strategy``) when the fleet is a cache-backed BlueprintPolicy; else

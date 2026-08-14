@@ -601,7 +601,11 @@ class _MCCFRSolver:
             # (external sampling).  The traverser's per-combo value below is the
             # opponent-strategy-weighted expectation ``Σ_a σ_opp(a)·v(·a)``; the sampled
             # child ``v`` is an unbiased single-sample estimate of it.
-            opp_ci = self._combo_index[tuple(sorted(holes[actor]))]
+            # ``holes[actor]`` is already ``(c0, c1)`` with ``c0 < c1`` by
+            # construction (every sampler draws it straight from ``combo_cards``
+            # rows, which ``combo_index`` keys match verbatim) — sorting it here
+            # would be a no-op on every call.
+            opp_ci = self._combo_index[holes[actor]]
             opp_row = sigma[opp_ci]                       # (n_legal,) opponent strategy
             a_idx = sample_index(self.rng, opp_row)
             token = env.step_in_place(legal[a_idx], settle_winners=False)
@@ -714,7 +718,7 @@ class _MCCFRSolver:
         meta_pk = (pk_base, "META", seat)
         self.state.ensure_vnode(meta_pk, _BIAS_CLASSES, seat, self._n_combos, "combo")
         sigma = regret_match_matrix(self.state.vregret[meta_pk])
-        opp_ci = self._combo_index[tuple(sorted(holes[seat]))]
+        opp_ci = self._combo_index[holes[seat]]  # already (c0, c1), c0 < c1
         return sample_index(self.rng, sigma[opp_ci])
 
     def _vleaf_value(self, env, profile: Dict[int, BiasClass], pk_base,

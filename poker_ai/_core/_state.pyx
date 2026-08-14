@@ -39,6 +39,17 @@ from libc.string cimport memcpy
 from libc.math cimport ceil
 from cpython.bytes cimport PyBytes_FromStringAndSize
 
+import itertools
+
+import numpy as np
+
+from environment import range_showdown
+from environment.evaluator import default_evaluator
+from environment.player import Player
+from environment.pot import Pot
+from environment.poker_env import _as_runout, _n_choose_k, _settle_runout, _settle_traverser
+from environment.utils import enumerate_combos
+
 
 # ---------------------------------------------------------------------------
 # Compile-time bounds (loud RuntimeError on overflow — never silent truncation)
@@ -981,10 +992,6 @@ cdef class FastState:
     # ------------------------------------------------------------------
     def payout(self):
         """Net chip delta per seat at a terminal: ``won[i] - contrib[i]``."""
-        from environment.evaluator import default_evaluator
-        from environment.pot import Pot
-        from environment.player import Player
-
         cdef int seat
         board = [self.board[k] for k in range(5)]
         grouped = {}
@@ -1023,9 +1030,6 @@ cdef class FastState:
         two for a flop root, ``None`` for an already-complete board.  A bare int
         is accepted as the one-card form (see ``poker_env._as_runout``).
         """
-        from environment import range_showdown
-        from environment.poker_env import _as_runout
-
         if not self.is_terminal:
             raise ValueError("vector_payout is only defined at a terminal node.")
         cdef int s
@@ -1097,12 +1101,6 @@ cdef class FastState:
         computes it fresh, as before — required whenever the board/opponents can
         differ per call (e.g. a leaf rollout's own independently-drawn board).
         """
-        import numpy as np
-        from environment import range_showdown
-        from environment.evaluator import default_evaluator
-        from environment.poker_env import _settle_traverser
-        from environment.player import Player
-
         if not self.is_terminal:
             raise ValueError(
                 "vector_payout_concrete is only defined at a terminal node."
@@ -1232,13 +1230,6 @@ cdef class FastState:
         ``player_i``/``order``.  The completion average is an integer chip sum, so
         the result is independent of completion order (the deck order need not match).
         """
-        import itertools
-        import numpy as np
-        from environment.evaluator import default_evaluator
-        from environment.player import Player
-        from environment.utils import enumerate_combos
-        from environment.poker_env import _settle_runout, _n_choose_k
-
         if not self.is_decision_free:
             raise ValueError(
                 "runout_equity requires a decision-free all-in runout state "

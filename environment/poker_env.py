@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import collections
 import copy
+import functools
 import itertools
 import json
 import logging
@@ -2760,6 +2761,7 @@ class PokerEnv:
     # ------------------------------------------------------------------
 
     @staticmethod
+    @functools.lru_cache(maxsize=4)
     def get_canonical_actions(betting_round: int) -> List[str]:
         """Return the full abstract action set for ``betting_round`` in stable order.
 
@@ -2772,7 +2774,11 @@ class PokerEnv:
         -------
         list[str]
             All possible action strings for this stage, ordered as
-            ``["fold", "call", "all_in", "raise:<f1>", ...]``.
+            ``["fold", "call", "all_in", "raise:<f1>", ...]``. Depends only on
+            ``betting_round`` and the module-level ``RAISE_SIZES_BY_STAGE``
+            (never a per-instance override — this is a ``staticmethod``), both
+            fixed for the process, so the result is cached; callers must treat
+            the returned list as read-only (shared across calls).
 
         Raises
         ------
