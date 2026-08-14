@@ -274,8 +274,8 @@ class FastMCCFRAdapter(_PolicyStateMixin):
     def undo(self, token) -> None:
         self._fast.undo(token)
 
-    def vector_payout_concrete(self, seat: int):
-        return self._fast.vector_payout_concrete(seat, self.combo_cards)
+    def vector_payout_concrete(self, seat: int, feasible=None):
+        return self._fast.vector_payout_concrete(seat, self.combo_cards, feasible)
 
 
 def build_fast_walk_env(root_env):

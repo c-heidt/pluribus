@@ -148,8 +148,6 @@ def config_fingerprint(
             "beta": getattr(cfg, "beta", None),
         },
         "leaf": {
-            "n_rollouts": cfg.leaf.n_rollouts,
-            "use_decision_free_equity": bool(cfg.leaf.use_decision_free_equity),
             "policies": sorted(str(k) for k in cfg.leaf.policies),
         },
         "table_policy": table_policy,

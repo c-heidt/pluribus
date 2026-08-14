@@ -47,6 +47,8 @@ def rank_combos_on_board(
     combo_cards: np.ndarray,
     board: Sequence[int],
     evaluator=None,
+    removal: Optional[Tuple[np.ndarray, np.ndarray, int]] = None,
+    deck_uniq: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Rank every hole combo on a fixed board.
 
@@ -61,6 +63,14 @@ def rank_combos_on_board(
         Scalar hand evaluator; defaults to the shared
         :data:`environment.evaluator.default_evaluator` (the same object
         ``compute_winners`` and ``runout_equity`` use).
+    removal, deck_uniq : optional
+        Precomputed :func:`removal_index`/:func:`deck_slots` for ``combo_cards``'
+        deck. A caller ranking many boards on ONE deck (e.g. a fresh, uncached
+        board every MCCFR iteration — the ``ranked_board`` LRU cache doesn't help
+        there) should compute these once and pass them through, so validity uses
+        a dense-mask lookup instead of ``np.isin`` against the tiny board each
+        call. Falls back to computing validity via ``np.isin`` when omitted
+        (unchanged behavior, e.g. the board-keyed-cached ``ranked_board`` path).
 
     Returns
     -------
@@ -77,12 +87,18 @@ def rank_combos_on_board(
     board_list = [int(c) for c in board]
 
     n = combo_cards.shape[0]
-    # Vectorised validity: a combo is impossible iff either card is on the board.
     board_arr = np.asarray(board_list, dtype=combo_cards.dtype)
-    valid = ~(
-        np.isin(combo_cards[:, 0], board_arr)
-        | np.isin(combo_cards[:, 1], board_arr)
-    )
+    if removal is not None and deck_uniq is not None:
+        s0, s1, deck_size = removal
+        mask = np.zeros(deck_size, dtype=bool)
+        mask[np.searchsorted(deck_uniq, board_arr)] = True
+        valid = ~(mask[s0] | mask[s1])
+    else:
+        # Vectorised validity: a combo is impossible iff either card is on the board.
+        valid = ~(
+            np.isin(combo_cards[:, 0], board_arr)
+            | np.isin(combo_cards[:, 1], board_arr)
+        )
 
     ranks = np.full(n, _SENTINEL_RANK, dtype=np.int64)
     # Rank only the board-compatible combos (the rest stay at the sentinel and
@@ -144,10 +160,12 @@ def _ranked_cached(low_card_rank: int, high_card_rank: int, board: Tuple[int, ..
 @lru_cache(maxsize=_BOARD_CACHE_SIZE)
 def _valid_cached(low_card_rank: int, high_card_rank: int, board: Tuple[int, ...]):
     cards, _ = enumerate_combos(low_card_rank, high_card_rank)
+    s0, s1, deck_size = _removal_cached(low_card_rank, high_card_rank)
+    uniq = _deck_slots_cached(low_card_rank, high_card_rank)
     board_arr = np.asarray(board, dtype=cards.dtype)
-    valid = ~(
-        np.isin(cards[:, 0], board_arr) | np.isin(cards[:, 1], board_arr)
-    )
+    mask = np.zeros(deck_size, dtype=bool)
+    mask[np.searchsorted(uniq, board_arr)] = True
+    valid = ~(mask[s0] | mask[s1])
     valid.flags.writeable = False
     return valid
 
@@ -156,6 +174,29 @@ def _valid_cached(low_card_rank: int, high_card_rank: int, board: Tuple[int, ...
 def _removal_cached(low_card_rank: int, high_card_rank: int):
     cards, _ = enumerate_combos(low_card_rank, high_card_rank)
     return removal_index(cards)
+
+
+@lru_cache(maxsize=64)
+def _deck_slots_cached(low_card_rank: int, high_card_rank: int):
+    cards, _ = enumerate_combos(low_card_rank, high_card_rank)
+    return np.unique(cards)
+
+
+def deck_slots(low_card_rank: int, high_card_rank: int) -> np.ndarray:
+    """Memoised sorted-unique card-int array for a deck (Cactus-Kev encoded).
+
+    The companion lookup for :func:`removal_for`: card integers are NOT
+    ``0..51`` (they're the evaluator's sparse bit-packed encoding — deck values
+    span into the hundreds of millions), so an arbitrary card can't be densified
+    to its :func:`removal_index` slot by direct indexing. ``np.searchsorted(
+    deck_slots(low, high), card)`` gives that slot (the same densification
+    ``removal_index`` uses internally, exposed for a caller's OWN small,
+    dynamic exclusion set — e.g. card-removal masking against a few board/hole
+    cards — rather than ``combo_cards``' fixed two columns). Depends only on the
+    deck, so callers masking many terminals on one deck should call this once
+    (it's ``lru_cache``d, so repeated calls are cheap regardless).
+    """
+    return _deck_slots_cached(int(low_card_rank), int(high_card_rank))
 
 
 def ranked_board(

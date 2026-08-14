@@ -79,7 +79,7 @@ def _solve(target_round, stacks, seed, use_core, iters=80):
     n = len(stacks)
     env = _root(target_round, stacks, seed)
     ranges = {s: np.ones(env.n_combos, np.float32) / env.n_combos for s in range(n)}
-    leaf = LeafConfig(policies={c: UniformPolicy() for c in _BIAS_CLASSES}, n_rollouts=2)
+    leaf = LeafConfig(policies={c: UniformPolicy() for c in _BIAS_CLASSES})
     ctx = SubgameContext.from_runtime(
         env=env, my_seat=0, my_hole=tuple(int(c) for c in env.players[0].cards),
         ranges=ranges, folded_ranges={}, leaf=leaf, rng=np.random.default_rng(7),

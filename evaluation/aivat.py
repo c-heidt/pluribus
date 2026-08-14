@@ -68,7 +68,6 @@ turning it on does not perturb the deck / hero / opponent sampling — the raw
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import logging
 from typing import Dict, List, Sequence, Tuple
 
@@ -146,19 +145,14 @@ class LeafValue:
         opponent belief, or ``None`` for a blueprint-only agent (belief-free draws).
     leaf_cfg
         The continuation leaf config — reuse the session's ``solver_cfg.leaf`` for
-        its **fleet** (``policies``).  Its ``n_rollouts`` is *overridden* to
-        ``value_rollouts`` (default 1): the estimator is unbiased at any rollout
-        count and the ``n_hole_samples`` averaging already tames ``v``'s noise, so
-        paying the session's search ``n_rollouts`` (e.g. 20) per value evaluation
-        would be ~20× cost for negligible gain.
+        its **fleet** (``policies``); passed straight through (``continuation_value``
+        always takes exactly one rollout, so there is nothing left to override).
     rng
         Dedicated AIVAT RNG (a distinct seed sub-stream), used for both the belief
         hole sampling and the rollout runouts — kept separate from the hand's
         deck / hero / opponent RNGs so AIVAT never perturbs the played hand.
     n_hole_samples
         Number of joint hole draws averaged per ``v`` evaluation.
-    value_rollouts
-        Rollouts per :func:`continuation_value` call (default 1); see ``leaf_cfg``.
     """
 
     def __init__(
@@ -168,27 +162,11 @@ class LeafValue:
         rng: np.random.Generator,
         *,
         n_hole_samples: int = 6,
-        value_rollouts: int = 1,
     ) -> None:
         self._hero = hero
         self._rng = rng
         self._m = int(n_hole_samples)
-        self._rollouts = int(value_rollouts)
-        # Reuse the session fleet but pin a cheap rollout count.  Whether to take the
-        # exact decision-free runout is decided per call from the node's street (see
-        # child_values), so it is not baked in here.
-        self._base_use_equity = bool(leaf_cfg.use_decision_free_equity)
-        self._leaf_exact = dataclasses.replace(
-            leaf_cfg, n_rollouts=self._rollouts, use_decision_free_equity=True
-        )
-        self._leaf_sampled = dataclasses.replace(
-            leaf_cfg, n_rollouts=self._rollouts, use_decision_free_equity=False
-        )
-        # Exact decision-free runout equities are memoised across all v calls of a
-        # hand (keyed on (holes, runout snapshot) inside continuation_value), so a
-        # repeated all-in integration runs once — the same shared-cache trick the
-        # solver uses.
-        self._runout_cache: dict = {}
+        self._leaf = leaf_cfg
 
     def child_values(
         self, env_before: PokerEnv, legal: Sequence[str]
@@ -200,13 +178,6 @@ class LeafValue:
         steps each legal action via make/undo and scores the resulting child with
         :func:`continuation_value`.  ``env_before`` is never mutated (the sampled
         env is a fresh ``with_hole_cards`` copy).
-
-        The exact decision-free runout is used only when the node is **post-flop**:
-        a pre-flop-rooted rollout can reach a pre-flop all-in whose exact 5-card
-        runout blows past ``runout_equity``'s enumeration cap (thousands of sampled
-        boards per terminal).  So pre-flop nodes fall back to the sampled single
-        board — mirroring the solver's own ``_use_equity = flag AND street_at_root
-        != 0`` guard.  ``v`` is unbiased either way.
         """
         legal = list(legal)
         sums: Dict[str, float] = {a: 0.0 for a in legal}
@@ -214,17 +185,14 @@ class LeafValue:
         n_players = env_before.n_players
         profile = {s: "none" for s in range(n_players)}
         m = max(self._m, 1)
-        use_exact = self._base_use_equity and env_before.betting_round != 0
-        leaf = self._leaf_exact if use_exact else self._leaf_sampled
-        ctx = _LeafCtx(leaf, self._rng)
-        cache = self._runout_cache if use_exact else None
+        ctx = _LeafCtx(self._leaf, self._rng)
         with _preserve_global_random():
             for _ in range(m):
                 holes = self._sample_joint(env_before)
                 base = env_before.with_hole_cards(holes)
                 for a in legal:
                     tok = base.step_in_place(a)
-                    v = continuation_value(base, profile, ctx, cache)
+                    v = continuation_value(base, profile, ctx)
                     sums[a] += float(v[hero_seat])
                     base.undo(tok)
         return {a: sums[a] / m for a in legal}

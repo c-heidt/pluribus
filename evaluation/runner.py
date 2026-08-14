@@ -1186,7 +1186,6 @@ def build_blueprint_session(
     *,
     blueprint_path: str,
     lut_path: str,
-    use_decision_free_equity: bool = True,
     max_iterations: int = 60_000,   # the single absolute per-replica ITERATION ceiling
     # Absolute per-search WALL cap, one-worker translation of Pluribus's real-time budget:
     # its 30 s TOP on a 22-core shared-table 6-player MCCFR search = 30*22 = 660 core-seconds
@@ -1255,13 +1254,7 @@ def build_blueprint_session(
         _assert_index_caches_complete(tables)
     blueprint = BlueprintPolicy(tables, bias_multiplier=bias_multiplier)
 
-    # ``n_rollouts`` is NOT set here — it propagates from ``LeafConfig``'s own
-    # default (poker_ai/search/leaf.py), the single source of truth for the leaf
-    # config.  Overriding it here would silently mask that config.
-    leaf = LeafConfig(
-        policies={c: blueprint for c in _BIAS_CLASSES},
-        use_decision_free_equity=use_decision_free_equity,
-    )
+    leaf = LeafConfig(policies={c: blueprint for c in _BIAS_CLASSES})
     # ``discount_interval`` and ``auto_budget`` are NOT set here — they propagate
     # from ``SolverConfig``'s own defaults (poker_ai/search/solver_state.py), the
     # single source of truth.  Only the leaf and the genuine run-knobs
@@ -1271,6 +1264,13 @@ def build_blueprint_session(
         max_iterations=max_iterations,
         max_wall_seconds=max_wall_seconds,
         beta=cfg.beta,          # OX-Search gadget (Approach B); None ⇒ off (vanilla/DBR)
+        # VR-MCCFR control-variate baseline (opponent_modeling §5.5).  Requested
+        # unconditionally here, same as evaluation/calibrate.py: the flag is
+        # self-gating on ``ctx.models`` in mccfr.py (``self._vr = variance_reduction
+        # and bool(ctx.models)``), so it stays a true no-op for vanilla/OX/
+        # blueprint_only (byte-identical) and only activates for DBR arms, which is
+        # exactly where it earns its keep (flop MCCFR is DBR's noisiest regime).
+        variance_reduction=True,
     )
     return EvalSession(
         config=cfg,

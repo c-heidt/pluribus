@@ -43,9 +43,8 @@ Key = Tuple[PublicKey, int]
 class SolverConfig:
     """Static solver hyperparameters (§6.5).
 
-    ``leaf`` is required and carries the continuation-strategy fleet + the
-    ``use_decision_free_equity`` toggle consumed at depth-limit leaves and
-    forced-runout terminals.
+    ``leaf`` is required and carries the continuation-strategy fleet consumed
+    at depth-limit leaves.
     """
 
     leaf: "LeafConfig"

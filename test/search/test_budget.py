@@ -28,12 +28,12 @@ from test.search._helpers import _ctx, _late_env, _policies
 
 
 def _cfg(**kw):
-    leaf = LeafConfig(policies=_policies(), n_rollouts=1)
+    leaf = LeafConfig(policies=_policies())
     return SolverConfig(leaf=leaf, **kw)
 
 
 def _ctx_for(street, n_players):
-    leaf = LeafConfig(policies=_policies(), n_rollouts=1)
+    leaf = LeafConfig(policies=_policies())
     ranges = {s: np.ones(4, np.float32) for s in range(n_players)}
     return SubgameContext(
         my_seat=0, my_hole=(0, 1), ranges=ranges, folded_ranges={},

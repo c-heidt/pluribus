@@ -46,7 +46,7 @@ def _stub_session(
     blueprint=None,
     card_info_lut=None,
 ) -> EvalSession:
-    leaf = LeafConfig(policies=_policies(), n_rollouts=1)
+    leaf = LeafConfig(policies=_policies())
     solver_cfg = SolverConfig(
         leaf=leaf, max_iterations=4, max_wall_seconds=30.0,
         discount_interval=20,   # serial → fast + deterministic

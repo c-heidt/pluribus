@@ -58,7 +58,7 @@ def _turn_env_3p(seed, low=9, high=14, stacks=(200, 200, 200)):
 
 def _ctx(env, seed):
     ranges = {s: np.ones(env.n_combos, np.float32) / env.n_combos for s in range(3)}
-    leaf = LeafConfig(policies={c: _UniformPolicy() for c in _BIAS_CLASSES}, n_rollouts=1)
+    leaf = LeafConfig(policies={c: _UniformPolicy() for c in _BIAS_CLASSES})
     return SubgameContext.from_runtime(
         env=env, my_seat=0,
         my_hole=tuple(int(c) for c in env.players[0].cards),
@@ -196,7 +196,7 @@ def test_phantom_traverser_hole_is_uniform_not_range_weighted():
     ranges = {0: trav_range,
               1: np.ones(env.n_combos, np.float32) / env.n_combos,
               2: np.ones(env.n_combos, np.float32) / env.n_combos}
-    leaf = LeafConfig(policies={c: _UniformPolicy() for c in _BIAS_CLASSES}, n_rollouts=1)
+    leaf = LeafConfig(policies={c: _UniformPolicy() for c in _BIAS_CLASSES})
     ctx = SubgameContext.from_runtime(
         env=env, my_seat=0, my_hole=tuple(int(c) for c in env.players[0].cards),
         ranges=ranges, folded_ranges={}, leaf=leaf, rng=np.random.default_rng(0))

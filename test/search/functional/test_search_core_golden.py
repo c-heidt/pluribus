@@ -52,12 +52,14 @@ _RNG_SEED = 7
 _N_ITERS = 50
 
 # Frozen fingerprints — see the module docstring for when and how to regenerate.
-# MCCFR regenerated 2026-07-19: the regime is now traverser-vectorized — one walk
-# sweeps the traverser's whole range (opponents/chance still sampled), folding regret
-# + average strategy into the shared ``vregret``/``vstrat`` matrices (this fixture is
-# a HU preflop root, whose depth-limit leaf is the vectorized continuation meta-game).
-# A deliberate maths change from the prior scalar external-sampling walk.
-GOLDEN_DIGEST_MCCFR = "05e91c0061ed1a6cc680c44453cccaf2d6240663ddd9493ff382610b90fb9911"
+# MCCFR regenerated 2026-08-14: the depth-limit leaf rollout (continuation_value /
+# continuation_value_vector / continuation_value_vector_fast) now always takes
+# EXACTLY one action-line/board sample — the n_rollouts averaging loop (and the
+# LeafConfig field driving it) was removed.  This fixture's shared _ctx() helper
+# previously defaulted to n_rollouts=2, so the preflop root's depth-limit leaf
+# (the vectorized continuation meta-game) now scores a genuinely different (single-
+# sample) value — a deliberate maths change, not a regression.
+GOLDEN_DIGEST_MCCFR = "a5521b63d4b0f443b22ac19370f78faebb45431e6842de8f902bc14867d11ee4"
 GOLDEN_DIGEST_VECTOR = "7e6e3da6534d92c5e9a808a48b9da06054558cbb4a7ee8727fab0efa23113db2"
 
 

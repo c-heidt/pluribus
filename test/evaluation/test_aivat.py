@@ -168,7 +168,7 @@ class TestAccumulatorArithmetic:
 def _hero_on_flop(seed=0, low=11, high=14, stacks=(300, 300)):
     """A heads-up flop env + a hero SearchAgent whose tracker is initialised."""
     env = _flop_env(low=low, high=high, stacks=stacks, seed=seed)
-    leaf = LeafConfig(policies=_policies(), n_rollouts=1)
+    leaf = LeafConfig(policies=_policies())
     cfg = SolverConfig(leaf=leaf, max_iterations=4, max_wall_seconds=30.0,
                        discount_interval=20)
     hero_seat = env.player_i
@@ -223,7 +223,7 @@ class TestBeliefSampling:
         my_hole = tuple(sorted(int(c) for c in env.players[hero_seat].cards))
         hero = SimpleNamespace(my_seat=hero_seat, my_hole=my_hole, tracker=None)
         board = {int(c) for c in env.community_cards}
-        leaf = LeafConfig(policies=_policies(), n_rollouts=1)
+        leaf = LeafConfig(policies=_policies())
 
         vf = LeafValue(hero, leaf, np.random.default_rng(0), n_hole_samples=1)
         for _ in range(30):

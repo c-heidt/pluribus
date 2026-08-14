@@ -26,6 +26,7 @@ from typing import Dict, Tuple
 
 import numpy as np
 
+from environment import range_showdown
 from environment.utils import make_deck_arr
 from information_abstraction.lookup import clusters_for_board
 from poker_ai.blueprint.tree_utils import sample_index
@@ -109,6 +110,26 @@ class _MCCFRSolver:
         self.n_players = root_env.n_players
         self._combo_cards = root_env.combo_cards
         self._my_hole = tuple(sorted(int(c) for c in ctx.my_hole))
+
+        # Densified card-removal slots (once per solver, not per node/iteration):
+        # card ints are Cactus-Kev encoded (not ``0..51``), so a dense boolean
+        # exclusion mask needs each combo's two cards mapped to a compact
+        # ``0..deck_size-1`` slot first — the same densification
+        # ``range_showdown.removal_index`` uses for showdown settlement, reused
+        # here so root-hole sampling's card-removal checks (`np.isin` against a
+        # tiny per-call exclusion set, confirmed hot by profiling) become a
+        # dense-mask lookup instead. ``removal_for``/``deck_slots`` are
+        # ``lru_cache``d per deck, so this is cheap even recomputed elsewhere.
+        low, high = root_env.low_card_rank, root_env.high_card_rank
+        self._combo_slot0, self._combo_slot1, self._deck_size = (
+            range_showdown.removal_for(low, high)
+        )
+        self._deck_uniq = range_showdown.deck_slots(low, high)
+        # Fixed per-iteration payout-feasibility mask (recomputed at the top of
+        # every ``_vectorized_iterate`` call; ``None`` iff the current root is
+        # leaf-containing, where the board deals progressively and no single
+        # fixed mask is valid for a whole iteration — see ``_vectorized_iterate``).
+        self._iter_feasible = None
 
         self._live_seats = sorted(ctx.ranges.keys())
         all_seats = set(ctx.ranges) | set(ctx.folded_ranges)
@@ -395,6 +416,19 @@ class _MCCFRSolver:
         )
         return self._sequential_sample()
 
+    def _disjoint_mask(self, excluded) -> np.ndarray:
+        """``(n_combos,)`` bool: combos sharing no card with any card in ``excluded``.
+
+        Card-removal check via the precomputed densified slots (``__init__``)
+        instead of ``np.isin`` against the small, per-call ``excluded`` set —
+        confirmed by profiling as a hot cost (12-20% of MCCFR wall) across every
+        call site below. ``excluded`` may be empty.
+        """
+        mask = np.zeros(self._deck_size, dtype=bool)
+        if excluded:
+            mask[np.searchsorted(self._deck_uniq, list(excluded))] = True
+        return ~(mask[self._combo_slot0] | mask[self._combo_slot1])
+
     def _sample_root_holes_vectorized(self, traverser: int) -> Dict[int, Tuple[int, int]]:
         """Root holes for the vectorized walk: real opponents, phantom traverser.
 
@@ -431,10 +465,7 @@ class _MCCFRSolver:
             if not ok:
                 continue
             excl = used | board
-            excl_arr = np.fromiter(excl, dtype=cc.dtype, count=len(excl))
-            feas = np.flatnonzero(
-                ~(np.isin(cc[:, 0], excl_arr) | np.isin(cc[:, 1], excl_arr))
-            )
+            feas = np.flatnonzero(self._disjoint_mask(excl))
             if feas.size == 0:
                 continue
             row = int(feas[self.rng.integers(feas.size)])
@@ -455,9 +486,7 @@ class _MCCFRSolver:
         for s in order.tolist():
             w = self._weights[s].copy()
             if used:
-                forbidden = np.fromiter(used, dtype=np.int64)
-                conflict = np.isin(cc[:, 0], forbidden) | np.isin(cc[:, 1], forbidden)
-                w[conflict] = 0.0
+                w[~self._disjoint_mask(used)] = 0.0
             total = w.sum()
             if total <= 0.0:
                 raise ValueError("MCCFR joint sampler: card exhaustion in fallback.")
@@ -485,27 +514,49 @@ class _MCCFRSolver:
         and :class:`SearchPolicy` read.  Returns the traverser's ``(n_combos,)`` root
         counterfactual value (used by the calibration root-value signal).
         """
-        if self._cmaps is not None and self._cmaps.n_completion:
-            # Frozen future runout for this iteration (the board cards past the
-            # root community), folded into the future-street cluster ids exactly
-            # as the vector regime folds its sampled completion.  Only turn/river
-            # roots reach future streets; leaf-containing roots (cmaps is None) cut
-            # to a leaf first.  Read the runout off the PokerEnv root (``env`` here
-            # may be the deck-less FastState adapter) — reseat already froze it.
+        runout = None
+        if self._cmaps is not None:
+            # Frozen board for this iteration — reseat has already dealt the WHOLE
+            # 5-card runout before the walk starts, and it never changes again this
+            # iteration (leaf-free root: no depth-limit leaf re-deals mid-walk).
+            # Read it off the PokerEnv root (``env`` here may be the deck-less
+            # FastState adapter). Only turn/river/HU-flop roots reach here;
+            # leaf-containing roots (preflop / multiway-flop, cmaps is None) deal
+            # the board PROGRESSIVELY as betting advances instead — see below.
             runout = self.root_env.deck.board_runout(5)
-            completion = tuple(int(c) for c in runout[self._root_len:])
-            self._cmaps.refresh(completion)
+            if self._cmaps.n_completion:
+                # Future-street cluster ids past the root community, folded in
+                # exactly as the vector regime folds its sampled completion.
+                completion = tuple(int(c) for c in runout[self._root_len:])
+                self._cmaps.refresh(completion)
         # Traverser root reach: its board-masked range, additionally masked to
         # combos card-disjoint from every OTHER seat's sampled hole (card removal
         # — the vector analogue of the joint sampler's disjointness rejection).
-        cc = self._combo_cards
         excl: set = set()
         for s in range(self.n_players):
             if s != i:
                 excl.update(int(c) for c in holes[s])
-        excl_arr = np.fromiter(excl, dtype=cc.dtype, count=len(excl))
-        disjoint = ~(np.isin(cc[:, 0], excl_arr) | np.isin(cc[:, 1], excl_arr))
+        disjoint = self._disjoint_mask(excl)
         pi_p0 = self._reach[i] * disjoint
+
+        # Fixed per-iteration payout-feasibility mask: every terminal reached
+        # during THIS iteration's walk settles the SAME traverser (``i``) against
+        # the SAME frozen board + the SAME other-seats' holes, so the card-removal
+        # mask ``vector_payout_concrete`` needs is identical at every one of those
+        # terminals (measured ~33 calls/iteration on a HU-flop cell) — compute it
+        # ONCE here instead of rebuilding it at each terminal.  Valid ONLY when the
+        # board is genuinely fixed for the whole iteration (leaf-free roots,
+        # ``runout is not None``): a leaf-containing root (preflop / multiway-flop)
+        # deals its board PROGRESSIVELY as the walk advances streets, so a terminal
+        # reached mid-walk may hold fewer board cards than the eventual full
+        # board — precomputing against the wrong (future) board there would
+        # silently rule out combos on cards not yet actually dealt at that
+        # terminal. Those roots pass ``feasible=None`` and keep computing the mask
+        # fresh per terminal (the pre-existing, always-correct behavior).
+        self._iter_feasible = (
+            self._disjoint_mask(set(int(c) for c in runout) | excl)
+            if runout is not None else None
+        )
         return self._vwalk(env, i, pi_p0, holes)
 
     def _vwalk(self, env, p: int, pi_p: np.ndarray,
@@ -597,7 +648,7 @@ class _MCCFRSolver:
         """Descend one edge: settle a terminal / leaf, or recurse a decision node."""
         verdict = self.ctx.depth_limit.classify(env)
         if verdict == "terminal":
-            return env.vector_payout_concrete(p)
+            return env.vector_payout_concrete(p, feasible=self._iter_feasible)
         if verdict == "leaf":
             # Depth-limit continuation meta-game (only pre-flop / multiway-flop
             # roots reach it; those never cross to a future street first).
@@ -688,10 +739,8 @@ class _MCCFRSolver:
 
     def _board_feasible_mask(self, env) -> np.ndarray:
         """``(n_combos,)`` bool: combos sharing no card with ``env``'s board."""
-        cc = self._combo_cards
         board = list(env.community_cards)
         if not board:
             return np.ones(self._n_combos, dtype=bool)
-        barr = np.fromiter((int(c) for c in board), dtype=cc.dtype, count=len(board))
-        return ~(np.isin(cc[:, 0], barr) | np.isin(cc[:, 1], barr))
+        return self._disjoint_mask(board)
 

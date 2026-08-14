@@ -184,11 +184,10 @@ def test_core_sigma_matches_python_on_rollout_nodes(tmp_path, bias):
         tables.close()
 
 
-def _ctx(env, policy, n_rollouts, seed):
+def _ctx(env, policy, seed):
     n = env.n_players
     ranges = {s: np.ones(env.n_combos, np.float32) / env.n_combos for s in range(n)}
-    leaf = LeafConfig(policies={c: policy for c in _BIASES}, n_rollouts=n_rollouts,
-                      use_decision_free_equity=True)
+    leaf = LeafConfig(policies={c: policy for c in _BIASES})
     return SubgameContext.from_runtime(
         env=env, my_seat=0, my_hole=tuple(int(c) for c in env.players[0].cards),
         ranges=ranges, folded_ranges={}, leaf=leaf, rng=np.random.default_rng(seed))
@@ -225,16 +224,16 @@ def test_rollout_in_core_policy_unbiased_vs_python(tmp_path):
         # The in-core path must actually be selected for this fleet.
         assert _resolve_core_policy({c: policy for c in _BIASES}, profile) is policy
 
-        R, B = 1200, 8
+        N = 800  # independent single-rollout calls averaged per arm
 
         def estimate(fast, base_seed):
             vals = []
-            for b in range(B):
-                ctx = _ctx(env, policy, R, seed=base_seed * 100 + b)
+            for i in range(N):
+                ctx = _ctx(env, policy, seed=base_seed * 100_000 + i)
                 fn = continuation_value_vector_fast if fast else continuation_value_vector
                 vals.append(fn(copy.deepcopy(env), profile, ctx, traverser))
-            arr = np.array(vals)                       # (B, n_combos)
-            return arr.mean(0), arr.std(0, ddof=1) / np.sqrt(B)
+            arr = np.array(vals)                       # (N, n_combos)
+            return arr.mean(0), arr.std(0, ddof=1) / np.sqrt(N)
 
         m_fast, se_fast = estimate(True, 1)
         m_py, se_py = estimate(False, 2)

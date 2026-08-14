@@ -2497,7 +2497,9 @@ class PokerEnv:
             valid, combo_cards, opp_reach, sign * gain, removal
         )
 
-    def vector_payout_concrete(self, seat: int) -> "np.ndarray":
+    def vector_payout_concrete(
+        self, seat: int, feasible: "Optional[np.ndarray]" = None
+    ) -> "np.ndarray":
         """Per-combo chip delta to ``seat`` at a terminal with **concrete** opponents.
 
         The external-sampling twin of :meth:`vector_payout`: every *other* seat
@@ -2512,6 +2514,19 @@ class PokerEnv:
         cards (card removal).  Multiway and side pots are handled by the shared
         :func:`_settle_traverser` (same ``Pot.compute_utility`` as
         ``compute_winners``).
+
+        Parameters
+        ----------
+        feasible : numpy.ndarray, optional
+            Precomputed ``(n_combos,)`` bool feasibility mask (``True`` iff
+            ``seat``'s combo shares no card with the board or any other seat's
+            dealt hole).  A caller settling MANY terminals in one MCCFR
+            iteration against the SAME frozen board + opponent holes (the main
+            walk — see :mod:`poker_ai.search.mccfr`) computes this once and
+            passes it through, skipping the exclusion-set rebuild below.
+            ``None`` (default) computes it fresh, as before — the only safe
+            choice when the board/opponents can differ per call (e.g. a leaf
+            rollout, which draws its own independent board every call).
 
         Raises
         ------
@@ -2529,17 +2544,27 @@ class PokerEnv:
         n_combos = combo_cards.shape[0]
         community = list(self.community_cards)
 
-        # Feasibility: ``seat``'s combo must share no card with the board or any
-        # OTHER seat's dealt hole (every seat carries concrete sampled cards under
-        # external sampling).  Impossible combos return 0.
-        excluded = set(int(c) for c in community)
-        for s in range(n):
-            if s != seat:
-                excluded.update(int(c) for c in self.players[s]._cards)
-        excl = np.fromiter(excluded, dtype=combo_cards.dtype, count=len(excluded))
-        feasible = ~(
-            np.isin(combo_cards[:, 0], excl) | np.isin(combo_cards[:, 1], excl)
-        )
+        low, high = self.low_card_rank, self.high_card_rank
+        removal = range_showdown.removal_for(low, high)
+        deck_uniq = range_showdown.deck_slots(low, high)
+        if feasible is None:
+            # Feasibility: ``seat``'s combo must share no card with the board or
+            # any OTHER seat's dealt hole (every seat carries concrete sampled
+            # cards under external sampling).  Impossible combos return 0.  Card
+            # ints are Cactus-Kev encoded (not ``0..51``), so membership is
+            # tested via the densified slot index (``removal_index``/
+            # ``deck_slots``) rather than ``np.isin`` against the tiny exclusion
+            # set — a dense boolean lookup over ``deck_size`` (<=52) slots beats
+            # a general set-membership scan, and this runs at every terminal.
+            excluded = set(int(c) for c in community)
+            for s in range(n):
+                if s != seat:
+                    excluded.update(int(c) for c in self.players[s]._cards)
+            s0, s1, deck_size = removal
+            excl_slots = np.searchsorted(deck_uniq, list(excluded))
+            excl_mask = np.zeros(deck_size, dtype=bool)
+            excl_mask[excl_slots] = True
+            feasible = ~(excl_mask[s0] | excl_mask[s1])
 
         # (i) ``seat`` folded → forfeits its contribution regardless of hand.
         if not self.players[seat].is_active:
@@ -2550,7 +2575,13 @@ class PokerEnv:
         # aligned to ``active``, infeasible seat combos parked at the sentinel
         # (they lose every pot; masked to 0 below regardless).
         active = [self.players[s] for s in range(n) if self.players[s].is_active]
-        trav_ranks, _ = range_showdown.rank_combos_on_board(combo_cards, community)
+        # Reuse the deck densification already computed above (this fires on a
+        # FRESH, uncached board most terminals — a distinct MCCFR-sampled runout
+        # each time — so ranked_board's board-keyed LRU cache doesn't help here;
+        # passing removal/deck_uniq through skips a second np.isin pass).
+        trav_ranks, _ = range_showdown.rank_combos_on_board(
+            combo_cards, community, removal=removal, deck_uniq=deck_uniq,
+        )
         trav_ranks = trav_ranks.copy()
         trav_ranks[~feasible] = range_showdown._SENTINEL_RANK
         opp_hands = [

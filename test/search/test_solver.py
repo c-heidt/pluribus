@@ -207,7 +207,7 @@ class TestJointSampler:
         _stub_lut(env)
         ranges = {s: np.ones(env.n_combos, np.float32) / env.n_combos for s in (0, 1)}
         folded = {2: np.ones(env.n_combos, np.float32) / env.n_combos}
-        leaf = LeafConfig(policies=_policies(), n_rollouts=1)
+        leaf = LeafConfig(policies=_policies())
         ctx = SubgameContext.from_runtime(
             env=env, my_seat=0, my_hole=tuple(int(c) for c in env.players[0].cards),
             ranges=ranges, folded_ranges=folded, leaf=leaf, rng=np.random.default_rng(0),
@@ -719,7 +719,7 @@ class TestVectorRegime:
         actor = env.player_i
         my_hole = tuple(int(c) for c in env.players[actor].cards)
         ranges = {s: np.ones(env.n_combos, np.float32) / env.n_combos for s in range(2)}
-        leaf = LeafConfig(policies=_policies(), n_rollouts=1)
+        leaf = LeafConfig(policies=_policies())
         ctx = SubgameContext.from_runtime(
             env=env, my_seat=actor, my_hole=my_hole, ranges=ranges,
             folded_ranges={}, leaf=leaf, rng=np.random.default_rng(0),
@@ -782,22 +782,46 @@ class TestSearchLifetimeCaches:
         return env
 
     def _count_continuation(self, monkeypatch):
-        """Patch the solver's ``continuation_value_vector`` with a counting wrapper
+        """Patch the solver's continuation-value rollout with a counting wrapper
         that records the same key ``_vleaf_value`` memoises on (the traverser hole is
-        dropped — one per-combo vector serves every combo); delegates to the real fn."""
+        dropped — one per-combo vector serves every combo); delegates to the real fn.
+
+        Patches BOTH ``poker_ai.search.mccfr.continuation_value_vector`` (what
+        ``_leaf_fn`` falls back to for a plain-``PokerEnv`` frontier) AND
+        ``poker_ai.search.leaf_fast.continuation_value_vector_fast`` (what
+        ``_leaf_fn`` re-imports directly for a compiled/``FastState`` frontier,
+        deliberately bypassing the ``mccfr``-level name — see ``_leaf_fn``'s
+        docstring). Patching only the first is silently blind under
+        ``PLURIBUS_SEARCH_CORE=1``: every leaf frontier there is compiled, so
+        ``_leaf_fn`` always takes the bypass path and the ``mccfr``-level patch
+        is never invoked — the solve still runs correctly (leaves are reached,
+        ``leaf_value_cache`` fills in), only this counting instrumentation goes
+        blind, which previously read as "never reached a depth-limit leaf".
+        """
+        import poker_ai.search.leaf_fast as leaf_fast_mod
         import poker_ai.search.mccfr as mod
         keys = []
-        original = mod.continuation_value_vector
 
-        def wrapper(env, profile, ctx, traverser_seat):
+        def _record(env, profile, traverser_seat):
             n = env.n_players
             hk = tuple(tuple(int(c) for c in env.players[s].cards)
                        for s in range(n) if s != traverser_seat)
             keys.append((env.public_key, traverser_seat, hk,
                          tuple(sorted(profile.items()))))
-            return original(env, profile, ctx, traverser_seat)
 
-        monkeypatch.setattr(mod, "continuation_value_vector", wrapper)
+        def _wrap(original):
+            def wrapper(env, profile, ctx, traverser_seat):
+                _record(env, profile, traverser_seat)
+                return original(env, profile, ctx, traverser_seat)
+            return wrapper
+
+        monkeypatch.setattr(
+            mod, "continuation_value_vector", _wrap(mod.continuation_value_vector)
+        )
+        monkeypatch.setattr(
+            leaf_fast_mod, "continuation_value_vector_fast",
+            _wrap(leaf_fast_mod.continuation_value_vector_fast),
+        )
         return keys
 
     def test_leaf_value_computed_once_per_key(self, monkeypatch):

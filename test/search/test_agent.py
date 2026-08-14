@@ -47,7 +47,7 @@ def _cfg(leaf, iters=20) -> SolverConfig:
 
 
 def _agent(blueprint=None, **kw) -> SearchAgent:
-    leaf = LeafConfig(policies=_policies(), n_rollouts=2)
+    leaf = LeafConfig(policies=_policies())
     return SearchAgent(
         leaf_policies=leaf.policies,
         blueprint_policy=blueprint or UniformPolicy(),

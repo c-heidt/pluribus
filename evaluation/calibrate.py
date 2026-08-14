@@ -1350,7 +1350,6 @@ def run_calibration(
     starting_stack: int,
     low_card_rank: int,
     high_card_rank: int,
-    use_decision_free_equity: bool,
     out_dir: Path,
     wall_target: Optional[float],
     regime_ab_streets: Sequence[int] = (2,),
@@ -1428,7 +1427,6 @@ def run_calibration(
     # NOT be widened to the ladder max (the sweep exceeds it per-solve via an explicit t).
     session = build_blueprint_session(
         base_cfg, blueprint_path=blueprint_path, lut_path=lut_path,
-        use_decision_free_equity=use_decision_free_equity,
         max_wall_seconds=1e9, bias_multiplier=bias_multiplier,
     )
     prod_cfg = session.solver_cfg
@@ -1763,8 +1761,6 @@ def _cli():
     @click.option("--starting-stack", default=10_000, type=int, show_default=True)
     @click.option("--low-card-rank", default=2, type=int, show_default=True)
     @click.option("--high-card-rank", default=14, type=int, show_default=True)
-    @click.option("--no-decision-free-equity", is_flag=True, default=False,
-                  help="Disable the exact decision-free leaf equity (debug).")
     @click.option("--wall-target", default=None, type=float,
                   help="Per-decision wall budget (s); flags cells whose suggested "
                   "budget would exceed it, and sets the wall for the turn regime A/B.")
@@ -1830,7 +1826,6 @@ def _cli():
             run_seed=o["run_seed"], big_blind=o["big_blind"],
             small_blind=o["small_blind"], starting_stack=o["starting_stack"],
             low_card_rank=o["low_card_rank"], high_card_rank=o["high_card_rank"],
-            use_decision_free_equity=not o["no_decision_free_equity"],
             out_dir=Path(o["out_dir"]), wall_target=o["wall_target"],
             regime_ab_streets=regime_ab_streets,
         )

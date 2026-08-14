@@ -260,8 +260,7 @@ def _raw_clusters(env, street: int, board) -> np.ndarray:
 
 def _cluster_ctx(env, ranges, seed=0):
     """A :class:`SubgameContext` whose leaf fleet is the cluster-keyed blueprint."""
-    leaf = LeafConfig(policies={c: _ClusterKeyedPolicy() for c in _BIAS_CLASSES},
-                      n_rollouts=2)
+    leaf = LeafConfig(policies={c: _ClusterKeyedPolicy() for c in _BIAS_CLASSES})
     return SubgameContext.from_runtime(
         env=env, my_seat=0,
         my_hole=tuple(int(c) for c in env.players[0].cards),

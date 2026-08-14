@@ -39,7 +39,7 @@ overlay actions are not representable), or the frontier is already terminal.
 from __future__ import annotations
 
 import logging
-from typing import List, Mapping, Tuple
+from typing import Mapping, Tuple
 
 import numpy as np
 
@@ -137,12 +137,10 @@ def continuation_value_vector_fast(
     """
     n = frontier_env.n_players
     cfg = ctx.leaf
-    n_combos = frontier_env.n_combos
     FastState = _core_state()
     if (
         FastState is None
         or frontier_env.is_terminal
-        or cfg.n_rollouts <= 0
         or getattr(frontier_env, "_extra_legal_actions", None)
     ):
         return continuation_value_vector(frontier_env, profile, ctx, traverser_seat)
@@ -177,40 +175,34 @@ def continuation_value_vector_fast(
     # ``None`` → the Python callback below.
     core_policy = _resolve_core_policy(cfg.policies, profile)
 
-    accum = np.zeros(n_combos, dtype=np.float64)
     try:
-        for _r in range(cfg.n_rollouts):
-            completion = (
-                list(rng.choice(undealt, size=k, replace=False)) if k > 0 else []
-            )
-            board = prefix + [int(c) for c in completion]
-            fs.set_board(board)
-            fs.refresh_clusters(lut)
-            tokens: List = []
-            while not fs.is_terminal:
-                seat = fs.player_i
-                if seat not in profile:
-                    raise ValueError(
-                        f"continuation_value_vector_fast: profile is missing acting "
-                        f"seat {seat}; it must cover every seat that can act."
-                    )
-                legal = [a for a in fs.legal_actions() if a is not None]
-                bias = profile[seat]
-                if core_policy is not None:
-                    br = fs.betting_round
-                    legal_cols = np.array(
-                        [ACTION_TO_IDX[br][a] for a in legal], dtype=np.int64
-                    )
-                    probs = core_policy.core_sigma(br, fs.info_set(), legal_cols, bias)
-                else:
-                    probs = cfg.policies[bias].strategy(
-                        _policy_state(fs, legal), bias=bias
-                    )
-                idx = sample_index(rng, probs)
-                tokens.append(fs.step_in_place(legal[idx]))
-            accum += fs.vector_payout_concrete(traverser_seat, combo_cards)
-            for tok in reversed(tokens):
-                fs.undo(tok)
+        completion = (
+            list(rng.choice(undealt, size=k, replace=False)) if k > 0 else []
+        )
+        board = prefix + [int(c) for c in completion]
+        fs.set_board(board)
+        fs.refresh_clusters(lut)
+        while not fs.is_terminal:
+            seat = fs.player_i
+            if seat not in profile:
+                raise ValueError(
+                    f"continuation_value_vector_fast: profile is missing acting "
+                    f"seat {seat}; it must cover every seat that can act."
+                )
+            legal = [a for a in fs.legal_actions() if a is not None]
+            bias = profile[seat]
+            if core_policy is not None:
+                br = fs.betting_round
+                legal_cols = np.array(
+                    [ACTION_TO_IDX[br][a] for a in legal], dtype=np.int64
+                )
+                probs = core_policy.core_sigma(br, fs.info_set(), legal_cols, bias)
+            else:
+                probs = cfg.policies[bias].strategy(
+                    _policy_state(fs, legal), bias=bias
+                )
+            idx = sample_index(rng, probs)
+            fs.step_in_place(legal[idx])
     except ValueError:
         # A malformed caller contract (e.g. profile missing an acting seat) is a
         # real bug at the call site, not a fast-path/core hiccup — never mask it as
@@ -224,4 +216,4 @@ def continuation_value_vector_fast(
         )
         return continuation_value_vector(frontier_env, profile, ctx, traverser_seat)
 
-    return accum / cfg.n_rollouts
+    return fs.vector_payout_concrete(traverser_seat, combo_cards)

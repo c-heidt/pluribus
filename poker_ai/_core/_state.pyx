@@ -1073,7 +1073,7 @@ cdef class FastState:
             valid, combo_cards, opp_reach, sign * gain, removal
         )
 
-    def vector_payout_concrete(self, int traverser_seat, combo_cards):
+    def vector_payout_concrete(self, int traverser_seat, combo_cards, feasible=None):
         """Per-combo chip delta to ``traverser_seat`` at a terminal with **concrete**
         opponents — byte-identical to ``PokerEnv.vector_payout_concrete`` (search
         Phase 2).
@@ -1089,6 +1089,13 @@ cdef class FastState:
         method is byte-identical to the env by construction — only the field source
         differs.  The board is complete (5 cards) at every terminal a leaf rollout or
         MCCFR walk reaches.
+
+        ``feasible``, optional: precomputed ``(n_combos,)`` bool feasibility mask —
+        a caller settling many terminals against the SAME frozen board + opponent
+        holes in one MCCFR iteration (the main walk) computes this once and passes
+        it through, skipping the exclusion-set rebuild below.  ``None`` (default)
+        computes it fresh, as before — required whenever the board/opponents can
+        differ per call (e.g. a leaf rollout's own independently-drawn board).
         """
         import numpy as np
         from environment import range_showdown
@@ -1106,17 +1113,28 @@ cdef class FastState:
         n_combos = combo_cards.shape[0]
         community = [self.board[k] for k in range(5)]
 
-        # Feasibility: the traverser's combo shares no card with the board or any
-        # OTHER seat's concrete hole.  Impossible combos return 0.
-        excluded = set(community)
-        for s in range(n):
-            if s != seat:
-                excluded.add(self.hole[s][0])
-                excluded.add(self.hole[s][1])
-        excl = np.fromiter(excluded, dtype=combo_cards.dtype, count=len(excluded))
-        feasible = ~(
-            np.isin(combo_cards[:, 0], excl) | np.isin(combo_cards[:, 1], excl)
-        )
+        low, high = self._low_card_rank, self._high_card_rank
+        removal = range_showdown.removal_for(low, high)
+        deck_uniq = range_showdown.deck_slots(low, high)
+        if feasible is None:
+            # Feasibility: the traverser's combo shares no card with the board or
+            # any OTHER seat's concrete hole.  Impossible combos return 0.  Card
+            # ints are Cactus-Kev encoded (not ``0..51``), so membership is tested
+            # via the densified slot index (``removal_index``/``deck_slots``)
+            # rather than ``np.isin`` against the tiny exclusion set — a dense
+            # boolean lookup over ``deck_size`` (<=52) slots beats a general
+            # set-membership scan, and this runs at every terminal node in the
+            # compiled walk.
+            excluded = set(community)
+            for s in range(n):
+                if s != seat:
+                    excluded.add(self.hole[s][0])
+                    excluded.add(self.hole[s][1])
+            s0, s1, deck_size = removal
+            excl_slots = np.searchsorted(deck_uniq, list(excluded))
+            excl_mask = np.zeros(deck_size, dtype=bool)
+            excl_mask[excl_slots] = True
+            feasible = ~(excl_mask[s0] | excl_mask[s1])
 
         # (i) traverser folded → forfeits its contribution regardless of hand.
         if self.is_active[seat] == 0:
@@ -1125,7 +1143,13 @@ cdef class FastState:
         # Rank the traverser's combos once; each opponent ranks to a scalar.  Build
         # ``rank_mat`` (n_combos, n_active) column-aligned to the active seats.
         active_seats = [s for s in range(n) if self.is_active[s] != 0]
-        trav_ranks, _ = range_showdown.rank_combos_on_board(combo_cards, community)
+        # Reuse the deck densification already computed above (this fires on a
+        # FRESH, uncached board most terminals — a distinct MCCFR-sampled runout
+        # each time — so ranked_board's board-keyed LRU cache doesn't help here;
+        # passing removal/deck_uniq through skips a second np.isin pass).
+        trav_ranks, _ = range_showdown.rank_combos_on_board(
+            combo_cards, community, removal=removal, deck_uniq=deck_uniq,
+        )
         trav_ranks = trav_ranks.copy()
         trav_ranks[~feasible] = range_showdown._SENTINEL_RANK
         opp_hands = [
@@ -1183,8 +1207,9 @@ cdef class FastState:
     def runout_key(self):
         """``(board_prefix, pot_contributions, active_mask)`` — ``None`` if not a
         decision-free runout.  Byte-identical to ``PokerEnv.runout_key``
-        (``_runout_info``) so the search-lifetime ``runout_cache`` shared with the
-        PokerEnv path keys identically."""
+        (``_runout_info``), so a caller memoising ``runout_equity`` integrations
+        (e.g. AIVAT's terminal chance correction) keys identically regardless of
+        which engine reached the terminal."""
         if not self.is_decision_free:
             return None
         cdef int tbl = self._terminal_board_len

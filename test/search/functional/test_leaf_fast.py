@@ -75,10 +75,9 @@ def _flop_frontier(seed, n=3, lut=None):
     return env
 
 
-def _ctx_for(env, rng_seed=3, n_rollouts=8, use_equity=True, policy_cls=UniformPolicy):
+def _ctx_for(env, rng_seed=3, policy_cls=UniformPolicy):
     n = env.n_players
-    leaf = LeafConfig(policies={c: policy_cls() for c in _BIAS_CLASSES},
-                      n_rollouts=n_rollouts, use_decision_free_equity=use_equity)
+    leaf = LeafConfig(policies={c: policy_cls() for c in _BIAS_CLASSES})
     return SubgameContext.from_runtime(
         env=env, my_seat=0, my_hole=tuple(int(c) for c in env.players[0].cards),
         ranges={s: np.ones(env.n_combos, np.float32) / env.n_combos for s in range(n)},
@@ -227,9 +226,10 @@ def test_rollout_vector_unbiased_vs_python():
 
     Both sweep the traverser's whole range at the reached terminal (settled
     byte-identically by ``vector_payout_concrete``); they differ only in the board
-    draw + RNG stream, so over many rollouts the two per-combo means must agree
-    within combined Monte-Carlo error.  A persistent per-combo gap would betray a
-    scoring / policy / board-draw bias in the vectorized rollout.
+    draw + RNG stream, so over many independent single-rollout calls the two
+    per-combo means must agree within combined Monte-Carlo error.  A persistent
+    per-combo gap would betray a scoring / policy / board-draw bias in the
+    vectorized rollout.
     """
     env = _flop_frontier(7)
     if "call" in env.legal_actions:
@@ -237,16 +237,16 @@ def test_rollout_vector_unbiased_vs_python():
     active = [s for s in range(env.n_players) if env.players[s].is_active]
     profile = {s: "none" for s in active}
     traverser = active[0]
-    R, B = 1500, 8
+    N = 1000  # independent single-rollout calls averaged per arm
 
     def estimate(fast, base_seed):
         vals = []
-        for b in range(B):
-            ctx = _ctx_for(env, rng_seed=base_seed * 100 + b, n_rollouts=R)
+        for i in range(N):
+            ctx = _ctx_for(env, rng_seed=base_seed * 100_000 + i)
             fn = continuation_value_vector_fast if fast else continuation_value_vector
             vals.append(fn(copy.deepcopy(env), profile, ctx, traverser))
-        arr = np.array(vals)                       # (B, n_combos)
-        return arr.mean(0), arr.std(0, ddof=1) / np.sqrt(B)
+        arr = np.array(vals)                       # (N, n_combos)
+        return arr.mean(0), arr.std(0, ddof=1) / np.sqrt(N)
 
     m_fast, se_fast = estimate(True, 1)
     m_py, se_py = estimate(False, 2)

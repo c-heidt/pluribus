@@ -36,7 +36,7 @@ class _Uniform(Policy):
 
 
 def _session(n_players=3):
-    leaf = LeafConfig(policies={c: _Uniform() for c in _BIAS_CLASSES}, n_rollouts=1)
+    leaf = LeafConfig(policies={c: _Uniform() for c in _BIAS_CLASSES})
     scfg = SolverConfig(leaf=leaf, max_iterations=4, max_wall_seconds=30.0,
                         discount_interval=20)
     lut = collections.defaultdict(lambda: collections.defaultdict(lambda: 0))

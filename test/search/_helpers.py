@@ -144,10 +144,10 @@ def _late_env(target_round, low=11, high=14, stacks=(200, 200), seed=0) -> Poker
     return _advance_to(env, target_round)
 
 
-def _ctx(env, *, n_rollouts=2, seed=0, ranges=None, folded=None) -> SubgameContext:
+def _ctx(env, *, seed=0, ranges=None, folded=None) -> SubgameContext:
     if ranges is None:
         ranges = {s: np.ones(env.n_combos, np.float32) / env.n_combos for s in range(2)}
-    leaf = LeafConfig(policies=_policies(), n_rollouts=n_rollouts)
+    leaf = LeafConfig(policies=_policies())
     return SubgameContext.from_runtime(
         env=env,
         my_seat=0,
