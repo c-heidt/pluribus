@@ -54,6 +54,7 @@ from poker_ai.blueprint.core_runner import CoreDriver, core_enabled
 from poker_ai.tables.cfr_tables import CFRTables
 from poker_ai.blueprint.training import (
     cfr_step,
+    pin_blas_threads,
     seed,
     strategy_step,
 )
@@ -185,6 +186,10 @@ class Worker(mp.Process):
         from :meth:`Server._join_queue` and raise
         :class:`WorkerError`.
         """
+        # Pin BLAS/OpenMP threads before any other post-fork setup — every
+        # subsequent numpy-touching step (LUT load, CoreDriver, every CFR
+        # traversal) must run under the pin, not just the traversal loop.
+        pin_blas_threads(1)
         # Reopen LMDB indexes so this process has its own reader
         # lock-table slots; reusing the inherited handles triggers
         # MDB_BAD_RSLOT on the first transaction.
