@@ -35,6 +35,7 @@ from poker_ai.blueprint.training import (
     DiscountState,
     at_sync_barrier,
     cfr_step,
+    pin_blas_threads,
     seed,
     should_discount,
     should_update_strategy,
@@ -146,6 +147,8 @@ def simple_search(
 
     from poker_ai.tables.index import lmdb_map_size_for_players
     from information_abstraction import load_info_set_lut
+
+    pin_blas_threads(1)
 
     _LOG_INTERVAL_SECS = 60.0
 

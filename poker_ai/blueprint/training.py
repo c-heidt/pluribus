@@ -58,6 +58,46 @@ def seed(seed: int = 42) -> None:
     _py_random.seed(seed)
 
 
+def pin_blas_threads(n_threads: int = 1) -> None:
+    """Pin this process's BLAS/OpenMP thread pools to ``n_threads``.
+
+    Each CFR traversal is a single fine-grained walk over tiny per-node
+    arrays that never benefits from intra-op BLAS threads — the same
+    reasoning as ``poker_ai.search.parallel._limit_worker_threads``,
+    duplicated here (not imported) since training has no other dependency
+    on the search package. Without this, ``W`` forked training workers on a
+    ``C``-core box each spin up OpenBLAS's default ~``C``-thread pool,
+    oversubscribing to ``W*C`` threads; the search-side function's docstring
+    documents a concrete measured regression this exact fix produced there
+    (a 22-core/8-worker box where an unpinned pool ran *slower* than serial
+    and inverted the compiled core's per-iteration win into a net loss).
+
+    Best-effort and never raises (pinning is an optimisation, not
+    correctness): sets the standard env vars AND calls OpenBLAS's runtime
+    setter directly on numpy's bundled library, since a forked child's BLAS
+    pool is already initialised and may ignore the env var alone.
+    """
+    import os as _os
+
+    for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                 "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        _os.environ[_var] = str(n_threads)
+    try:
+        import ctypes
+        import glob
+
+        libdir = _os.path.join(_os.path.dirname(np.__file__), ".libs")
+        for _so in glob.glob(_os.path.join(libdir, "libopenblas*.so")):
+            try:
+                _lib = ctypes.CDLL(_so)
+            except OSError:
+                continue
+            if hasattr(_lib, "openblas_set_num_threads"):
+                _lib.openblas_set_num_threads(int(n_threads))
+    except Exception:
+        pass  # best-effort; a missing/renamed BLAS must never break training
+
+
 PRUNE_PROBABILITY: float = 0.95
 """Probability of selecting CFR-P over standard CFR once past ``prune_threshold``.
 
