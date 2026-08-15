@@ -94,6 +94,21 @@ echo "Pinning code to commit $GIT_REF_SHA (GIT_REF=$GIT_REF)"
 git -C "$PROJECT_DIR" worktree add --detach "$WORK_DIR/code" "$GIT_REF_SHA"
 CODE_DIR="$WORK_DIR/code"
 
+# poker_ai/environment/cli/etc. are an editable pip install with a STATIC
+# package -> PROJECT_DIR path map (see the compiled-core preflight comment
+# below for the full mechanism).  `cd "$CODE_DIR"` alone does NOT override
+# that for the actual training invocation: the real `poker_ai` command is an
+# installed console-script file living in the conda env's bin/, and Python
+# sets sys.path[0] to THAT SCRIPT'S OWN DIRECTORY, not the cwd, for a normal
+# script invocation (cwd is only auto-added to sys.path for `python -c`/`-m`/
+# the REPL). So `poker_ai train start` would silently resolve every import
+# back to PROJECT_DIR regardless of CODE_DIR, defeating the pin for the one
+# thing it exists to fix.  PYTHONPATH does not have this problem — it is
+# consulted for every invocation style — so it, not cwd, is what actually
+# pins the run.  Verified empirically: a bare `cd` leaked to PROJECT_DIR for
+# a real script invocation; this export did not.
+export PYTHONPATH="$CODE_DIR${PYTHONPATH:+:$PYTHONPATH}"
+
 # Training parameters (cycle-based options are counted in sync cycles = N * sync_interval iterations).
 #
 # The cycle/iteration cadence below is fitted to the cluster's current throughput
