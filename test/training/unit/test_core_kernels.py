@@ -38,6 +38,7 @@ if _core.CORE_AVAILABLE:
         five as core_five,
         six as core_six,
         seven as core_seven,
+        multicard_batch as core_multicard_batch,
     )
     from poker_ai._core._settle import (
         compute_utility_won as core_settle_won,
@@ -469,6 +470,80 @@ class TestEvaluatorKernel:
         for hand in itertools.combinations(self.deck, 5):
             h = list(hand)
             assert core_five(h) == _py_evaluator._five(h)
+
+    def test_batch_named_edge_hands(self):
+        """The batch kernel agrees with the scalar kernel on known hand classes."""
+        from environment.utils import new_card
+
+        def hand(*strs):
+            return [new_card(s) for s in strs]
+
+        cases_by_k = {5: [], 6: [], 7: []}
+        cases_by_k[5].append(hand("As", "Ks", "Qs", "Js", "Ts"))   # royal flush
+        cases_by_k[5].append(hand("9h", "8h", "7h", "6h", "5h"))   # straight flush
+        cases_by_k[5].append(hand("As", "2s", "3s", "4s", "5s"))   # wheel str flush
+        cases_by_k[5].append(hand("Ac", "Ad", "Ah", "As", "Kd"))   # quads
+        cases_by_k[5].append(hand("Ac", "Ad", "Ah", "Kd", "Ks"))   # full house
+        cases_by_k[5].append(hand("Ah", "5c", "4d", "3s", "2h"))   # wheel straight
+        cases_by_k[7].append(hand("As", "Ks", "Qs", "Js", "Ts", "2c", "3d"))
+        cases_by_k[7].append(hand("2s", "2h", "2d", "2c", "5s", "5h", "9d"))
+        cases_by_k[6].append(hand("Ah", "Kh", "Qh", "2c", "3d", "4s"))
+
+        for k, cases in cases_by_k.items():
+            hands = np.array(cases, dtype=np.int64)
+            batch_ranks = core_multicard_batch(hands, k)
+            scalar_fn = {5: core_five, 6: core_six, 7: core_seven}[k]
+            for i, cs in enumerate(cases):
+                assert batch_ranks[i] == scalar_fn(cs)
+
+    def test_batch_fuzz_vs_scalar_and_oracle(self):
+        """Batch kernel == per-row scalar kernel == 21-subset oracle, 30k hands/k."""
+        rng = np.random.RandomState(1)
+        deck = self.deck
+        for k, scalar_fn in ((5, core_five), (6, core_six), (7, core_seven)):
+            hands = np.array(
+                [rng.choice(deck, size=k, replace=False) for _ in range(30_000)],
+                dtype=np.int64,
+            )
+            batch_ranks = core_multicard_batch(hands, k)
+            scalar_ranks = np.array(
+                [scalar_fn(list(h)) for h in hands], dtype=np.int64
+            )
+            oracle = _py_evaluator._evaluate_batch_oracle(hands)
+            assert np.array_equal(batch_ranks, scalar_ranks), f"scalar k={k}"
+            assert np.array_equal(batch_ranks, oracle), f"oracle k={k}"
+
+    def test_batch_used_before_configure_raises(self):
+        # Already configured by setup_method; assert a trivial batch call works.
+        from environment.utils import new_card
+
+        h = [new_card(s) for s in
+             ("Ac", "Ad", "Ah", "Kd", "Ks", "2c", "3d")]
+        hands = np.array([h], dtype=np.int64)
+        assert core_multicard_batch(hands, 7)[0] == core_seven(h)
+
+    def test_batch_empty_input(self):
+        assert core_multicard_batch(np.empty((0, 7), dtype=np.int64), 7).shape == (0,)
+
+    def test_batch_invalid_k_raises(self):
+        with pytest.raises(ValueError):
+            core_multicard_batch(np.zeros((1, 4), dtype=np.int64), 4)
+
+    def test_batch_exhaustive_five(self):
+        """All C(52,5) = 2,598,960 five-card hands, in ONE batched call.
+
+        Cheap enough to run by default (unlike ``test_exhaustive_five``, which
+        needs ``@pytest.mark.slow`` because it makes 2.6M individual Python
+        calls) — the whole point of the batch kernel is that this is one call.
+        """
+        import itertools
+
+        hands = np.array(
+            list(itertools.combinations(self.deck, 5)), dtype=np.int64
+        )
+        batch_ranks = core_multicard_batch(hands, 5)
+        oracle = _py_evaluator._evaluate_batch_oracle(hands)
+        assert np.array_equal(batch_ranks, oracle)
 
 
 # ---------------------------------------------------------------------------

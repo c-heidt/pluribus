@@ -635,30 +635,38 @@ default_evaluator: Evaluator = Evaluator()
 
 
 # ---------------------------------------------------------------------------
-# Optional compiled-core evaluator (Phase 1d: _five/_six/_seven)
+# Optional compiled-core evaluator (Phase 1d: _five/_six/_seven; batch: item 4)
 # ---------------------------------------------------------------------------
-# When the extension is built AND enabled (``PLURIBUS_CORE_KERNELS`` includes
-# ``evaluator``), route the shared ``default_evaluator``'s scalar dispatch
-# through the Cython kernel.  It is a byte-identical drop-in — it indexes the
-# evaluator's own dumped tables (``_flush_best`` / ``_flush_rank`` and the sorted
-# ``_unsuited`` / ``_nonflush{6,7}`` key/rank arrays) — so every consumer of
+# When the extension is built AND enabled, route the shared ``default_evaluator``
+# through the Cython kernel(s).  Two independently gated pieces, both
+# byte-identical drop-ins — they index the evaluator's own dumped tables
+# (``_flush_best`` / ``_flush_rank`` and the sorted ``_unsuited`` /
+# ``_nonflush{6,7}`` key/rank arrays) — so every consumer of
 # ``default_evaluator`` (terminal settlement, range showdown, batch ranking)
-# sees identical ranks.  ``evaluate`` looks the dispatch up in ``hand_size_map``
-# at call time, so swapping the map is transparent; the scalar ``_five`` /
-# ``_six`` / ``_seven`` methods stay untouched as the byte-exact oracle, and the
-# numpy ``evaluate_batch`` path (not the scalar kernel's target) is left as
-# Python.
+# sees identical ranks either way:
+#   * ``evaluator`` — scalar ``_five``/``_six``/``_seven``.  ``evaluate`` looks
+#     the dispatch up in ``hand_size_map`` at call time, so swapping the map is
+#     transparent; the scalar methods stay untouched as the byte-exact oracle.
+#   * ``evaluator_batch`` — the numpy-vectorised ``_multicard_vec`` (the
+#     ``evaluate_batch`` engine).  ``evaluate_batch`` only ever calls
+#     ``self._multicard_vec(block, k)``, so swapping that ONE instance
+#     attribute (exactly the ``hand_size_map`` pattern) transparently
+#     accelerates every caller of ``evaluate_batch`` — no other call site
+#     needs to change.
+# Both flags normally move together (``kernel_enabled`` falls back to the
+# master ``PLURIBUS_SEARCH_CORE``/``PLURIBUS_CFR_CORE`` switches when no
+# ``PLURIBUS_CORE_KERNELS`` dev override is set), but ``configure()`` must run
+# whenever EITHER is on — a dev enabling ``evaluator_batch`` alone via the
+# fine-grained override must not skip table installation.
 try:
     from poker_ai._core import CORE_AVAILABLE as _CORE_AVAILABLE
     from poker_ai._core.flags import kernel_enabled as _kernel_enabled
 
-    if _CORE_AVAILABLE and _kernel_enabled("evaluator"):
-        from poker_ai._core._eval import (
-            configure as _core_eval_configure,
-            five as _core_five,
-            six as _core_six,
-            seven as _core_seven,
-        )
+    _use_scalar = _CORE_AVAILABLE and _kernel_enabled("evaluator")
+    _use_batch = _CORE_AVAILABLE and _kernel_enabled("evaluator_batch")
+
+    if _use_scalar or _use_batch:
+        from poker_ai._core._eval import configure as _core_eval_configure
 
         _core_eval_configure(
             default_evaluator._flush_best,
@@ -670,10 +678,23 @@ try:
             default_evaluator._nonflush7_keys,
             default_evaluator._nonflush7_ranks,
         )
+
+    if _use_scalar:
+        from poker_ai._core._eval import (
+            five as _core_five,
+            six as _core_six,
+            seven as _core_seven,
+        )
+
         default_evaluator.hand_size_map = {
             5: _core_five,
             6: _core_six,
             7: _core_seven,
         }
+
+    if _use_batch:
+        from poker_ai._core._eval import multicard_batch as _core_multicard_batch
+
+        default_evaluator._multicard_vec = _core_multicard_batch
 except ImportError:
     pass

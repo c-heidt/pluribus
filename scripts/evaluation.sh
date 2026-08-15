@@ -194,6 +194,7 @@ from poker_ai._core.flags import kernel_enabled, search_core_enabled
 
 live = {
     "evaluator": default_evaluator.hand_size_map[7].__module__.startswith("poker_ai._core"),
+    "evaluator_batch": default_evaluator._multicard_vec.__module__.startswith("poker_ai._core"),
     "settlement": Pot.compute_utility.__name__ == "_compute_utility_core",
     "showdown": rs.showdown_cfv.__module__.startswith("poker_ai._core"),
     "regret_match_matrix": "poker_ai._core" in getattr(

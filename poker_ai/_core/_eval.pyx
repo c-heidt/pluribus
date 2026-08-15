@@ -76,7 +76,7 @@ def configure(flush_best, flush_rank, unsuited_keys, unsuited_ranks,
 @cython.boundscheck(False)
 @cython.wraparound(False)
 cdef short _lookup(int64_t[::1] keys, int16_t[::1] ranks,
-                   long long product) except? -1:
+                   long long product) except? -1 nogil:
     """searchsorted-left over ``keys`` + exact-match check; ``ranks[idx]``.
 
     Matches the scalar dict's semantics: an exact hit for every valid hand
@@ -167,3 +167,109 @@ def seven(cards):
     if not _configured:
         raise RuntimeError("poker_ai._core._eval used before configure()")
     return _multi(cards, _nf7_keys, _nf7_ranks)
+
+
+# ---------------------------------------------------------------------------
+# Batch evaluator — drop-in for ``Evaluator._multicard_vec`` (the vectorised
+# counterpart of five/six/seven).  Reimplements their per-row logic as a tight
+# nogil loop over a 2-D memoryview rather than calling five()/_multi() per
+# row: both take an untyped ``cards`` object and iterate it via the Python
+# iterator protocol (boxing every card int) and _multi returns a boxed
+# ``cdef object`` rank, which would defeat the point of batching at scale.
+# Dispatches on k ONCE per call (not once per row) to avoid a per-row branch.
+# ---------------------------------------------------------------------------
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef void _batch5(const long[:, ::1] cv, long[::1] out, Py_ssize_t n) except * nogil:
+    cdef Py_ssize_t i
+    cdef long long c0, c1, c2, c3, c4, product
+    cdef int hand_or
+    for i in range(n):
+        c0 = cv[i, 0]
+        c1 = cv[i, 1]
+        c2 = cv[i, 2]
+        c3 = cv[i, 3]
+        c4 = cv[i, 4]
+        if (c0 & c1 & c2 & c3 & c4 & 0xF000) != 0:
+            hand_or = <int>((c0 | c1 | c2 | c3 | c4) >> 16)
+            out[i] = _flush_rank[hand_or & 0x1FFF]
+        else:
+            product = (c0 & 0xFF) * (c1 & 0xFF) * (c2 & 0xFF) * (c3 & 0xFF) * (c4 & 0xFF)
+            out[i] = _lookup(_unsuited_keys, _unsuited_ranks, product)
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef void _batch67(const long[:, ::1] cv, long[::1] out, Py_ssize_t n, int k,
+                   int64_t[::1] keys, int16_t[::1] ranks) except * nogil:
+    cdef Py_ssize_t i, j
+    cdef int counts1, counts2, counts4, counts8, s
+    cdef int mask1, mask2, mask4, mask8
+    cdef long long product, card
+    for i in range(n):
+        counts1 = counts2 = counts4 = counts8 = 0
+        mask1 = mask2 = mask4 = mask8 = 0
+        product = 1
+        for j in range(k):
+            card = cv[i, j]
+            s = <int>((card >> 12) & 0xF)
+            if s == 1:
+                counts1 += 1
+                mask1 |= <int>(card >> 16)
+            elif s == 2:
+                counts2 += 1
+                mask2 |= <int>(card >> 16)
+            elif s == 4:
+                counts4 += 1
+                mask4 |= <int>(card >> 16)
+            elif s == 8:
+                counts8 += 1
+                mask8 |= <int>(card >> 16)
+            product *= (card & 0xFF)
+        if counts1 >= 5:
+            out[i] = _flush_best[mask1 & 0x1FFF]
+        elif counts2 >= 5:
+            out[i] = _flush_best[mask2 & 0x1FFF]
+        elif counts4 >= 5:
+            out[i] = _flush_best[mask4 & 0x1FFF]
+        elif counts8 >= 5:
+            out[i] = _flush_best[mask8 & 0x1FFF]
+        else:
+            out[i] = _lookup(keys, ranks, product)
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def multicard_batch(cards, int k):
+    """Rank a block of exactly-``k``-card hands; drop-in for
+    ``Evaluator._multicard_vec``, the batch counterpart of five/six/seven.
+
+    Parameters
+    ----------
+    cards : array-like
+        ``(n, k)`` card ints, ``k`` in ``{5, 6, 7}`` (every row the same k).
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(n,)`` int64 ranks in ``[1, 7462]`` (lower = stronger).
+    """
+    if not _configured:
+        raise RuntimeError("poker_ai._core._eval used before configure()")
+    if k not in (5, 6, 7):
+        raise ValueError("multicard_batch supports k in {5, 6, 7}, got %d" % k)
+    cdef const long[:, ::1] cv = np.ascontiguousarray(cards, dtype=np.int64)
+    cdef Py_ssize_t n = cv.shape[0]
+    out = np.empty(n, dtype=np.int64)
+    if n == 0:
+        return out
+    cdef long[::1] o = out
+    cdef int64_t[::1] keys
+    cdef int16_t[::1] ranks
+    if k == 5:
+        _batch5(cv, o, n)
+    else:
+        keys = _nf7_keys if k == 7 else _nf6_keys
+        ranks = _nf7_ranks if k == 7 else _nf6_ranks
+        _batch67(cv, o, n, k, keys, ranks)
+    return out
