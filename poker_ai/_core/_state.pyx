@@ -49,6 +49,7 @@ from environment.player import Player
 from environment.pot import Pot
 from environment.poker_env import _as_runout, _n_choose_k, _settle_runout, _settle_traverser
 from environment.utils import enumerate_combos
+from information_abstraction.lookup import MemmapLookup
 
 
 # ---------------------------------------------------------------------------
@@ -408,11 +409,16 @@ cdef class FastState:
         at a decision node with no cluster (never a silent cluster-0).
         """
         cdef int seat, si, blen
+        cdef Py_ssize_t n = self.n_players
         board = [self.board[seat] for seat in range(5)]
         for seat in range(self.n_players):
             for si in range(N_DECISION_STAGES):
                 self.clusters[seat][si] = 0
                 self.has_cluster[seat][si] = 0
+        holes = np.array(
+            [[self.hole[seat][0], self.hole[seat][1]] for seat in range(n)],
+            dtype=np.int64,
+        )
         for si in range(N_DECISION_STAGES):
             name = _STAGE_NAMES[si]
             blen = _BOARD_LEN[si]
@@ -420,16 +426,25 @@ cdef class FastState:
                 stage_lut = card_info_lut[name]
             except (KeyError, TypeError):
                 continue
-            for seat in range(self.n_players):
-                key = tuple(
-                    sorted([self.hole[seat][0], self.hole[seat][1]])
-                    + sorted(board[:blen])
-                )
-                try:
-                    self.clusters[seat][si] = <int>stage_lut[key]
-                    self.has_cluster[seat][si] = 1
-                except (KeyError, IndexError):
-                    pass
+            if isinstance(stage_lut, MemmapLookup):
+                board_arr = np.array(board[:blen], dtype=np.int64)
+                ids = stage_lut.seat_batch_lookup(holes, board_arr)
+                for seat in range(n):
+                    cid = ids[seat]
+                    if cid >= 0:
+                        self.clusters[seat][si] = <int>cid
+                        self.has_cluster[seat][si] = 1
+            else:
+                for seat in range(self.n_players):
+                    key = tuple(
+                        sorted([self.hole[seat][0], self.hole[seat][1]])
+                        + sorted(board[:blen])
+                    )
+                    try:
+                        self.clusters[seat][si] = <int>stage_lut[key]
+                        self.has_cluster[seat][si] = 1
+                    except (KeyError, IndexError):
+                        pass
 
     # ------------------------------------------------------------------
     # Derived read-only contract (mirrors FastStateRef / PokerEnv)

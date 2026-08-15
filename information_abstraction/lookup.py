@@ -315,6 +315,45 @@ class MemmapLookup:
         out[valid_mask] = self._mm[rows].astype(np.int64)
         return out
 
+    def seat_batch_lookup(self, holes: np.ndarray, board: np.ndarray) -> np.ndarray:
+        """Cluster id for a SMALL number of hole pairs (one per seat) against
+        one fixed board.
+
+        This is the compiled search core's leaf-rollout cluster refresh
+        shape (``poker_ai._core._state.FastState.refresh_clusters`` calls
+        this once per stage per sampled board, batching across seats) —
+        unlike :meth:`clusters_for_board`, which is built for thousands of
+        combo rows against one board and pays a fixed per-call numpy
+        overhead that only amortises at that scale. Every hole pair here is
+        assumed disjoint from the board and from each other (guaranteed by
+        the caller — real dealt cards can't collide); a row that fails to
+        resolve anyway (should not happen for valid input) returns ``-1``,
+        the same "no cluster" convention :meth:`clusters_for_board` uses.
+
+        Backed by a ``nogil`` Cython kernel
+        (``poker_ai._core._cluster_lookup.batch_row_lookup``) reimplementing
+        this method's own combinadic row-index identity directly in
+        compiled code — imported locally (not at module scope) since this
+        module has no other dependency on ``poker_ai``, and the only caller
+        is itself part of ``poker_ai._core``.
+
+        Parameters
+        ----------
+        holes : numpy.ndarray
+            ``(n_seats, 2)`` hole-card pairs, eval-card integers.
+        board : numpy.ndarray
+            The public cards for this street.
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(n_seats,)`` int64 cluster ids, ``-1`` on an unresolved row.
+        """
+        self._load()
+        keys_sorted, vals_sorted, C = self._indexer()
+        from poker_ai._core._cluster_lookup import batch_row_lookup
+        return batch_row_lookup(holes, board, keys_sorted, vals_sorted, C, self._mm, self._n_cards)
+
     def prewarm(self) -> int:
         """Pull ``cluster_ids.dat`` into the OS page cache via a sequential read.
 

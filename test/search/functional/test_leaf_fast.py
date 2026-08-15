@@ -40,7 +40,7 @@ if _core.CORE_AVAILABLE:
         continuation_value_vector_fast, _policy_state,
     )
     from poker_ai.search.mccfr import _BIAS_CLASSES
-    from test.search._helpers import UniformPolicy
+    from test.search._helpers import UniformPolicy, _real_lut
 
     _cystate.configure(_STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND)
     FastState = _cystate.FastState
@@ -118,6 +118,62 @@ def test_refresh_clusters_matches_lut(seed):
             assert has == 1 and cid == expected, (
                 f"seed={seed} seat={seat} street={si}: cluster {cid} != {expected}"
             )
+
+
+@pytest.mark.requires_lut
+@pytest.mark.parametrize("n", [2, 3])
+@pytest.mark.parametrize("seed", range(10))
+def test_refresh_clusters_matches_lut_memmap(seed, n):
+    """Same gate as ``test_refresh_clusters_matches_lut``, but against the REAL
+    20-card LUT (``MemmapLookup``-backed flop/turn/river) instead of the synthetic
+    ``_RealishLUT`` (a plain dict-like object).  ``_RealishLUT`` never exercises the
+    ``MemmapLookup`` batched path added to ``refresh_clusters`` (roadmap item #21) —
+    this test is the one that actually walks it, for both HU (n=2) and multiway
+    (n=3), since the batched path only fires for ``n_players`` >= 1 seats' worth of
+    a single fixed board per call either way.
+    """
+    from information_abstraction.lookup import MemmapLookup
+    from environment.poker_env import new_game
+
+    lut = _real_lut()
+    np.random.seed(seed)
+    env = new_game(n, card_info_lut=lut, initial_chips=10000)
+    g = 0
+    while env.betting_round < 1 and not env.is_terminal and g < 60:
+        legal = [a for a in env.legal_actions if a is not None]
+        env.step_in_place("call" if "call" in legal else legal[0])
+        g += 1
+    assert env.betting_round == 1, f"seed={seed} n={n}: stuck at {env.betting_round}"
+
+    fs = FastState.from_poker_env(env)
+    prefix = [int(c) for c in env.community_cards]
+    used = set(prefix)
+    for p in env.players:
+        used.update(int(c) for c in p.cards)
+    deck = [int(c) for c in np.unique(env.combo_cards)]
+    undealt = [c for c in deck if c not in used]
+    rng = np.random.RandomState(seed)
+    completion = list(rng.choice(undealt, size=5 - len(prefix), replace=False))
+    board = prefix + [int(c) for c in completion]
+    fs.set_board(board)
+    fs.refresh_clusters(lut)
+
+    holes = [[int(c) for c in p.cards] for p in env.players]
+    board_len = (0, 3, 4, 5)
+    names = ("pre_flop", "flop", "turn", "river")
+    exercised_memmap = False
+    for si in range(4):
+        blen = board_len[si]
+        stage_lut = lut[names[si]]
+        exercised_memmap = exercised_memmap or isinstance(stage_lut, MemmapLookup)
+        for seat in range(n):
+            key = tuple(sorted(holes[seat]) + sorted(board[:blen]))
+            expected = int(stage_lut[key])
+            cid, has = fs.cluster_at(seat, si)
+            assert has == 1 and cid == expected, (
+                f"seed={seed} n={n} seat={seat} street={si}: cluster {cid} != {expected}"
+            )
+    assert exercised_memmap, "real LUT unexpectedly has no MemmapLookup-backed street"
 
 
 def test_policy_state_matches_env_at_frontier():
