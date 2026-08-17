@@ -375,6 +375,7 @@ def construct_roots(
     *,
     per_cell: int,
     run_seed: int,
+    per_cell_deterministic: Optional[int] = None,
     n_live_filter: Optional[Sequence[int]] = None,
 ) -> Dict[Cell, List[RootSample]]:
     """CONSTRUCT ``per_cell`` roots for EVERY ``(street, n_live)`` cell, deterministically.
@@ -390,10 +391,20 @@ def construct_roots(
     budget is calibrated on.  Same cell/regime routing (:func:`_select_regime`) and
     :class:`RootSample` shape as :func:`collect_roots`, so the sweep is unchanged."""
     n_players = int(cfg.n_players)
+    per_cell_deterministic = (per_cell if per_cell_deterministic is None
+                              else int(per_cell_deterministic))
     out: Dict[Cell, List[RootSample]] = defaultdict(list)
     for street, n_live in _target_cells(n_players, n_live_filter):
-        for k in range(per_cell):
-            idx = (street * (n_players + 1) + n_live) * per_cell + k
+        # DETERMINISTIC cells (vector river) get MORE hands instead of reps: their reps are
+        # byte-identical, so root variety is the only thing extra compute can buy there.
+        n_roots = (per_cell_deterministic
+                   if _is_deterministic(_production_regime(street, n_live), street)
+                   else per_cell)
+        for k in range(int(n_roots)):
+            # Root index uses a FIXED stride, not ``n_roots`` — so root k of a cell is the
+            # same root regardless of how many roots that cell asks for (changing a count
+            # never reshuffles the others, and the n_live split stays lossless).
+            idx = (street * (n_players + 1) + n_live) * _ROOT_STRIDE + k
             try:
                 sample = _construct_one(session, cfg, collect_cfg, condition,
                                         street, n_live, run_seed, idx)
@@ -437,6 +448,24 @@ class _CalibHero:
         self.my_seat = int(ctx.my_seat)
         self.my_hole = tuple(int(c) for c in ctx.my_hole)
         self.tracker = _BeliefTracker(ctx.ranges, getattr(ctx, "folded_ranges", {}))
+
+
+_ROOT_STRIDE = 64
+"""Per-cell root-index stride in :func:`construct_roots` — a constant, so a cell's root
+``k`` is seeded the same however many roots that cell requests."""
+
+
+def _is_deterministic(regime: str, street: int) -> bool:
+    """Does this cell's solve depend on the RNG at all?
+
+    The **vector river** is fully deterministic: the vector regime enumerates both ranges
+    exactly, and the river has no future chance node left to sample — so every seed yields
+    a byte-identical solve (the 2026-08 vanilla calibration measured its cross-rep spread
+    at exactly 0.0, against 62-75 mbb for the MCCFR cells).  Extra *reps* there are pure
+    waste; extra *hands* still buy root variety.  Vector flop/turn still sample their
+    remaining board cards, so they are NOT deterministic (turn's spread was 15.8).
+    """
+    return str(regime) == "vector" and int(street) == 3
 
 
 def _blueprint_none(ctx):
@@ -758,14 +787,21 @@ def _sweep_setup(worker_id: int, shared: dict):
 
 
 def _sweep_process(spec_idx: int, state: dict, shared: dict) -> None:
-    """Solve one ``(job, sample, rep, budget)`` at search ``workers=1`` (deployment model).
+    """Run ONE search per ``(job, sample, rep)`` and snapshot EVERY ladder rung from it.
 
-    The seed is ``base + 1000*si + rep`` — job-independent by design, so the A/B pair
-    (vector + mccfr jobs over the *same* roots) draws the same seeds it would in a
-    sequential per-cell sweep → byte-identical results to the un-pooled version.
+    A solve's trajectory depends only on ``(env, seeded ctx.rng, cfg)`` — never on
+    ``max_iterations`` — so the strategy after ``t`` iterations of the top-rung search is
+    byte-identical to a separate solve capped at ``t``.  Re-solving per rung therefore
+    re-walked the same trajectory ~3.8x over; instead we solve once to the top and read the
+    average strategy at each rung (``solve(snapshot_at=...)``).  The saved compute buys
+    more reps, which is what actually tightens the metric.
+
+    The seed is ``base + 1000*si + rep`` — job-independent by design, so paired jobs over
+    the *same* roots draw the same seeds a sequential per-cell sweep would.
     """
-    j, si, rep, t = shared["all_specs"][spec_idx]
+    j, si, rep = shared["all_specs"][spec_idx]
     samples, force_regime = shared["jobs"][j]
+    ladder = shared["ladders"][j]
     s = samples[si]
     seed = shared["base_seed"] + 1000 * si + rep
     # Peak-RAM cap: multiway MCCFR solves hold the largest vregret/vstrat tables, so a
@@ -778,15 +814,31 @@ def _sweep_process(spec_idx: int, state: dict, shared: dict) -> None:
     try:
         env_t = copy.deepcopy(s.env)
         ctx_t = dataclasses.replace(s.ctx, rng=np.random.default_rng(seed))
+        top = int(ladder[-1])
         cfg_t = dataclasses.replace(
-            shared["prod_cfg"], auto_budget=False, max_iterations=int(t),
+            shared["prod_cfg"], auto_budget=False, max_iterations=top,
             max_wall_seconds=1e9,
         )
-        res = solve(env_t, ctx_t, cfg_t, regime_override=force_regime)
-        # Root value for the convergence metric — DIAGNOSTIC only now (the budget comes from
-        # hot_l1 self-stability).  The vector regime's internal value is enumeration-exact;
-        # the MCCFR regime's is a noisy single-combo value, optionally replaced by the CRN
-        # estimate (``crn_value``, off by default) for the diagnostic value-gap column.
+        # One row per rung, captured mid-search.  ``sig`` must be COPIED: the policy reads
+        # the live state, which keeps evolving after the snapshot returns.
+        snaps: List[tuple] = []
+
+        def _grab(t: int, avg, elapsed: float) -> None:
+            # Mirrors ``_root_sigma``: an unseen root key would make ``strategy_for`` return
+            # uniform, which reads as (falsely) converged — so require the key and record a
+            # miss as None.
+            sig = None
+            if s.pk in avg._state.legal_at:
+                try:
+                    sig = np.array(avg.strategy_for(s.pk, s.hr, s.legal), dtype=np.float64)
+                except Exception:  # pragma: no cover - defensive
+                    sig = None
+            snaps.append((int(t), sig, float(elapsed)))
+
+        res = solve(env_t, ctx_t, cfg_t, regime_override=force_regime,
+                    snapshot_at=ladder, on_snapshot=_grab)
+        # Root value — DIAGNOSTIC only (the budget comes from hot_l1 self-stability), so it
+        # is read once from the FINAL state and attached to the top rung's row.
         row_regime = force_regime if force_regime is not None else s.regime
         root_value = res.root_value
         if shared.get("crn_value") and str(row_regime) == "mccfr":
@@ -797,10 +849,15 @@ def _sweep_process(spec_idx: int, state: dict, shared: dict) -> None:
             )
             if cv is not None:
                 root_value = cv
-        state["results"].append((
-            j, si, rep, int(t), _root_sigma(res, s), root_value,
-            int(res.iterations_run), float(res.wall_seconds), str(res.stop_reason),
-        ))
+        for (t, sig, elapsed) in snaps:
+            # A rung below the top completed its full count by construction; only the top
+            # can carry the solve's real stop reason.
+            stop = str(res.stop_reason) if t >= top else "iteration_cap"
+            state["results"].append((
+                j, si, rep, int(t), sig,
+                (root_value if t >= top else None),
+                int(t), float(elapsed), stop,
+            ))
     finally:
         if heavy:
             sem.release()
@@ -844,18 +901,27 @@ def sweep_jobs(
     from evaluation.hand_pool import run_index_pool
 
     jobs = list(jobs)
-    all_specs = [(j, si, rep, int(t))
+    # ONE spec per (job, sample, rep): each runs a single search to its ladder TOP and
+    # snapshots every rung on the way (see ``_sweep_process``), so the ladder costs one
+    # search instead of one per rung.
+    # Per-JOB rep count: a deterministic cell (vector river) needs exactly one — every seed
+    # gives a byte-identical solve there — while the sampled cells need ``reps``.
+    job_reps = [1 if _is_deterministic(job.get("force_regime") or job["cell"][1],
+                                       job["cell"][2]) else int(reps)
+                for job in jobs]
+    all_specs = [(j, si, rep)
                  for j, job in enumerate(jobs)
                  for si in range(len(job["samples"]))
-                 for rep in range(reps) for t in job["ladder"]]
+                 for rep in range(job_reps[j])]
     if not all_specs:
         return []
-    # Longest-processing-time-first: hand out the most expensive solves FIRST so the deep
-    # 30k+ rungs overlap the bulk instead of trailing it on a few cores (the pool serves
-    # specs in list order).  Cost ~ budget / rough throughput; the throughput guess only
-    # affects ORDERING (utilisation), never correctness.
+    # Longest-processing-time-first: hand out the most expensive searches FIRST so the deep
+    # ones overlap the bulk instead of trailing it on a few cores (the pool serves specs in
+    # list order).  Cost ~ top budget / rough throughput; the throughput guess only affects
+    # ORDERING (utilisation), never correctness.
     def _spec_cost(spec):
-        j, _si, _rep, t = spec
+        j, _si, _rep = spec
+        t = int(jobs[j]["ladder"][-1])
         cell = jobs[j]["cell"]
         regime = jobs[j].get("force_regime") or cell[1]
         thr = _LPT_THROUGHPUT.get((regime, int(cell[2])), 80.0)
@@ -899,6 +965,7 @@ def sweep_jobs(
                 mw_sem = None
     shared = {
         "jobs": [(job["samples"], job.get("force_regime")) for job in jobs],
+        "ladders": [[int(t) for t in job["ladder"]] for job in jobs],
         "prod_cfg": prod_cfg, "base_seed": int(base_seed), "all_specs": all_specs,
         "crn_value": bool(crn_value), "crn_worlds": int(crn_worlds),
         "mw_sem": mw_sem, "heavy_idx": heavy_idx,
@@ -932,7 +999,7 @@ def sweep_jobs(
         by = by_job.get(j, {})
         job_refs[j] = {
             (si, rep): (by.get((si, rep, t_ref)) or (None,) * 2)[1]
-            for si in range(len(job["samples"])) for rep in range(reps)
+            for si in range(len(job["samples"])) for rep in range(job_reps[j])
         }
 
     # Second pass: build rows (now that every job's reference value is known).
@@ -946,7 +1013,7 @@ def sweep_jobs(
         ref_from = job.get("ref_from")
         ref_values = job_refs[ref_from] if ref_from is not None else None
         for si, s in enumerate(samples):
-            for rep in range(reps):
+            for rep in range(job_reps[j]):
                 top = by.get((si, rep, t_ref))
                 ref_sig = top[0] if top is not None else None
                 ref_val = (ref_values.get((si, rep)) if ref_values is not None
@@ -1333,6 +1400,7 @@ def run_calibration(
     crn_worlds: int = 32,
     collect_hands: int,
     per_cell_cap: int,
+    per_cell_cap_deterministic: Optional[int] = None,
     reps: int,
     ladder_points: int,
     ladder_lo: float,
@@ -1460,6 +1528,7 @@ def run_calibration(
             samples = construct_roots(
                 session, cond_cfg, collect_cfg, condition,
                 per_cell=per_cell_cap, run_seed=run_seed,
+                per_cell_deterministic=per_cell_cap_deterministic,
                 n_live_filter=n_live_filter,
             )
         else:
@@ -1539,7 +1608,12 @@ def run_calibration(
     for j in jobs:
         j["ladder"] = ladders[_lkey(j)]
 
-    n_solves = sum(len(j["samples"]) * reps * len(list(j["ladder"])) for j in jobs)
+    # One SEARCH per (sample, rep) — the ladder is snapshotted from it, so rungs no longer
+    # multiply the solve count.  Deterministic cells run a single rep.
+    n_solves = sum(len(j["samples"])
+                   * (1 if _is_deterministic(j.get("force_regime") or j["cell"][1],
+                                             j["cell"][2]) else reps)
+                   for j in jobs)
     logger.info("sweeping %d jobs (%d cells, %d solves) across %d cores in ONE pool",
                 len(jobs), len({j["cell"] for j in jobs}), n_solves, resolved_workers)
     all_rows = sweep_jobs(jobs, prod_cfg, pool_workers=resolved_workers, reps=reps,
@@ -1706,11 +1780,16 @@ def _cli():
                   help="Fixed card-worlds per CRN value estimate (only used with --crn-value).")
     @click.option("--collect-hands", default=400, type=int, show_default=True,
                   help="Hands played to harvest roots when --sample-roots is set.")
-    @click.option("--per-cell-cap", default=4, type=int, show_default=True,
-                  help="Roots kept per (condition, regime, street, n_live) cell.")
-    @click.option("--reps", default=4, type=int, show_default=True,
-                  help="Independent re-solve replicates per root; averaging over reps is "
-                       "what lowers the MCCFR value-estimate noise floor, so keep ≥4.")
+    @click.option("--per-cell-cap", default=6, type=int, show_default=True,
+                  help="Distinct HANDS (roots) per cell for the sampled cells.")
+    @click.option("--per-cell-cap-deterministic", default=8, type=int, show_default=True,
+                  help="Distinct HANDS for the DETERMINISTIC cells (vector river): every "
+                       "seed there gives a byte-identical solve, so they run exactly ONE "
+                       "rep and spend their compute on extra hands instead.")
+    @click.option("--reps", default=12, type=int, show_default=True,
+                  help="Independent re-solves per root.  ONE search per rep now covers the "
+                       "whole ladder (mid-search snapshots), so reps — not rungs — is where "
+                       "extra compute buys a tighter mean hot_l1.")
     @click.option("--ladder-points", default=6, type=int, show_default=True,
                   help="Rungs per ladder, walking DOWN from the wall-anchored top.")
     @click.option("--ladder-top-seconds", default="600,600,60", show_default=True,
@@ -1817,6 +1896,7 @@ def _cli():
             construct_roots_mode=o["construct_roots"], n_live_filter=n_live_filter,
             crn_value=o["crn_value"], crn_worlds=o["crn_worlds"],
             collect_hands=o["collect_hands"], per_cell_cap=o["per_cell_cap"],
+            per_cell_cap_deterministic=o["per_cell_cap_deterministic"],
             reps=o["reps"], ladder_points=o["ladder_points"], ladder_lo=o["ladder_lo"],
             ladder_top_seconds=top_secs, ladder_top_seconds_vector=top_secs_vec,
             probe_seconds=o["probe_seconds"],

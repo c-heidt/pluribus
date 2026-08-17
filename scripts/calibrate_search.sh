@@ -26,8 +26,8 @@
 #SBATCH --partition=cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=3:00:00   # sized for N_LIVE=2,3 (~54 core-h → ~1h wall at MAX_CONCURRENT_MULTIWAY=32). The n_live=4 slice is the expensive one (~116 core-h → ~3.5h; incl. the turn-n4 14.5 it/s outlier): when running N_LIVE=4, raise this to 5:00:00. Full grid would be ~4.5h.
-#SBATCH --cpus-per-task=32
+#SBATCH --time=5:00:00   # sized for N_LIVE=2,3 (~54 core-h → ~1h wall at MAX_CONCURRENT_MULTIWAY=32). The n_live=4 slice is the expensive one (~116 core-h → ~3.5h; incl. the turn-n4 14.5 it/s outlier): when running N_LIVE=4, raise this to 5:00:00. Full grid would be ~4.5h.
+#SBATCH --cpus-per-task=64
 # --mem: sized for MAX_CONCURRENT_MULTIWAY=32 (the ≤5h target).  ~32 * ~10 GB/multiway-solve
 # + lights + blueprint ≈ 340 GB (ESTIMATE — VERIFY real RSS on run 1 and tighten; if it comes
 # in well under, lower this for faster scheduling).  ≤5h and low RAM are in tension here: to
@@ -78,8 +78,9 @@ WORKERS=${WORKERS:-}                       # empty → SLURM_CPUS_PER_TASK-1 (pr
 MAX_CONCURRENT_MULTIWAY=${MAX_CONCURRENT_MULTIWAY:-16}  # peak-RAM cap: at most this many multiway (≥3 live) MCCFR solves run at once (biggest tables); cheap solves backfill the rest. Wall is heavy-bound ≈ (multiway core-hours ~152)/K → K=32 gives ~4.7h (≤5h). Uncapped (~52 concurrent) would front-load the RAM and likely exceed the node. Empty → no cap. Peak RAM ≈ K*multiway + (WORKERS-K)*light; size --mem to that. Lower K = less RAM but a longer wall (K=16→~9.5h).
 COLLECT_HANDS=${COLLECT_HANDS:-400}
 N_LIVE=${N_LIVE:-2,3}                      # live-player counts to calibrate; empty = all. '2,3' EXCLUDES the deep 4-player lines (~2/3 of the cost incl. the turn-n4 outlier) — run them later with N_LIVE=4. Lossless split: roots are seeded per (street, n_live, k). The grid is POST-FLOP only (preflop is played from the blueprint, never searched).
-PER_CELL_CAP=${PER_CELL_CAP:-4}
-REPS=${REPS:-4}                            # ≥4: averaging over reps lowers the MCCFR value-estimate noise floor
+PER_CELL_CAP=${PER_CELL_CAP:-6}            # distinct HANDS (roots) per cell for the sampled cells
+PER_CELL_CAP_DETERMINISTIC=${PER_CELL_CAP_DETERMINISTIC:-8}  # distinct HANDS for the DETERMINISTIC cells (vector river): every seed gives a byte-identical solve there, so they run exactly ONE rep and spend the compute on extra hands instead
+REPS=${REPS:-4}                            # re-solves per root, SAMPLED cells only (different seed, same hand). Deterministic cells (vector river) always use 1 — extra reps there are byte-identical. Snapshot ladders make one rep cover every rung, so a cell = PER_CELL_CAP hands x REPS searches.
 HOT_L1_TOL=${HOT_L1_TOL:-0.10}            # convergence: per-cell budget = smallest rung where MEAN hot_l1 (single-worker strategy self-distance vs its own top budget, averaged over the cell's solves) ≤ this. Cells that never settle are flagged → raise that street LADDER_TOP_SECONDS.
 LADDER_POINTS=${LADDER_POINTS:-6}          # rungs per ladder, walking DOWN from the wall-anchored top
 LADDER_TOP_SECONDS=${LADDER_TOP_SECONDS:-600,600,60}          # MCCFR per-street (flop,turn,river) wall budget for the ladder TOP rung: top = probed it/s × this. Hard cells (flop/turn: hot_l1 0.23-0.43 at their production budgets) get the full 600s; river converged at ~9000 iters/22s so 60s brackets it without waste.
@@ -265,7 +266,7 @@ echo "  - Workers:           ${WORKERS:-(auto = SLURM_CPUS_PER_TASK-1)}"
 echo "  - Max concurrent mw: ${MAX_CONCURRENT_MULTIWAY:-(uncapped)}  (peak-RAM cap on multiway MCCFR solves)"
 echo "  - Live counts:       ${N_LIVE:-(all)}"
 echo "  - CPUs:              ${SLURM_CPUS_PER_TASK:-(unset)}"
-echo "  - Collect hands:     $COLLECT_HANDS  (per-cell cap $PER_CELL_CAP, reps $REPS)"
+echo "  - Hands/reps:        $PER_CELL_CAP hands x $REPS reps (sampled cells); $PER_CELL_CAP_DETERMINISTIC hands x 1 rep (deterministic: vector river)"
 echo "  - Ladder:            wall-anchored top = probe(${PROBE_SECONDS}s) x mccfr[${LADDER_TOP_SECONDS}]s/vector[${LADDER_TOP_SECONDS_VECTOR}]s (flop,turn,river), down to ${LADDER_LO}x top, $LADDER_POINTS pts"
 echo "  - hot_l1 tol:        $HOT_L1_TOL  (budget = smallest rung with mean hot_l1 ≤ tol)"
 echo "  - Wall target (s):   ${WALL_TARGET:-(disabled)}"
@@ -300,6 +301,7 @@ run_calibrate() {  # $1 = conditions, $2 = out-dir
     --model-error "$MODEL_ERROR" \
     --collect-hands "$COLLECT_HANDS" \
     --per-cell-cap "$PER_CELL_CAP" \
+    --per-cell-cap-deterministic "$PER_CELL_CAP_DETERMINISTIC" \
     --reps "$REPS" \
     --hot-l1-tol "$HOT_L1_TOL" \
     --ladder-points "$LADDER_POINTS" \

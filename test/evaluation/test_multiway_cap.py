@@ -74,11 +74,22 @@ class _Res:
 _TRACK: dict = {}
 
 
-def _fake_solve(env, ctx, cfg, regime_override=None):
+class _FakePolicy:
+    """Stands in for the live ``SearchPolicy`` handed to an ``on_snapshot`` hook."""
+
+    def __init__(self, pk):
+        self._state = type("S", (), {"legal_at": {pk: True}})()
+
+    def strategy_for(self, pk, hr, legal):
+        return np.array([0.5, 0.5])
+
+
+def _fake_solve(env, ctx, cfg, regime_override=None, snapshot_at=None, on_snapshot=None):
     """Cheap stand-in for ``solve`` that records heavy-solve concurrency.
 
     Called from INSIDE ``_sweep_process``'s semaphore-guarded block, so the peak it
-    records is exactly the quantity the cap is supposed to bound.
+    records is exactly the quantity the cap is supposed to bound.  Fires ``on_snapshot``
+    once per requested rung, as the real ``solve`` does.
     """
     regime = regime_override or env["regime"]
     heavy = (regime == "mccfr" and int(env["n_live"]) >= 3)
@@ -90,6 +101,9 @@ def _fake_solve(env, ctx, cfg, regime_override=None):
         time.sleep(0.05)          # long enough for workers to genuinely overlap
         with _TRACK["lock"]:
             _TRACK["cur"].value -= 1
+    if on_snapshot is not None:
+        for t in (snapshot_at or ()):
+            on_snapshot(int(t), _FakePolicy(("pk", 0, 0)), 0.01)
     return _Res(("pk", 0, 0))
 
 

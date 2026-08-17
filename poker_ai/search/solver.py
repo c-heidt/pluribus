@@ -20,7 +20,7 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from poker_ai.search.budget import iteration_budget
 from poker_ai.search.context import SubgameContext
@@ -162,6 +162,8 @@ def solve(
     cfg: SolverConfig,
     warm_start: Optional[SolverState] = None,
     regime_override: Optional[str] = None,
+    snapshot_at: Optional[Sequence[int]] = None,
+    on_snapshot: Optional[Callable[[int, "SearchPolicy", float], None]] = None,
 ) -> SearchResult:
     """Search ``root_env`` and return the bot's strategy plus the solved state.
 
@@ -234,7 +236,24 @@ def solve(
     else:
         solver = _MCCFRSolver(root_env, state, ctx, cfg, ctx.rng)
     start = time.perf_counter()
-    iterations, stop_reason = run_loop(solver, state, cfg)
+    # Optional mid-search SNAPSHOTS (calibration): fire ``on_snapshot(t, avg_policy,
+    # elapsed)`` at each requested iteration count.  Because the hook runs after the
+    # discount step, and the trajectory of a solve depends only on (env, seeded ctx.rng,
+    # cfg) — never on ``max_iterations`` — what it observes at ``t`` is exactly what a
+    # separate solve with ``max_iterations == t`` would return.  So a whole ladder of
+    # budgets costs ONE search instead of one per rung.  ``SearchPolicy`` reads ``state``
+    # live, so the snapshot needs no copy; the caller must extract (not retain) what it
+    # needs, since the state keeps evolving.
+    hook = None
+    if on_snapshot is not None and snapshot_at:
+        _want = {int(t) for t in snapshot_at}
+        _avg = SearchPolicy(state, use_average=True)
+
+        def hook(t: int, elapsed: float) -> None:
+            if t in _want:
+                on_snapshot(t, _avg, elapsed)
+
+    iterations, stop_reason = run_loop(solver, state, cfg, on_iteration=hook)
     # The MCCFR regime walks ``root_env`` in place (reseat per iteration) rather than
     # deepcopying it, so rewind it to pristine — solve() must not mutate ``root_env``
     # (warm re-search reuses it).  The vector regime walks via make/undo balance (or a

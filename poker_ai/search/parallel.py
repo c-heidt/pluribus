@@ -52,7 +52,8 @@ def resolve_workers(workers: "int | None") -> int:
 # ----------------------------------------------------------------------
 
 
-def run_loop(solver, state: SolverState, cfg: SolverConfig) -> Tuple[int, str]:
+def run_loop(solver, state: SolverState, cfg: SolverConfig,
+             on_iteration=None) -> Tuple[int, str]:
     """Drive ``solver`` under the dual stop; return ``(iterations, stop_reason)``.
 
     This *is* the orchestrator's search loop (Linear-CFR discount on the
@@ -76,6 +77,12 @@ def run_loop(solver, state: SolverState, cfg: SolverConfig) -> Tuple[int, str]:
         if delta > 0 and t % delta == 0:
             k = t / delta
             state.discount(k / (k + 1.0))
+        # Optional per-iteration hook, fired AFTER the discount step — so what it observes
+        # at ``t`` is byte-identical to what a solve with ``max_iterations == t`` returns.
+        # Used by the calibration to snapshot the strategy at every ladder rung from ONE
+        # search instead of re-running the same trajectory per rung.  ``None`` ⇒ zero cost.
+        if on_iteration is not None:
+            on_iteration(t, time.perf_counter() - start)
         if time.perf_counter() - start >= cfg.max_wall_seconds:
             stop_reason = "wall_cap"
             break
