@@ -112,39 +112,42 @@ export PYTHONPATH="$CODE_DIR${PYTHONPATH:+:$PYTHONPATH}"
 # Training parameters (cycle-based options are counted in sync cycles = N * sync_interval iterations).
 #
 # The cycle/iteration cadence below is fitted to the cluster's current throughput
-# of ~7M traversals-per-player per hour (the ``t`` in the progress logs), which at
-# SYNC_INTERVAL=1000 is 7,000 sync cycles/hour.  Re-derive if throughput changes:
-#   cycles/hour = 7e6 / SYNC_INTERVAL ;  raw traversals-per-player/hour = 7e6.
+# of ~3.5M traversals-per-player per hour on the widened action grid (the ``t``
+# in the progress logs — down from ~7M/h pre-widening, since more legal actions
+# per node means more work per traversal), which at SYNC_INTERVAL=1000 is 3,500
+# sync cycles/hour.  Re-derive if throughput changes:
+#   cycles/hour = 3.5e6 / SYNC_INTERVAL ;  raw traversals-per-player/hour = 3.5e6.
 N_PLAYERS=${N_PLAYERS:-4}
 MAX_RUNTIME_HOURS=${MAX_RUNTIME_HOURS:-96}
 SYNC_INTERVAL=${SYNC_INTERVAL:-1000}
-# LCFR discount stretched over the first 4h (was ~13 min at this throughput),
-# keeping the same 19 discount steps: one every 1400 cycles (12 min), window
-# 28000 cycles (4.0h = 20 * DISCOUNT_INTERVAL).
-DISCOUNT_INTERVAL=${DISCOUNT_INTERVAL:-1400}
-DISCOUNT_DURATION_CYCLES=${DISCOUNT_DURATION_CYCLES:-28000}
+# LCFR discount stretched over the first 4h, keeping the same 19 discount
+# steps: one every 700 cycles (12 min), window 14000 cycles (4.0h = 20 *
+# DISCOUNT_INTERVAL).  Halved from 1400/28000 to track the 7M->3.5M/h
+# throughput drop on the widened grid; still 12 min / 4.0h of wall-clock.
+DISCOUNT_INTERVAL=${DISCOUNT_INTERVAL:-700}
+DISCOUNT_DURATION_CYCLES=${DISCOUNT_DURATION_CYCLES:-14000}
 # Pre-flop average-strategy warm-up: start accumulating φ after the first 6h
-# (42000 cycles = 6.0h at 7,000 cycles/h), matching CHECKPOINT_START_CYCLES so
+# (21000 cycles = 6.0h at 3,500 cycles/h), matching CHECKPOINT_START_CYCLES so
 # the pre-flop average and the post-flop snapshots share one warm-up and both
-# skip the near-random early era (past the 28000-cycle LCFR discount window).
-UPDATE_THRESHOLD=${UPDATE_THRESHOLD:-42000}
+# skip the near-random early era (past the 14000-cycle LCFR discount window).
+UPDATE_THRESHOLD=${UPDATE_THRESHOLD:-21000}
 STRATEGY_INTERVAL=${STRATEGY_INTERVAL:-1}
-# Checkpoint every 3 hours (21000 cycles = 3.0h at 7,000 cycles/h).  Every
+# Checkpoint every 3 hours (10500 cycles = 3.0h at 3,500 cycles/h).  Every
 # checkpoint is now RETAINED (previous generations are no longer deleted) and
 # doubles as a post-flop average-strategy snapshot for the offline
 # `poker_ai train average` tool, so this interval is also the snapshot cadence.
 # 3h over the 96h run yields ~30 retained snapshots for the average.
-CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-21000}
+CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-10500}
 # Start checkpointing/snapshotting after the first 6 hours — the
-# average-strategy warm-up.  42000 cycles = 6.0h at 7,000 cycles/h (past the
-# 28000-cycle / 4h LCFR discount window), so the retained snapshots exclude the
+# average-strategy warm-up.  21000 cycles = 6.0h at 3,500 cycles/h (past the
+# 14000-cycle / 4h LCFR discount window), so the retained snapshots exclude the
 # near-random early era that pollutes the average.  With the interval above the
 # first snapshot lands exactly at 6h (gate is ``sync_step >= start``), then one
 # every 3h.  An end-of-run / SIGTERM checkpoint is always written regardless of
 # this gate.
-CHECKPOINT_START_CYCLES=${CHECKPOINT_START_CYCLES:-42000}
-# CFR-P pruning begins at 2.5h.  Raw iterations (traversals-per-player): 2.5h * 7e6/h = 17.5M.
-PRUNE_THRESHOLD=${PRUNE_THRESHOLD:-17500000}
+CHECKPOINT_START_CYCLES=${CHECKPOINT_START_CYCLES:-21000}
+# CFR-P pruning begins at 2.5h.  Raw iterations (traversals-per-player): 2.5h * 3.5e6/h = 8.75M.
+PRUNE_THRESHOLD=${PRUNE_THRESHOLD:-8750000}
 C=${C:--3000000}
 PICKLE_DIR=${PICKLE_DIR:-false}
 N_PROCESSES=${N_PROCESSES:-}
