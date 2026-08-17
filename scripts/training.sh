@@ -108,10 +108,23 @@ export PLURIBUS_CHUNK_SIZE=${PLURIBUS_CHUNK_SIZE:-4000000}
 # run's saturation — the mmap cannot grow once workers fork, so an undersized
 # street fails LOUDLY and early (before real compute is spent), telling you to
 # raise the value and restart.  The chosen sizes are persisted in the
-# checkpoint so a resume reuses them.  Defaults ≈ 21 GiB of shm; raise --mem
+# checkpoint, and on resume the persisted size is never shrunk — but
+# PLURIBUS_INDEX_CAPACITY can still raise it further per street (see
+# poker_ai/tables/cfr_tables.py::_build_index_caches), so bumping this env var
+# and resuming is enough to recover from an overflow without discarding the
+# checkpoint.
+#
+# Sized 2026-08-17 for the widened raise grid (preflop/flop first+subsequent
+# raise options roughly doubled/tripled; turn/river grid unchanged) from a
+# real old-grid checkpoint's per-street infoset counts, projected forward by
+# an idealized action-sequence-count model (preflop/flop ratios trusted
+# directly from the raise-option counts; turn/river deliberately capped well
+# below the model's naive ~40x, since that figure assumes no early
+# termination and heavily overstates real growth) — see conversation history,
+# not an exact measurement.  Defaults ≈ 132 GiB of shm; raise --mem
 # accordingly (chunk tables need the rest of RAM).
 export PLURIBUS_INDEX_CACHE=${PLURIBUS_INDEX_CACHE:-1}
-export PLURIBUS_INDEX_CAPACITY=${PLURIBUS_INDEX_CAPACITY:-"67108864,268435456,268435456,268435456"}
+export PLURIBUS_INDEX_CAPACITY=${PLURIBUS_INDEX_CAPACITY:-"8388608,1073741824,536870912,4294967296"}
 # Compiled Cython core for CFR training — the SINGLE operator switch.  1 = every
 # worker drives its traversals through poker_ai._core (the compiled walk) AND every
 # byte-identical kernel the training hot path uses — ``evaluator`` + ``settlement``

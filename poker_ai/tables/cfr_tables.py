@@ -168,9 +168,12 @@ class CFRTables:
             LMDB-only path).  Must be constructed in the parent before workers
             fork; call :meth:`prewarm_caches` before the fork.
         index_capacities : dict[int, int], optional
-            Per-street cache slot counts (fresh-run sizing).  When ``None`` and
-            the cache is enabled, ``PLURIBUS_INDEX_CAPACITY`` is consulted; on
-            resume the size is derived from the existing row count regardless.
+            Per-street cache slot counts (typically the checkpoint-persisted
+            sizes on a resume).  When ``None`` and the cache is enabled,
+            ``PLURIBUS_INDEX_CAPACITY`` is consulted instead.  When both are
+            present (a resume with the env var also set), the per-street
+            *max* of the two wins — a resume never shrinks below what was
+            persisted, but the env var can still raise it further.
         """
         if actions_per_street is None:
             raise ValueError("actions_per_street is required")
@@ -228,7 +231,26 @@ class CFRTables:
         self, shm_dir: str, index_capacities: Optional[Dict[int, int]]
     ) -> None:
         """Create and attach a per-street :class:`ShmIndexCache`."""
-        capacities = index_capacities or _parse_capacities_env()
+        env_capacities = _parse_capacities_env()
+        if index_capacities and env_capacities:
+            # Resume: never shrink below what the checkpoint persisted (that
+            # would overflow as soon as the resumed run keeps allocating),
+            # but let PLURIBUS_INDEX_CAPACITY raise a street further — e.g.
+            # after an overflow crash forced a resize — without discarding
+            # the checkpoint.
+            capacities = {
+                r: max(index_capacities.get(r, 0), env_capacities.get(r, 0))
+                for r in range(4)
+            }
+            if capacities != {r: index_capacities.get(r, 0) for r in range(4)}:
+                log.info(
+                    "PLURIBUS_INDEX_CAPACITY raises the resumed index cache "
+                    "above the persisted checkpoint size: persisted=%s "
+                    "env=%s merged=%s",
+                    index_capacities, env_capacities, capacities,
+                )
+        else:
+            capacities = index_capacities or env_capacities
         load_factor = float(
             os.environ.get("PLURIBUS_INDEX_LOAD_FACTOR", DEFAULT_LOAD_FACTOR)
         )

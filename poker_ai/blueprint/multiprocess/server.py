@@ -401,10 +401,12 @@ class Server:
 
         # Shared-memory index cache (on by default): serves the per-node
         # info-set lookup from shm instead of an LMDB read txn.  On resume the
-        # capacity persisted in the checkpoint is reused (so the cache never
-        # shrinks below the original run and overflows); on a fresh run the
-        # size comes from PLURIBUS_INDEX_CAPACITY / existing rows (see
-        # CFRTables).
+        # capacity persisted in the checkpoint is reused as a floor (so the
+        # cache never shrinks below the original run and overflows), but
+        # PLURIBUS_INDEX_CAPACITY can still raise a street further — the
+        # per-street max of the two is used (see
+        # CFRTables._build_index_caches); on a fresh run the size comes from
+        # PLURIBUS_INDEX_CAPACITY / existing rows.
         enable_index_cache = os.environ.get("PLURIBUS_INDEX_CACHE", "1") == "1"
         persisted_caps = _read_persisted_index_capacities(self._save_path)
         self._tables = CFRTables(
