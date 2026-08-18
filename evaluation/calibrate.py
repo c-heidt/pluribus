@@ -26,7 +26,8 @@ subclass — intercepts each searched decision to capture the *exact* production
 :class:`~poker_ai.search.context.SubgameContext` (ranges, models, regime routing,
 live-player count).  Those captured roots are then re-solved at a geometric ladder
 of per-replica budgets; the resulting per-cell curves yield a suggested
-``mccfr_per_player_by_street`` / ``vector_budget_by_street`` block.
+per-cell ``MCCFR_BUDGET`` / ``VECTOR_BUDGET`` block (one number per
+(approach, street, n_live)).
 
 A **cell** is ``(condition, regime, street, n_live)`` — i.e. exactly the axes the
 budget keys on (``budget._is_vector`` + ``budget.iteration_budget``'s per-street /
@@ -73,7 +74,14 @@ from poker_ai.search.budget import iteration_budget
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.parallel import resolve_workers
 from poker_ai.search.solver import _select_regime, solve
-from poker_ai.search.solver_state import SolverConfig
+from poker_ai.search.solver_state import (
+    DBR,
+    MCCFR_BUDGET,
+    OX,
+    VANILLA,
+    VECTOR_BUDGET,
+    SolverConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +257,7 @@ def _target_cells(n_players: int,
 
     **POST-FLOP ONLY.**  Pre-flop is not calibrated: the bot plays it from the blueprint
     (Pluribus does the same — search starts on the flop), so a pre-flop search budget
-    would never be used.  ``mccfr_per_player_by_street[0]`` therefore keeps its default
+    would never be used.  The preflop table entries therefore keep their shipped values
     and is simply never measured.
 
     Each post-flop street can be reached with any live count from heads-up up to the full
@@ -1334,70 +1342,90 @@ def _production_regime(street: int, n_live: int) -> str:
     return "vector" if (int(n_live) == 2 and int(street) in (2, 3)) else "mccfr"
 
 
-def suggest_config(summaries: Sequence[CellSummary],
-                   default_mccfr_base: Tuple[int, int, int, int] = (3000, 5000, 4000, 3000),
-                   # MUST track SolverConfig.vector_budget_by_street — this is what an
-                   # UNRESOLVED cell falls back to, so a stale value here silently emits a
-                   # DOWNGRADE (it read (1500,1000,500) while production ran (1500,1350,850)).
-                   default_vector: Tuple[int, int, int] = (1500, 1350, 850),
-                   ) -> Dict[str, object]:
-    """Fold per-cell suggested budgets into a ``SolverConfig`` budget block.
+def _approach_of(condition: str) -> str:
+    """Map a calibration condition label onto a budget-table approach key.
+
+    Conditions are user-facing labels (``'vanilla'``, ``'DBR'``, ``'OX(beta=3.0)'``); the
+    tables are keyed by the approach :func:`poker_ai.search.budget.search_approach` infers
+    at solve time.  Keeping the mapping here, rather than assuming the label IS the key,
+    is what lets an ``OX(beta=...)`` arm land in the OX row instead of silently missing.
+    """
+    c = str(condition).strip().lower()
+    if c.startswith("ox"):
+        return OX
+    if c.startswith("dbr"):
+        return DBR
+    return VANILLA
+
+
+def _shipped_budget(regime: str) -> Dict[str, Dict[Tuple[int, int], int]]:
+    """The per-cell budget tables :class:`SolverConfig` actually ships.
+
+    An UNRESOLVED cell keeps production's current value, so this MUST be what production
+    runs.  A hardcoded copy went stale once already — it read ``(1500, 1000, 500)`` while
+    production ran ``(1500, 1350, 850)``, so an unresolved turn cell would have emitted a
+    silent DOWNGRADE.  Reading the shipped tables makes the two impossible to diverge.
+    """
+    table = VECTOR_BUDGET if regime == "vector" else MCCFR_BUDGET
+    return {a: dict(cells) for a, cells in table.items()}
+
+
+def suggest_config(summaries: Sequence[CellSummary]) -> Dict[str, object]:
+    """Fold per-cell suggested budgets into the ``SolverConfig`` budget tables.
+
+    One number per ``(approach, street, n_live)`` — the same shape production reads, so
+    the emitted block can be pasted straight into ``solver_state``.  No per-live-player
+    base is backed out and no cross-approach ratio is fitted: a cell's budget is its own
+    measurement, and cells that did not resolve keep whatever production ships today.
 
     Each cell's ``suggested_budget`` is the smallest single-worker budget at which the
-    strategy has stopped moving (mean ``hot_l1 <= tol``, the tolerance chosen per regime
-    — see :func:`_tol_for`).  Vector per street comes
-    from the heads-up vector cells.  MCCFR ``base[street]`` is the per-live-player budget:
-    the suggested per-replica budget divided by the cell's live-player count (production
-    budget is ``base * n_live``), taken as the **max** over live-player counts so the
-    slowest-converging live-count is covered, rounded up.  Cells that never settled within
-    the ladder keep the current default and are flagged (raise LADDER_HI/MAX for those).
+    strategy has stopped moving (mean ``hot_l1 <= tol``, the tolerance chosen per regime —
+    see :func:`_tol_for`).  ``below_ladder`` cells are treated as unresolved: converging at
+    the lowest rung means the real budget is somewhere below the ladder, so the rung is an
+    over-estimate, not a measurement.
 
     No wall cap is emitted: production uses a single flat ``max_wall_seconds`` backstop.
+    ⚠ The emitted numbers are convergence points only — they are NOT clipped to any wall.
+    A cell whose budget does not fit the per-search wall must be clipped by hand against
+    its measured ``throughput_it_s``; the report prints both.
     """
-    mccfr_by_street: Dict[int, int] = {}
-    vector_by_street: Dict[int, int] = {}
+    mccfr = _shipped_budget("mccfr")
+    vector = _shipped_budget("vector")
     unresolved: List[str] = []
     for s in summaries:
-        _cond, regime, street, n_live = s.cell
-        # Skip turn-A/B forced-alternate cells (a regime production never routes this
+        cond, regime, street, n_live = s.cell
+        # Skip forced-alternate A/B cells (a regime production never routes this
         # (street, n_live) to) — they belong in the A/B report, not the prod budget.
         if regime != _production_regime(street, n_live):
             continue
+        approach = _approach_of(cond)
         # ``below_ladder`` ⇒ converged at the lowest rung, so this is an over-estimate, not
-        # a measurement: treat it as unresolved (keep the default) and flag it.
+        # a measurement: treat it as unresolved (keep the shipped value) and flag it.
         val = None if s.below_ladder else s.suggested_budget
         if val is None:
             why = ("converges BELOW the ladder — lower this street's ladder_top_seconds"
                    if s.below_ladder else
                    "still moving at the top rung — raise this street's ladder_top_seconds")
             unresolved.append(
-                f"{_STREET_NAME.get(street, street)}/{regime}/n_live={n_live} ({why})"
+                f"{cond}/{_STREET_NAME.get(street, street)}/{regime}/n_live={n_live} ({why})"
             )
             continue
-        if regime == "mccfr":
-            # Production budget is base * n_live, so back out the per-player base.
-            base = int(np.ceil(int(val) / max(2, int(n_live))))
-            mccfr_by_street[street] = max(mccfr_by_street.get(street, 0), base)
-        elif regime == "vector":
-            vector_by_street[street] = max(vector_by_street.get(street, 0), int(val))
-
-    mccfr_base = [
-        _round_up(mccfr_by_street[st]) if st in mccfr_by_street else default_mccfr_base[st]
-        for st in (0, 1, 2, 3)
-    ]
-    # vector_budget_by_street is (flop, turn, river) = streets 1,2,3.
-    vector = [
-        _round_up(vector_by_street[st]) if st in vector_by_street else default_vector[i]
-        for i, st in enumerate((1, 2, 3))
-    ]
+        target = vector if regime == "vector" else mccfr
+        target.setdefault(approach, {})[(int(street), int(n_live))] = _round_up(int(val))
+    # Decided policy (mirrors solver_state): OX is sized like DBR in the VECTOR regime,
+    # where its gadget root is live and costs about what a modelled solve does, and like
+    # VANILLA in MCCFR, where ``beta`` is inert and the solve is an ordinary best response.
+    # Mirrored here so the emitted block matches production rather than leaving OX stale.
+    vector[OX] = dict(vector[DBR])
+    mccfr[OX] = dict(mccfr[VANILLA])
     return {
         "hot_l1_tol": {
             r: next((s.hot_l1_tol for s in summaries if s.cell[1] == r), None)
             for r in ("mccfr", "vector")
         },
-        "mccfr_per_player_by_street": tuple(mccfr_base),
-        "vector_budget_by_street": tuple(vector),
-        "unresolved_cells": unresolved,  # never settled within the ladder → raise LADDER_HI/MAX
+        "mccfr_budget": mccfr,
+        "vector_budget": vector,
+        "unresolved_cells": unresolved,  # never settled within the ladder
     }
 
 
@@ -1539,12 +1567,16 @@ def _print_report(summaries: Sequence[CellSummary], config: Dict[str, object],
                   f"{s.cross_rep_hot_l1:.3f}")
     print("\nSuggested SolverConfig block (hot_l1 tol mccfr="
           f"{config['hot_l1_tol']['mccfr']} vector={config['hot_l1_tol']['vector']}):")
-    print(f"    mccfr_per_player_by_street = {config['mccfr_per_player_by_street']}"
-          "   # (preflop, flop, turn, river); budget = base * n_live")
-    print(f"    vector_budget_by_street    = {config['vector_budget_by_street']}"
-          "   # (flop, turn, river)")
+    print("  (convergence points; NOT wall-clipped — check each against wall@sugg above)")
+    for label, table in (("_MCCFR", config["mccfr_budget"]),
+                         ("_VECTOR", config["vector_budget"])):
+        for approach in ("vanilla", "dbr", "ox"):
+            cells = table.get(approach) or {}
+            body = ", ".join(f"({st}, {nl}): {b}"
+                             for (st, nl), b in sorted(cells.items()))
+            print(f"    {label}_{approach.upper()} = {{{body}}}")
     if config["unresolved_cells"]:
-        print("  NOTE: did not converge below threshold within the ladder (kept default): "
+        print("  NOTE: did not converge within the ladder (kept the shipped value): "
               + ", ".join(config["unresolved_cells"]))
     print("=" * 92 + "\n")
     _print_regime_ab(summaries, wall_target)
@@ -1808,7 +1840,7 @@ def run_calibration(
         "workers": resolved_workers,
         "max_concurrent_multiway": max_concurrent_multiway,  # peak-RAM cap (None ⇒ uncapped)
         # Live-count slice this run covered (None ⇒ the full grid).  A partial run's
-        # suggested_config keeps the DEFAULT budget for every street it did not measure.
+        # suggested_config keeps the SHIPPED budget for every cell it did not measure.
         "n_live_filter": list(n_live_filter) if n_live_filter else None,
         # Whether VR-MCCFR (opponent_modeling §5.5) was active this run — DBR-only, so
         # it affects only modeled MCCFR cells; recorded so a run is self-documenting.

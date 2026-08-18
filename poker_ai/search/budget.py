@@ -14,17 +14,20 @@ Two regimes, sized on different principles (they differ by design, §6.5):
 - **Vector** (heads-up flop/turn/river) is **full-width** — every iteration updates
   every infoset over the whole range.  Iterations-to-converge is therefore driven by
   tree *depth* (streets left to resolve: flop > turn > river), essentially *not* by
-  the infoset count.  So the budget is a per-stage constant; the infoset count
-  (~746k flop / ~89k turn / ~26k river at 200 buckets/street) only bounds the
-  per-iteration *wall* (flop ≈ 1500 it × 746k rows ≈ tens of s/replica, i.e. the
-  paper's 1–33 s envelope).
+  the infoset count, which only bounds the per-iteration *wall*.
 
 - **MCCFR** (multiway, or the heads-up pre-flop root) is **sampled**, and only the
   **hot path** must converge — nodes the solved tree never covers fall back to the
-  blueprint at play time (a hard fallback, no blend), so they need no search refinement.  Its
-  per-replica budget grows ~linearly with the live-player count (a bigger hot path),
-  **not** the exponential full-tree size: ``base[street] × n_live``, clamped to
-  ``max_iterations``.
+  blueprint at play time (a hard fallback, no blend), so they need no search refinement.
+
+The budget itself is **looked up, not computed**: an explicit number per
+``(approach, street, n_live)`` in :data:`~poker_ai.search.solver_state.MCCFR_BUDGET` /
+:data:`~poker_ai.search.solver_state.VECTOR_BUDGET`.  There is no per-live-player base
+multiplied out and no per-approach scale factor.  Those formulas implied a regularity the
+measurements do not have — DBR's cost is not a fixed multiple of vanilla's, and its
+convergence point differs per street — and they coupled unrelated cells, so retuning one
+wall-bound cell silently moved every cell sharing the base.  See the tables for how each
+number was derived and which are wall-clipped rather than converged.
 
 Both regimes yield a **per-replica** count.  Production always runs a single replica
 (``workers=1`` — one hand per core, per-hand parallelism), so the budget IS the work.
@@ -36,8 +39,40 @@ The regime split mirrors :func:`poker_ai.search.solver._select_regime` exactly.
 
 from __future__ import annotations
 
+import logging
+
 from poker_ai.search.context import SubgameContext
-from poker_ai.search.solver_state import SolverConfig
+from poker_ai.search.solver_state import DBR, OX, VANILLA, SolverConfig
+
+logger = logging.getLogger(__name__)
+
+
+def search_approach(ctx: SubgameContext, cfg: SolverConfig) -> str:
+    """Which approach this solve is — ``'vanilla'`` | ``'dbr'`` | ``'ox'``.
+
+    Inferred from the solve's own inputs rather than passed in, so no caller can label a
+    solve one thing and configure it another:
+
+    - **DBR** is the approach that carries opponent models (``ctx.models``);
+    - **OX-Search** is the one that sets ``cfg.beta`` (the gadget root);
+    - neither ⇒ the **vanilla** paper baseline.
+
+    The two are mutually exclusive by construction — ``evaluation.runner.for_condition``
+    rejects a model on an OX arm and a ``beta`` on a DBR arm — so the order here cannot
+    mask a real configuration.  A solve that somehow carries both is a config bug, not a
+    fourth approach: prefer DBR (the models genuinely change the walk, whereas ``beta``
+    outside the vector regime is already inert) and say so loudly.
+    """
+    has_models = bool(getattr(ctx, "models", None))
+    has_beta = getattr(cfg, "beta", None) is not None
+    if has_models and has_beta:
+        logger.warning(
+            "solve carries BOTH opponent models and beta=%s — these are mutually "
+            "exclusive approaches; budgeting it as DBR.", cfg.beta,
+        )
+    if has_models:
+        return DBR
+    return OX if has_beta else VANILLA
 
 
 def _is_vector(ctx: SubgameContext) -> bool:
@@ -53,6 +88,36 @@ def _is_vector(ctx: SubgameContext) -> bool:
     return len(ctx.ranges) == 2 and ctx.street_at_root in (2, 3)
 
 
+def _lookup(table, street: int, n_live: int, approach: str, regime: str) -> int:
+    """The explicit budget for ``(street, n_live)``, or the nearest larger-table entry.
+
+    The tables cover the cells production actually reaches (up to 4 live players, the
+    blueprint's table size).  A deeper game — a 6p table, where ``n_live`` can reach 6 —
+    would otherwise KeyError mid-hand and abort the search, so an uncovered live-count
+    falls back to the LARGEST covered one for that street and says so once.  That is a
+    deliberate under-budget, not a silent extrapolation: the hot path grows with the live
+    count, so the fallback is too small, and the log line is the signal to measure the
+    cell and add it rather than to trust the number.
+    """
+    hit = table.get((street, n_live))
+    if hit is not None:
+        return int(hit)
+    covered = sorted(nl for (st, nl) in table if st == street)
+    if not covered:
+        raise KeyError(
+            f"no {regime} budget for street {street} under approach {approach!r}; "
+            f"the tables in poker_ai.search.solver_state need an entry for it"
+        )
+    fallback = covered[-1]
+    logger.warning(
+        "no %s budget for (street=%d, n_live=%d) under %r — falling back to the "
+        "largest covered live-count (n_live=%d, %d iters). This UNDER-budgets the "
+        "search; measure the cell and add it to solver_state.",
+        regime, street, n_live, approach, fallback, table[(street, fallback)],
+    )
+    return int(table[(street, fallback)])
+
+
 def iteration_budget(ctx: SubgameContext, cfg: SolverConfig,
                      regime_override: "str | None" = None) -> int:
     """Per-replica iterations to run for the subgame ``ctx`` under ``cfg`` (§6.5).
@@ -62,9 +127,8 @@ def iteration_budget(ctx: SubgameContext, cfg: SolverConfig,
     structural **per-replica** budget for the selected regime, clamped to at most
     ``cfg.max_iterations`` (the absolute ceiling) and at least 1:
 
-    - **vector** — a per-stage constant indexed (flop, turn, river);
-    - **MCCFR** — ``base[street] × n_live`` (the hot path grows ~linearly with the live
-      players), clamped to ``max_iterations``.
+    - **vector** — the ``(street, n_live=2)`` entry of this approach's vector table;
+    - **MCCFR** — the ``(street, n_live)`` entry of this approach's MCCFR table.
 
     Both are per-replica: production runs one replica (``workers=1``); extra replicas
     only reduce variance, they never divide the budget.
@@ -77,22 +141,12 @@ def iteration_budget(ctx: SubgameContext, cfg: SolverConfig,
     if not getattr(cfg, "auto_budget", True):
         return cfg.max_iterations
 
+    approach = search_approach(ctx, cfg)
+    n_live = max(2, len(ctx.ranges))
+    street = int(ctx.street_at_root)
     is_vec = (regime_override == "vector" if regime_override is not None
               else _is_vector(ctx))
-    if is_vec:
-        # Per-stage constant, indexed (flop, turn, river) = street 1, 2, 3.
-        flop, turn, river = cfg.vector_budget_by_street
-        budget = {1: flop, 2: turn, 3: river}[ctx.street_at_root]
-    else:
-        # Hot-path budget, ~linear in the live-player count (a deep multiway flop needs
-        # more sampled work than a river).  base indexed by ``street_at_root``
-        # (0=preflop … 3=river).
-        n_live = max(2, len(ctx.ranges))
-        budget = cfg.mccfr_per_player_by_street[ctx.street_at_root] * n_live
-        # DBR needs more iterations than vanilla for the same VALUE convergence (its
-        # tail-driven objective inflates the sampled-value variance), so scale UP only
-        # when the subgame carries opponent models.  Vanilla (no models) is byte-untouched.
-        if getattr(ctx, "models", None):
-            budget = budget * float(getattr(cfg, "dbr_mccfr_scale", 1.0))
-
+    table = (cfg.vector_budget if is_vec else cfg.mccfr_budget)[approach]
+    budget = _lookup(table, street, n_live, approach,
+                     "vector" if is_vec else "mccfr")
     return max(1, min(int(budget), int(cfg.max_iterations)))

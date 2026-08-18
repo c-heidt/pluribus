@@ -20,7 +20,8 @@ single row — used by ``frozen`` and the policy readers to index one combo's ro
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, Sequence, Tuple
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Dict, Mapping, Sequence, Tuple
 
 import numpy as np
 
@@ -28,6 +29,124 @@ from poker_ai.blueprint.tree_utils import calculate_strategy_from_row
 
 if TYPE_CHECKING:  # avoid a runtime import cycle (leaf -> policy -> solver_state)
     from poker_ai.search.leaf import LeafConfig
+
+
+# The three search approaches, as the budget tables key them.  Inferred from the solve's
+# own inputs (``poker_ai.search.budget.search_approach``), never passed in: DBR is the
+# approach that carries opponent models, OX-Search the one that sets ``beta``, and the two
+# are mutually exclusive by construction (``evaluation.runner.for_condition`` enforces it).
+VANILLA = "vanilla"
+DBR = "dbr"
+OX = "ox"
+APPROACHES = (VANILLA, DBR, OX)
+
+# ---------------------------------------------------------------------------- #
+# Per-cell iteration budgets — EXPLICIT, one number per (approach, street, n_live)
+# ---------------------------------------------------------------------------- #
+# There is deliberately NO formula here: no per-live-player base multiplied out, no
+# per-approach scale factor.  Those were convenient but dishonest — they implied a
+# structure the measurements do not have (DBR's cost is not a fixed multiple of
+# vanilla's; it is ~2x slower per iteration on the flop and ~2.1x on the turn, and its
+# convergence point differs per street), and they made a change for one wall-bound cell
+# silently move every other cell that shared the base.  One number per cell means each
+# is independently traceable to what it came from, and editing one edits exactly one.
+#
+# DERIVATION (2026-08 v7 calibration, single worker):
+#     budget = min(v7 convergence suggestion, iterations that fit 630 s at the measured
+#                  throughput of THAT approach on THAT cell), rounded to 50
+# 630 s leaves ~5% headroom under the ~660 s reference (Pluribus's 30 s x 22-core top =
+# 660 core-seconds/search; 4p < 6p).  Cells whose convergence point sits under the wall
+# take the convergence point; cells where the wall bites first are WALL-CLIPPED and
+# marked below — for those the number is what fits, not what converges.
+#
+# OX-Search is SPLIT across the two tables, because the gadget only exists in one regime:
+#   - VECTOR (its real home, HU turn/river): DBR's numbers.  The gadget root is live there
+#     and costs about what DBR's modelled solve does, so DBR's budget is the right size.
+#   - MCCFR: VANILLA's numbers.  ``beta`` is inert outside the vector regime — solver.py
+#     warns that such a solve is "an ordinary best response, NOT adaptation-safe" — so an
+#     OX-labelled MCCFR solve IS a vanilla solve and should be budgeted as one.  Giving it
+#     DBR's number would spend DBR's wall on a search doing none of DBR's work.
+# Kept as explicit tables rather than aliases so any of the three can diverge later.
+
+# (street, n_live) -> per-replica iterations.  street: 0=preflop 1=flop 2=turn 3=river.
+_MCCFR_VANILLA = {
+    # Preflop is played from the BLUEPRINT in production and never searched, so these are
+    # unmeasured carry-forwards, kept only so a forced preflop solve has a sane number.
+    (0, 2): 6000, (0, 3): 9000, (0, 4): 12000,
+    (1, 2): 36250,   # WALL-CLIPPED (630 s @ 57.5 it/s); v7 wanted 36436 — essentially at it
+    (1, 3): 41500,   # v7 convergence point (287 s) — wall not binding
+    (1, 4): 47250,   # EXTRAPOLATED from n3 (see LIVE-COUNT EXTRAPOLATION below), 327 s
+    (2, 3): 59450,   # WALL-CLIPPED (630 s @ 94.4 it/s); v7 wanted 69627
+    (2, 4): 59450,   # EXTRAPOLATED, then WALL-CLIPPED — n4 wants 67672, 630 s allows 59441
+    (3, 3): 8150,    # v7 convergence point (19 s) — wall nowhere near binding
+    (3, 4): 9300,    # EXTRAPOLATED from n3 (22 s)
+}
+_MCCFR_DBR = {
+    (0, 2): 6000, (0, 3): 9000, (0, 4): 12000,   # unmeasured ⇒ same as vanilla
+    (1, 2): 29800,   # WALL-CLIPPED (630 s @ 47.3 it/s) — cannot afford vanilla's 36250
+    (1, 3): 27250,   # v7 CEILING, not a measurement: this cell converged BELOW the ladder
+    (1, 4): 31000,   # EXTRAPOLATED from n3 (242 s).  n3 was itself a below-ladder CEILING,
+                     # so this inherits that — an upper bound propagated, not a measurement
+    (2, 3): 28500,   # WALL-CLIPPED (630 s @ 45.2 it/s); v7 wanted 56441
+    (2, 4): 28500,   # EXTRAPOLATED, then WALL-CLIPPED — n4 wants 32441, 630 s allows 28481
+    (3, 3): 15350,   # v7 convergence point (39 s) — DBR genuinely needs ~1.9x vanilla here
+    (3, 4): 17450,   # EXTRAPOLATED from n3 (45 s)
+}
+# The vector regime only runs heads-up (n_live == 2); the flop entry is oracle/A-B only,
+# since a real HU flop routes to MCCFR.
+_VECTOR_VANILLA = {
+    (1, 2): 1500,    # oracle / calibration A-B only — never routed in production
+    (2, 2): 2550,    # v7 convergence point (328 s @ 7.8 it/s)
+    (3, 2): 600,     # v7: converged BELOW the whole ladder, and EXACT here (no chance node
+                     # left; measured cross-seed spread 0.0), so this is a real bound (3 s)
+}
+_VECTOR_DBR = {
+    (1, 2): 1500,
+    (2, 2): 1700,    # WALL-CLIPPED (630 s @ 3.1 it/s) — DBR cannot afford vanilla's 2550
+    (3, 2): 600,     # exact, same as vanilla
+}
+
+# LIVE-COUNT EXTRAPOLATION (the ``n_live == 4`` entries).  v7 ran n_live=2,3 only, so the
+# 4-player cells are DERIVED, not measured:
+#
+#     budget(n4) = min( budget(n3) * 1.138 ,  630 s * throughput(n3) )
+#
+# The 1.138 is the one live-count trend v7 actually resolved — vanilla flop, 36436 (n2) ->
+# 41475 (n3).  It is a SINGLE pair of points on ONE street: the turn and river ran at n3
+# only, and DBR's flop n3 landed below its ladder (a ceiling, not a convergence point), so
+# neither yields a second estimate.  Treat 1.138 as the best available reading of the
+# pattern, not as an established growth law.
+#
+# Note how much flatter that is than the ``base * n_live`` model these tables replaced,
+# which grew the budget by 1.333 from n3 to n4: the hot path widens with the live count far
+# more slowly than per-player scaling assumed.  That is why the n4 flop/river budgets move
+# so much here — the old carry-forwards were shaped by the steeper law, not by evidence.
+#
+# Throughput at n4 is ASSUMED EQUAL to n3 rather than extrapolated.  v7 measured throughput
+# RISING with the live count (flop 57.5 -> 144.4 it/s from n2 to n3), so holding it flat is
+# the conservative direction: if n4 is in fact faster, these budgets merely leave wall
+# unused; had the rise been extrapolated and been wrong, the solves would overrun the wall
+# backstop and truncate silently.  Both turn cells are wall-clipped under that assumption
+# and would grow if a real n4 throughput measurement came in higher.
+
+# ⚠ CROSS-ARM COMPARABILITY: on the wall-bound cells DBR runs FEWER iterations than
+# vanilla (flop n2 29800 vs 36250; turn n2 vector 1700 vs 2550; turn n3 28500 vs 59450)
+# purely because it is slower per iteration.  An evaluation that compares the two is
+# therefore NOT budget-controlled on those cells, and a DBR loss there is confounded with
+# the shorter search.  Equalising would mean cutting vanilla to DBR's number — a real
+# option, deliberately not taken here since it would weaken the paper baseline.
+MCCFR_BUDGET: Mapping[str, Mapping[Tuple[int, int], int]] = MappingProxyType({
+    VANILLA: MappingProxyType(dict(_MCCFR_VANILLA)),
+    DBR: MappingProxyType(dict(_MCCFR_DBR)),
+    # OX in the MCCFR regime has no gadget ⇒ it is a vanilla solve (see above).
+    OX: MappingProxyType(dict(_MCCFR_VANILLA)),
+})
+VECTOR_BUDGET: Mapping[str, Mapping[Tuple[int, int], int]] = MappingProxyType({
+    VANILLA: MappingProxyType(dict(_VECTOR_VANILLA)),
+    DBR: MappingProxyType(dict(_VECTOR_DBR)),
+    # OX's real home: the gadget is live here, so it is sized like DBR (see above).
+    OX: MappingProxyType(dict(_VECTOR_DBR)),
+})
 
 
 # A public node identifier.  ``env.public_key`` is ``(betting_stage, history)``;
@@ -86,54 +205,21 @@ class SolverConfig:
     # pinned digests that need a fixed iteration count set ``auto_budget=False``
     # explicitly, and then a flat ``max_iterations`` is honoured verbatim.
     auto_budget: bool = True
-    # Vector regime (heads-up TURN/RIVER in production; the flop entry is used only when
-    # vector is driven directly for the oracle / calibration A-B — a real HU flop routes
-    # to MCCFR).  **Full-width**, so iterations-to-converge is driven by tree *depth*, not
-    # the infoset count — a per-stage constant ``(flop, turn, river)``.  Turn/river are the
-    # 2026-08 calibration (v4) value-gap convergence points: turn resolved at 1350, river at
-    # 850 (the 10-mbb bar; river spread≈0 so it is exact).  Flop (off the production path)
-    # keeps a depth-appropriate 1500.  The 200-buckets/street infoset counts (~746k flop /
-    # ~89k turn / ~26k river) bound only the per-iteration *wall* (river ≈ 90 it/s under
-    # load; turn ≈ 8 it/s → ~170 s at 1350).
-    vector_budget_by_street: tuple = (1500, 1350, 850)  # (flop[oracle-only], turn, river)
-    # MCCFR regime (multiway, or heads-up pre-flop): **sampled**, and only the HOT PATH
-    # needs to converge — infosets the solved tree never covers fall back to the
-    # blueprint at play time (a hard fallback, no blend).  The per-replica budget is ``base[street] *
-    # n_live`` (the hot path grows ~linearly with the live-player count, NOT the
-    # exponential full-tree size), clamped to ``max_iterations``.  Per-replica, like
-    # vector: production runs one replica (``workers=1``, one hand per core); more
-    # replicas would only add samples, never divide the budget.
+    # Per-cell iteration budgets — EXPLICIT tables, one number per
+    # ``(approach, street, n_live)``; see MCCFR_BUDGET / VECTOR_BUDGET at module level for
+    # the numbers and their derivation.  There is no formula and no multiplier: the budget
+    # is looked up, not computed.  ``poker_ai.search.budget.iteration_budget`` reads these,
+    # picking the table by regime and the row by the approach it infers from the solve's
+    # own inputs (models ⇒ DBR, ``beta`` ⇒ OX, neither ⇒ vanilla).
     #
-    # Per-street base **per live player**, indexed by ``street_at_root`` (0=preflop …
-    # 3=river) — a deep multiway flop needs far more sampled work than a river.  SHAPED
-    # by the 200-bucket subgame infoset counts (flop ~746k ≫ turn ~89k > river ~26k;
-    # HU-preflop ~8k) so flop gets the most: HU flop — the dominant MCCFR case (~70% of
-    # searches) — resolves to ``6000 * 2 = 12000`` it/replica.  These are infoset-SHAPED
-    # starting points, NOT fitted: MCCFR did not converge within the 2026-08 (v4)
-    # calibration ladder (flop value-gap 174 mbb at 12000 vs 104 at the suggested 19049),
-    # so the absolutes await a best-response-gap rerun on a deeper ladder — but the
-    # ordering and the ceiling are correct (previously flat 3000 + a 5_000 cap flattened
-    # both).
+    # Per-replica, and production runs one replica per hand (``workers=1``, one hand per
+    # core), so these ARE the per-search numbers.  With ``workers > 1`` the MCCFR budget is
+    # divided across replicas (more cores ⇒ shorter wall at ~constant work); the vector
+    # budget is not divisible — each full-width replica needs the whole horizon.
     #
-    # TIME-FEASIBILITY (2026-08): the per-regime/per-street time profile lives HERE, in the
-    # iteration budgets — ``max_wall_seconds`` is a pure safety knob, not a schedule.  Sized
-    # so the worst DBR cell (base * n_live * dbr_mccfr_scale) finishes inside ~660 s of
-    # single-worker wall at the measured v6 throughputs (Pluribus's 30 s * 22-core top =
-    # 660 core-seconds/search is the feasibility reference; 4p < 6p).  Flop base 5000:
-    # 4-way flop 40k @ ~61 it/s = ~660 s (the binding cell); HU flop 20k = ~560 s.
-    # ⚠ turn n_live=4 measured 14.5 it/s in v6 (~5x slower than turn n3 — suspect outlier);
-    # if that verifies, its 32k budget wall-trims at 660 s (~9.6k iters) and the turn base
-    # needs its own revisit — do NOT gut turn n2/n3 for one unverified number.
-    mccfr_per_player_by_street: tuple = (3000, 5000, 4000, 3000)  # pf, flop, turn, river
-    # DBR-only MCCFR budget multiplier.  DBR's tail-driven exploitation objective needs
-    # more iterations than vanilla to reach depth (opponent_modeling §5.5 /
-    # [[reference_vector_vs_mccfr_variance]]) — the 2026-08 calibration showed the DBR HU-flop
-    # strategy still moving (hot_l1 0.23) at 28k.  3.0 made calibration too expensive to fit
-    # a 5 h wall / node RAM, so 2.0 is the compromise.  Applied to ``base[street] * n_live``
-    # ONLY when the subgame carries opponent models (``ctx.models`` non-empty), so the
-    # vanilla/paper baseline is byte-for-byte untouched (no models ⇒ inert).  Clamped to
-    # ``max_iterations`` (60k): HU flop 10k→20000, preflop-4 12k→24000, 4-way flop 20k→40000.
-    dbr_mccfr_scale: float = 2.0
+    # Overridable per solve, so a caller can pin a cell without editing the module tables.
+    mccfr_budget: "Mapping[str, Mapping[Tuple[int, int], int]]" = MCCFR_BUDGET
+    vector_budget: "Mapping[str, Mapping[Tuple[int, int], int]]" = VECTOR_BUDGET
     # OX-Search safety parameter β (Approach B, PO-CES-HU; Ge et al. ICML 2024,
     # Thm 4.6: ``exp(σ₂ˢ) − exp(σ) ≤ Δ/β``).  ``None`` → OX-Search is OFF and the
     # vector solve is byte-for-byte the vanilla/DBR path (no gadget root, no opt-out

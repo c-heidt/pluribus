@@ -3,8 +3,9 @@
 # node (evaluation/calibrate.py).  It plays hands with the trained blueprint, captures
 # the exact production subgame roots the hero searches, and re-solves each at a ladder
 # of per-replica iteration budgets — emitting a suggested
-# ``mccfr_per_player_by_street`` / ``vector_budget_by_street`` block plus a
-# per-cell throughput/convergence table (calibration_summary.json + calibration_rows.csv).
+# per-cell ``MCCFR_BUDGET`` / ``VECTOR_BUDGET`` block (one number per
+# (approach, street, n_live)) plus a per-cell throughput/convergence table
+# (calibration_summary.json + calibration_rows.csv).
 #
 # It mirrors scripts/evaluation.sh: the LUT (runtime subset) and the blueprint are
 # staged to node-local fast scratch, the compiled search core is required-and-verified
