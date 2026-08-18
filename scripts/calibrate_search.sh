@@ -81,7 +81,9 @@ N_LIVE=${N_LIVE:-2,3}                      # live-player counts to calibrate; em
 PER_CELL_CAP=${PER_CELL_CAP:-6}            # distinct HANDS (roots) per cell for the sampled cells
 PER_CELL_CAP_DETERMINISTIC=${PER_CELL_CAP_DETERMINISTIC:-8}  # distinct HANDS for the DETERMINISTIC cells (vector river): every seed gives a byte-identical solve there, so they run exactly ONE rep and spend the compute on extra hands instead
 REPS=${REPS:-4}                            # re-solves per root, SAMPLED cells only (different seed, same hand). Deterministic cells (vector river) always use 1 — extra reps there are byte-identical. Snapshot ladders make one rep cover every rung, so a cell = PER_CELL_CAP hands x REPS searches.
-HOT_L1_TOL=${HOT_L1_TOL:-0.10}            # convergence: per-cell budget = smallest rung where MEAN hot_l1 (single-worker strategy self-distance vs its own top budget, averaged over the cell's solves) ≤ this. Cells that never settle are flagged → raise that street LADDER_TOP_SECONDS.
+HOT_L1_TOL_MCCFR=${HOT_L1_TOL_MCCFR:-0.20}  # convergence tolerance for the SAMPLED cells. LOOSER than vector on purpose: external-sampling MCCFR leaves Monte-Carlo dispersion that decays like 1/sqrt(T) and never reaches 0, so a vector-tight bar would measure noise, not convergence (and would demand budget bought purely to average out noise the next street's re-solve discards). Each cell also reports its MEASURED cross-seed spread ('xrep' = cross-rep hot_l1 at the top budget: same hand, same iterations, different seed); the run flags any cell whose tol sits at or under it, meaning the budget is being resolved finer than two independent seeds of that cell agree to — loosen this above the reported xrep if so.
+HOT_L1_TOL_VECTOR=${HOT_L1_TOL_VECTOR:-0.10}  # convergence tolerance for the FULL-WIDTH cells. Tighter: the vector regime enumerates both ranges, so there is no per-iteration sampling noise to average out (the river cell is exactly deterministic).
+# Both: per-cell budget = smallest rung where MEAN hot_l1 ≤ tol. hot_l1 = single-worker strategy self-distance vs its OWN top budget, measured over the hero's WHOLE ROOT STREET (reach-weighted over every hero decision node on that street, since one solve serves the whole street — not the root alone, and not past the street boundary, which is re-solved), averaged over the cell's solves. Cells that never settle are flagged → raise that street LADDER_TOP_SECONDS.
 LADDER_POINTS=${LADDER_POINTS:-6}          # rungs per ladder, walking DOWN from the wall-anchored top
 LADDER_TOP_SECONDS=${LADDER_TOP_SECONDS:-600,600,60}          # MCCFR per-street (flop,turn,river) wall budget for the ladder TOP rung: top = probed it/s × this. Hard cells (flop/turn: hot_l1 0.23-0.43 at their production budgets) get the full 600s; river converged at ~9000 iters/22s so 60s brackets it without waste.
 LADDER_TOP_SECONDS_VECTOR=${LADDER_TOP_SECONDS_VECTOR:-600,600,15}  # same for VECTOR cells — separate because the regimes converge at very different iteration counts (HU river vector settles ~1071 iters vs ~9000 multiway river MCCFR), so one per-street value cannot bracket both.
@@ -268,7 +270,7 @@ echo "  - Live counts:       ${N_LIVE:-(all)}"
 echo "  - CPUs:              ${SLURM_CPUS_PER_TASK:-(unset)}"
 echo "  - Hands/reps:        $PER_CELL_CAP hands x $REPS reps (sampled cells); $PER_CELL_CAP_DETERMINISTIC hands x 1 rep (deterministic: vector river)"
 echo "  - Ladder:            wall-anchored top = probe(${PROBE_SECONDS}s) x mccfr[${LADDER_TOP_SECONDS}]s/vector[${LADDER_TOP_SECONDS_VECTOR}]s (flop,turn,river), down to ${LADDER_LO}x top, $LADDER_POINTS pts"
-echo "  - hot_l1 tol:        $HOT_L1_TOL  (budget = smallest rung with mean hot_l1 ≤ tol)"
+echo "  - hot_l1 tol:        mccfr $HOT_L1_TOL_MCCFR / vector $HOT_L1_TOL_VECTOR  (budget = smallest rung with mean hot_l1 ≤ tol; hot_l1 spans the hero's whole root street, reach-weighted; MCCFR is looser because sampling leaves dispersion)"
 echo "  - Wall target (s):   ${WALL_TARGET:-(disabled)}"
 echo "  - Regime A/B:        $REGIME_AB_STREETS"
 echo "  - CRN root value:    $CRN_VALUE  (worlds $CRN_WORLDS; false = raw internal MCCFR value)"
@@ -303,7 +305,8 @@ run_calibrate() {  # $1 = conditions, $2 = out-dir
     --per-cell-cap "$PER_CELL_CAP" \
     --per-cell-cap-deterministic "$PER_CELL_CAP_DETERMINISTIC" \
     --reps "$REPS" \
-    --hot-l1-tol "$HOT_L1_TOL" \
+    --hot-l1-tol-mccfr "$HOT_L1_TOL_MCCFR" \
+    --hot-l1-tol-vector "$HOT_L1_TOL_VECTOR" \
     --ladder-points "$LADDER_POINTS" \
     --ladder-lo "$LADDER_LO" \
     --ladder-top-seconds "$LADDER_TOP_SECONDS" \

@@ -57,7 +57,7 @@ class _Sample:
 
 
 class _Res:
-    """A SearchResult-shaped stub; ``_root_sigma`` reads legal_at/average_policy."""
+    """A SearchResult-shaped stub (only ``root_value``/timings are read from it)."""
 
     def __init__(self, pk):
         self.root_value = 1.0
@@ -75,10 +75,19 @@ _TRACK: dict = {}
 
 
 class _FakePolicy:
-    """Stands in for the live ``SearchPolicy`` handed to an ``on_snapshot`` hook."""
+    """Stands in for the live ``SearchPolicy`` handed to an ``on_snapshot`` hook.
+
+    ``_street_sigma`` sweeps ``legal_at`` for same-street (``pk[0]``) hero
+    (``actor_at``) nodes and weights each by its ``vstrat`` row mass, so the stub
+    state carries all three.
+    """
 
     def __init__(self, pk):
-        self._state = type("S", (), {"legal_at": {pk: True}})()
+        self._state = type("S", (), {
+            "legal_at": {pk: ("fold", "call")},
+            "actor_at": {pk: 0},
+            "vstrat": {pk: np.ones((1, 2))},
+        })()
 
     def strategy_for(self, pk, hr, legal):
         return np.array([0.5, 0.5])
@@ -123,9 +132,6 @@ def _jobs():
 
 def _run(max_concurrent_multiway: Optional[int], workers: int, monkeypatch):
     monkeypatch.setattr(calibrate, "solve", _fake_solve)
-    # _root_sigma needs the sample's pk in legal_at; give every _Res the right key.
-    monkeypatch.setattr(calibrate, "_root_sigma",
-                        lambda res, s: np.array([0.5, 0.5]))
     ctx = mp.get_context("fork")
     _TRACK["lock"] = ctx.Lock()
     _TRACK["cur"] = ctx.Value("i", 0)

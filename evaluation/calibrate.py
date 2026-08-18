@@ -54,7 +54,7 @@ import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -93,8 +93,9 @@ class RootSample:
     ``env`` is a private deepcopy (a solve may walk it in place but restores it; we
     still deepcopy per re-solve defensively).  ``ctx`` is the frozen
     :class:`SubgameContext` the agent built — reused verbatim, only its ``rng`` is
-    swapped per replicate.  ``(pk, hr, legal)`` locate the hero's root decision row
-    so the swept solve's average strategy can be read back for the L1 metric.
+    swapped per replicate.  ``(pk, hr, legal)`` locate the hero's root decision row;
+    ``pk`` additionally anchors the *street* (``pk[0]``) and identifies the hero seat
+    (``actor_at[pk]``) that :func:`_street_sigma` sweeps for the L1 metric.
     """
 
     condition: str
@@ -678,24 +679,99 @@ def _top_seconds_for(regime: str, street: int, mccfr_secs: Sequence[float],
     return float({1: flop, 2: turn, 3: river}.get(int(street), flop))
 
 
-def _root_sigma(res, s: RootSample) -> Optional[np.ndarray]:
-    """The hero's root **average** strategy from a solve, or ``None`` on a miss.
+# A snapshot of the hero's strategy over the ROOT STREET: ``{public_key: (sigma, reach)}``.
+StreetSigma = Dict[Any, Tuple[np.ndarray, float]]
 
-    ``strategy_for`` silently returns uniform for an unseen node, which would look
-    (falsely) converged — so we require the root key to be present in the solved
-    tree, and treat its absence as a miss (recorded NaN), not a distribution.
+
+def _street_sigma(policy, s: RootSample) -> Optional[StreetSigma]:
+    """The hero's **average** strategy at every decision it can face on the root street.
+
+    Scope — why the street and not just the root, nor the whole depth-limited tree:
+    one solve serves the hero for the *whole street*.  The agent re-searches only when
+    an off-tree raise is injected (:mod:`poker_ai.search.agent`), so after the root
+    decision every further hero node on this street is read out of **this same tree** at
+    a deeper public key; only the street boundary triggers a fresh solve.  So the played
+    set is exactly ``{hero decision nodes with pk[0] == root stage}``.  Measuring the root
+    alone under-measures (it ignores the later, rarer, slowest-converging nodes the bot
+    will still play from this solve); measuring to the depth limit over-measures (those
+    nodes exist only to give the street's nodes correct leaf values and are thrown away
+    and re-solved, so charging convergence for them buys a wastefully large budget).
+
+    ``public_key`` is ``(betting_stage, history)``, so ``pk[0]`` is the street — the
+    filter is exact, not a heuristic.  ``actor_at`` picks out the hero's own nodes; the
+    row index ``s.hr`` stays valid across the whole street because the board (and hence
+    ``combo_index``) does not change within one.
+
+    Each node carries its **reach mass** ``vstrat[pk][hr].sum()`` — the cumulative
+    reach-weighted strategy mass this row accumulated, i.e. how often this decision
+    actually comes up for the hero's hand.  That weights the aggregate toward the
+    decisions the hero really faces instead of letting an all-but-unreachable node
+    dominate a flat average.
+
+    Returns ``None`` on a miss (root key absent from the solved tree).  ``strategy_for``
+    silently returns uniform for an unseen node, which would read as falsely converged,
+    so absence must never be mistaken for a distribution.
     """
-    if s.pk not in res.state.legal_at:
+    st = policy._state
+    if s.pk not in st.legal_at:
         return None
-    try:
-        sig = res.average_policy.strategy_for(s.pk, s.hr, s.legal)
-    except Exception:  # pragma: no cover - defensive
+    hero = st.actor_at.get(s.pk)
+    if hero is None:
         return None
-    return np.asarray(sig, dtype=np.float64)
+    stage = s.pk[0]
+    out: StreetSigma = {}
+    for pk, legal in st.legal_at.items():
+        # DBR's opponent meta-game registers ``(pk_base, "META", seat)`` rows in this same
+        # table (:mod:`poker_ai.search.mccfr`).  Those are bias-class draws, not the hero's
+        # betting decisions, and their action set is ``_BIAS_CLASSES`` — scoring them would
+        # corrupt the DBR arm's metric only, i.e. exactly the comparison the calibration
+        # exists to make.  A real public key is ``(stage, history)``; require that shape
+        # explicitly rather than relying on the meta key's ``[0]`` merely not matching.
+        if len(pk) != 2 or pk[0] != stage or st.actor_at.get(pk) != hero:
+            continue
+        try:
+            sig = np.asarray(policy.strategy_for(pk, s.hr, list(legal)),
+                             dtype=np.float64)
+        except Exception:  # pragma: no cover - defensive
+            continue
+        mat = st.vstrat.get(pk)
+        reach = (float(mat[s.hr].sum())
+                 if mat is not None and 0 <= s.hr < mat.shape[0] else 0.0)
+        out[pk] = (sig, reach)
+    return out or None
 
 
-def _hot_l1(sig: Optional[np.ndarray], ref: Optional[np.ndarray],
-            floor: float = 0.05) -> float:
+def _weighted_node_mean(snap: Optional[StreetSigma], ref: Optional[StreetSigma],
+                        per_node) -> float:
+    """Reach-weighted mean of ``per_node(sig, ref_sig)`` over the reference's nodes.
+
+    The **reference** (top-budget) snapshot defines both the node set and the weights,
+    so every rung of a ladder is scored on the same decisions with the same weights and
+    the rungs are directly comparable.  A node the reference reached but the snapshot
+    has not yet is scored against **uniform** — not skipped — because uniform is
+    literally what ``strategy_for`` returns there, hence what the bot would play at that
+    budget.  Falls back to an unweighted mean if every reach is zero (no iterations yet).
+    """
+    if snap is None or ref is None:
+        return float("nan")
+    num = den = 0.0
+    flat_num = flat_den = 0.0
+    for pk, (rsig, w) in ref.items():
+        got = snap.get(pk)
+        sig = got[0] if got is not None else np.full(rsig.shape, 1.0 / len(rsig))
+        if sig.shape != rsig.shape:      # node widened between rungs — skip, not compare
+            continue
+        d = float(per_node(sig, rsig))
+        num += w * d
+        den += w
+        flat_num += d
+        flat_den += 1.0
+    if den > 0:
+        return num / den
+    return flat_num / flat_den if flat_den > 0 else float("nan")
+
+
+def _hot_l1_node(sig: np.ndarray, ref: np.ndarray, floor: float = 0.05) -> float:
     """L1 restricted to the *hot* actions (max prob ≥ ``floor`` in ``sig`` or ``ref``).
 
     The full-distribution L1 never vanishes at an indifferent infoset — the mixture
@@ -703,23 +779,34 @@ def _hot_l1(sig: Optional[np.ndarray], ref: Optional[np.ndarray],
     convergence for cold, never-played tail mass.  Restricting to the actions that
     carry real probability measures the *played* decision instead.
     """
-    if sig is None or ref is None:
-        return float("nan")
     hot = np.maximum(sig, ref) >= floor
     if not hot.any():
         return 0.0
     return float(np.abs(sig[hot] - ref[hot]).sum())
 
 
-def _argmax_match(sig: Optional[np.ndarray], ref: Optional[np.ndarray]) -> float:
-    """1.0 if the top (played) action matches the reference, else 0.0 (nan on miss).
+def _hot_l1(snap: Optional[StreetSigma], ref: Optional[StreetSigma]) -> float:
+    """Reach-weighted mean hot-action L1 over the hero's root-street decisions."""
+    return _weighted_node_mean(snap, ref, _hot_l1_node)
+
+
+def _full_l1(snap: Optional[StreetSigma], ref: Optional[StreetSigma]) -> float:
+    """Reach-weighted mean *full-distribution* L1 — diagnostic column only."""
+    return _weighted_node_mean(
+        snap, ref, lambda a, b: float(np.abs(a - b).sum()))
+
+
+def _argmax_match(snap: Optional[StreetSigma], ref: Optional[StreetSigma]) -> float:
+    """Reach-weighted fraction of root-street decisions whose top action matches.
 
     Since the bot plays the final iterate's top action, "the played action stops
     flipping" is the operational convergence bar the value gap does not show directly.
+    Diagnostic: it ignores the mixture, so it flickers at an indifference point and
+    cannot drive the budget on its own.
     """
-    if sig is None or ref is None:
-        return float("nan")
-    return 1.0 if int(np.argmax(sig)) == int(np.argmax(ref)) else 0.0
+    return _weighted_node_mean(
+        snap, ref,
+        lambda a, b: 1.0 if int(np.argmax(a)) == int(np.argmax(b)) else 0.0)
 
 
 def _value_gap_mbb(val: Optional[float], ref_val: Optional[float],
@@ -753,10 +840,20 @@ class SweepRow:
     value_gap_mbb: float
     root_value: float           # hero root EV for the played hand (chips), or nan
     # Secondary diagnostics on the played decision (the value gap does not show these).
-    hot_l1: float               # L1 over hot actions only (≥ 5% mass in t or ref)
-    argmax_match: float         # 1.0 if the top action matches the reference, else 0.0
-    # Legacy full-policy L1 — kept as a column for continuity, no longer the driver.
+    # Reach-weighted mean over the hero's ROOT-STREET decisions (see _street_sigma).
+    hot_l1: float               # per node: L1 over hot actions only (≥ 5% mass in t or ref)
+    argmax_match: float         # per node: 1.0 if the top action matches the reference
+    # Full-distribution L1 (cold tail mass included) — diagnostic column, not the driver.
     l1_to_ref: float
+    # SAMPLING SCALE (top rung only, sampled cells only; nan elsewhere): mean hot_l1 of
+    # this rep's top-budget strategy against the SAME HAND's other reps at the SAME budget.
+    # Same hand, same iteration count, different seed ⇒ pure Monte-Carlo dispersion: how
+    # far apart two equally-valid solves of this cell land.  NOT a hard floor on ``hot_l1``
+    # — that is a NESTED comparison (rung t vs the same solve's top shares iterations
+    # 1..t), so its noise partially cancels and it can legitimately sit below this.  It is
+    # the scale check: a tolerance far under it certifies a precision the solver does not
+    # reproducibly have.
+    hot_l1_cross_rep: float = float("nan")
 
     @property
     def cell(self) -> Cell:
@@ -824,15 +921,12 @@ def _sweep_process(spec_idx: int, state: dict, shared: dict) -> None:
         snaps: List[tuple] = []
 
         def _grab(t: int, avg, elapsed: float) -> None:
-            # Mirrors ``_root_sigma``: an unseen root key would make ``strategy_for`` return
-            # uniform, which reads as (falsely) converged — so require the key and record a
-            # miss as None.
-            sig = None
-            if s.pk in avg._state.legal_at:
-                try:
-                    sig = np.array(avg.strategy_for(s.pk, s.hr, s.legal), dtype=np.float64)
-                except Exception:  # pragma: no cover - defensive
-                    sig = None
+            # The hero's whole ROOT-STREET strategy (root + every deeper same-street node
+            # it will still play out of this one solve), with per-node reach weights.
+            try:
+                sig = _street_sigma(avg, s)
+            except Exception:  # pragma: no cover - defensive
+                sig = None
             snaps.append((int(t), sig, float(elapsed)))
 
         res = solve(env_t, ctx_t, cfg_t, regime_override=force_regime,
@@ -1013,6 +1107,18 @@ def sweep_jobs(
         ref_from = job.get("ref_from")
         ref_values = job_refs[ref_from] if ref_from is not None else None
         for si, s in enumerate(samples):
+            # Sampling noise floor of the metric itself: this hand's top-budget strategy
+            # across reps.  Identical hand and identical iteration count, only the seed
+            # differs, so whatever hot_l1 remains here is irreducible MCCFR dispersion —
+            # the floor no budget can beat.  Needs >= 2 reps (deterministic cells run 1,
+            # and have no sampling noise to measure anyway).
+            tops = {r: by[(si, r, t_ref)][0] for r in range(job_reps[j])
+                    if by.get((si, r, t_ref)) is not None}
+            cross: Dict[int, float] = {}
+            if len(tops) >= 2:
+                for rep, mine in tops.items():
+                    cross[rep] = _mean_ignoring_nan(
+                        [_hot_l1(mine, o) for r, o in tops.items() if r != rep])
             for rep in range(job_reps[j]):
                 top = by.get((si, rep, t_ref))
                 ref_sig = top[0] if top is not None else None
@@ -1024,8 +1130,6 @@ def sweep_jobs(
                     if g is None:
                         continue
                     sig, val, iters, wall, stop = g
-                    l1 = (float(np.abs(sig - ref_sig).sum())
-                          if sig is not None and ref_sig is not None else float("nan"))
                     rows.append(SweepRow(
                         condition=s.condition, regime=row_regime, street=s.street,
                         n_live=s.n_live, per_replica=int(t), workers=1,
@@ -1034,7 +1138,9 @@ def sweep_jobs(
                         value_gap_mbb=_value_gap_mbb(val, ref_val, big_blind),
                         root_value=(float(val) if val is not None else float("nan")),
                         hot_l1=_hot_l1(sig, ref_sig), argmax_match=_argmax_match(sig, ref_sig),
-                        l1_to_ref=l1,
+                        l1_to_ref=_full_l1(sig, ref_sig),
+                        hot_l1_cross_rep=(cross.get(rep, float("nan"))
+                                          if t == t_ref else float("nan")),
                     ))
     return rows
 
@@ -1067,7 +1173,15 @@ class CellSummary:
     # and ``suggested_budget`` is an OVER-estimate: lower this regime/street's
     # ``ladder_top_seconds`` to bracket the crossing.  Not used for the emitted config.
     below_ladder: bool
-    hot_l1_tol: float
+    hot_l1_tol: float                         # the tolerance THIS cell was judged against
+    # MEASURED sampling scale: mean cross-rep hot_l1 at the top budget (same hand, same
+    # iteration count, different seed).  nan for the deterministic cells and any cell run
+    # with a single rep.  See ``SweepRow.hot_l1_cross_rep`` — a scale, not a hard floor.
+    cross_rep_hot_l1: float
+    # True ⇒ ``hot_l1_tol`` sits at or under that scale: the budget is being picked at a
+    # precision finer than two independent seeds of this cell agree to, so it is largely
+    # an artefact of which seeds ran.  Loosen the tolerance (or accept a noisy budget).
+    tol_below_cross_rep: bool
     n_samples: int
     workers: int
 
@@ -1105,14 +1219,44 @@ def _mean_ignoring_nan(vals: Sequence[float]) -> float:
     return float(np.mean(clean)) if clean else float("nan")
 
 
+# Convergence tolerance is PER REGIME, because the two regimes have different floors.
+#
+# ``vector`` enumerates both ranges full-width: given the subgame it samples nothing on
+# the river and only the river card on the turn, so its average strategy has no
+# per-iteration sampling noise to shake off and a tight bar is meaningful.
+#
+# ``mccfr`` is EXTERNAL SAMPLING.  Its average strategy carries Monte-Carlo dispersion
+# that decays like 1/sqrt(T) and never reaches zero, and the street-scoped metric now
+# includes the rarely-visited later nodes where the per-node visit count — hence the
+# noise — is worst.  Holding it to the vector bar would not measure convergence, it
+# would measure sampling noise, and the ladder would report "unresolved" or demand a
+# budget bought entirely to average out noise the re-solve at the next street discards.
+DEFAULT_HOT_L1_TOL_MCCFR = 0.20
+DEFAULT_HOT_L1_TOL_VECTOR = 0.10
+
+
+def _tol_for(cell: Cell, tol_mccfr: float, tol_vector: float) -> float:
+    """Convergence tolerance for ``cell`` — MCCFR is sampled, vector is not (see above)."""
+    return float(tol_mccfr if str(cell[1]) == "mccfr" else tol_vector)
+
+
 def summarize_cell(cell: Cell, rows: Sequence[SweepRow],
-                   hot_l1_tol: float = 0.10, big_blind: int = 100) -> CellSummary:
+                   hot_l1_tol_mccfr: float = DEFAULT_HOT_L1_TOL_MCCFR,
+                   hot_l1_tol_vector: float = DEFAULT_HOT_L1_TOL_VECTOR,
+                   big_blind: int = 100) -> CellSummary:
     """Per-cell single-worker budget = smallest rung at which the strategy has stopped
-    moving.  The signal is MEAN ``hot_l1`` (each solve's hot-action strategy vs its OWN
-    top-budget strategy) averaged over the cell's solves.  Value gap / replica spread /
-    argmax are kept as diagnostics only; they no longer pick the budget (value is
-    payoff-leverage-noisy on deep cells, and replica spread is reproducibility, not
-    convergence)."""
+    moving.  The signal is MEAN ``hot_l1``: each solve's hot-action strategy over its
+    whole ROOT STREET (reach-weighted across the hero's decision nodes, :func:`_street_sigma`)
+    against its OWN top-budget strategy, averaged over the cell's solves.  Value gap /
+    replica spread / argmax are kept as diagnostics only; they no longer pick the budget
+    (value is payoff-leverage-noisy on deep cells, and replica spread is reproducibility,
+    not convergence).
+
+    The tolerance is chosen PER REGIME (:func:`_tol_for`) — sampled MCCFR carries
+    Monte-Carlo dispersion that full-width vector does not.  ``cross_rep_hot_l1`` measures
+    that dispersion directly from the cell's own reps, so the chosen tolerance can be
+    checked against the cell's real precision instead of trusted."""
+    hot_l1_tol = _tol_for(cell, hot_l1_tol_mccfr, hot_l1_tol_vector)
     ladder = sorted({r.per_replica for r in rows})
     gap_t = defaultdict(list)
     hot_t = defaultdict(list)
@@ -1156,6 +1300,11 @@ def summarize_cell(cell: Cell, rows: Sequence[SweepRow],
     # rather than emitting a budget the data does not support; the fix is a smaller
     # ``ladder_top_seconds`` for that regime/street so the ladder brackets the crossing.
     below_ladder = bool(below_ref) and suggested_budget == below_ref[0]
+    # Measured sampling scale: cross-rep hot_l1 at the TOP budget (same hand, same
+    # iterations, different seed).  Judging convergence to a tolerance under it means
+    # resolving a difference finer than two independent seeds of this cell agree to.
+    cross_rep = _mean_ignoring_nan([r.hot_l1_cross_rep for r in rows])
+    tol_below_cross = bool(not np.isnan(cross_rep) and hot_l1_tol <= cross_rep)
     return CellSummary(
         cell=cell, ladder=ladder, mean_value_gap_mbb=mean_gap, mean_hot_l1=mean_hot,
         argmax_stability=amatch, mean_l1=mean_l1, mean_wall=mean_wall,
@@ -1163,7 +1312,9 @@ def summarize_cell(cell: Cell, rows: Sequence[SweepRow],
         replica_spread_mbb=replica_spread_mbb,
         suggested_budget=suggested_budget, converged=suggested_budget is not None,
         below_ladder=below_ladder,
-        hot_l1_tol=float(hot_l1_tol), n_samples=n_samples, workers=w,
+        hot_l1_tol=float(hot_l1_tol), cross_rep_hot_l1=cross_rep,
+        tol_below_cross_rep=tol_below_cross,
+        n_samples=n_samples, workers=w,
     )
 
 
@@ -1193,7 +1344,8 @@ def suggest_config(summaries: Sequence[CellSummary],
     """Fold per-cell suggested budgets into a ``SolverConfig`` budget block.
 
     Each cell's ``suggested_budget`` is the smallest single-worker budget at which the
-    strategy has stopped moving (worst-case ``hot_l1 <= tol``).  Vector per street comes
+    strategy has stopped moving (mean ``hot_l1 <= tol``, the tolerance chosen per regime
+    — see :func:`_tol_for`).  Vector per street comes
     from the heads-up vector cells.  MCCFR ``base[street]`` is the per-live-player budget:
     the suggested per-replica budget divided by the cell's live-player count (production
     budget is ``base * n_live``), taken as the **max** over live-player counts so the
@@ -1239,7 +1391,10 @@ def suggest_config(summaries: Sequence[CellSummary],
         for i, st in enumerate((1, 2, 3))
     ]
     return {
-        "hot_l1_tol": (summaries[0].hot_l1_tol if summaries else None),
+        "hot_l1_tol": {
+            r: next((s.hot_l1_tol for s in summaries if s.cell[1] == r), None)
+            for r in ("mccfr", "vector")
+        },
         "mccfr_per_player_by_street": tuple(mccfr_base),
         "vector_budget_by_street": tuple(vector),
         "unresolved_cells": unresolved,  # never settled within the ladder → raise LADDER_HI/MAX
@@ -1256,13 +1411,14 @@ def _write_rows_csv(rows: Sequence[SweepRow], path: Path) -> None:
         w.writerow(["condition", "regime", "street", "n_live", "per_replica",
                     "workers", "pooled_iters", "wall_seconds", "stop_reason",
                     "sample", "rep", "value_gap_mbb", "root_value", "hot_l1",
-                    "argmax_match", "l1_to_ref"])
+                    "argmax_match", "l1_to_ref", "hot_l1_cross_rep"])
         for r in rows:
             w.writerow([r.condition, r.regime, r.street, r.n_live, r.per_replica,
                         r.workers, r.pooled_iters, f"{r.wall_seconds:.6f}",
                         r.stop_reason, r.sample, r.rep, f"{r.value_gap_mbb:.6f}",
                         f"{r.root_value:.6f}", f"{r.hot_l1:.6f}",
-                        f"{r.argmax_match:.6f}", f"{r.l1_to_ref:.6f}"])
+                        f"{r.argmax_match:.6f}", f"{r.l1_to_ref:.6f}",
+                        f"{r.hot_l1_cross_rep:.6f}"])
 
 
 def _gap_at_wall(summary: CellSummary, target_wall: float) -> Tuple[int, float, float]:
@@ -1340,7 +1496,7 @@ def _print_report(summaries: Sequence[CellSummary], config: Dict[str, object],
               "NOT production. Re-run with PLURIBUS_SEARCH_CORE=1.")
     hdr = (f"{'condition':<10} {'regime':<7} {'street':<8} {'n_live':>6} "
            f"{'W':>4} {'top_it':>7} {'it/s':>8} {'wall@top':>9} {'hotL1@pen':>10} "
-           f"{'sugg':>7} {'wall@sugg':>10}")
+           f"{'xrep':>7} {'tol':>5} {'sugg':>7} {'wall@sugg':>10}")
     print(hdr)
     print("-" * len(hdr))
     for s in sorted(summaries, key=lambda x: (x.cell[0], x.cell[1], x.cell[2], x.cell[3])):
@@ -1355,6 +1511,8 @@ def _print_report(summaries: Sequence[CellSummary], config: Dict[str, object],
         print(f"{cond:<10} {regime:<7} {_STREET_NAME.get(street, street):<8} "
               f"{n_live:>6} {s.workers:>4} {t_top:>7} {s.throughput_it_s:>8.1f} "
               f"{s.mean_wall[t_top]:>9.2f} {hl1_pen:>10.3f} "
+              f"{(f'{s.cross_rep_hot_l1:.3f}' if not np.isnan(s.cross_rep_hot_l1) else '-'):>7} "
+              f"{s.hot_l1_tol:>5.2f} "
               f"{(str(sugg) if sugg is not None else '>max'):>7} "
               f"{(f'{wall_sugg:.2f}' if wall_sugg is not None else '-'):>10}")
     if wall_target is not None:
@@ -1368,8 +1526,19 @@ def _print_report(summaries: Sequence[CellSummary], config: Dict[str, object],
                 cond, regime, street, n_live = s.cell
                 print(f"  ! {cond}/{regime}/{_STREET_NAME.get(street, street)}/"
                       f"n_live={n_live}: wall@sugg={wall_sugg:.2f}s > {wall_target:.2f}s")
-    print("\nSuggested SolverConfig block (hot_l1 tol "
-          f"{config['hot_l1_tol']}):")
+    floored = [s for s in summaries if s.tol_below_cross_rep]
+    if floored:
+        print("-" * len(hdr))
+        print("  ! tolerance is AT OR BELOW the measured cross-seed spread ('xrep') — the "
+              "budget for these cells is resolved finer than independent seeds agree to, "
+              "so it is largely an artefact of which seeds ran. Loosen their tol:")
+        for s in floored:
+            cond, regime, street, n_live = s.cell
+            print(f"    {cond}/{regime}/{_STREET_NAME.get(street, street)}/n_live="
+                  f"{n_live}: tol={s.hot_l1_tol:.2f} <= xrep="
+                  f"{s.cross_rep_hot_l1:.3f}")
+    print("\nSuggested SolverConfig block (hot_l1 tol mccfr="
+          f"{config['hot_l1_tol']['mccfr']} vector={config['hot_l1_tol']['vector']}):")
     print(f"    mccfr_per_player_by_street = {config['mccfr_per_player_by_street']}"
           "   # (preflop, flop, turn, river); budget = base * n_live")
     print(f"    vector_budget_by_street    = {config['vector_budget_by_street']}"
@@ -1407,7 +1576,8 @@ def run_calibration(
     ladder_top_seconds: Sequence[float] = (600.0, 600.0, 60.0),
     ladder_top_seconds_vector: Sequence[float] = (600.0, 600.0, 15.0),
     probe_seconds: float = 30.0,
-    hot_l1_tol: float = 0.10,
+    hot_l1_tol_mccfr: float = DEFAULT_HOT_L1_TOL_MCCFR,
+    hot_l1_tol_vector: float = DEFAULT_HOT_L1_TOL_VECTOR,
     collect_iters: int,
     table_policy: str,
     fixed_seats: Optional[Sequence[str]] = None,
@@ -1625,7 +1795,9 @@ def run_calibration(
     by_cell: Dict[Cell, List[SweepRow]] = defaultdict(list)
     for r in all_rows:
         by_cell[r.cell].append(r)
-    summaries = [summarize_cell(c, rs, hot_l1_tol=hot_l1_tol, big_blind=big_blind)
+    summaries = [summarize_cell(c, rs, hot_l1_tol_mccfr=hot_l1_tol_mccfr,
+                                hot_l1_tol_vector=hot_l1_tol_vector,
+                                big_blind=big_blind)
                  for c, rs in by_cell.items()]
 
     config = suggest_config(summaries)
@@ -1664,7 +1836,9 @@ def run_calibration(
         # Value gap / replica spread are DIAGNOSTIC columns only (value is payoff-leverage-
         # noisy on deep cells; replica spread is reproducibility, not convergence).
         "metric": "mean_hot_l1",
-        "hot_l1_tol": float(hot_l1_tol),
+        # PER REGIME: sampled MCCFR has a Monte-Carlo floor that full-width vector lacks.
+        "hot_l1_tol": {"mccfr": float(hot_l1_tol_mccfr),
+                       "vector": float(hot_l1_tol_vector)},
         "suggested_config": {
             k: (list(v) if isinstance(v, tuple) else v) for k, v in config.items()
         },
@@ -1676,6 +1850,13 @@ def run_calibration(
                 "pooled_it_s": s.pooled_it_s,
                 "suggested_budget": s.suggested_budget,
                 "converged": s.converged, "below_ladder": s.below_ladder,
+                "hot_l1_tol": s.hot_l1_tol,
+                # Measured Monte-Carlo spread of the metric (cross-rep at the top
+                # budget); null for the deterministic / single-rep cells.  A tol at or
+                # under it means the budget is resolved finer than seeds agree to.
+                "cross_rep_hot_l1": (None if np.isnan(s.cross_rep_hot_l1)
+                                     else s.cross_rep_hot_l1),
+                "tol_below_cross_rep": s.tol_below_cross_rep,
                 "mean_hot_l1": {str(t): s.mean_hot_l1[t] for t in s.ladder},
                 "argmax_stability": {str(t): s.argmax_stability[t] for t in s.ladder},
                 "mean_value_gap_mbb": {str(t): s.mean_value_gap_mbb[t] for t in s.ladder},
@@ -1811,12 +1992,25 @@ def _cli():
                   help="Wall-bounded probe solve per ladder that measures its it/s (sets the "
                        "top rung).  Run box-saturating, so the throughput matches the loaded "
                        "run rather than an idle-box overestimate.")
-    @click.option("--hot-l1-tol", default=0.10, type=float, show_default=True,
-                  help="Convergence tolerance: the per-cell budget is the smallest rung where "
-                       "the MEAN hot_l1 (each single-worker solve's hot-action strategy vs its "
-                       "own top budget, averaged over the cell's solves) <= this — i.e. the "
-                       "strategy has stopped moving. A cell that never gets there within the "
-                       "ladder is flagged (raise --ladder-top-seconds for that street).")
+    @click.option("--hot-l1-tol-mccfr", default=DEFAULT_HOT_L1_TOL_MCCFR, type=float,
+                  show_default=True,
+                  help="Convergence tolerance for the SAMPLED (MCCFR) cells. The per-cell "
+                       "budget is the smallest rung where the MEAN hot_l1 (each single-worker "
+                       "solve's hot-action strategy over its whole root street vs its own top "
+                       "budget, averaged over the cell's solves) <= this. Looser than the "
+                       "vector bar on purpose: external sampling leaves Monte-Carlo dispersion "
+                       "that decays like 1/sqrt(T) and never reaches zero, so a tight bar would "
+                       "measure noise, not convergence. The run reports each cell's MEASURED "
+                       "cross-seed spread (cross-rep hot_l1 at the top budget: same hand, same "
+                       "iterations, different seed) and flags any cell whose tol sits at or "
+                       "below it — there the emitted budget is resolved finer than independent "
+                       "seeds agree to, so loosen this above the reported spread.")
+    @click.option("--hot-l1-tol-vector", default=DEFAULT_HOT_L1_TOL_VECTOR, type=float,
+                  show_default=True,
+                  help="Convergence tolerance for the FULL-WIDTH (vector) cells. Tighter than "
+                       "the MCCFR bar: the vector regime enumerates both ranges, so it has no "
+                       "per-iteration sampling noise to average out (the river cell is exactly "
+                       "deterministic) and a tight bar is meaningful there.")
     @click.option("--collect-iters", default=64, type=int, show_default=True,
                   help="Cheap per-solve budget used only to advance collection hands.")
     @click.option("--table-policy", default="random", show_default=True,
@@ -1900,7 +2094,8 @@ def _cli():
             reps=o["reps"], ladder_points=o["ladder_points"], ladder_lo=o["ladder_lo"],
             ladder_top_seconds=top_secs, ladder_top_seconds_vector=top_secs_vec,
             probe_seconds=o["probe_seconds"],
-            hot_l1_tol=o["hot_l1_tol"],
+            hot_l1_tol_mccfr=o["hot_l1_tol_mccfr"],
+            hot_l1_tol_vector=o["hot_l1_tol_vector"],
             collect_iters=o["collect_iters"], table_policy=o["table_policy"],
             fixed_seats=fixed_seats, bias_multiplier=o["bias_multiplier"],
             run_seed=o["run_seed"], big_blind=o["big_blind"],
