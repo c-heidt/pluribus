@@ -412,72 +412,132 @@ analysis.
 
 It reads only the four tables (§6); every number below is one grouped query.
 
+### Grain: the arm
+
+A snapshot routinely holds several **arms** — a `condition` (`vanilla` /
+`DBR(...)` / `OX(...)` / `blueprint_only`) crossed with a `table_label` (the
+opponent mix). Under CRN the arms replay the *same deals*, so a snapshot with A
+arms holds A `games` rows per deal.
+
+Every number is therefore computed **within one arm**, and nothing is averaged or
+counted across arms:
+
+- A bb/100 pooled over `vanilla` and `DBR` rows answers no question — it is a
+  mixture whose weights are an accident of how many hands each arm got.
+- A pooled hand / decision / search count is just the deal count multiplied by A;
+  reporting it as "hands" silently inflates the apparent experiment size.
+- The one legitimate cross-arm number is the **CRN paired Δ** below. It is a
+  *difference on the matched deal*, not a pool.
+
+Two consequences worth stating outright, because both were once got wrong:
+
+- **Deals are matched on `(table_label, deck_seed)`, not `deck_seed`.**
+  `deck_seed` is a pure function of `(run_seed, hand_index)` and carries no table
+  component (`runner.derive_seeds`), so a snapshot holding two table policies
+  repeats every seed. Matched on the seed alone, every deal looks like a
+  within-arm duplicate, is dropped as ambiguous, and the whole comparison silently
+  reports zero pairs.
+- **Firing and cost are per street, as rates, never as shares of a pooled total.**
+  The regimes own disjoint streets (subgame §6.5), the iteration budget is a
+  per-street constant, and wall differs by an order of magnitude between pre-flop
+  and flop — so a regime's "share of searches" only restates how often each street
+  arose, and a mean wall over all searches describes a mixture no solver ever ran
+  at. The one sum that *is* meaningful is cost: total search seconds ÷ hands.
+
 ### What it prints
 
 ```
-experiment  run_id=2026-07-01_6max_mix   git=d64a49b   6000 hands   6-max
-────────────────────────────────────────────────────────────────────────────
-STRENGTH (hero bb/100, 95% CI)
-  table=all_blueprint          +14.8 ± 5.1   (3600 hands)   ✓ winning
-  table=random_bias             -1.9 ± 7.2   (2400 hands)   ~ inconclusive
-  overall                       +8.1 ± 4.2   (6000 hands)
-  by position (overall)  BTN +31  CO +18  MP +6  UTG -9  SB -22  BB -14   (bb/100)
+experiment  run_id=2026-07-01_6max_mix   git=d64a49b   6-max
+  3000 deals × 2 conditions = 6000 game rows   (4 arms = 2 conditions × 2 tables)
+  conditions: vanilla, DBR(p_max=0.6)
+  tables:     all_blueprint, random_bias
+──────────────────────────────────────────────────────────────────────────────
+STRENGTH — per arm (aivat bb/100 ± 95% CI).  Arms are never pooled.
+  table=all_blueprint
+    vanilla             +14.8 ± 5.1     1500 hands   ✓ winning
+      by position  BTN +31  CO +18  MP +6  UTG -9  SB -22  BB -14
+    DBR(p_max=0.6)      +21.0 ± 5.2     1500 hands   ✓ winning
+      by position  BTN +38  CO +24  MP +9  UTG -6  SB -19  BB -11
+  table=random_bias
+    vanilla              -1.9 ± 7.2     1500 hands   ~ inconclusive
+    DBR(p_max=0.6)      +12.4 ± 7.1     1500 hands   ✓ winning
 
-RANGE TRACKING BY OPPONENT TYPE (resolved at showdown: 18.4% of seat-snapshots)
-  net info gain    +0.31 nats  overall            ✓ helps
-    by opponent    bp +0.44   bp_call +0.05   bp_raise -0.12  ⚠
-    by stage       flop +0.52   turn +0.21   river -0.06   ⚠ harmful on river
-  collapsed truth  3.1% of resolved   uniform fallback 1.2% of seat-hands
+PAIRED Δ vs vanilla — CRN, matched on table_label + deck_seed (aivat bb/100, 95% bootstrap CI)
+  DBR(p_max=0.6)   (3000 of 3000 deals matched)
+    all_blueprint            +6.20  [+2.85, +9.61]     1500 pairs   ✓ better
+      └ where it fired       +8.90  [+4.71, +13.02]     980 pairs   ✓ better
+      matched-sample means: vanilla +14.8 → DBR(p_max=0.6) +21.0
+    random_bias             +14.30  [+9.92, +18.71]    1500 pairs   ✓ better
+      └ where it fired      +18.44  [+12.90, +23.85]   1121 pairs   ✓ better
+      matched-sample means: vanilla -1.9 → DBR(p_max=0.6) +12.4
+    ALL TABLES pooled       +10.25  [+7.48, +13.05]    3000 pairs   ✓ better
+      matched-sample means: vanilla +6.5 → DBR(p_max=0.6) +16.7
 
-SOLVER APPROACH  (share of searches · mean wall · wall-cap rate · mean iters)
-  mc (sampled_runout)        71%   7.9s   48% wall-cap   6240 it   ✓ routed OK
-  mc decision-free           14%   9.6s   63% wall-cap   5010 it   ⚠ mostly wall-bound
-  vectorized                 15%   2.1s    4% wall-cap   9900 it   ✓ routed OK
-  routing check: each approach fired only in its intended spots ✓
+RANGE TRACKING — per condition (net info gain vs the uniform prior, nats)
+  vanilla   net gain +0.31 nats   resolved 18.4% of 22400 seat-snapshots   collapsed 3.1%   fallback 1.2%
+      by opponent  bp +0.44   bp_call +0.05   bp_raise -0.12
+      by street    flop +0.52   turn +0.21   river -0.06
+  DBR(p_max=0.6)   net gain +0.29 nats   resolved 18.1% of 22610 seat-snapshots   collapsed 3.4%   fallback 1.3%
+      by opponent  bp +0.41   bp_call +0.04   bp_raise -0.10
+      by street    flop +0.49   turn +0.20   river -0.05
 
-SEARCH COST / BUDGET
-  fired            68.0% of decisions (12190 / 17930)
-  wall / search    mean 7.1s   p95 14.9s   vs 15.0s cap
-  stop reason      wall_cap 41%   iteration_cap 59%   ⚠ 41% wall-bound
-  iterations       mean 7180   iters/s 1010   cache hit rate 93.6%
+SEARCH — per condition × street (fire rate is within the street)
+  vanilla   fired 68.0% of 8965 hero decisions (3.0/hand)   14.2s search per hand   routing OK ✓
+      street  solver      fired       n    wall     p95  wall-cap   iters    it/s
+      preflop mccfr          31%    2410    1.4s    2.1s        4%    3120    2230
+      flop    mccfr          74%    2280    9.6s   14.7s       63%    5010     520
+      turn    vector         86%    2160    3.1s    5.2s       12%    1000     320
+      river   vector         89%    2115    1.2s    2.0s        3%     500     420
+
+HU COVERAGE — heads-up with hero (OX-Search-HU fires from the turn on)
+  vanilla   HU at some point 61.2%   eligible (turn+) 38.9%   of 3000 hands
+      first HU street  preflop 8%  flop 14%  turn 22%  river 17%
 
 FLAGS
-  ⚠ range tracking net-harmful vs bp_raise (-0.12) and on the river (-0.06)
-  ⚠ 41% of searches hit the wall cap — search is budget-bound
-  ⚠ mc decision-free hits the wall cap 63% of the time — most budget-bound approach
-  ⓘ resolved fraction 18% — range aggregates are showdown-conditional (5 opponents fold often)
+  ⚠ range tracking net-harmful [vanilla] on river: -0.06 nats
+  ⚠ search is budget-bound [vanilla]: wall-cap stops on flop 63%
+  ⓘ resolved fraction 18.4% [vanilla] — range aggregates are weak evidence
 ```
+
+The shape is the point. Every arm's absolute bb/100 here is a ±5–7 interval, but
+the DBR edge itself is `+6.20 [+2.85, +9.61]` — a tighter interval than either arm's
+own, because the paired difference cancels the shared card-luck. That is the number
+the experiment is run to produce, and it exists only at the arm grain.
 
 ### The queries
 
 **Strength — the headline.** Hero win rate in **bb/100** (chip delta normalised by
-the big blind, ×100) with a 95% CI, grouped by table composition. Sign + CI answers
-"am I winning, and is it significant?"
+the big blind, ×100) with a 95% CI, **one row per arm**. Sign + CI answers "am I
+winning, and is it significant?"; the arm grouping is what makes the answer belong
+to something.
 
 ```sql
 WITH g AS (                                  -- per-hand win rate in bb/100
-    SELECT table_label,
+    SELECT condition, table_label,           -- the arm: never grouped away
            100.0 * hero_chips_delta / big_blind AS bb100
     FROM games
 )
-SELECT table_label,
+SELECT condition, table_label,
        COUNT(*)                               AS hands,
        AVG(bb100)                             AS mean_bb100,
        1.96 * (  -- normal-approx 95% CI half-width
          SQRT( AVG(bb100*bb100) - AVG(bb100)*AVG(bb100) )
          / SQRT(COUNT(*)) )                    AS ci95
 FROM g
-GROUP BY table_label;
+GROUP BY condition, table_label;
 ```
 
 `big_blind` is stored per hand (§6), so this holds even if the blind level varies.
-A CI straddling zero → *inconclusive*, not *bad*; flag it as such rather than as a
-loss. Two 6-max-specific breakdowns matter alongside the top line:
+A CI straddling zero → *inconclusive*, not *bad*; the summary labels each arm
+`winning` / `losing` / `inconclusive` rather than leaving the reader to compare a
+mean against its own `±`. There is deliberately **no cross-arm "overall" row** —
+see "Grain: the arm" above. Two 6-max-specific breakdowns matter alongside the top
+line:
 
 - **By position** — group the same `bb100` by `hero_position` (derived from
-  `hero_seat` − `button_seat` mod `n_players`). In 6-max, aggregate strength hides
-  large per-position swings; a positive overall with a bleeding blind defence is a
-  real finding, not noise.
+  `hero_seat` − `button_seat` mod `n_players`), *within the arm*. In 6-max,
+  aggregate strength hides large per-position swings; a positive arm with a
+  bleeding blind defence is a real finding, not noise.
 - **Variance reduction** — when `aivat_value` is populated (§10.2), report the CI on
   it instead of `hero_chips_delta`: same mean (AIVAT is unbiased), far tighter
   interval, so small edges become detectable. The summary prefers `aivat_value` when
@@ -486,69 +546,67 @@ loss. Two 6-max-specific breakdowns matter alongside the top line:
 - **Cross-condition paired difference (CRN)** — when comparing arms
   (`condition` = vanilla / DBR, §10.1), the headline is not each arm's absolute
   `bb100` but the **per-hand difference** between arms on the matched deal: join on
-  `deck_seed`, compute `Δ = aivat_value(DBR) − aivat_value(vanilla)` per hand, and
-  bootstrap the CI on `mean(Δ)`. Because the shared card-luck cancels, this CI is
-  dramatically tighter than differencing the two arms' independent means — it is what
-  makes a small `DBR − vanilla` edge significant at ~10k hands. (The model-error *sweep* is the same Δ
+  `(table_label, deck_seed)` (see "Grain: the arm" — the seed alone is not unique
+  across table policies), compute `Δ = aivat_value(DBR) − aivat_value(vanilla)` per
+  hand, and bootstrap the CI on `mean(Δ)`. Because the shared card-luck cancels,
+  this CI is dramatically tighter than differencing the two arms' independent means
+  — it is what makes a small `DBR − vanilla` edge significant at ~10k hands. The Δ
+  is reported per table (the opponent mix changes the size of the edge) plus a
+  clearly-labelled pooled row, and carries both arms' **matched-sample** means so
+  the difference can be read against the levels it came from. `n_paired` is printed
+  against the arm sizes, and a comparison that matched few or no deals raises a
+  flag: a silent "0 pairs" is the failure mode this section must never have.
+  (The model-error *sweep* is the same Δ
   computed at each injected `SyntheticOpponentModel` error level — see
   [opponent_modeling.md](opponent_modeling.md) scope note; the old cumulative-count
   "learning curve" was removed with the online learner.)
 
-**Search cost / budget health.** Are searches firing, and do they fit the budget?
+**Search: firing, cost and budget health — per condition × street.** Are searches
+firing where they should, and do they fit the budget? One grouped query, at the
+grain the budget itself is defined on.
 
 ```sql
-SELECT regime,
-       AVG(searched)                          AS fire_rate,
-       AVG(wall_seconds)                      AS mean_wall,
-       MAX(wall_seconds)                      AS max_wall,     -- p95 in the script
-       AVG(iterations)                        AS mean_iters,
-       AVG(iters_per_sec)                     AS mean_ips,
-       CAST(SUM(cache_hits) AS REAL)
-         / NULLIF(SUM(cache_hits + cache_misses), 0) AS cache_hit_rate
-FROM decisions
-WHERE searched = 1
-GROUP BY regime;
+SELECT g.condition, d.betting_stage,
+       COUNT(*)                                   AS n_decisions,
+       CAST(SUM(d.searched) AS REAL) / COUNT(*)   AS fire_rate,   -- WITHIN the street
+       AVG(CASE WHEN d.searched=1 THEN d.wall_seconds END)  AS mean_wall,
+       MAX(CASE WHEN d.searched=1 THEN d.wall_seconds END)  AS max_wall,  -- p95 in the script
+       SUM(CASE WHEN d.searched=1 THEN d.wall_seconds END)  AS total_wall,
+       AVG(CASE WHEN d.searched=1 THEN d.iterations END)    AS mean_iters,
+       AVG(CASE WHEN d.searched=1 THEN d.iters_per_sec END) AS mean_ips,
+       AVG(CASE WHEN d.searched=1 AND d.stop_reason='wall_cap' THEN 1.0
+                WHEN d.searched=1 THEN 0.0 END)             AS wallcap_rate
+FROM decisions d JOIN games g ON g.game_id = d.game_id
+GROUP BY g.condition, d.betting_stage;
 ```
 
 (Percentiles like p95 are computed in the script from the pulled column, since
 SQLite has no native percentile function.)
 
-**Solver approach — which one runs, how often, and is it behaving.**
-`regime` (`mccfr` | `vector`) is the approach (§6). Two things: the **usage mix** and a
-light **health signal** that each approach is doing what it should — no deep quality
-ranking.
+`regime` (`mccfr` | `vector`) — the solver approach (§6) — is reported *alongside*
+each street as the solver that actually ran there, not as a share of a pooled search
+total. The regimes own disjoint streets (subgame §6.5), so a share only restates how
+often each street came up while inviting the head-to-head reading this section
+explicitly cannot support (a true quality comparison would need the deferred
+exploitability oracle; not in scope here).
 
-```sql
-SELECT regime,
-       COUNT(*)                                   AS searches,
-       CAST(COUNT(*) AS REAL)
-         / (SELECT COUNT(*) FROM decisions WHERE searched=1) AS share,      -- usage mix
-       AVG(wall_seconds)                          AS mean_wall,
-       AVG(iterations)                            AS mean_iters,
-       AVG(stop_reason = 'wall_cap')              AS wallcap_rate           -- budget health
-FROM decisions
-WHERE searched = 1
-GROUP BY regime
-ORDER BY searches DESC;
-```
-
-Reading the health signal — "is this approach correct and doing what it should":
+Reading it — "is search correct, and is it doing what it should":
 
 - **Routing (the correctness signal)** — each approach should fire only in its
-  intended spots (vector → heads-up turn/river, decision-free → all-in showdowns,
-  mc → the rest; subgame doc §6.4.1 / §6.7). A one-line check that `betting_stage` /
-  `num_live` match the expected envelope per approach catches a mis-routed solver — a
-  correctness bug the usage mix alone would hide.
+  intended spots (vector → heads-up flop/turn/river; mccfr → the rest; subgame doc
+  §6.4.1 / §6.7). A one-line check that `betting_stage` / `num_live` match the
+  expected envelope catches a mis-routed solver — a correctness bug the usage
+  numbers alone would hide.
 - **Budget** — `wallcap_rate` near 1 (or `mean_iters` pinned at the cap) means the
-  approach almost always exhausts the wall budget rather than the iteration budget:
-  it is the slow/expensive one in the spots it owns. A cost signal, not a
-  correctness one. (Whether it has actually *converged* by then is a separate story
-  — no convergence test exists in the solve loop today, so it is not measured here.)
-
-Note the mix reflects *how often each spot arises*, not which approach is better —
-approaches run in different situations, so this is a usage-and-health view, not a
-head-to-head. (A true quality comparison would need the deferred exploitability
-oracle; not in scope here.)
+  solver almost always exhausts the wall budget rather than the iteration budget on
+  that street: it is the expensive one there. A cost signal, not a correctness one.
+  Per street, because the iteration budget is a per-street constant
+  (`search/budget.py`) and pre-flop and flop wall differ by an order of magnitude —
+  one pooled rate describes a mixture no solver ever experienced, and names nothing
+  actionable. (Whether it has actually *converged* by then is a separate story — no
+  convergence test exists in the solve loop today, so it is not measured here.)
+- **Cost** — `total_wall / hands` is the summary's one deliberate sum: the
+  wall-clock a hand costs, which is what an experiment budget is built from.
 
 **Range-tracking health — the second headline.** Is the belief helping versus a
 uniform prior, and where does it break down? Joined to `game_seats` so it breaks
@@ -556,7 +614,8 @@ down **by the opponent type at the seat** — the 6-max question of *which* oppo
 the tracker models well.
 
 ```sql
-SELECT s.agent_label      AS opponent,     -- who sat at this seat
+SELECT g.condition,                        -- the arm whose tracker this is
+       s.agent_label      AS opponent,     -- who sat at this seat
        rq.betting_stage,
        AVG(rq.resolved)                          AS resolved_frac,
        AVG(rq.net_info_gain)  FILTER (WHERE rq.resolved) AS mean_net_gain,
@@ -565,27 +624,38 @@ SELECT s.agent_label      AS opponent,     -- who sat at this seat
        COUNT(*)                                  AS snapshots
 FROM range_quality rq
 JOIN game_seats s ON s.game_id = rq.game_id AND s.seat = rq.seat
-GROUP BY s.agent_label, rq.betting_stage;
+JOIN games g      ON g.game_id = rq.game_id
+GROUP BY g.condition, s.agent_label, rq.betting_stage;
 ```
 
 `mean_net_gain > 0` means tracking beats the uniform prior for that opponent/stage;
 `< 0` means it *hurts more than it helps* there (§7) and is a flag. The
 `resolved_frac` runs lower than heads-up — with five opponents most seats fold
-before showdown — so report it alongside every quality number (§11).
+before showdown — so report it alongside every quality number (§11). Grouped by
+`condition` because the belief is produced by the arm that is playing: pooling a DBR
+arm's tracker with vanilla's averages two different trackers into a number that
+describes neither.
 
 ### Automated flags
 
 The script turns a few thresholds into explicit warnings so a bad run announces
 itself without anyone reading the tables:
 
+Every flag **names the arm it fired for**: a threshold crossed in one arm says
+nothing about another, and an un-attributed message is unreadable the moment a
+snapshot holds more than one.
+
 | Flag | Condition | Reading |
 |---|---|---|
-| range net-harmful | `mean_net_gain < 0` for any stage | tracking hurts there; revisit flooring / fallback / bucketing (subgame §10) |
-| budget-bound | high share of `stop_reason = 'wall_cap'` | search exhausts the wall budget rather than the iteration budget — raise the cap or shrink the tree (exact now that `stop_reason` is logged, not a p95 heuristic) |
-| search silent | overall `fire_rate ≈ 0` | search never triggered — likely a trigger/config error |
+| losing | an arm's strength CI entirely below 0 | genuine loss for that arm, not noise |
+| unpaired | a CRN comparison matched 0 deals (or none was produced despite ≥2 conditions) | the multi-arm headline is missing — arms must share `run_seed` / `table_policy` / table shape to pair |
+| thin pairing | matched deals well under the smaller arm's hand count | arms cover different hand ranges; the Δ rests on a subset |
+| unbalanced arms | arm hand counts differ materially | an arm ran short (resume cursor / early failure) — CRN assumes equal coverage |
+| range net-harmful | `mean_net_gain < 0` for any (condition, stage) | tracking hurts there; revisit flooring / fallback / bucketing (subgame §10) |
+| budget-bound | high share of `stop_reason = 'wall_cap'` **on a named street** | search exhausts the wall budget rather than the iteration budget there — raise the cap or shrink the tree |
+| search silent | an arm's `fire_rate ≈ 0` | search never triggered — likely a trigger/config error. `blueprint_only` is exempt: it is *supposed* to be silent |
 | high collapse | `collapse_rate` above a set threshold | belief routinely rules out reality — card-removal / replay bug or too-aggressive updates |
 | thin resolution | `resolved_frac` very low | range metrics rest on few showdowns — treat as weak evidence (§11 sampling bias) |
-| losing | strength CI entirely below 0 for an opponent | genuine loss vs. that opponent, not noise |
 
 Thresholds live in one place in the script so they are easy to tune; the summary
 prints the numbers regardless, and only the flag lines are threshold-gated.
@@ -597,10 +667,12 @@ prints the numbers regardless, and only the flag lines are threshold-gated.
 def summarize(db_path: str) -> dict:
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)  # read-only
     report = {
-        "strength":      _query_strength(con),      # per table + position + overall
-        "approach":      _query_approach(con),       # usage mix + routing/budget health
-        "search":        _query_search_cost(con),   # + p95 computed in python
-        "range_quality": _query_range_health(con),  # joined to game_seats, per opponent
+        "meta":          _query_meta(con),          # arm inventory: deals vs game rows
+        "strength":      _query_strength(con),      # per arm + position, never pooled
+        "paired":        _query_paired(con),        # CRN Δ, matched (table, deck_seed)
+        "range_quality": _query_range_health(con),  # per condition, per opponent/street
+        "hu_coverage":   _query_hu_coverage(con),   # per condition, as fractions
+        "search":        _query_search(con),        # per condition x street; p95 in python
     }
     report["flags"] = _evaluate_flags(report)       # the table above
     _print_human(report)                            # the block shown above
@@ -616,7 +688,8 @@ aggregation, not the `FILTER` clause** shown in §8 (so the summary runs against
 older SQLite on whatever box does the analysis), and the CI / percentile helpers
 are **self-contained Python** (no numpy dependency in the standalone path). The CLI
 is `argparse` (`python -m evaluation.summarize <snapshot> [--no-json]`). Strength
-prefers `aivat_value` when every game carries it and falls back to raw
+and the paired Δ share one metric chooser, so they can never quietly disagree: both
+prefer `aivat_value` when every game carries it and fall back to raw
 `hero_chips_delta` otherwise. The runner (§10.1) calls `summarize(dest)` after the
 final sync-back against the permanent snapshot, wrapped so a summary failure is
 logged rather than failing the already-committed run.
