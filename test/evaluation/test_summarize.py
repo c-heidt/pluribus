@@ -131,8 +131,16 @@ class TestHelpers:
         assert _position_name(2, 0, 6) == "BB"
         assert _position_name(5, 0, 6) == "CO"
         assert _position_name(0, 2, 6) == "MP"     # offset (0-2)%6 = 4 → MP
-        # unmapped table size falls back to POSk (offset from button).
-        assert _position_name(3, 0, 4) == "POS3"
+        # 4-max, the shipped multiplayer table size.  PokerEnv seats SB at 0, BB at
+        # 1 and the button last (`poker_env` `is_dealer` on players[-1]), so with
+        # button=3: seat 3 BTN, 0 SB, 1 BB, and seat 2 — first to act pre-flop under
+        # the `[2:]+[:2]` order — is UTG.
+        assert [_position_name(s, 3, 4) for s in (3, 0, 1, 2)] == \
+            ["BTN", "SB", "BB", "UTG"]
+        assert [_position_name(s, 4, 5) for s in (4, 0, 1, 2, 3)] == \
+            ["BTN", "SB", "BB", "UTG", "CO"]
+        # unmapped table size still falls back to POSk (offset from button).
+        assert _position_name(3, 0, 7) == "POS3"
 
     def test_verdict_treats_straddling_ci_as_inconclusive(self):
         # §8: a CI straddling zero is *inconclusive*, not *bad*.
@@ -392,6 +400,55 @@ class TestStrength:
         rep = build_report(log._con)
         assert rep["strength"]["used_aivat"] is True
         assert math.isclose(_arm(rep)["mean_bb100"], 200.0)       # from aivat, not 999
+
+    def test_metric_raw_overrides_fully_populated_aivat(self, db):
+        """``metric='raw'`` must win over the auto AIVAT preference.
+
+        AIVAT is only worth using when it actually reduces variance, which is a
+        property of a given run — so the choice has to be overridable rather than
+        inferred from mere presence of the column.
+        """
+        log, _ = db
+        for h, (raw, aiv) in enumerate(((999.0, 100.0), (555.0, 300.0))):
+            with log.game():
+                log.log_game(_game(h, condition="vanilla", deck_seed=h,
+                                   hero_chips_delta=raw, aivat_value=aiv))
+                log.log_game(_game(10 + h, condition="DBR", deck_seed=h,
+                                   hero_chips_delta=raw + 40.0, aivat_value=aiv + 90.0))
+        auto = build_report(log._con)
+        raw = build_report(log._con, metric="raw")
+        aivat = build_report(log._con, metric="aivat")
+
+        assert auto["strength"]["used_aivat"] is True            # auto picks AIVAT
+        assert auto["strength"]["metric_mode"] == "auto"
+        assert math.isclose(_arm(auto, "vanilla")["mean_bb100"], 200.0)
+
+        assert raw["strength"]["used_aivat"] is False
+        assert raw["strength"]["metric"] == "raw_bb100"
+        assert math.isclose(_arm(raw, "vanilla")["mean_bb100"], 777.0)   # (999+555)/2
+        assert math.isclose(_arm(raw, "DBR")["mean_bb100"], 817.0)
+
+        assert aivat["strength"]["used_aivat"] is True
+        assert math.isclose(_arm(aivat, "vanilla")["mean_bb100"], 200.0)
+
+        # The paired Δ must move onto the same column — the two headlines can never
+        # disagree about which metric they are reporting.
+        (rcell,) = raw["paired"]["comparisons"][0]["cells"]
+        (acell,) = auto["paired"]["comparisons"][0]["cells"]
+        assert raw["paired"]["used_aivat"] is False
+        assert math.isclose(rcell["mean_delta_bb100"], 40.0)      # raw gap
+        assert math.isclose(acell["mean_delta_bb100"], 90.0)      # aivat gap
+
+    def test_metric_is_reported_and_validated(self, db):
+        log, _ = db
+        with log.game():
+            log.log_game(_game(0, hero_chips_delta=100.0, aivat_value=50.0))
+        # A forced metric is stated in the rendered block, so a saved summary can
+        # never be misread as the automatic choice.
+        assert "forced" in _print_human(build_report(log._con, metric="raw"))
+        assert "forced" not in _print_human(build_report(log._con))
+        with pytest.raises(ValueError):
+            build_report(log._con, metric="bogus")
 
     def test_losing_flag_names_the_arm(self, db):
         log, _ = db

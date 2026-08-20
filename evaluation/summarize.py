@@ -70,6 +70,8 @@ _CI_Z = 1.96                        # normal-approx 95% CI multiplier (§8)
 _POSITION_NAMES = {
     2: ["BTN", "BB"],                            # heads-up: button posts the SB
     3: ["BTN", "SB", "BB"],
+    4: ["BTN", "SB", "BB", "UTG"],
+    5: ["BTN", "SB", "BB", "UTG", "CO"],
     6: ["BTN", "SB", "BB", "UTG", "MP", "CO"],
 }
 
@@ -93,6 +95,11 @@ _PAIRED_BASELINE_PREFERENCE = ("vanilla", "blueprint_only")
 # Conditions that are *supposed* to never search, so a zero fire rate is correct
 # behaviour there and must not raise the "search silent" flag.
 _NO_SEARCH_CONDITIONS = ("blueprint_only",)
+
+# Outcome column for bb/100 (see :func:`_bb100_reader`).  ``auto`` picks AIVAT when
+# fully populated; the explicit modes let an analyst override that when AIVAT is not
+# earning its keep on a particular run.
+_METRICS = ("auto", "aivat", "raw")
 
 
 def _position_name(hero_seat: int, button_seat: int, n_players: int) -> str:
@@ -299,14 +306,29 @@ def _query_meta(con: sqlite3.Connection) -> dict:
     }
 
 
-def _bb100_reader(games: List[dict]):
+def _bb100_reader(games: List[dict], metric: str = "auto"):
     """``(reader, used_aivat)`` for per-hand bb/100 over ``games``.
 
-    Prefers ``aivat_value`` (§10.2) when **every** row carries it (unbiased, tighter
-    CI); falls back to raw ``hero_chips_delta`` otherwise.  Shared by the strength
-    and paired sections so the two headlines can never quietly use different metrics.
+    ``metric`` selects the outcome column:
+
+    - ``auto`` (default) — prefer ``aivat_value`` (§10.2) when **every** row carries
+      it (unbiased in theory, tighter CI); fall back to raw ``hero_chips_delta``.
+    - ``raw`` — force ``hero_chips_delta``, even when AIVAT is fully populated.
+      AIVAT is only worth using when it *actually* reduces variance; that is a
+      property of the estimator on a given run, not a given, so the choice has to be
+      overridable from the outside (compare ``sd(aivat)`` against ``sd(raw)`` per arm
+      before trusting it).
+    - ``aivat`` — force ``aivat_value``; rows missing it drop out of the aggregate.
+
+    Shared by the strength and paired sections so the two headlines can never
+    quietly use different metrics.
     """
-    used_aivat = bool(games) and all(g["aivat_value"] is not None for g in games)
+    if metric not in _METRICS:
+        raise ValueError(f"metric must be one of {_METRICS}, got {metric!r}")
+    if metric == "auto":
+        used_aivat = bool(games) and all(g["aivat_value"] is not None for g in games)
+    else:
+        used_aivat = metric == "aivat"
 
     def bb100(g) -> Optional[float]:
         bb = g["big_blind"]
@@ -318,7 +340,7 @@ def _bb100_reader(games: List[dict]):
     return bb100, used_aivat
 
 
-def _query_strength(con: sqlite3.Connection) -> dict:
+def _query_strength(con: sqlite3.Connection, metric: str = "auto") -> dict:
     """Hero bb/100 with 95% CI **per arm** — ``(condition, table_label)`` (§8).
 
     One row per arm, plus that arm's by-position split.  There is deliberately no
@@ -331,7 +353,7 @@ def _query_strength(con: sqlite3.Connection) -> dict:
         "SELECT condition, table_label, hero_chips_delta, aivat_value, big_blind, "
         "hero_seat, button_seat, n_players FROM games",
     )
-    bb100, used_aivat = _bb100_reader(games)
+    bb100, used_aivat = _bb100_reader(games, metric)
 
     by_arm: Dict[Tuple[str, str], List[float]] = {}
     by_arm_pos: Dict[Tuple[str, str], Dict[str, List[float]]] = {}
@@ -362,13 +384,14 @@ def _query_strength(con: sqlite3.Connection) -> dict:
         })
     return {
         "metric": "aivat_bb100" if used_aivat else "raw_bb100",
+        "metric_mode": metric,
         "used_aivat": used_aivat,
         "grain": "condition x table_label",
         "arms": arms,
     }
 
 
-def _query_paired(con: sqlite3.Connection) -> dict:
+def _query_paired(con: sqlite3.Connection, metric: str = "auto") -> dict:
     """Cross-condition CRN paired differences (§10.1) — the multi-arm headline.
 
     When two or more ``condition`` arms are present, the comparison of interest is
@@ -412,7 +435,7 @@ def _query_paired(con: sqlite3.Connection) -> dict:
         "SELECT condition, table_label, deck_seed, hero_chips_delta, aivat_value, "
         "big_blind FROM games WHERE condition IS NOT NULL AND deck_seed IS NOT NULL",
     )
-    bb100, used_aivat = _bb100_reader(games)
+    bb100, used_aivat = _bb100_reader(games, metric)
 
     per_cond: Dict[str, Dict[Tuple[str, int], float]] = {}
     dupes: Dict[str, set] = {}
@@ -530,6 +553,7 @@ def _query_paired(con: sqlite3.Connection) -> dict:
     return {
         "available": True,
         "metric": "aivat_bb100" if used_aivat else "raw_bb100",
+        "metric_mode": metric,
         "used_aivat": used_aivat,
         "match_key": "table_label + deck_seed",
         "baseline": baseline,
@@ -949,7 +973,9 @@ def _print_human(report: dict) -> str:
 def _strength_block(L: List[str], report: dict) -> None:
     st = report["strength"]
     metric = "aivat bb/100" if st["used_aivat"] else "raw bb/100"
-    L.append(f"STRENGTH — per arm ({metric} ± 95% CI).  Arms are never pooled.")
+    # Not the auto choice — say so, so a saved block can't be misread later.
+    forced = ", forced" if st.get("metric_mode", "auto") != "auto" else ""
+    L.append(f"STRENGTH — per arm ({metric} ± 95% CI{forced}).  Arms are never pooled.")
     if not st["arms"]:
         L.append("  (no hands logged)")
         return
@@ -1102,12 +1128,16 @@ def _hu_block(L: List[str], report: dict) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def build_report(con: sqlite3.Connection) -> dict:
-    """Assemble the full report dict from an open (read-only) connection."""
+def build_report(con: sqlite3.Connection, metric: str = "auto") -> dict:
+    """Assemble the full report dict from an open (read-only) connection.
+
+    ``metric`` (``auto`` | ``aivat`` | ``raw``) picks the outcome column for both
+    bb/100 headlines — see :func:`_bb100_reader`.
+    """
     report = {
         "meta": _query_meta(con),
-        "strength": _query_strength(con),
-        "paired": _query_paired(con),
+        "strength": _query_strength(con, metric),
+        "paired": _query_paired(con, metric),
         "range_quality": _query_range_health(con),
         "hu_coverage": _query_hu_coverage(con),
         "search": _query_search(con),
@@ -1116,17 +1146,20 @@ def build_report(con: sqlite3.Connection) -> dict:
     return report
 
 
-def summarize(db_path, *, write_json: bool = True, echo: bool = True) -> dict:
+def summarize(
+    db_path, *, write_json: bool = True, echo: bool = True, metric: str = "auto"
+) -> dict:
     """Summarize the snapshot at ``db_path`` (§8); return the report dict.
 
     Opens the file **read-only** (never the live node-local WAL file — the runner
     points this at the permanent-FS snapshot).  Prints the human block and, unless
     disabled, writes ``summary.json`` next to the snapshot for cross-run comparison.
+    ``metric`` (``auto`` | ``aivat`` | ``raw``) overrides the outcome column.
     """
     db_path = Path(db_path)
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        report = build_report(con)
+        report = build_report(con, metric)
     finally:
         con.close()
 
@@ -1150,8 +1183,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--no-json", action="store_true", help="Do not write summary.json."
     )
+    parser.add_argument(
+        "--metric", choices=_METRICS, default="auto",
+        help="Outcome column for bb/100. 'auto' (default) uses aivat_value when "
+             "every hand carries it, else raw chips; 'raw' forces hero_chips_delta "
+             "(use when AIVAT is not actually reducing variance on this run); "
+             "'aivat' forces aivat_value.",
+    )
     args = parser.parse_args(argv)
-    summarize(args.snapshot, write_json=not args.no_json)
+    summarize(args.snapshot, write_json=not args.no_json, metric=args.metric)
     return 0
 
 

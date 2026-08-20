@@ -687,10 +687,17 @@ choices differ from the sketch above: the queries use **`CASE`-based conditional
 aggregation, not the `FILTER` clause** shown in §8 (so the summary runs against
 older SQLite on whatever box does the analysis), and the CI / percentile helpers
 are **self-contained Python** (no numpy dependency in the standalone path). The CLI
-is `argparse` (`python -m evaluation.summarize <snapshot> [--no-json]`). Strength
-and the paired Δ share one metric chooser, so they can never quietly disagree: both
-prefer `aivat_value` when every game carries it and fall back to raw
-`hero_chips_delta` otherwise. The runner (§10.1) calls `summarize(dest)` after the
+is `argparse` (`python -m evaluation.summarize <snapshot> [--no-json] [--metric …]`).
+Strength and the paired Δ share one metric chooser, so they can never quietly
+disagree: both prefer `aivat_value` when every game carries it and fall back to raw
+`hero_chips_delta` otherwise. `--metric raw` overrides that preference (and
+`--metric aivat` forces the other way); a forced choice is stated in the printed
+block and recorded as `metric_mode` in `summary.json`. The override exists because
+AIVAT's benefit is a **property of the run, not of the column**: it is only worth
+using when it actually reduces variance, so compare `sd(aivat_value)` against
+`sd(hero_chips_delta)` per arm before trusting it — a ratio near 1 means the
+estimator is not earning its per-hand cost, and below 1 means it is adding variance.
+The runner (§10.1) calls `summarize(dest)` after the
 final sync-back against the permanent snapshot, wrapped so a summary failure is
 logged rather than failing the already-committed run.
 
