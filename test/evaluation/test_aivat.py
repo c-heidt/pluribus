@@ -533,3 +533,80 @@ class TestCrnPairing:
                   for k in sorted(set(a) & set(b)) if a[k][2] == b[k][2]]
         assert deltas
         assert max(abs(d) for d in deltas) < 1e-9
+
+
+class TestSiblingCommonRandomNumbers:
+    """Sibling children must be scored under *common* random numbers.
+
+    ``continuation_value`` is a one-rollout estimate, so a single ``v̂`` is very
+    noisy.  The correction only uses ``v̂`` inside the difference
+    ``v̂(child_taken) − Σ_a π(a)·v̂(child_a)``; if the siblings are scored under
+    independent randomness that noise accumulates into the difference instead of
+    cancelling out of it, and AIVAT ends up *adding* variance.  Measured on the
+    4-player / 100bb / m=6 stub: MC noise was 70% of the correction's variance and
+    ``var_x = 0.76`` (below 1 — actively harmful); under CRN, 49% and ``var_x = 1.17``.
+
+    Gated on the mechanism, not on a variance number: a ratio measured over a few
+    hundred stub hands is far too noisy to assert a margin on without either
+    flaking or being so loose it proves nothing.  Whether every sibling *saw the
+    same randomness* is exact, cheap, and is the property that was actually wrong.
+    """
+
+    def _record_states(self, monkeypatch):
+        """Record (rng state, board_rng state) at each rollout, in call order."""
+        import evaluation.aivat as aivat_mod
+        seen = []
+        original = aivat_mod.continuation_value
+
+        def spy(frontier_env, profile, ctx):
+            seen.append((ctx.rng.bit_generator.state["state"]["state"],
+                         ctx.board_rng.bit_generator.state["state"]["state"]))
+            return original(frontier_env, profile, ctx)
+
+        monkeypatch.setattr(aivat_mod, "continuation_value", spy)
+        return seen
+
+    def test_all_siblings_share_one_random_draw(self, monkeypatch):
+        env, hero = _hero_on_flop(seed=5)
+        legal = [a for a in env.legal_actions if a is not None]
+        assert len(legal) >= 2, "need >=2 siblings for this to mean anything"
+        m = 4
+        seen = self._record_states(monkeypatch)
+        LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1),
+                  n_hole_samples=m).child_values(env, legal)
+
+        assert len(seen) == m * len(legal)
+        # child_values iterates samples outer, legal inner -> chunk by len(legal).
+        for i in range(m):
+            chunk = seen[i * len(legal):(i + 1) * len(legal)]
+            assert len(set(chunk)) == 1, (
+                f"belief draw {i}: siblings were scored under different randomness "
+                f"{chunk} — the CRN rewind is not in effect"
+            )
+
+    def test_different_belief_draws_use_different_randomness(self, monkeypatch):
+        """The flip side: CRN is *within* a belief draw only.
+
+        If the rewind leaked across draws, the m samples would be m copies of one
+        rollout and averaging them would buy nothing.
+        """
+        env, hero = _hero_on_flop(seed=5)
+        legal = [a for a in env.legal_actions if a is not None]
+        m = 4
+        seen = self._record_states(monkeypatch)
+        LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1),
+                  n_hole_samples=m).child_values(env, legal)
+        per_draw = [seen[i * len(legal)] for i in range(m)]
+        assert len(set(per_draw)) == m, "belief draws reused the same randomness"
+
+    def test_values_still_differ_between_actions(self):
+        """CRN must not collapse the siblings onto one value.
+
+        Sharing the randomness is the point; sharing the *result* would mean every
+        correction term is identically zero and AIVAT silently does nothing.
+        """
+        env, hero = _hero_on_flop(seed=5)
+        legal = [a for a in env.legal_actions if a is not None]
+        vals = LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1),
+                         n_hole_samples=6).child_values(env, legal)
+        assert len(set(vals.values())) > 1, f"all siblings scored identically: {vals}"

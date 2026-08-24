@@ -223,6 +223,25 @@ class LeafValue:
         steps each legal action via make/undo and scores the resulting child with
         :func:`continuation_value`.  ``env_before`` is never mutated (the sampled
         env is a fresh ``with_hole_cards`` copy).
+
+        **Siblings are scored under common random numbers.**  Both streams are
+        rewound to the same state before every legal action, so within one belief
+        draw the children differ *only* by the action taken — same opponent holes,
+        same board runout, same rollout action line wherever the line is shared.
+
+        This matters because :func:`continuation_value` is a **one-rollout** estimate
+        (one sampled action line on one sampled board — the solver's design, not an
+        accident here), so an individual ``v̂`` carries enormous Monte-Carlo noise.
+        The correction only ever uses ``v̂`` inside the difference
+        ``v̂(child_taken) − Σ_a π(a)·v̂(child_a)``, and under CRN the noise the
+        siblings share cancels in that difference instead of accumulating into it.
+        Scoring them independently was measured to make MC noise **69% of the
+        correction's variance**, which is what left AIVAT *adding* variance rather
+        than removing it.
+
+        Unbiasedness is untouched: ``E[v̂(child_a)] = v(child_a)`` still holds for
+        each ``a`` separately, and the control-variate identity needs nothing about
+        how the siblings' noise is correlated — only about each one's mean.
         """
         legal = list(legal)
         sums: Dict[str, float] = {a: 0.0 for a in legal}
@@ -233,13 +252,22 @@ class LeafValue:
         ctx = _LeafCtx(self._leaf, self._rng, self._board_rng)
         with _preserve_global_random():
             for _ in range(m):
+                # Drawn once per belief sample, BEFORE the snapshot: the holes are
+                # shared by the siblings too (they are part of what must not vary).
                 holes = self._sample_joint(env_before)
                 base = env_before.with_hole_cards(holes, rng=self._board_rng)
+                sample_rng = self._rng.bit_generator.state
+                sample_board = self._board_rng.bit_generator.state
                 for a in legal:
+                    self._rng.bit_generator.state = sample_rng
+                    self._board_rng.bit_generator.state = sample_board
                     tok = base.step_in_place(a)
                     v = continuation_value(base, profile, ctx)
                     sums[a] += float(v[hero_seat])
                     base.undo(tok)
+                # Leaves both streams wherever the last sibling ended — a
+                # deterministic function of the situation, so the next belief draw
+                # and the next node stay reproducible.
         return {a: sums[a] / m for a in legal}
 
     # ------------------------------------------------------------------ #
