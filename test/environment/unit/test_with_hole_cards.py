@@ -321,6 +321,57 @@ class TestShuffleUndealtInvoked:
         assert seq_with_shuffle != seq_no_shuffle
 
 
+def _global_state():
+    """Hashable snapshot of the global MT19937 state (key *and* position)."""
+    st = np.random.get_state()
+    return (st[0], st[1].tobytes(), st[2], st[3], st[4])
+
+
+class TestRngArgument:
+    """``with_hole_cards(..., rng=)`` forwards the caller's stream to the reshuffle.
+
+    Every caller of this method is exploring a *hypothetical* re-deal, never
+    dealing the played hand, so each should own its randomness rather than share
+    the global stream with the real deal (and with each other).
+    """
+
+    def _undealt(self, env):
+        return [int(c) for c in env.deck._cards[env.deck._idx:]]
+
+    def test_leaves_global_state_untouched(self):
+        env = _env()
+        holes = _holes_with(env, 0, _disjoint_combo(env, 0))
+        before = _global_state()
+        env.with_hole_cards(holes, rng=np.random.default_rng(0))
+        assert _global_state() == before
+
+    def test_default_still_uses_global(self):
+        env = _env()
+        holes = _holes_with(env, 0, _disjoint_combo(env, 0))
+        before = _global_state()
+        env.with_hole_cards(holes)
+        assert _global_state() != before
+
+    def test_same_seed_reproduces_undealt_order(self):
+        env = _env()
+        holes = _holes_with(env, 0, _disjoint_combo(env, 0))
+        a = env.with_hole_cards(holes, rng=np.random.default_rng(4))
+        b = env.with_hole_cards(holes, rng=np.random.default_rng(4))
+        assert self._undealt(a) == self._undealt(b)
+
+    def test_independent_of_global_stream_position(self):
+        """The point of the argument: an unrelated consumer of the global stream
+        must not change what this call deals."""
+        env = _env()
+        holes = _holes_with(env, 0, _disjoint_combo(env, 0))
+        np.random.seed(1)
+        a = env.with_hole_cards(holes, rng=np.random.default_rng(4))
+        np.random.seed(2)
+        np.random.random(37)                     # burn an arbitrary amount
+        b = env.with_hole_cards(holes, rng=np.random.default_rng(4))
+        assert self._undealt(a) == self._undealt(b)
+
+
 class TestDeckReplaceDrawn:
     """Direct tests on the underlying ``Deck.replace_drawn`` helper.
 

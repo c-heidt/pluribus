@@ -19,8 +19,12 @@ multi-rollout-per-leaf average were both tried and dropped (perf; see the
 compiled core now agree exactly: one rollout, one sampled board, no averaging.
 
 The module is a pure consumer of :class:`PokerEnv`, :class:`Policy`, and
-:class:`SubgameContext`; ``ctx.rng`` drives the action sampling (the board
-runout uses the env's global-``np.random`` deal, as elsewhere in the engine).
+:class:`SubgameContext`; ``ctx.rng`` drives the action sampling and
+``ctx.board_rng`` the board runout.  The two are deliberately separate streams,
+and **neither is the global** ``np.random``: a rollout board is a hypothetical
+re-deal, so drawing it from the played game's stream would make the search's
+randomness depend on unrelated consumers (and theirs on the search's iteration
+count).  See :mod:`poker_ai.search.rng`.
 """
 
 from __future__ import annotations
@@ -34,6 +38,20 @@ from environment.poker_env import PokerEnv
 from poker_ai.blueprint.tree_utils import sample_index
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.policy import BiasClass, Policy
+
+
+def board_rng_for(ctx) -> np.random.Generator:
+    """The stream a leaf rollout draws its board runout from.
+
+    ``ctx.board_rng`` when the context carries one (the norm —
+    :meth:`SubgameContext.from_runtime` always derives it), else ``ctx.rng``.
+    Never the global ``np.random``: see the module docstring.
+
+    Takes a duck-typed ``ctx`` because the leaf machinery is reused outside the
+    solver by lightweight carriers (e.g. ``evaluation.aivat._LeafCtx``).
+    """
+    rng = getattr(ctx, "board_rng", None)
+    return ctx.rng if rng is None else rng
 
 
 @dataclass
@@ -93,7 +111,7 @@ def continuation_value(
     holes: List[Tuple[int, int]] = [
         tuple(int(c) for c in frontier_env.players[i].cards) for i in range(n)
     ]
-    e = frontier_env.with_hole_cards(holes)
+    e = frontier_env.with_hole_cards(holes, rng=board_rng_for(ctx))
     while not e.is_terminal:
         seat = e.player_i
         if seat not in profile:
@@ -149,7 +167,7 @@ def continuation_value_vector(
     holes: List[Tuple[int, int]] = [
         tuple(int(c) for c in frontier_env.players[i].cards) for i in range(n)
     ]
-    e = frontier_env.with_hole_cards(holes)
+    e = frontier_env.with_hole_cards(holes, rng=board_rng_for(ctx))
     while not e.is_terminal:
         seat = e.player_i
         if seat not in profile:

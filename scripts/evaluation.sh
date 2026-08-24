@@ -93,8 +93,8 @@ MAX_HANDS=${MAX_HANDS:-}
 # DBR model knobs — consumed ONLY by a DBR(...) arm; model-free arms never receive
 # them (a DBR arm with MODEL_P_MAX unset aborts rather than silently running vanilla).
 MODEL_P_MAX=${MODEL_P_MAX:-}
-MODEL_ERROR=${MODEL_ERROR:-0.0}
-MODEL_CONFIDENCE=${MODEL_CONFIDENCE:-1.0}
+MODEL_ERROR=${MODEL_ERROR:-0.2}
+MODEL_CONFIDENCE=${MODEL_CONFIDENCE:-0.8}
 MODEL_SEED=${MODEL_SEED:-0}
 # Auto-run the paired CRN summary over the permanent snapshot once all arms finish.
 SUMMARIZE=${SUMMARIZE:-true}

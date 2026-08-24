@@ -1584,7 +1584,7 @@ class PokerEnv:
         return bool(self._extra_legal_actions.get(self._current_public_state()))
 
     def with_hole_cards(
-        self, holes: "Sequence[Tuple[int, int]]"
+        self, holes: "Sequence[Tuple[int, int]]", *, rng=None
     ) -> "PokerEnv":
         """Return a deepcopy with every seat's hole cards replaced.
 
@@ -1624,6 +1624,15 @@ class PokerEnv:
             One ``(c0, c1)`` tuple per seat, indexed by seat position
             (``holes[i]`` is seat ``i``'s new hole).  Length must
             equal ``self.n_players``.
+        rng : numpy.random.Generator, optional
+            Stream for the undealt-deck reshuffle, forwarded to
+            :meth:`Deck.shuffle_undealt`.  This method is the engine's
+            *hypothetical* re-deal — every caller is exploring a
+            counterfactual (a search leaf rollout, an AIVAT value
+            evaluation), never dealing the played hand — so callers should
+            pass their own stream and leave the global ``np.random`` to the
+            real deal.  See :mod:`poker_ai.search.rng`.  ``None`` keeps the
+            legacy global draw.
 
         Returns
         -------
@@ -1677,7 +1686,7 @@ class PokerEnv:
             h = holes[seat]
             new.players[seat]._cards = (int(h[0]), int(h[1]))
         new.deck.replace_drawn(tuple(old_union), new_union)
-        new.deck.shuffle_undealt()
+        new.deck.shuffle_undealt(rng)
         return new
 
     def reseat_private_cards(

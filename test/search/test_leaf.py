@@ -17,7 +17,7 @@ import pytest
 from environment.player import Player
 from environment.poker_env import PokerEnv, PolicyState
 from poker_ai.search.context import SubgameContext
-from poker_ai.search.leaf import LeafConfig, continuation_value
+from poker_ai.search.leaf import LeafConfig, board_rng_for, continuation_value
 from poker_ai.search.policy import BiasClass, Policy
 
 
@@ -89,9 +89,9 @@ def _spy_with_hole_cards(monkeypatch):
     recorded: List[List[Tuple[int, ...]]] = []
     original = PokerEnv.with_hole_cards
 
-    def spy(self, holes):
+    def spy(self, holes, **kwargs):
         recorded.append([tuple(int(c) for c in h) for h in holes])
-        return original(self, holes)
+        return original(self, holes, **kwargs)
 
     monkeypatch.setattr(PokerEnv, "with_hole_cards", spy)
     return recorded
@@ -239,3 +239,72 @@ class TestBlueprintCanonicalisation:
         continuation_value(env, _profile(env), _ctx(env))
         assert seen_flags  # the rollout did query a policy
         assert all(seen_flags)  # always for_blueprint=True
+
+
+# --------------------------------------------------------------------------- #
+# RNG ownership (poker_ai.search.rng)
+# --------------------------------------------------------------------------- #
+
+def _global_state():
+    """Hashable snapshot of the global MT19937 state (key *and* position)."""
+    st = np.random.get_state()
+    return (st[0], st[1].tobytes(), st[2], st[3], st[4])
+
+
+class TestRngOwnership:
+    """A leaf rollout is a *hypothetical* re-deal and must own its randomness.
+
+    Drawing the rollout board from the global stream coupled the search to every
+    other consumer of that stream — and, in the other direction, made AIVAT's value
+    function depend on the hero's iteration count, which is what destroyed the
+    evaluation's CRN pairing.
+    """
+
+    def test_rollout_does_not_consume_global_rng(self):
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        ctx = _ctx(env)
+        before = _global_state()
+        continuation_value(env, _profile(env), ctx)
+        assert _global_state() == before
+
+    def test_rollout_is_independent_of_global_stream_position(self):
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        np.random.seed(1)
+        a = continuation_value(env, _profile(env), _ctx(env, seed=9))
+        np.random.seed(2)
+        np.random.random(41)                      # unrelated global consumer
+        b = continuation_value(env, _profile(env), _ctx(env, seed=9))
+        np.testing.assert_array_equal(a, b)
+
+    def test_from_runtime_derives_a_board_stream(self):
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        ctx = _ctx(env)
+        assert ctx.board_rng is not None
+        assert ctx.board_rng is not ctx.rng
+
+    def test_board_stream_is_distinct_from_sampling_stream(self):
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        ctx = _ctx(env)
+        a = [float(ctx.rng.random()) for _ in range(8)]
+        b = [float(ctx.board_rng.random()) for _ in range(8)]
+        assert a != b
+
+    def test_deriving_board_stream_leaves_sampling_stream_untouched(self):
+        """Adding the board split must not change the solver's sampling draws."""
+        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        baseline = np.random.default_rng(42)
+        ctx = _ctx(env, seed=42)
+        assert [float(ctx.rng.random()) for _ in range(8)] == \
+               [float(baseline.random()) for _ in range(8)]
+
+    def test_board_rng_for_falls_back_to_ctx_rng(self):
+        """A duck-typed carrier without ``board_rng`` falls back to ``rng`` —
+        never to the global stream."""
+        rng = np.random.default_rng(0)
+        carrier = collections.namedtuple("C", "leaf rng")(None, rng)
+        assert board_rng_for(carrier) is rng
+
+    def test_board_rng_for_prefers_board_rng(self):
+        rng, brng = np.random.default_rng(0), np.random.default_rng(1)
+        carrier = collections.namedtuple("C", "leaf rng board_rng")(None, rng, brng)
+        assert board_rng_for(carrier) is brng

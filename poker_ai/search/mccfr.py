@@ -35,6 +35,7 @@ from poker_ai.search.context import SubgameContext
 from poker_ai.search.fast_env import build_fast_mccfr_env
 from poker_ai.search.leaf import continuation_value_vector
 from poker_ai.search.policy import BiasClass
+from poker_ai.search.rng import spawn_one
 from poker_ai.search.solver_state import SolverConfig, SolverState
 from poker_ai.search.vform import (
     apply_model_clamp,
@@ -189,11 +190,12 @@ class _MCCFRSolver:
         # the seed sequence so ``self.rng`` itself is NOT advanced — the sampling
         # stream (hole + action draws) must stay bit-identical to a board-free
         # baseline, or the traversal desyncs.
-        try:
-            _board_seed = self.rng.bit_generator._seed_seq.spawn(1)[0]
-            self._board_rng = np.random.default_rng(_board_seed)
-        except AttributeError:  # generator without an exposed seed sequence
-            self._board_rng = np.random.default_rng(int(self.rng.integers(0, 2 ** 63 - 1)))
+        #
+        # Derived via ``search.rng.spawn_one``, NOT a bare ``_seed_seq.spawn(1)``:
+        # the pinned numpy (1.17.4) drops ``spawn_key`` when generating state, so
+        # the bare call handed back a child bit-identical to ``self.rng`` and the
+        # separation this comment describes was silently not happening.
+        self._board_rng = spawn_one(self.rng)
 
         # ---- Traverser-vectorized walk (all MCCFR subgames) ------------------
         # The traverser's private hand is solved in VECTOR form: every combo's row

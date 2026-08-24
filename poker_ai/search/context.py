@@ -31,6 +31,7 @@ from typing_extensions import Literal
 
 from environment.poker_env import PokerEnv
 from poker_ai.search.ranges import Range
+from poker_ai.search.rng import spawn_one
 
 if TYPE_CHECKING:
     # LeafConfig is introduced in §6.4 (poker_ai/search/leaf.py) which
@@ -127,8 +128,15 @@ class SubgameContext:
     leaf : LeafConfig
         Continuation-strategy configuration for depth-limit leaves.
     rng : numpy.random.Generator
-        Source of randomness; passed to the leaf rollouts and any
-        sampling done by the solver.
+        Sampling stream: hole draws and the leaf rollout's action draws.
+    board_rng : numpy.random.Generator, optional
+        Separate stream for the leaf rollout's **board** runout (the undealt
+        reshuffle inside :meth:`PokerEnv.with_hole_cards`).  Kept apart from
+        ``rng`` for the same reason ``_MCCFRSolver`` keeps its reseat shuffle
+        apart: a board draw interleaved into the sampling stream desyncs the
+        action-sampling trajectory.  :meth:`from_runtime` derives one
+        automatically; ``None`` falls back to ``rng`` (never to the global
+        ``np.random`` — see :mod:`poker_ai.search.rng`).
     """
 
     my_seat: int
@@ -145,6 +153,8 @@ class SubgameContext:
     #: an unmodeled solve is bit-for-bit vanilla Pluribus (the baseline needs no
     #: separate code path).  See :func:`poker_ai.search.vform.apply_model_clamp`.
     models: Mapping[int, "OpponentModel"] = MappingProxyType({})
+    #: Board-runout stream for leaf rollouts; see the class docstring.
+    board_rng: Optional[np.random.Generator] = None
 
     @classmethod
     def from_runtime(
@@ -157,6 +167,7 @@ class SubgameContext:
         leaf: "LeafConfig",
         rng: np.random.Generator,
         models: Optional[Mapping[int, "OpponentModel"]] = None,
+        board_rng: Optional[np.random.Generator] = None,
     ) -> "SubgameContext":
         """Build a context for a search rooted at ``env``.
 
@@ -173,10 +184,16 @@ class SubgameContext:
         ``writeable`` flag is cleared, and ``board_compatible`` is set
         non-writeable.  The caller's original dicts and arrays are
         unaffected.
+
+        ``board_rng`` defaults to a fresh child of ``rng``.  It is *spawned*
+        (:func:`poker_ai.search.rng.spawn_one`) rather than drawn from, so
+        ``rng`` is not advanced and the solver's sampling trajectory is
+        unchanged by the existence of a separate board stream.
         """
         board_mask = _board_compatible_mask(env)
         board_mask.flags.writeable = False
         return cls(
+            board_rng=board_rng if board_rng is not None else spawn_one(rng),
             my_seat=my_seat,
             my_hole=my_hole,
             ranges=_freeze_ranges(ranges),

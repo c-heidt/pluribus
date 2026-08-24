@@ -59,7 +59,21 @@ _N_ITERS = 50
 # previously defaulted to n_rollouts=2, so the preflop root's depth-limit leaf
 # (the vectorized continuation meta-game) now scores a genuinely different (single-
 # sample) value — a deliberate maths change, not a regression.
-GOLDEN_DIGEST_MCCFR = "a5521b63d4b0f443b22ac19370f78faebb45431e6842de8f902bc14867d11ee4"
+#
+# MCCFR regenerated again 2026-08-24 (RNG stream ownership, poker_ai/search/rng.py).
+# No maths, env-tree or fixture change: the walk draws the SAME quantities from
+# DIFFERENT streams.  Three deliberate re-plumbings contribute, and reverting all
+# three reproduces the 2026-08-14 literal
+# (a5521b63d4b0f443b22ac19370f78faebb45431e6842de8f902bc14867d11ee4) byte-for-byte,
+# which is what establishes there is no accidental drift hiding in here:
+#   1. the leaf board runout moved off the GLOBAL np.random onto ``ctx.board_rng``;
+#   2. ``_MCCFRSolver._board_rng`` became a genuine child — on numpy 1.17.4 the bare
+#      ``_seed_seq.spawn(1)`` it used returns a stream bit-identical to its parent,
+#      so the separation its own comment describes had never taken effect;
+#   3. ``SubgameContext.from_runtime`` now derives a board child, which advances the
+#      parent's spawn counter and so shifts WHICH child (2) receives.
+# The vector digest is unchanged: that fixture roots on the turn, which is leaf-free.
+GOLDEN_DIGEST_MCCFR = "fee362b119ec094ea1e3e9c82dccf37e63b6a196138ff73a68840d9a5613e3ec"
 GOLDEN_DIGEST_VECTOR = "7e6e3da6534d92c5e9a808a48b9da06054558cbb4a7ee8727fab0efa23113db2"
 
 

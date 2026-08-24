@@ -578,3 +578,57 @@ def test_bot_fold_makes_agent_dormant(_seeded, monkeypatch):
     agent.on_board_update(env, _to_flop(env))
     assert len(log) == 0
     assert agent.last_search is None
+
+
+# --------------------------------------------------------------------------- #
+# RNG stream ownership (poker_ai.search.rng)
+# --------------------------------------------------------------------------- #
+
+class TestRngStreamSplit:
+    """The agent's PLAY draws must not depend on how much its SOLVER consumed.
+
+    Approaches burn randomness at different, approach-dependent rates: a DBR solve,
+    an OX solve and a vanilla solve consume different amounts at the same node, and
+    a skipped or failed solve consumes none.  On one shared stream that shifts the
+    action actually played, so two CRN-paired arms diverge at the first decision
+    even where their strategies agree exactly — which is precisely the pairing the
+    evaluation's paired Δ depends on.
+    """
+
+    def test_play_and_solve_streams_are_distinct(self):
+        agent = _agent()
+        assert agent._play_rng is not agent._solve_rng
+        a = [float(agent._play_rng.random()) for _ in range(8)]
+        b = [float(agent._solve_rng.random()) for _ in range(8)]
+        assert a != b
+
+    def test_neither_stream_aliases_the_caller_rng(self):
+        """Both must be genuine children — the numpy spawn_key quirk made the
+        first 'child' come back bit-identical to its parent."""
+        agent = _agent()
+        baseline = [float(np.random.default_rng(0).random()) for _ in range(8)]
+        assert [float(agent._play_rng.random()) for _ in range(8)] != baseline
+        assert [float(agent._solve_rng.random()) for _ in range(8)] != baseline
+
+    def test_play_stream_is_unaffected_by_solver_consumption(self):
+        """The property under test: burn the solver stream arbitrarily, the play
+        draws are unchanged."""
+        quiet, busy = _agent(), _agent()
+        busy._solve_rng.random(1234)                  # simulate a heavier solve
+        assert [float(quiet._play_rng.random()) for _ in range(16)] == \
+               [float(busy._play_rng.random()) for _ in range(16)]
+
+    def test_same_seed_reproduces_both_streams(self):
+        a, b = _agent(), _agent()
+        assert [float(a._play_rng.random()) for _ in range(8)] == \
+               [float(b._play_rng.random()) for _ in range(8)]
+
+    def test_sample_draws_from_the_play_stream(self):
+        # Behavioural end-to-end form of the above: two agents at the same seed
+        # sample the same actions, and burning only the solve stream changes
+        # nothing about what gets played.
+        quiet, busy = _agent(), _agent()
+        busy._solve_rng.random(999)
+        legal, prob = ["fold", "call", "raise:1.0"], [0.2, 0.3, 0.5]
+        assert [quiet._sample(prob, legal) for _ in range(20)] == \
+               [busy._sample(prob, legal) for _ in range(20)]

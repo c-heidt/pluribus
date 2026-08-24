@@ -38,6 +38,7 @@ from poker_ai.search.cluster_maps import _STREET_NAME
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.policy import BiasClass, Policy
 from poker_ai.search.ranges import RangeTracker
+from poker_ai.search.rng import spawn
 from poker_ai.search.solver import SearchResult, SolverConfig, solve
 
 if TYPE_CHECKING:
@@ -66,7 +67,22 @@ class SearchAgent:
         self._leaf_policies = leaf_policies     # the four §4 variants (== cfg.leaf.policies)
         self._blueprint = blueprint_policy      # round-1 play + round-1->2 Bayes
         self._cfg = solver_cfg                  # carries .leaf (the LeafConfig)
-        self._rng = rng
+        # Two independent sub-streams off the caller's ``rng``, never one shared
+        # stream.  ``_play_rng`` draws the action actually played; ``_solve_rng``
+        # feeds the solver (hole draws, leaf rollouts, and — via
+        # ``SubgameContext.from_runtime`` — a further board sub-stream).
+        #
+        # The split exists because the two consume at wildly different, *approach-
+        # dependent* rates: a DBR solve, an OX solve and a vanilla solve burn
+        # different amounts of randomness at the same node, and a failed or skipped
+        # solve burns none.  Sharing one stream would make the played action depend
+        # on that, so two CRN-paired arms would diverge at the first decision even
+        # where their strategies agree exactly — destroying the pairing the
+        # evaluation's paired Δ is built on.  Split, the play draws stay aligned
+        # across arms for as long as the strategies themselves do.
+        #
+        # Spawned (not drawn), so ``rng``'s own byte-stream is untouched.
+        self._play_rng, self._solve_rng = spawn(rng, 2)
         # When ``False`` the agent never solves — every boundary/observed-action
         # search trigger is skipped, so ``play_distribution`` always returns the
         # blueprint.  This is the **blueprint-only pipeline test** (no search): NOT
@@ -350,7 +366,7 @@ class SearchAgent:
             self.tracker.snapshot(),
             self.tracker.folded_snapshot(),
             self._cfg.leaf,
-            self._rng,
+            self._solve_rng,
             # The SAME hand-start snapshot the belief likelihood used (§6.3
             # invariant): infer the opponent's range under the strategy we clamp to.
             models=self._models,
@@ -561,7 +577,7 @@ class SearchAgent:
             prob = prob / total
         else:
             prob = np.full(len(legal), 1.0 / len(legal))
-        idx = int(self._rng.choice(len(legal), p=prob))
+        idx = int(self._play_rng.choice(len(legal), p=prob))
         return legal[idx]
 
     def _hand_row(self, env: PokerEnv) -> int:

@@ -222,3 +222,71 @@ class TestShuffleUndealt:
         deck._idx = len(deck._cards)
         deck.shuffle_undealt()
         assert deck._idx == len(deck._cards)
+
+
+def _global_state():
+    """Hashable snapshot of the global MT19937 state.
+
+    Both the key array *and* the position index are needed: the key only changes
+    when the generator refills (every 624 draws), so comparing it alone would call
+    a stream that HAS been consumed 'untouched'.
+    """
+    import numpy as np
+    st = np.random.get_state()
+    return (st[0], st[1].tobytes(), st[2], st[3], st[4])
+
+
+class TestShuffleUndealtRng:
+    """``shuffle_undealt(rng)`` draws from the caller's stream, not the global one.
+
+    A hypothetical re-deal (a search leaf rollout, an AIVAT value evaluation) that
+    draws from the global stream makes its randomness depend on how much unrelated
+    work consumed that stream.  These pin the escape hatch that lets such callers
+    own their randomness.
+    """
+
+    def _dealt_deck(self):
+        deck = Deck(2, 14)
+        players = [Player(i, 10000) for i in range(3)]
+        deck.deal_private_cards(players)
+        deck.deal_community(3)
+        return deck
+
+    def test_leaves_global_state_untouched(self):
+        import numpy as np
+        deck = self._dealt_deck()
+        before = _global_state()
+        deck.shuffle_undealt(np.random.default_rng(0))
+        assert _global_state() == before
+
+    def test_global_path_still_consumes_global(self):
+        # The ``rng=None`` default must keep its old behaviour for the played deal.
+        deck = self._dealt_deck()
+        before = _global_state()
+        deck.shuffle_undealt()
+        assert _global_state() != before
+
+    def test_same_rng_seed_gives_same_order(self):
+        import numpy as np
+        a, b = self._dealt_deck(), self._dealt_deck()
+        b._cards = a._cards.copy()
+        a.shuffle_undealt(np.random.default_rng(5))
+        b.shuffle_undealt(np.random.default_rng(5))
+        np.testing.assert_array_equal(a._cards, b._cards)
+
+    def test_different_rng_seed_gives_different_order(self):
+        import numpy as np
+        a, b = self._dealt_deck(), self._dealt_deck()
+        b._cards = a._cards.copy()
+        a.shuffle_undealt(np.random.default_rng(5))
+        b.shuffle_undealt(np.random.default_rng(6))
+        assert not np.array_equal(a._cards, b._cards)
+
+    def test_preserves_drawn_segment_and_undealt_set(self):
+        import numpy as np
+        deck = self._dealt_deck()
+        drawn_before = deck._cards[: deck._idx].copy()
+        undealt_before = set(int(c) for c in deck.remaining)
+        deck.shuffle_undealt(np.random.default_rng(1))
+        np.testing.assert_array_equal(deck._cards[: deck._idx], drawn_before)
+        assert set(int(c) for c in deck.remaining) == undealt_before

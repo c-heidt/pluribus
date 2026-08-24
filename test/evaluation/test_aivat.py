@@ -17,6 +17,7 @@ Three levels, mirroring the doc's "budget the effort in the acceptance test":
 All fast: small deck, heads-up, tiny solver budget — no ``slow`` / ``requires_lut``.
 """
 
+import contextlib
 import math
 from types import SimpleNamespace
 
@@ -137,17 +138,6 @@ class TestAccumulatorArithmetic:
         )
         # chance_term = 100 − 60 = 40 → aivat = 100 − 0 − 40 = 60 (the exact average).
         assert math.isclose(val, 60.0)
-
-    def test_preflop_allin_skips_expensive_runout(self):
-        # A pre-flop all-in (board_len=0 → 5 cards to come) must NOT sample boards:
-        # runout_equity is never called; the hand keeps only its action corrections.
-        class _Boom(_FakeTerminal):
-            def runout_equity(self, *, rng=None, cap=5000):
-                raise AssertionError("runout_equity must not run for a preflop all-in")
-
-        acc = AivatAccumulator(0, _FakeValue({}), np.random.default_rng(0))
-        val = acc.finalize(_Boom({0: 100.0}, decision_free=True, board_len=0))
-        assert math.isclose(val, 100.0)         # no chance term applied
 
     def test_preflop_allin_skips_expensive_runout(self):
         # A pre-flop all-in (board_len=0 → 5 cards to come) must NOT call the
@@ -301,8 +291,9 @@ class TestAcceptance:
         assert all(r[1] is not None for r in on)         # populated when on
 
     def test_aivat_is_passive_on_the_played_hand(self, tmp_path):
-        # The RNG-isolation guard (_preserve_global_random) must leave the played
-        # hand untouched: the raw hero_chips_delta is identical with AIVAT on or off.
+        # RNG isolation, OUTWARD direction: turning AIVAT on must not perturb the
+        # deal / hero / opponent sampling, so the raw hero_chips_delta is identical
+        # with AIVAT on or off.
         off = _run(tmp_path, aivat=False, run_id="P0", n=20, seed=21)
         on = _run(tmp_path, aivat=True, run_id="P1", n=20, seed=21)
         assert [r[2] for r in off] == [r[2] for r in on]
@@ -329,3 +320,216 @@ def test_aivat_max_runout_cards_default_unchanged():
 
     acc5 = AivatAccumulator(0, object(), np.random.default_rng(0), max_runout_cards=5)
     assert acc5._cheap_runout(_T()) is True                 # covered when raised
+
+
+# --------------------------------------------------------------------------- #
+# RNG isolation, INWARD direction — AIVAT must not inherit anyone else's stream
+# --------------------------------------------------------------------------- #
+
+def _global_state():
+    """Hashable snapshot of the global MT19937 state (key *and* position)."""
+    st = np.random.get_state()
+    return (st[0], st[1].tobytes(), st[2], st[3], st[4])
+
+
+@contextlib.contextmanager
+def _corrected_nodes():
+    """Record, per hand, the AIVAT-visible inputs at every corrected node.
+
+    Each entry is ``(seat, action, legal, probs, live_belief, folded_belief)`` —
+    **every** input the correction is a function of.  Equal chip deltas is not a
+    substitute for this key (two different lines can net the same chips, so it
+    dilutes the sample with coincidences), and neither is equal *play*: two arms
+    can sample the same action from different strategies.
+
+    All four non-action components are genuinely arm-dependent, and legitimately so:
+
+    - ``probs`` is the played σ, so a different iteration budget gives a different
+      control-variate baseline ``Σ π(a)·v(a)`` at the very same node;
+    - the beliefs come from ``hero.tracker``, whose boundary update replays buffered
+      actions under *the last search's* average policy
+      (``SearchAgent._apply_boundary_belief_update``), so different budgets hold
+      different posteriors.
+
+    None of that is an RNG leak — it is the control variate honestly differing
+    between arms.  What the RNG fix guarantees, and what these tests gate, is that
+    once every one of these inputs agrees, ``aivat_value`` agrees *exactly*.
+
+    A self-restoring context manager rather than a ``monkeypatch`` helper: two arms
+    are recorded in one test, and a second ``monkeypatch.setattr`` would wrap the
+    first arm's patch instead of the original — both recorders would then fire and
+    the two arms' sequences would cross-contaminate.
+    """
+    from evaluation.aivat import AivatAccumulator
+    hands, cur = [], []
+    orig_correct = AivatAccumulator.correct_action
+    orig_finalize = AivatAccumulator.finalize
+
+    def _digest(snapshot):
+        return tuple(sorted(
+            (int(seat), np.asarray(w, dtype=np.float64).tobytes())
+            for seat, w in snapshot.items()
+        ))
+
+    def correct(self, env_before, seat, action, legal, probs):
+        tracker = getattr(self._v._hero, "tracker", None)
+        cur.append((
+            int(seat), action, tuple(legal),
+            tuple(round(float(p), 12) for p in probs),
+            _digest(tracker.snapshot()) if tracker is not None else None,
+            _digest(tracker.folded_snapshot()) if tracker is not None else None,
+        ))
+        return orig_correct(self, env_before, seat, action, legal, probs)
+
+    def finalize(self, terminal_env):
+        hands.append(tuple(cur))
+        cur.clear()
+        return orig_finalize(self, terminal_env)
+
+    AivatAccumulator.correct_action = correct
+    AivatAccumulator.finalize = finalize
+    try:
+        yield hands
+    finally:
+        AivatAccumulator.correct_action = orig_correct
+        AivatAccumulator.finalize = orig_finalize
+
+
+class TestRngIsolation:
+
+    def test_consumes_no_global_randomness(self, tmp_path):
+        """AIVAT owns its streams outright — it must not read the global one at all.
+
+        Stronger than passivity: snapshot-and-restore would also leave the global
+        state equal, but would still have made AIVAT's own draws depend on whatever
+        the hero's solver left behind.  This asserts the value function never
+        touches the stream in the first place.
+        """
+        env, hero = _hero_on_flop(seed=5)
+        legal = [a for a in env.legal_actions if a is not None]
+        vf = LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1),
+                       n_hole_samples=3)
+        before = _global_state()
+        vf.child_values(env, legal)
+        assert _global_state() == before
+
+    def test_value_is_independent_of_global_stream_position(self):
+        """An unrelated consumer of the global stream must not move v."""
+        env, hero = _hero_on_flop(seed=5)
+        legal = [a for a in env.legal_actions if a is not None]
+
+        def once():
+            return LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1),
+                             n_hole_samples=3).child_values(env, legal)
+
+        np.random.seed(1)
+        a = once()
+        np.random.seed(2)
+        np.random.random(53)                       # burn an arbitrary amount
+        b = once()
+        assert a == b
+
+    def test_value_is_independent_of_solver_consumption(self):
+        """**The regression test for the pairing defect.**
+
+        The hero's solver burns an arm-dependent amount of randomness — a DBR solve,
+        an OX solve and a vanilla solve differ, and a skipped solve burns none.  When
+        the value function shared that stream, two arms scored an identically-played
+        hand differently, so ``aivat_value`` could not cancel in the CRN-paired Δ and
+        the estimator injected arm-specific noise into the headline.
+        """
+        env, hero = _hero_on_flop(seed=5)
+        legal = [a for a in env.legal_actions if a is not None]
+
+        def once():
+            return LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1),
+                             n_hole_samples=3).child_values(env, legal)
+
+        a = once()
+        hero._solve_rng.random(4096)               # a much heavier solve
+        np.random.random(77)                       # and the traffic it used to cause
+        b = once()
+        assert a == b
+
+    def test_board_stream_is_separate_from_sampling_stream(self):
+        _env, hero = _hero_on_flop(seed=5)
+        vf = LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1))
+        assert vf._board_rng is not vf._rng
+        assert [float(vf._rng.random()) for _ in range(8)] != \
+               [float(vf._board_rng.random()) for _ in range(8)]
+
+    def test_deriving_board_stream_leaves_sampling_stream_untouched(self):
+        """Spawned, not drawn: adding the board split must not change the belief
+        sampler's draws."""
+        _env, hero = _hero_on_flop(seed=5)
+        vf = LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1))
+        baseline = np.random.default_rng(1)
+        assert [float(vf._rng.random()) for _ in range(8)] == \
+               [float(baseline.random()) for _ in range(8)]
+
+
+class TestCrnPairing:
+    """AIVAT must STACK with CRN, not erode it (evaluation.md §10.1).
+
+    The evaluation's headline is a paired Δ over arms sharing a deck seed.  Where
+    two arms see an identical deal, the raw metric contributes exactly zero to that
+    difference; ``aivat_value`` has to do the same, or the estimator injects
+    arm-specific noise straight into the statistic it is meant to sharpen.
+
+    "Identical" here means identical *AIVAT inputs*: the corrected-node sequence,
+    the played σ at each node, and the belief ``v`` integrates over (see
+    :func:`_corrected_nodes`).  Equal play alone is not enough — two arms can sample
+    the same action from different strategies, and their trackers can hold different
+    posteriors, both of which legitimately change the control variate without any
+    RNG being involved.  Making the correction cancel on *those* deals too would
+    need an arm-INDEPENDENT value function, which is a separate design decision and
+    is what still caps the pairing benefit; it is not an RNG fix.
+    """
+
+    def _arm(self, tmp_path, run_id, iters, n=60, seed=31):
+        import dataclasses
+        session = _stub_session(run_id=run_id, run_seed=seed, n_players=2,
+                                starting_stack=400,
+                                blueprint=_NonUniformPolicy())
+        session.solver_cfg = dataclasses.replace(session.solver_cfg,
+                                                 max_iterations=iters)
+        session.config.aivat = True
+        session.config.aivat_hole_samples = 3
+        log = ExperimentLog.open(tmp_path / f"{run_id}.sqlite")
+        try:
+            with _corrected_nodes() as nodes:
+                run_evaluation(log=log, session=session, max_hands=n)
+            rows = log._con.execute(
+                "SELECT hand_index, aivat_value, hero_chips_delta FROM games "
+                "ORDER BY hand_index").fetchall()
+        finally:
+            log.close()
+        assert len(nodes) == len(rows), "recorder/rows misaligned"
+        return {r[0]: (r[1], r[2], nodes[i]) for i, r in enumerate(rows)}
+
+    def test_identical_inputs_give_identical_aivat_value(self, tmp_path):
+        a = self._arm(tmp_path, "CRN_A", iters=4)
+        b = self._arm(tmp_path, "CRN_B", iters=40)
+        paired = [(a[k], b[k]) for k in sorted(set(a) & set(b))]
+        same = [(x, y) for x, y in paired if x[2] == y[2]]
+        assert len(same) >= 5, (
+            f"only {len(same)} deals with identical AIVAT inputs — too few to "
+            "gate on; raise n or lower the arms' divergence"
+        )
+        for x, y in same:
+            assert x[1] == y[1]                    # raw delta agrees (sanity)
+            assert x[0] == pytest.approx(y[0], abs=1e-9), (
+                "aivat_value differs between arms despite identical inputs — the "
+                "value function is inheriting arm-dependent randomness, which "
+                "breaks the CRN pairing the paired Δ relies on"
+            )
+
+    def test_cancels_exactly_in_the_paired_difference(self, tmp_path):
+        """The consequence: those deals contribute exactly 0 to the paired Δ,
+        matching what the raw metric contributes."""
+        a = self._arm(tmp_path, "CRN_C", iters=4)
+        b = self._arm(tmp_path, "CRN_D", iters=40)
+        deltas = [b[k][0] - a[k][0]
+                  for k in sorted(set(a) & set(b)) if a[k][2] == b[k][2]]
+        assert deltas
+        assert max(abs(d) for d in deltas) < 1e-9

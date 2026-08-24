@@ -60,9 +60,32 @@ the action was sampled from, and AIVAT corrects the action *given the policy*.
 **Cost.**  All of this lands in the *experiment* time budget, never the real-time
 search hot path (§10.2): each ``v`` call is a few belief-sampled rollouts, and it is
 evaluated at the (2–4) legal siblings of each decision.  It is gated behind an
-opt-in flag (``EvalConfig.aivat``) and driven by a dedicated RNG sub-stream so
-turning it on does not perturb the deck / hero / opponent sampling — the raw
-``hero_chips_delta`` of a hand is identical with AIVAT on or off.
+opt-in flag (``EvalConfig.aivat``).
+
+**RNG isolation — two directions, both required.**  AIVAT owns dedicated streams
+(``rng`` for beliefs + rollout actions, a spawned child for board runouts) and reads
+the global ``np.random`` nowhere.  That buys:
+
+- *outward* — turning AIVAT on does not perturb the deck / hero / opponent sampling,
+  so a hand's raw ``hero_chips_delta`` is identical with AIVAT on or off;
+- *inward* — AIVAT's own draws do not depend on how much randomness anything else
+  consumed.  This is the direction that matters for the headline: the evaluation
+  compares CRN-paired arms, and while the hero's solver burns an arm-dependent
+  amount of RNG, a value function sharing that stream would score an identically
+  played hand differently in each arm.  ``aivat_value`` is instead a pure function
+  of ``(run_seed, hand_index)`` and the played line, so it cancels exactly in the
+  paired Δ and AIVAT *stacks* with CRN (evaluation.md §10.1) instead of eroding it.
+
+Passivity used to be enforced by snapshot-and-restore around the global stream
+(:func:`_preserve_global_random`, kept as a backstop); that delivered the outward
+direction only, and the missing inward one is why the first AIVAT run showed no
+variance reduction and inflated the DBR headline (evaluation.md §10.2).
+
+A residual, *legitimate* arm-dependence remains and is not an RNG matter: ``v``
+integrates over ``hero.tracker`` (updated under the last search's average policy)
+and ``π`` is the played σ, so arms at different budgets still compute different —
+still unbiased — corrections.  Making those cancel too needs an arm-independent
+``v``, which is a separate design decision.
 """
 
 from __future__ import annotations
@@ -75,6 +98,7 @@ import numpy as np
 
 from environment.poker_env import PokerEnv
 from poker_ai.search.leaf import LeafConfig, continuation_value
+from poker_ai.search.rng import spawn_one
 
 logger = logging.getLogger(__name__)
 
@@ -91,15 +115,20 @@ _MAX_RUNOUT_CARDS = 2
 def _preserve_global_random():
     """Run a block, then restore the **global** ``np.random`` state it consumed.
 
-    The leaf value machinery reshuffles the undealt deck via
-    :meth:`Deck.shuffle_undealt`, which draws from the *global* ``np.random``
-    (chance.py) — the same stream the played hand deals its board from.  AIVAT is a
-    passive post-hoc estimator: it must not move that stream, or turning it on would
-    change the real hand's later board cards.  Snapshotting and restoring the global
-    state around each value evaluation makes AIVAT's deck reshuffling a no-op on the
-    played hand (its own ``aivat_rng`` :class:`~numpy.random.Generator` is a separate
-    object, unaffected by ``set_state``, so AIVAT's own sampling still advances
-    normally and reproducibly).
+    A **defensive backstop, not the isolation mechanism.**  AIVAT draws every
+    random number it needs from its own streams (``self._rng`` for beliefs and
+    rollout actions, ``self._board_rng`` for board runouts), so in the normal case
+    this manager sees an unchanged state and restores a no-op.  It stays because
+    passivity — the played hand's ``hero_chips_delta`` being bit-identical with
+    AIVAT on or off — is a hard guarantee that should not depend on every engine
+    path *below* the value function continuing to honour its ``rng`` argument.
+
+    Restoring the global state was previously how AIVAT stayed passive, but it
+    never made AIVAT's own draws *independent* of the global stream: the value
+    function still consumed whatever state the hero's solver had left behind, so
+    two arms playing an identical hand drew different boards and the evaluation's
+    CRN pairing was destroyed.  Owning the streams outright is what fixes that;
+    see :mod:`poker_ai.search.rng`.
     """
     state = np.random.get_state()
     try:
@@ -111,18 +140,24 @@ def _preserve_global_random():
 class _LeafCtx:
     """Minimal ``SubgameContext`` stand-in for :func:`continuation_value`.
 
-    ``continuation_value`` reads only ``ctx.leaf`` (the fleet + rollout knobs) and
-    ``ctx.rng`` (the rollout action-sampling source) — never the ranges / board mask
-    — so the value function passes this lightweight duck-typed carrier instead of
-    building a full :class:`SubgameContext` (which would need ranges we integrate
-    over ourselves).
+    ``continuation_value`` reads only ``ctx.leaf`` (the fleet + rollout knobs),
+    ``ctx.rng`` (the rollout action-sampling source) and ``ctx.board_rng`` (the
+    rollout board runout) — never the ranges / board mask — so the value function
+    passes this lightweight duck-typed carrier instead of building a full
+    :class:`SubgameContext` (which would need ranges we integrate over ourselves).
     """
 
-    __slots__ = ("leaf", "rng")
+    __slots__ = ("leaf", "rng", "board_rng")
 
-    def __init__(self, leaf: LeafConfig, rng: np.random.Generator) -> None:
+    def __init__(
+        self,
+        leaf: LeafConfig,
+        rng: np.random.Generator,
+        board_rng: np.random.Generator,
+    ) -> None:
         self.leaf = leaf
         self.rng = rng
+        self.board_rng = board_rng
 
 
 class LeafValue:
@@ -148,9 +183,18 @@ class LeafValue:
         its **fleet** (``policies``); passed straight through (``continuation_value``
         always takes exactly one rollout, so there is nothing left to override).
     rng
-        Dedicated AIVAT RNG (a distinct seed sub-stream), used for both the belief
-        hole sampling and the rollout runouts — kept separate from the hand's
-        deck / hero / opponent RNGs so AIVAT never perturbs the played hand.
+        Dedicated AIVAT RNG (a distinct seed sub-stream), used for the belief hole
+        sampling and the rollout action draws.  A second stream for the rollout
+        **board** runouts is spawned from it — split for the same reason the solver
+        splits its own (a board draw interleaved into the sampling stream desyncs
+        the sampling trajectory), and spawned rather than drawn from so ``rng``'s
+        byte-stream is unchanged by the split.
+
+        Both streams are AIVAT's alone.  Nothing here reads the global
+        ``np.random``, which belongs to the played hand's deal: that independence
+        is what makes ``aivat_value`` a pure function of ``(run_seed, hand_index)``
+        and the played line, so two CRN-paired arms that play a hand identically
+        produce an identical correction and it cancels exactly in the paired Δ.
     n_hole_samples
         Number of joint hole draws averaged per ``v`` evaluation.
     """
@@ -165,6 +209,7 @@ class LeafValue:
     ) -> None:
         self._hero = hero
         self._rng = rng
+        self._board_rng = spawn_one(rng)
         self._m = int(n_hole_samples)
         self._leaf = leaf_cfg
 
@@ -185,11 +230,11 @@ class LeafValue:
         n_players = env_before.n_players
         profile = {s: "none" for s in range(n_players)}
         m = max(self._m, 1)
-        ctx = _LeafCtx(self._leaf, self._rng)
+        ctx = _LeafCtx(self._leaf, self._rng, self._board_rng)
         with _preserve_global_random():
             for _ in range(m):
                 holes = self._sample_joint(env_before)
-                base = env_before.with_hole_cards(holes)
+                base = env_before.with_hole_cards(holes, rng=self._board_rng)
                 for a in legal:
                     tok = base.step_in_place(a)
                     v = continuation_value(base, profile, ctx)

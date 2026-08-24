@@ -161,14 +161,28 @@ class Deck:
             self._cards[p_d] = self._cards[p_a]
             self._cards[p_a] = tmp
 
-    def shuffle_undealt(self) -> None:
+    def shuffle_undealt(self, rng=None) -> None:
         """Shuffle the undealt segment in place (positions ``>= _idx``).
 
         Drawn segment (``< _idx``) is untouched.  Called by
         :meth:`PokerEnv.with_hole_cards` after :meth:`replace_drawn`
         so the next community deal samples uniformly over the
         remaining cards instead of preferring the specific positions
-        that received displaced cards from the swap.  Uses the
-        global numpy RNG, matching the construction-time shuffle.
+        that received displaced cards from the swap.
+
+        Parameters
+        ----------
+        rng : numpy.random.Generator, optional
+            Stream to shuffle from.  **Every off-game caller should pass
+            one.**  Only the played hand's own deal belongs on the global
+            stream; a hypothetical re-deal (a search leaf rollout, an AIVAT
+            value evaluation) that draws from the global RNG makes its own
+            randomness depend on how much *other* work consumed that stream —
+            see :mod:`poker_ai.search.rng`.  ``None`` keeps the global
+            ``np.random`` draw, matching the construction-time shuffle.
         """
-        np.random.shuffle(self._cards[self._idx:])
+        segment = self._cards[self._idx:]
+        if rng is None:
+            np.random.shuffle(segment)
+        else:
+            rng.shuffle(segment)

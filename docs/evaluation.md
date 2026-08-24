@@ -895,6 +895,10 @@ locks it:
   and this **stacks multiplicatively with AIVAT** (§10.2), which further corrects
   the residual opponent-action variance after the tree diverges. (`pairing_id`
   remains the *within*-run seat-rotation lever; this is the *across*-run one.)
+  The stacking is **conditional on AIVAT's RNG isolation** (§10.2): a value function
+  that shares a stream with anything arm-dependent scores an identically-played deal
+  differently per arm, which turns AIVAT into a *source* of paired-Δ noise rather
+  than a reducer of it. Gated by `test_aivat.py::TestCrnPairing`.
 - **Fixed `max_hands`, not a time budget** (see the loop note above), so every
   condition contains the same `hand_index` set to pair against. Each condition is
   its own `run_id`; a `condition` label column on `games` (e.g. `vanilla|DBR|blueprint_only`,
@@ -1008,12 +1012,27 @@ uses cheap sequential-with-removal rather than the exact conditioned joint. **Th
 information-leak rule** (the main correctness trap): `v` integrates only over the
 *observer's* belief and never reads an opponent's concrete hole; `π` at an opponent
 node may condition on that opponent's own hole (it is exactly the distribution the
-action was sampled from). AIVAT is **passive** — its value evaluations reshuffle the
-undealt deck via the *global* `np.random` (as the search does), so the module
-snapshots and restores that global state around each evaluation, leaving the played
-hand's deck stream untouched; a hand's raw `hero_chips_delta` is byte-identical with
-AIVAT on or off, and AIVAT runs on its own RNG sub-stream (a 5th `derive_seeds`
-child). Gated behind the opt-in `EvalConfig.aivat` / `--aivat` flag (extra per-hand
+action was sampled from).
+
+**RNG isolation** (see [poker_ai/search/rng.py](../poker_ai/search/rng.py)) — AIVAT
+owns its randomness in *both* directions. It runs on its own sub-stream (a 5th
+`derive_seeds` child) plus a spawned board-runout stream, and reads the global
+`np.random` nowhere; the global stream belongs to the played hand's deal alone.
+Outward, that keeps AIVAT **passive**: a hand's raw `hero_chips_delta` is
+byte-identical with AIVAT on or off. Inward — the direction that matters for the
+headline — it makes `aivat_value` a pure function of `(run_seed, hand_index)` and
+the played line, so it **stacks** with the §10.1 CRN pairing instead of eroding it.
+Earlier the value function reshuffled the undealt deck off the global stream and the
+module merely snapshot-and-restored it: that gave the outward guarantee only, and
+because the hero's solver consumes the global stream by an *arm-dependent* amount,
+two arms playing an identical hand drew different rollout boards. The resulting
+arm-specific noise landed directly in the paired Δ, which is why the first AIVAT run
+showed no variance reduction and inflated the DBR headline. Note that a residual,
+*legitimate* arm-dependence remains: `v` integrates over `hero.tracker`, whose
+boundary update replays under the last search's average policy, and `π` is the
+played σ — so arms at different budgets still compute different (still unbiased)
+corrections. Making those cancel too needs an arm-independent `v`, a separate
+decision. Gated behind the opt-in `EvalConfig.aivat` / `--aivat` flag (extra per-hand
 cost, in the experiment budget, off the real-time search hot path). The
 **acceptance test** ([test/evaluation/test_aivat.py](../test/evaluation/test_aivat.py))
 gates the §10.2 property — paired `mean(aivat) ≈ mean(hero_chips_delta)` within CI
