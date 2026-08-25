@@ -215,10 +215,10 @@ class EvalConfig:
     # AIVAT variance-reduced strength estimate (§10.2, step 9).  Off by default —
     # it adds per-hand cost (in the experiment budget, off the search hot path) and
     # is driven by a dedicated RNG sub-stream, so a hand's raw ``hero_chips_delta``
-    # is identical whether AIVAT is on or off.  ``aivat_hole_samples`` is the number
+    # is identical whether AIVAT is on or off.  ``aivat_rollouts`` is the number
     # of belief hole-draws averaged per value-function evaluation.
     aivat: bool = False
-    aivat_hole_samples: int = 6
+    aivat_rollouts: int = 6
 
     def fingerprint_table_policy(self) -> Dict[str, object]:
         """The table-composition + arm identity folded into ``config_fingerprint`` (§6).
@@ -1064,7 +1064,7 @@ def _play_and_log_one(
             aivat_rng = np.random.default_rng(aivat_ss)
             value_fn = LeafValue(
                 hero, session.solver_cfg.leaf, aivat_rng,
-                n_hole_samples=cfg.aivat_hole_samples,
+                n_rollouts=cfg.aivat_rollouts,
             )
             aivat = AivatAccumulator(hero_seat, value_fn, aivat_rng)
 
@@ -1424,11 +1424,11 @@ def _cli():
         "per-hand cost (experiment budget); the strength summary auto-switches to it.",
     )
     @click.option(
-        "--aivat-hole-samples",
+        "--aivat-rollouts",
         default=6,
         type=int,
         show_default=True,
-        help="Belief hole-draws averaged per AIVAT value-function evaluation.",
+        help="Baseline rollouts averaged per AIVAT value-function evaluation.",
     )
     @click.option(
         "--condition",
@@ -1558,7 +1558,7 @@ def _cli():
             sync_interval_hands=opts["sync_interval_hands"],
             sync_interval_minutes=opts["sync_interval_minutes"],
             aivat=opts["aivat"],
-            aivat_hole_samples=opts["aivat_hole_samples"],
+            aivat_rollouts=opts["aivat_rollouts"],
         )
         db_path = Path(opts["db_path"])
         db_path.parent.mkdir(parents=True, exist_ok=True)

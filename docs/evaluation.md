@@ -956,11 +956,22 @@ mean. Corrections are taken at:
 - **every chance node** (hole deal, board cards) — the MIVAT term `v(realized) −
   Σ_c P(c)·v(child_c)`, with `P` range-aware (card removal).
 
-**Value function `v`.** Reuse the search's own value machinery — the solved subgame's
-root/leaf values ([leaf.py](../poker_ai/search/leaf.py)) give a public-state value
-under the current ranges. Any consistent `v` is unbiased; pick the best cheap one at
-build time (candidate: the blueprint's expected value / rollout equity at the public
-state given ranges). Better `v` ⇒ more variance reduction, never a correctness risk.
+**Value function `v`.** As in the AIVAT paper, `v(h) = u^σ(h)`: the expected value of
+history `h` under a fixed baseline strategy profile `σ` (here the all-blueprint
+continuation fleet), evaluated at the hand's **actual** holes and Monte-Carlo'd by a
+few rollouts through [leaf.py](../poker_ai/search/leaf.py). Any consistent `v` is
+unbiased; better `v` ⇒ more variance reduction, never a correctness risk.
+
+Reading the true holes is **not** an information leak. That rule constrains the
+*agent* — which chooses actions, and would be cheating — not an offline estimator,
+which only scores a hand after the fact. Unbiasedness does not depend on it either:
+conditioned on the full history, the sampled action came from `π` and `v` is a fixed
+function of the resulting state, so `E[v(child_A)] = Σ_a π(a)·v(child_a)` whatever `v`
+reads. Integrating `v` over the hero's *belief* instead (the earlier implementation)
+was a deviation that bought nothing and cost twice — belief-sampling noise on top of
+rollout noise, and an `aivat_value` that depended on the arm under test, since two
+methods hold different posteriors once their searches diverge and the correction then
+stops cancelling in the CRN-paired Δ.
 
 **Computed online, stored as one scalar.** Accumulate corrections during the hand,
 while the env, ranges, and values are live, and store only `aivat_value` — no

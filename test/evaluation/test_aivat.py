@@ -5,9 +5,9 @@ Three levels, mirroring the doc's "budget the effort in the acceptance test":
 - **Deterministic arithmetic** — the :class:`AivatAccumulator` term / finalize sign
   against a fake value function, so the control-variate algebra
   (``u(z) − Σ(v(sampled) − Σπ·v(a))`` and the all-in runout term) is pinned exactly.
-- **Belief / no-leak** — :meth:`LeafValue._sample_joint` draws opponent holes only
-  from the tracked belief, never the opponent's revealed cards (the #1 correctness
-  trap).
+- **Baseline value function** — ``v(h)`` is the AIVAT paper's ``u^σ``: the baseline
+  value of the TRUE history, evaluated at the actual holes (an offline estimator may
+  read them; the no-leak rule constrains the agent, not the evaluator).
 - **Statistical acceptance** — a full stub run with AIVAT on gates the two
   properties §10.2 specifies: ``mean(aivat) ≈ mean(hero_chips_delta)`` (unbiased,
   paired CI) and ``var(aivat) ≪ var(hero_chips_delta)`` (the payoff, and the
@@ -19,7 +19,6 @@ All fast: small deck, heads-up, tiny solver budget — no ``slow`` / ``requires_
 
 import contextlib
 import math
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -152,7 +151,7 @@ class TestAccumulatorArithmetic:
 
 
 # --------------------------------------------------------------------------- #
-# Belief / no-leak (LeafValue._sample_joint)
+# Baseline value function (LeafValue.child_values)
 # --------------------------------------------------------------------------- #
 
 def _hero_on_flop(seed=0, low=11, high=14, stacks=(300, 300)):
@@ -167,19 +166,81 @@ def _hero_on_flop(seed=0, low=11, high=14, stacks=(300, 300)):
     return env, hero
 
 
-class TestBeliefSampling:
+class TestBaselineValueUsesActualHoles:
+    """``v(h)`` is the paper's ``u^σ``: the baseline value of the TRUE history.
 
-    def test_sampler_draws_only_from_belief_support(self):
-        # Force the opponent's belief onto a single board-compatible combo; every
-        # sampled opponent hole must be that combo — proving the sampler reads the
-        # belief, never the opponent's actual (revealed) cards (no information leak).
+    An earlier version integrated ``v`` over the tracker's belief, on the reasoning
+    that reading an opponent's hole would be an information leak.  That rule governs
+    the *agent* (which chooses actions) and not an offline estimator (which does
+    not); unbiasedness never depended on it, and paying for it cost belief-sampling
+    noise plus an arm-dependent ``v``.  These pin the paper-faithful behaviour.
+    """
+
+    def test_uses_the_real_holes_not_a_belief_draw(self):
+        # Collapse the tracker's belief onto a single combo the opponent does NOT
+        # hold.  If v still consulted the belief, the rollout would be handed that
+        # combo; it must be handed the opponent's actual cards instead.
+        env, hero = _hero_on_flop(seed=3)
+        opp = next(s for s in hero.tracker.snapshot() if s != hero.my_seat)
+        actual = tuple(int(c) for c in env.players[opp].cards)
+        w = hero.tracker._ranges[opp]
+        board_ok = _board_compatible(env)
+        my = set(hero.my_hole)
+        cc = env.combo_cards
+        decoy_i = next(
+            i for i in np.nonzero(w)[0]
+            if board_ok[i] and not (my & {int(cc[i, 0]), int(cc[i, 1])})
+            and {int(cc[i, 0]), int(cc[i, 1])} != set(actual)
+        )
+        w[:] = 0.0
+        w[decoy_i] = 1.0
+        decoy = (int(cc[decoy_i, 0]), int(cc[decoy_i, 1]))
+
+        seen = []
+        import evaluation.aivat as aivat_mod
+        original = aivat_mod.continuation_value
+
+        def spy(frontier_env, profile, ctx):
+            seen.append(tuple(int(c) for c in frontier_env.players[opp].cards))
+            return original(frontier_env, profile, ctx)
+
+        aivat_mod.continuation_value = spy
+        try:
+            legal = [a for a in env.legal_actions if a is not None]
+            LeafValue(hero, hero._cfg.leaf, np.random.default_rng(0),
+                      n_rollouts=3).child_values(env, legal)
+        finally:
+            aivat_mod.continuation_value = original
+
+        assert seen
+        assert all(h == actual for h in seen), (
+            f"rollouts saw {set(seen)}; expected the opponent's real hole {actual}"
+        )
+        assert all(set(h) != set(decoy) for h in seen), "v consulted the belief"
+
+    def test_value_is_independent_of_the_belief(self):
+        """The property that makes ``v`` arm-independent: two heroes holding
+        different posteriors over the same deal must score the node identically."""
+        env, hero = _hero_on_flop(seed=5)
+        legal = [a for a in env.legal_actions if a is not None]
+        before = LeafValue(hero, hero._cfg.leaf, np.random.default_rng(4),
+                           n_rollouts=3).child_values(env, legal)
+        opp = next(s for s in hero.tracker.snapshot() if s != hero.my_seat)
+        w = hero.tracker._ranges[opp]
+        w[:] = np.random.default_rng(0).random(w.shape)      # scramble the belief
+        after = LeafValue(hero, hero._cfg.leaf, np.random.default_rng(4),
+                          n_rollouts=3).child_values(env, legal)
+        assert before == after
+
+    def test_legacy_belief_sampler_still_serves_calibrate(self):
+        # ``_sample_joint`` is no longer part of the estimator but calibrate.py
+        # still uses it for belief-drawn worlds; keep it working.
         env, hero = _hero_on_flop(seed=3)
         opp = next(s for s in hero.tracker.snapshot() if s != hero.my_seat)
         w = hero.tracker._ranges[opp]
         board_ok = _board_compatible(env)
         my = set(hero.my_hole)
         cc = env.combo_cards
-        # A nonzero, board-compatible combo disjoint from the hero's known hole.
         idx = next(
             i for i in np.nonzero(w)[0]
             if board_ok[i] and not (my & {int(cc[i, 0]), int(cc[i, 1])})
@@ -188,58 +249,23 @@ class TestBeliefSampling:
         w[idx] = 1.0
         target = (int(cc[idx, 0]), int(cc[idx, 1]))
 
-        vf = LeafValue(hero, hero._cfg.leaf, np.random.default_rng(0), n_hole_samples=1)
+        vf = LeafValue(hero, hero._cfg.leaf, np.random.default_rng(0), n_rollouts=1)
         for _ in range(40):
             holes = vf._sample_joint(env)
-            assert holes[hero.my_seat] == tuple(sorted(hero.my_hole)) or \
-                set(holes[hero.my_seat]) == set(hero.my_hole)   # hero = own hole
             assert holes[opp] == target                          # belief respected
 
-    def test_child_values_are_finite_per_action(self):
-        env, hero = _hero_on_flop(seed=5)
-        legal = [a for a in env.legal_actions if a is not None]
-        vf = LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1), n_hole_samples=3)
-        vals = vf.child_values(env, legal)
-        assert set(vals) == set(legal)
-        assert all(np.isfinite(v) for v in vals.values())
-
-    def test_tracker_less_hero_samples_belief_free(self):
-        # A blueprint-only / non-search hero has ``tracker is None``.  AIVAT must
-        # still draw card-disjoint holes (hero = own hole, opponents uniform over
-        # the available combos) and evaluate v end-to-end — the "make AIVAT ready
-        # for a blueprint hero" contract.
-        env = _flop_env(low=11, high=14, stacks=(300, 300), seed=7)
-        hero_seat = env.player_i
-        my_hole = tuple(sorted(int(c) for c in env.players[hero_seat].cards))
-        hero = SimpleNamespace(my_seat=hero_seat, my_hole=my_hole, tracker=None)
-        board = {int(c) for c in env.community_cards}
-        leaf = LeafConfig(policies=_policies())
-
-        vf = LeafValue(hero, leaf, np.random.default_rng(0), n_hole_samples=1)
-        for _ in range(30):
-            holes = vf._sample_joint(env)
-            flat = [c for pair in holes for c in pair]
-            assert len(set(flat)) == len(flat)               # card-disjoint
-            assert not (set(flat) & board)                    # none on the board
-            assert set(holes[hero_seat]) == set(my_hole)      # hero = own hole
-
-        legal = [a for a in env.legal_actions if a is not None]
-        vals = LeafValue(hero, leaf, np.random.default_rng(1),
-                         n_hole_samples=2).child_values(env, legal)
-        assert set(vals) == set(legal)
-        assert all(np.isfinite(v) for v in vals.values())
 
 
 # --------------------------------------------------------------------------- #
 # Statistical acceptance + plumbing (full stub run)
 # --------------------------------------------------------------------------- #
 
-def _run(tmp_path, *, aivat, run_id="A", n=120, seed=13, hole_samples=4,
+def _run(tmp_path, *, aivat, run_id="A", n=120, seed=13, rollouts=4,
          starting_stack=400, blueprint=None):
     session = _stub_session(run_id=run_id, run_seed=seed, n_players=2,
                             starting_stack=starting_stack, blueprint=blueprint)
     session.config.aivat = aivat
-    session.config.aivat_hole_samples = hole_samples
+    session.config.aivat_rollouts = rollouts
     log = ExperimentLog.open(tmp_path / f"{run_id}.sqlite")
     try:
         run_evaluation(log=log, session=session, max_hands=n)
@@ -278,7 +304,7 @@ class TestAcceptance:
         # AIVAT reduces variance only against a realistic (non-uniform) policy —
         # a uniform policy leaves the corrections uncorrelated with outcomes.
         rows = _run(tmp_path, aivat=True, n=140, seed=13,
-                    starting_stack=6000, hole_samples=12,
+                    starting_stack=6000, rollouts=12,
                     blueprint=_NonUniformPolicy())
         aiv = np.array([r[1] for r in rows], dtype=float)
         dl = np.array([r[2] for r in rows], dtype=float)
@@ -408,7 +434,7 @@ class TestRngIsolation:
         env, hero = _hero_on_flop(seed=5)
         legal = [a for a in env.legal_actions if a is not None]
         vf = LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1),
-                       n_hole_samples=3)
+                       n_rollouts=3)
         before = _global_state()
         vf.child_values(env, legal)
         assert _global_state() == before
@@ -420,7 +446,7 @@ class TestRngIsolation:
 
         def once():
             return LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1),
-                             n_hole_samples=3).child_values(env, legal)
+                             n_rollouts=3).child_values(env, legal)
 
         np.random.seed(1)
         a = once()
@@ -443,7 +469,7 @@ class TestRngIsolation:
 
         def once():
             return LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1),
-                             n_hole_samples=3).child_values(env, legal)
+                             n_rollouts=3).child_values(env, legal)
 
         a = once()
         hero._solve_rng.random(4096)               # a much heavier solve
@@ -494,7 +520,7 @@ class TestCrnPairing:
         session.solver_cfg = dataclasses.replace(session.solver_cfg,
                                                  max_iterations=iters)
         session.config.aivat = True
-        session.config.aivat_hole_samples = 3
+        session.config.aivat_rollouts = 3
         log = ExperimentLog.open(tmp_path / f"{run_id}.sqlite")
         try:
             with _corrected_nodes() as nodes:
@@ -573,31 +599,31 @@ class TestSiblingCommonRandomNumbers:
         m = 4
         seen = self._record_states(monkeypatch)
         LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1),
-                  n_hole_samples=m).child_values(env, legal)
+                  n_rollouts=m).child_values(env, legal)
 
         assert len(seen) == m * len(legal)
-        # child_values iterates samples outer, legal inner -> chunk by len(legal).
+        # child_values iterates rollouts outer, legal inner -> chunk by len(legal).
         for i in range(m):
             chunk = seen[i * len(legal):(i + 1) * len(legal)]
             assert len(set(chunk)) == 1, (
-                f"belief draw {i}: siblings were scored under different randomness "
+                f"rollout {i}: siblings were scored under different randomness "
                 f"{chunk} — the CRN rewind is not in effect"
             )
 
-    def test_different_belief_draws_use_different_randomness(self, monkeypatch):
-        """The flip side: CRN is *within* a belief draw only.
+    def test_different_rollouts_use_different_randomness(self, monkeypatch):
+        """The flip side: CRN is *within* one rollout only.
 
-        If the rewind leaked across draws, the m samples would be m copies of one
-        rollout and averaging them would buy nothing.
+        If the rewind leaked across rollouts, the m samples would be m copies of a
+        single playout and averaging them would buy nothing.
         """
         env, hero = _hero_on_flop(seed=5)
         legal = [a for a in env.legal_actions if a is not None]
         m = 4
         seen = self._record_states(monkeypatch)
         LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1),
-                  n_hole_samples=m).child_values(env, legal)
-        per_draw = [seen[i * len(legal)] for i in range(m)]
-        assert len(set(per_draw)) == m, "belief draws reused the same randomness"
+                  n_rollouts=m).child_values(env, legal)
+        per_rollout = [seen[i * len(legal)] for i in range(m)]
+        assert len(set(per_rollout)) == m, "rollouts reused the same randomness"
 
     def test_values_still_differ_between_actions(self):
         """CRN must not collapse the siblings onto one value.
@@ -608,5 +634,5 @@ class TestSiblingCommonRandomNumbers:
         env, hero = _hero_on_flop(seed=5)
         legal = [a for a in env.legal_actions if a is not None]
         vals = LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1),
-                         n_hole_samples=6).child_values(env, legal)
+                         n_rollouts=6).child_values(env, legal)
         assert len(set(vals.values())) > 1, f"all siblings scored identically: {vals}"

@@ -529,7 +529,7 @@ def crn_root_value(res, root_env, ctx, *, worlds: int,
     hero_seat = int(ctx.my_seat)
     root_street = int(ctx.street_at_root)
     eval_rng = np.random.default_rng(int(seed))
-    lv = LeafValue(_CalibHero(ctx), ctx.leaf, eval_rng, n_hole_samples=1)
+    lv = LeafValue(_CalibHero(ctx), ctx.leaf, eval_rng, n_rollouts=1)
     bp = _blueprint_none(ctx)
     n = max(1, int(worlds))
     # Draw every world's opponent holes + board seed FIRST, off the shared eval stream,

@@ -41,29 +41,40 @@ shrinks variance, it can never skew the mean.  Two families of term are taken:
   all-in runout, which ``runout_equity`` already integrates, is corrected.  This is
   documented in evaluation.md §10.2 as a bounded scope.)
 
-**The value function ``v``.**  Reuses the search's own leaf machinery
-(:func:`poker_ai.search.leaf.continuation_value`) under a fixed all-blueprint
-continuation profile: it materialises a card-disjoint joint hole assignment sampled
-from the tracker's belief (the hero's own seat filled with its *known* hole), then
-takes the mean hero-seat continuation value over a handful of such samples.  Any
-consistent ``v`` is unbiased, so the internal hole sampling need not be the exact
-conditioned joint — sequential-with-removal is used for robustness.
+**The value function ``v``.**  As in the AIVAT paper: ``v(h)`` is the expected value
+of history ``h`` under a fixed baseline strategy profile, evaluated at the hand's
+**actual** holes.  Implemented by reusing the search's own leaf machinery
+(:func:`poker_ai.search.leaf.continuation_value`) under an all-blueprint continuation
+profile — that profile is the baseline σ — and averaging a handful of rollouts,
+because the exact expectation is far too large to enumerate here.
 
-**Information-leak rule (the #1 correctness trap).**  ``v`` integrates over the
-*observer's* belief and must never read an opponent's actual concrete hole; the
-belief-sampled holes come from ``tracker.snapshot()`` / ``folded_snapshot()``,
-which already exclude the board and the hero's hole (card removal).  The hero seat
-is filled with its own hole (known information, not a leak).  ``π`` at an opponent
-node *may* condition on that opponent's own hole — that is exactly the distribution
-the action was sampled from, and AIVAT corrects the action *given the policy*.
+**Why the actual holes, and why that is not an information leak.**  The estimator is
+**offline**: it never chooses an action, so nothing it reads can make the bot cheat
+or inflate the strength number.  The rule that private information must not be read
+constrains the *agent*, not the evaluator, and conflating the two costs real
+accuracy.  Unbiasedness does not depend on it either — condition on the full history
+(every player's holes included); the sampled action ``A`` is drawn from ``π`` and
+``v`` is a fixed function of the resulting state, so
+``E[v(child_A)] = Σ_a π(a)·v(child_a)`` and the term is zero-mean *whatever* ``v``
+reads.  That argument covers opponent nodes too, where ``π`` conditions on that
+opponent's own hole — exactly the distribution the action was sampled from.
+
+Reading the true holes is also what the rest of this module already does: the
+terminal runout correction integrates ``runout_equity`` over them.  An earlier
+version instead integrated ``v`` over the tracker's *belief*, which was a deviation
+from the paper that bought nothing (the unbiasedness argument above never needed it)
+and cost twice: it added belief-sampling noise on top of the rollout noise, and it
+made ``aivat_value`` depend on the arm under test — two methods hold different
+posteriors after their searches diverge, so the correction stopped cancelling in the
+CRN-paired Δ that the evaluation actually reports.
 
 **Cost.**  All of this lands in the *experiment* time budget, never the real-time
-search hot path (§10.2): each ``v`` call is a few belief-sampled rollouts, and it is
+search hot path (§10.2): each ``v`` call is a few baseline rollouts, and it is
 evaluated at the (2–4) legal siblings of each decision.  It is gated behind an
 opt-in flag (``EvalConfig.aivat``).
 
 **RNG isolation — two directions, both required.**  AIVAT owns dedicated streams
-(``rng`` for beliefs + rollout actions, a spawned child for board runouts) and reads
+(``rng`` for rollout actions, a spawned child for board runouts) and reads
 the global ``np.random`` nowhere.  That buys:
 
 - *outward* — turning AIVAT on does not perturb the deck / hero / opponent sampling,
@@ -81,11 +92,11 @@ Passivity used to be enforced by snapshot-and-restore around the global stream
 direction only, and the missing inward one is why the first AIVAT run showed no
 variance reduction and inflated the DBR headline (evaluation.md §10.2).
 
-A residual, *legitimate* arm-dependence remains and is not an RNG matter: ``v``
-integrates over ``hero.tracker`` (updated under the last search's average policy)
-and ``π`` is the played σ, so arms at different budgets still compute different —
-still unbiased — corrections.  Making those cancel too needs an arm-independent
-``v``, which is a separate design decision.
+``v`` is now arm-independent: it reads the actual holes and a fixed baseline
+profile, so two methods sharing a deal compute the *same* ``v`` at the same node.
+The only remaining arm-dependence is ``π`` itself — the played σ, which genuinely
+differs between methods — so the correction cancels in the paired Δ wherever the
+two arms' play coincides.
 """
 
 from __future__ import annotations
@@ -116,8 +127,8 @@ def _preserve_global_random():
     """Run a block, then restore the **global** ``np.random`` state it consumed.
 
     A **defensive backstop, not the isolation mechanism.**  AIVAT draws every
-    random number it needs from its own streams (``self._rng`` for beliefs and
-    rollout actions, ``self._board_rng`` for board runouts), so in the normal case
+    random number it needs from its own streams (``self._rng`` for rollout actions,
+    ``self._board_rng`` for board runouts), so in the normal case
     this manager sees an unchanged state and restores a no-op.  It stays because
     passivity — the played hand's ``hero_chips_delta`` being bit-identical with
     AIVAT on or off — is a hard guarantee that should not depend on every engine
@@ -161,30 +172,28 @@ class _LeafCtx:
 
 
 class LeafValue:
-    """Public-state value function ``v(state | belief) → hero-seat chip delta``.
+    """Baseline value function ``v(h) → hero-seat chip delta`` (AIVAT paper's ``u^σ``).
 
-    Averages :func:`continuation_value`'s hero-seat entry over
-    ``n_hole_samples`` card-disjoint joint hole draws from the current belief,
-    under a fixed all-blueprint continuation profile.  It reads the belief from the
-    live ``hero.tracker`` at call time (the tracker is stable within a betting round
-    — updated only at round boundaries — so a correction taken mid-round sees the
-    belief as of that round's start, a valid observer information set).  A hero with
-    ``tracker is None`` (a blueprint-only / non-search agent) is supported: opponent
-    holes are then drawn belief-free (uniform over available combos), still unbiased.
+    Averages :func:`continuation_value`'s hero-seat entry over ``n_rollouts``
+    playouts under a fixed all-blueprint continuation profile (the baseline σ),
+    evaluated at the hand's **actual** holes.  The average is a Monte-Carlo stand-in
+    for the exact expectation, which is too large to enumerate; more rollouts ⇒ a
+    lower-noise ``v``, never a different mean.
 
     Parameters
     ----------
     hero
-        Any agent exposing ``my_seat`` / ``my_hole`` (the known hero hole) and a
-        ``tracker`` — a :class:`~poker_ai.search.ranges.RangeTracker` supplying the
-        opponent belief, or ``None`` for a blueprint-only agent (belief-free draws).
+        Any agent exposing ``my_seat`` — the seat whose chip delta ``v`` returns.
+        (``my_hole`` / ``tracker`` are no longer read by the estimator; the belief
+        sampler :meth:`_sample_joint` still uses them and is still consumed by
+        :mod:`evaluation.calibrate`.)
     leaf_cfg
         The continuation leaf config — reuse the session's ``solver_cfg.leaf`` for
         its **fleet** (``policies``); passed straight through (``continuation_value``
         always takes exactly one rollout, so there is nothing left to override).
     rng
-        Dedicated AIVAT RNG (a distinct seed sub-stream), used for the belief hole
-        sampling and the rollout action draws.  A second stream for the rollout
+        Dedicated AIVAT RNG (a distinct seed sub-stream), used for the rollout
+        action draws.  A second stream for the rollout
         **board** runouts is spawned from it — split for the same reason the solver
         splits its own (a board draw interleaved into the sampling stream desyncs
         the sampling trajectory), and spawned rather than drawn from so ``rng``'s
@@ -195,8 +204,8 @@ class LeafValue:
         is what makes ``aivat_value`` a pure function of ``(run_seed, hand_index)``
         and the played line, so two CRN-paired arms that play a hand identically
         produce an identical correction and it cancels exactly in the paired Δ.
-    n_hole_samples
-        Number of joint hole draws averaged per ``v`` evaluation.
+    n_rollouts
+        Number of baseline playouts averaged per ``v`` evaluation.
     """
 
     def __init__(
@@ -205,12 +214,12 @@ class LeafValue:
         leaf_cfg: LeafConfig,
         rng: np.random.Generator,
         *,
-        n_hole_samples: int = 6,
+        n_rollouts: int = 6,
     ) -> None:
         self._hero = hero
         self._rng = rng
         self._board_rng = spawn_one(rng)
-        self._m = int(n_hole_samples)
+        self._m = int(n_rollouts)
         self._leaf = leaf_cfg
 
     def child_values(
@@ -218,16 +227,16 @@ class LeafValue:
     ) -> Dict[str, float]:
         """Mean hero-seat value of every ``legal`` action's child at ``env_before``.
 
-        For each of ``n_hole_samples`` belief draws, materialises the sampled holes
-        at ``env_before`` (board = the current street, so no board conflict), then
-        steps each legal action via make/undo and scores the resulting child with
-        :func:`continuation_value`.  ``env_before`` is never mutated (the sampled
-        env is a fresh ``with_hole_cards`` copy).
+        Runs ``n_rollouts`` baseline playouts at the hand's **actual** holes (the
+        paper's ``u^σ``), stepping each legal action via make/undo and scoring the
+        resulting child with :func:`continuation_value`.  ``env_before`` is never
+        mutated — each rollout works on a fresh ``with_hole_cards`` copy, which also
+        reshuffles the undealt deck so successive rollouts see different runouts.
 
         **Siblings are scored under common random numbers.**  Both streams are
-        rewound to the same state before every legal action, so within one belief
-        draw the children differ *only* by the action taken — same opponent holes,
-        same board runout, same rollout action line wherever the line is shared.
+        rewound to the same state before every legal action, so within one rollout
+        the children differ *only* by the action taken — same board runout, same
+        rollout action line wherever the line is shared.
 
         This matters because :func:`continuation_value` is a **one-rollout** estimate
         (one sampled action line on one sampled board — the solver's design, not an
@@ -250,11 +259,18 @@ class LeafValue:
         profile = {s: "none" for s in range(n_players)}
         m = max(self._m, 1)
         ctx = _LeafCtx(self._leaf, self._rng, self._board_rng)
+        # The hand's real holes — every seat, folded ones included, since ``v(h)`` is
+        # the baseline value of the true history ``h``.  Constant across rollouts, so
+        # it is hoisted out of the loop.
+        holes = [
+            tuple(int(c) for c in env_before.players[s].cards)
+            for s in range(n_players)
+        ]
         with _preserve_global_random():
             for _ in range(m):
-                # Drawn once per belief sample, BEFORE the snapshot: the holes are
-                # shared by the siblings too (they are part of what must not vary).
-                holes = self._sample_joint(env_before)
+                # Re-copy per rollout: ``with_hole_cards`` reshuffles the undealt
+                # deck off ``board_rng``, which is what makes each rollout an
+                # independent draw of the continuation.
                 base = env_before.with_hole_cards(holes, rng=self._board_rng)
                 sample_rng = self._rng.bit_generator.state
                 sample_board = self._board_rng.bit_generator.state
@@ -266,8 +282,8 @@ class LeafValue:
                     sums[a] += float(v[hero_seat])
                     base.undo(tok)
                 # Leaves both streams wherever the last sibling ended — a
-                # deterministic function of the situation, so the next belief draw
-                # and the next node stay reproducible.
+                # deterministic function of the situation, so the next rollout and
+                # the next node stay reproducible.
         return {a: sums[a] / m for a in legal}
 
     # ------------------------------------------------------------------ #
@@ -275,6 +291,13 @@ class LeafValue:
     # ------------------------------------------------------------------ #
     def _sample_joint(self, env: PokerEnv) -> List[Tuple[int, int]]:
         """One card-disjoint hole assignment for every seat (hero = its own hole).
+
+        .. note::
+           **Not used by the AIVAT estimator any more** — ``child_values`` evaluates
+           ``v`` at the hand's actual holes, as the paper does.  This belief sampler
+           is retained for :mod:`evaluation.calibrate`, which genuinely wants
+           belief-drawn opponent worlds for its CRN root-value estimate.
+
 
         The hero seat is fixed to ``hero.my_hole`` (known); every other seat is
         drawn from its tracked belief (live or fold-time), masked to the current

@@ -57,7 +57,7 @@ def _session(run_id, *, condition="vanilla", model_spec=None, aivat=False):
     session.config.search_enabled = condition != "blueprint_only"
     session.config.model_spec = model_spec
     session.config.aivat = aivat
-    session.config.aivat_hole_samples = 3
+    session.config.aivat_rollouts = 3
     return session
 
 
