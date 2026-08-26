@@ -75,6 +75,7 @@ from environment.utils import card_str
 from evaluation.aivat import AivatAccumulator, LeafValue
 from evaluation.opponents import (
     HERO_LABEL,
+    LABEL_TO_BIAS,
     OPPONENT_LABELS,
     BlueprintOpponent,
     ModelSpec,
@@ -959,11 +960,32 @@ def run_evaluation_parallel(
     Each of ``n_workers`` forked workers pulls the next ``hand_index`` from a shared
     dynamic counter (skipping the completed-set for resume), plays + logs it to its OWN
     node-local DB; the parent then merges those into ``target_db_path`` with disjoint id
-    ranges (:func:`~evaluation.sqlite_logging.merge_logs`) and syncs.  Because every hand
-    is fully determined by ``hand_index`` (deal, seats, seeds), the result is
-    **bit-reproducible regardless of ``n_workers``**, and CRN pairing across conditions
-    holds.  Dynamic pull matters: most hands fold pre-flop (no search) while a few are
-    minutes-long turn solves, so static sharding would idle cores.
+    ranges (:func:`~evaluation.sqlite_logging.merge_logs`) and syncs.  Dynamic pull
+    matters: most hands fold pre-flop (no search) while a few are minutes-long turn
+    solves, so static sharding would idle cores.
+
+    **Reproducibility — what is and is not guaranteed.**  Every hand's *inputs* are a
+    pure function of ``hand_index`` — deal, seating, and all five seed sub-streams
+    (:func:`derive_seeds`) — so nothing depends on which worker picked the hand up or
+    on what ran before it.  Whether the *outputs* then reproduce depends on the
+    solver's stop condition:
+
+    - **iteration-bound solves reproduce bit-for-bit**, for any ``n_workers`` and
+      against a sequential run.  This is the guarantee the pool is built on and the
+      one :mod:`test.evaluation.test_parallel_reproducibility` gates.
+    - **wall-capped solves do NOT** (``SolverConfig.max_wall_seconds``, logged as
+      ``decisions.stop_reason == 'wall_cap'``).  How many iterations fit in the cap
+      depends on machine load, so the same hand can be played differently on two
+      identical invocations — measured at 32/40 identical hands on a wall-bound
+      config, and the *whole batch's* wall-cap share swinging 16→42 of 55 searches
+      between two runs of one script.  CRN pairing across conditions degrades the
+      same way, since the arms then diverge for a reason unrelated to the method.
+
+    The wall cap is a backstop for a genuinely stuck solve, so hitting it *often*
+    means the iteration budget is mis-sized for the hardware, not that the run is
+    fine.  ``summarize`` flags it (``budget_bound``) once a street exceeds 40%
+    wall-cap stops; treat that flag as "these results are not reproducible", not
+    merely "searches were slow".
 
     Stop: ``max_hands`` (or ``cfg.max_hands``) as a **total** target (resume-safe), else
     the wall budget ``cfg.time_budget_hours``; ``stop_event`` (an ``mp.Event``) is polled
@@ -1062,9 +1084,18 @@ def _play_and_log_one(
         aivat = None
         if cfg.aivat:
             aivat_rng = np.random.default_rng(aivat_ss)
+            # Baseline continuation profile: the table's real composition, so the
+            # rollout continues the way these opponents actually play.  Derived
+            # from ``seat_labels``, which was drawn before the hero existed, so it
+            # is identical across arms and keeps ``v`` arm-independent.
             value_fn = LeafValue(
                 hero, session.solver_cfg.leaf, aivat_rng,
                 n_rollouts=cfg.aivat_rollouts,
+                seat_bias={
+                    s: LABEL_TO_BIAS[lbl]
+                    for s, lbl in seat_labels.items()
+                    if lbl in LABEL_TO_BIAS
+                },
             )
             aivat = AivatAccumulator(hero_seat, value_fn, aivat_rng)
 
@@ -1493,9 +1524,10 @@ def _cli():
         type=int,
         help="Number of hands to play concurrently, one per core (each hand runs one "
         "serial search).  Default (unset) = auto (cpu-1).  This is the DEFAULT execution "
-        "mode: hands are i.i.d. + seeded by index, so it is bit-reproducible vs "
-        "sequential and packs the box (most hands fold pre-flop).  Ignored under "
-        "--sequential.",
+        "mode: hands are i.i.d. + seeded by index, so it packs the box (most hands fold "
+        "pre-flop) and reproduces the sequential run bit-for-bit -- provided solves stop "
+        "on the ITERATION cap.  Wall-capped solves are load-dependent and reproduce "
+        "neither across worker counts nor across runs.  Ignored under --sequential.",
     )
     @click.option(
         "--sequential",

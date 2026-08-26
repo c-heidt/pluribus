@@ -922,6 +922,19 @@ locks it:
   its own `run_id`; a `condition` label column on `games` (e.g. `vanilla|DBR|blueprint_only`,
   with the `(p_max, τ)` cell for A) makes the paired join self-describing without a
   run_id→method side table.
+- **What reproducibility actually guarantees.** Every hand's *inputs* are a pure
+  function of `hand_index` (deal, seating, all five seed sub-streams), so results do
+  not depend on worker count or execution order. Whether the *outputs* reproduce
+  depends on how the solver stopped: **iteration-bound solves reproduce bit-for-bit**;
+  **wall-capped ones do not**, because how many iterations fit in
+  `max_wall_seconds` depends on machine load. Measured on a wall-bound config, two
+  identical invocations of one script agreed on only 32/40 hands and their wall-cap
+  share swung 16→42 of 55 searches. The same mechanism degrades CRN pairing, since
+  the arms then diverge for a reason that has nothing to do with the method under
+  test. `summarize` raises `budget_bound` once a street passes 40% wall-cap stops —
+  read that flag as "not reproducible", not just "slow", and re-run with an
+  iteration budget the hardware can actually finish.
+
 - **What cancels vs. what doesn't.** Card luck cancels fully (shared hole cards +
   board). Opponent *action* draws share a seed but desync once the hero diverges
   the tree — that residual is AIVAT's job, not CRN's; sharing the opponent-RNG

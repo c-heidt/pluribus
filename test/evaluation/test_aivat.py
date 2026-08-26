@@ -636,3 +636,87 @@ class TestSiblingCommonRandomNumbers:
         vals = LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1),
                          n_rollouts=6).child_values(env, legal)
         assert len(set(vals.values())) > 1, f"all siblings scored identically: {vals}"
+
+
+class TestBaselineProfile:
+    """σ must be the table's ACTUAL composition, not a uniform-blueprint guess.
+
+    The opponents' true policy is exactly ``blueprint.strategy(state, bias)``, so
+    passing the right bias class per seat makes the baseline continuation *match*
+    them instead of merely resembling them — a strictly better control variate.
+    The hero's own seat stays ``"none"`` on purpose: its real continuation is a
+    search result that has no policy form at arbitrary future nodes, and
+    substituting one would make ``v`` arm-dependent again.
+    """
+
+    def _profiles_seen(self, monkeypatch):
+        import evaluation.aivat as aivat_mod
+        seen = []
+        original = aivat_mod.continuation_value
+
+        def spy(frontier_env, profile, ctx):
+            seen.append(dict(profile))
+            return original(frontier_env, profile, ctx)
+
+        monkeypatch.setattr(aivat_mod, "continuation_value", spy)
+        return seen
+
+    def test_seat_bias_reaches_the_rollout(self, monkeypatch):
+        env, hero = _hero_on_flop(seed=5)
+        opp = 1 - hero.my_seat
+        legal = [a for a in env.legal_actions if a is not None]
+        seen = self._profiles_seen(monkeypatch)
+        LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1), n_rollouts=2,
+                  seat_bias={opp: "call"}).child_values(env, legal)
+        assert seen
+        assert all(p[opp] == "call" for p in seen)
+
+    def test_hero_seat_stays_unbiased(self, monkeypatch):
+        env, hero = _hero_on_flop(seed=5)
+        legal = [a for a in env.legal_actions if a is not None]
+        seen = self._profiles_seen(monkeypatch)
+        # Even if a caller wrongly supplies a bias for the hero's seat, the seat it
+        # cannot model must not silently claim a strategy it does not have.
+        LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1), n_rollouts=2,
+                  seat_bias={1 - hero.my_seat: "raise"}).child_values(env, legal)
+        assert all(p[hero.my_seat] == "none" for p in seen)
+
+    def test_defaults_to_unbiased_when_not_supplied(self, monkeypatch):
+        env, hero = _hero_on_flop(seed=5)
+        legal = [a for a in env.legal_actions if a is not None]
+        seen = self._profiles_seen(monkeypatch)
+        LeafValue(hero, hero._cfg.leaf, np.random.default_rng(1),
+                  n_rollouts=2).child_values(env, legal)
+        assert all(set(p.values()) == {"none"} for p in seen)
+
+    def test_bias_changes_the_value(self):
+        """Non-vacuity: if the profile did not reach the policy, every bias would
+        score the same and the whole change would be inert.
+
+        Needs a policy that actually *honours* ``bias`` — the shared
+        ``UniformPolicy`` fixture ignores it, so a fold-vs-raise continuation would
+        score identically there and this test would pass while proving nothing.
+        """
+        class _BiasHonouring(UniformPolicy):
+            def strategy(self, state, bias="none"):
+                la = state.legal_actions
+                if not la:
+                    return np.array([], np.float32)
+                w = np.ones(len(la), dtype=np.float64)
+                for i, a in enumerate(la):
+                    if bias == "fold" and a == "fold":
+                        w[i] = 40.0
+                    elif bias == "raise" and a in ("all_in",) or (
+                            bias == "raise" and str(a).startswith("raise")):
+                        w[i] = 40.0
+                w /= w.sum()
+                return w.astype(np.float32)
+
+        env, hero = _hero_on_flop(seed=5)
+        opp = 1 - hero.my_seat
+        legal = [a for a in env.legal_actions if a is not None]
+        leaf = LeafConfig(policies={c: _BiasHonouring()
+                                    for c in ("none", "fold", "call", "raise")})
+        mk = lambda b: LeafValue(hero, leaf, np.random.default_rng(2),
+                                 n_rollouts=8, seat_bias={opp: b})
+        assert mk("fold").child_values(env, legal) != mk("raise").child_values(env, legal)

@@ -15,6 +15,17 @@ per-hand reseed, a cached solver keyed across hands, a fork-inherited handle.  S
 a break is invisible in a serial run and shows up only as irreproducible cluster
 results, so it is pinned here rather than assumed.
 
+⚠️ **The contract is conditional, and this module gates only the half that holds.**
+Reproducibility survives the fork because no hand depends on execution order — but a
+solve stopped by ``SolverConfig.max_wall_seconds`` completes a *load-dependent*
+number of iterations, so a wall-capped run reproduces neither across worker counts
+nor across repeat runs (measured: 32/40 identical hands, with the batch's wall-cap
+share swinging 16→42 of 55 searches between two runs of one script).  The fixture
+here is deliberately iteration-bound — ``_stub_session`` solves at
+``max_iterations=4`` — and :meth:`TestWorkerCountIndependence.test_fixture_is_iteration_bound`
+asserts it, so if the fixture ever gains a binding wall cap the suite says *why*
+these tests stopped meaning anything instead of flaking on a busy machine.
+
 Hand-level determinism is the *reason* the pool can hand indices out dynamically:
 because no hand depends on which worker ran it or on what ran before it, cores can
 be filled greedily (most hands fold pre-flop; a few are long turn solves).
@@ -117,7 +128,37 @@ _N_MODELED = 9
 
 
 class TestWorkerCountIndependence:
-    """A hand's result must not depend on how many workers ran the batch."""
+    """A hand's result must not depend on how many workers ran the batch.
+
+    Valid only while the solves are iteration-bound; see the module docstring and
+    :meth:`test_fixture_is_iteration_bound`.
+    """
+
+    def test_fixture_is_iteration_bound(self, tmp_path):
+        """No solve here may stop on the wall cap.
+
+        The precondition for everything else in this class.  A wall-capped solve is
+        load-dependent, so if the fixture ever became wall-bound these tests would
+        start failing for a reason that has nothing to do with the pool — or worse,
+        pass on a fast machine and fail on a busy one.
+        """
+        path = tmp_path / "wallcheck.sqlite"
+        log = ExperimentLog.open(os.fspath(path))
+        try:
+            run_evaluation(log=log, session=_session("wallcheck"),
+                           max_hands=_N_HANDS)
+            stops = log._con.execute(
+                "SELECT stop_reason, COUNT(*) FROM decisions WHERE searched = 1 "
+                "GROUP BY stop_reason"
+            ).fetchall()
+        finally:
+            log.close()
+        by_reason = {r[0]: r[1] for r in stops}
+        assert by_reason, "no searches ran — the reproducibility tests are vacuous"
+        assert by_reason.get("wall_cap", 0) == 0, (
+            f"fixture became wall-capped ({by_reason}); a wall-bound solve is "
+            "load-dependent, so the worker-count tests below no longer test the pool"
+        )
 
     def test_parallel_matches_serial(self, tmp_path):
         serial = _serial(tmp_path, "R_serial")

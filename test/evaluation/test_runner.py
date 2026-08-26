@@ -10,6 +10,7 @@ cursor continues cleanly, seeding is reproducible, and hero position rotates.
 
 import collections
 import json
+from pathlib import Path
 import sqlite3
 
 import numpy as np
@@ -679,6 +680,37 @@ class TestSyncDue:
 # --------------------------------------------------------------------------- #
 # Real 20-card deck + LUT integration
 # --------------------------------------------------------------------------- #
+
+@pytest.mark.requires_lut
+def test_leaf_fleet_shares_the_opponents_policy_object(tmp_path):
+    """The leaf fleet and the opponents must be the SAME ``BlueprintPolicy``.
+
+    AIVAT's baseline profile σ (``LeafValue(seat_bias=...)``) reproduces an
+    opponent *exactly* only because the continuation fleet queries the very policy
+    object the opponent samples from — so the bias magnitude
+    (``BlueprintPolicy.bias_multiplier``) cannot drift between them, whatever it is
+    set to.  Split them into two objects and σ silently becomes an approximation
+    with nothing to flag it, so the sharing is pinned here rather than assumed.
+    """
+    from evaluation.runner import build_blueprint_session
+
+    bp, lut_dir = "data/2player_20cards_v2_strategy", "data/20cards_exact"
+    if not (Path(bp).exists() and Path(lut_dir).exists()):
+        pytest.skip("2p 20-card blueprint / LUT not present")
+    for mult in (2.0, 5.0, 12.0):
+        cfg = EvalConfig.for_condition(
+            "vanilla", run_id="x", run_seed=1, table_policy="fixed",
+            fixed_seats=["bp_call"], n_players=2, time_budget_hours=0.0,
+            big_blind=100, small_blind=50, starting_stack=10000,
+            low_card_rank=10, high_card_rank=14)
+        session = build_blueprint_session(
+            cfg, blueprint_path=bp, lut_path=lut_dir, bias_multiplier=mult,
+            max_iterations=10, max_wall_seconds=1.0)
+        fleet = session.solver_cfg.leaf.policies
+        assert all(fleet[c] is session.blueprint_policy for c in fleet)
+        assert session.new_opponent("bp_call")._policy is session.blueprint_policy
+        assert fleet["call"]._bias_multiplier == mult
+
 
 @pytest.mark.requires_lut
 def test_run_over_real_lut(tmp_path, lut):

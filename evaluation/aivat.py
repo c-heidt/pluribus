@@ -103,7 +103,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -206,6 +206,30 @@ class LeafValue:
         produce an identical correction and it cancels exactly in the paired Δ.
     n_rollouts
         Number of baseline playouts averaged per ``v`` evaluation.
+    seat_bias
+        ``seat → BiasClass`` for the baseline continuation profile σ.  Supply the
+        table's **actual** composition (``bp_fold`` → ``"fold"`` and so on) so the
+        rollout continues the way the real opponents do; the runner derives it from
+        the same ``seat_labels`` that built the opponents.  Missing seats — and the
+        hero's own — fall back to ``"none"``.
+
+        The opponents' true policy is *exactly* ``blueprint.strategy(state, bias)``,
+        so getting the bias right makes σ match them rather than merely resemble
+        them — **at any bias magnitude**, not just the default.  The magnitude lives
+        in ``BlueprintPolicy.bias_multiplier``, and
+        :func:`evaluation.runner.build_blueprint_session` hands the *same* policy
+        object to the leaf fleet and to the opponents, so the two cannot drift apart
+        whatever it is set to.  That sharing is what makes the match exact rather
+        than approximate; it is pinned by
+        ``test_runner.py::test_leaf_fleet_shares_the_opponents_policy_object``.  A
+        session that built the fleet and the opponents from *separate* policies
+        (the stub does) still benefits from the right bias class, but σ would then
+        only approximate the opponents rather than reproduce them.  The **hero's** seat deliberately stays ``"none"``: its real
+        continuation is a search result that does not exist as a policy at arbitrary
+        future nodes, and substituting one would make ``v`` arm-dependent again —
+        the thing the actual-holes change just removed.  ``v`` is allowed to be
+        wrong about the hero; it only has to be *consistent*, and a better σ for the
+        seats it can model is a strictly better control variate.
     """
 
     def __init__(
@@ -215,12 +239,14 @@ class LeafValue:
         rng: np.random.Generator,
         *,
         n_rollouts: int = 6,
+        seat_bias: Optional[Mapping[int, str]] = None,
     ) -> None:
         self._hero = hero
         self._rng = rng
         self._board_rng = spawn_one(rng)
         self._m = int(n_rollouts)
         self._leaf = leaf_cfg
+        self._seat_bias = dict(seat_bias or {})
 
     def child_values(
         self, env_before: PokerEnv, legal: Sequence[str]
@@ -256,7 +282,11 @@ class LeafValue:
         sums: Dict[str, float] = {a: 0.0 for a in legal}
         hero_seat = int(self._hero.my_seat)
         n_players = env_before.n_players
-        profile = {s: "none" for s in range(n_players)}
+        # The baseline profile σ: each seat continues under its ACTUAL bias class
+        # where known (see ``seat_bias``), else the unbiased blueprint.
+        profile = {
+            s: self._seat_bias.get(s, "none") for s in range(n_players)
+        }
         m = max(self._m, 1)
         ctx = _LeafCtx(self._leaf, self._rng, self._board_rng)
         # The hand's real holes — every seat, folded ones included, since ``v(h)`` is
