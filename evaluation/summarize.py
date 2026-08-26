@@ -340,6 +340,97 @@ def _bb100_reader(games: List[dict], metric: str = "auto"):
     return bb100, used_aivat
 
 
+def _query_aivat_health(con: sqlite3.Connection) -> dict:
+    """Did AIVAT actually reduce variance on **this run**?  (§10.2 sanity check.)
+
+    AIVAT's benefit is a property of the run, not of the column: the estimator is
+    unbiased for *any* value function, but a poor or noisy one shrinks nothing and
+    can make things worse.  A run was once summarised with an ``aivat_value`` that
+    was *adding* variance, unnoticed, because nothing measured it.  This does.
+
+    Per arm, over the hands carrying **both** columns:
+
+    - ``var_x = var(raw) / var(aivat)`` — the variance-reduction factor.  ``> 1`` is
+      a real reduction, ``< 1`` means AIVAT is adding variance and the run should be
+      read with ``--metric raw``.
+    - ``ci_shrink = sd(raw) / sd(aivat)`` — the same thing in CI terms, i.e. what the
+      error bars actually gained (``sqrt(var_x)``).
+    - ``hands_equiv = var_x`` — the effective sample-size multiplier.
+    - ``mean_shift`` = ``mean(aivat − raw)`` with a 95% CI.  It **must** straddle
+      zero: the estimator is unbiased by construction, so a shift that clears its own
+      CI is evidence of an implementation bug, not of a better estimate.
+    """
+    games = _rows(
+        con,
+        "SELECT condition, table_label, hero_chips_delta, aivat_value, big_blind "
+        "FROM games",
+    )
+    by_arm: Dict[Tuple[str, str], List[Tuple[float, float]]] = {}
+    for g in games:
+        bb, raw, aiv = g["big_blind"], g["hero_chips_delta"], g["aivat_value"]
+        if bb in (None, 0) or raw is None or aiv is None:
+            continue
+        arm = (_condition_label(g["condition"]), g["table_label"])
+        by_arm.setdefault(arm, []).append((100.0 * raw / bb, 100.0 * aiv / bb))
+
+    arms = []
+    for arm in sorted(by_arm, key=_arm_sort_key):
+        pairs = by_arm[arm]
+        n = len(pairs)
+        raws = [p[0] for p in pairs]
+        aivs = [p[1] for p in pairs]
+        var_raw = _mean_ci(raws)
+        var_aiv = _mean_ci(aivs)
+        vr = _population_var(raws)
+        va = _population_var(aivs)
+        shift = _mean_ci([a - r for r, a in pairs])
+        var_x = (vr / va) if va > 0 else None
+        arms.append({
+            "condition": arm[0],
+            "table": arm[1],
+            "n_hands": n,
+            "sd_raw": math.sqrt(vr),
+            "sd_aivat": math.sqrt(va),
+            "var_x": var_x,
+            "ci_shrink": math.sqrt(var_x) if var_x else None,
+            "mean_raw": var_raw["mean"],
+            "mean_aivat": var_aiv["mean"],
+            "mean_shift": shift["mean"],
+            "mean_shift_ci95": shift["ci95"],
+            "shift_significant": bool(
+                shift["ci95"] is not None and shift["mean"] is not None
+                and abs(shift["mean"]) > shift["ci95"]
+            ),
+            "verdict": _aivat_verdict(var_x),
+        })
+    return {"available": bool(arms), "arms": arms}
+
+
+def _population_var(values: Sequence[float]) -> float:
+    """Population variance, matching :func:`_mean_ci`'s documented formula."""
+    n = len(values)
+    if n == 0:
+        return 0.0
+    mean = sum(values) / n
+    return max(sum(v * v for v in values) / n - mean * mean, 0.0)
+
+
+def _aivat_verdict(var_x: Optional[float]) -> str:
+    """``helping`` / ``negligible`` / ``harmful`` from the variance-reduction factor.
+
+    The ``1.05`` floor is deliberate: AIVAT costs real per-hand compute, so a
+    reduction inside a couple of percent is not worth the column even though it is
+    technically positive.
+    """
+    if var_x is None:
+        return "n/a"
+    if var_x < 1.0:
+        return "harmful"
+    if var_x < 1.05:
+        return "negligible"
+    return "helping"
+
+
 def _query_strength(con: sqlite3.Connection, metric: str = "auto") -> dict:
     """Hero bb/100 with 95% CI **per arm** — ``(condition, table_label)`` (§8).
 
@@ -829,6 +920,29 @@ def _evaluate_flags(report: dict) -> List[dict]:
                 f"{a['mean_bb100']:+.1f} ± {a['ci95']:.1f} bb/100 "
                 f"({a['n_hands']} hands)")
 
+    # aivat — a headline computed from an estimator that is not reducing variance is
+    # strictly worse than the raw column it replaced, and nothing else in the report
+    # would say so.  Fires regardless of which metric is in use: on AIVAT it is a
+    # correctness warning, on raw it is the reason to keep it that way.
+    ah = report.get("aivat_health") or {}
+    on_aivat = report["strength"].get("used_aivat")
+    for a in ah.get("arms", []):
+        if a["verdict"] == "harmful":
+            add("warn", "aivat_harmful",
+                f"AIVAT is ADDING variance on {a['condition']} "
+                f"(var_x {a['var_x']:.2f} < 1)"
+                + ("; re-run the summary with --metric raw" if on_aivat
+                   else " — keep using --metric raw"))
+        elif a["verdict"] == "negligible" and on_aivat:
+            add("info", "aivat_negligible",
+                f"AIVAT buys almost nothing on {a['condition']} "
+                f"(var_x {a['var_x']:.2f}); the raw column is near-equivalent")
+        if a["shift_significant"]:
+            add("warn", "aivat_biased",
+                f"AIVAT mean shift on {a['condition']} is "
+                f"{a['mean_shift']:+.2f} ± {a['mean_shift_ci95']:.2f} bb/100 — "
+                "the estimator is unbiased by construction, so this is a bug")
+
     # pairing — the CRN comparison is the multi-arm headline, so a comparison that
     # matched few or no deals is a *louder* problem than any number it prints.
     pr = report.get("paired") or {}
@@ -932,6 +1046,8 @@ _VERDICT_MARK = {
     "inconclusive": "~", "n/a": " ",
 }
 
+_AIVAT_MARK = {"helping": "✓", "negligible": "~", "harmful": "✗", "n/a": " "}
+
 
 def _print_human(report: dict) -> str:
     """Render the §8 summary block; returns the string (also logged by the caller)."""
@@ -958,6 +1074,7 @@ def _print_human(report: dict) -> str:
 
     _strength_block(L, report)
     _paired_block(L, report)
+    _aivat_block(L, report)
     _range_block(L, report)
     _search_block(L, report)
     _hu_block(L, report)
@@ -972,22 +1089,43 @@ def _print_human(report: dict) -> str:
 
 def _strength_block(L: List[str], report: dict) -> None:
     st = report["strength"]
-    metric = "aivat bb/100" if st["used_aivat"] else "raw bb/100"
+    metric = "aivat" if st["used_aivat"] else "raw"
+    alt_st = report.get("strength_alt")
+    alt_metric = report.get("alt_metric")
     # Not the auto choice — say so, so a saved block can't be misread later.
     forced = ", forced" if st.get("metric_mode", "auto") != "auto" else ""
-    L.append(f"STRENGTH — per arm ({metric} ± 95% CI{forced}).  Arms are never pooled.")
+    L.append(
+        f"STRENGTH — per arm (bb/100 ± 95% CI{forced}).  Arms are never pooled."
+    )
     if not st["arms"]:
         L.append("  (no hands logged)")
         return
+    if alt_st:
+        # Both columns, always: the headline metric is a choice, and the reader
+        # needs the other number in front of them to audit it.  '*' marks the one
+        # the verdicts and flags are computed from.
+        L.append(f"  * = headline metric ({metric}); {alt_metric} shown alongside")
+    alt_by_arm = {}
+    if alt_st:
+        alt_by_arm = {(a["condition"], a["table"]): a for a in alt_st["arms"]}
     width = max(len(str(a["condition"])) for a in st["arms"])
     table = None
     for a in st["arms"]:
         if a["table"] != table:
             table = a["table"]
             L.append(f"  table={table}")
+        head = (
+            f"    {str(a['condition']):<{width}}  *{metric:<5} "
+            f"{_fmt(a['mean_bb100'], '+8.1f')} ± {_fmt(a['ci95'], '.1f'):<6}"
+        )
+        b = alt_by_arm.get((a["condition"], a["table"]))
+        if b:
+            head += (
+                f"   {alt_metric:<5} {_fmt(b['mean_bb100'], '+8.1f')} ± "
+                f"{_fmt(b['ci95'], '.1f'):<6}"
+            )
         L.append(
-            f"    {str(a['condition']):<{width}}  {_fmt(a['mean_bb100'], '+8.1f')} ± "
-            f"{_fmt(a['ci95'], '.1f'):<6} {a['n_hands']:>6} hands   "
+            f"{head}   {a['n_hands']:>6} hands   "
             f"{_VERDICT_MARK[a['verdict']]} {a['verdict']}"
         )
         if len(a["by_position"]) > 1:
@@ -1002,11 +1140,20 @@ def _paired_block(L: List[str], report: dict) -> None:
     if not pr or not pr.get("available"):
         return
     metric = "aivat" if pr["used_aivat"] else "raw"
+    alt_pr = report.get("paired_alt")
+    alt_metric = report.get("alt_metric")
+    alt_cells = {}
+    if alt_pr and alt_pr.get("available"):
+        for cmp_ in alt_pr["comparisons"]:
+            for cell in cmp_["cells"]:
+                alt_cells[(cmp_["treatment"], cell["table"])] = cell
     L.append("")
     L.append(
         f"PAIRED Δ vs {pr['baseline']} — CRN, matched on {pr['match_key']} "
-        f"({metric} bb/100, 95% bootstrap CI)"
+        f"(bb/100, 95% bootstrap CI)"
     )
+    if alt_cells:
+        L.append(f"  * = headline metric ({metric}); {alt_metric} shown alongside")
     for cmp in pr["comparisons"]:
         L.append(
             f"  {cmp['treatment']}   "
@@ -1017,11 +1164,22 @@ def _paired_block(L: List[str], report: dict) -> None:
             label = cell["table"] if cell["table"] is not None else "ALL TABLES pooled"
             b = cell["ci95_bootstrap"]
             L.append(
-                f"    {str(label):<20} {_fmt(cell['mean_delta_bb100'], '+8.2f')}  "
+                f"    {str(label):<20} *{metric:<5} "
+                f"{_fmt(cell['mean_delta_bb100'], '+8.2f')}  "
                 f"[{_fmt(b['lo'], '+.2f')}, {_fmt(b['hi'], '+.2f')}]  "
                 f"{cell['n_paired']:>6} pairs   {_VERDICT_MARK[cell['verdict']]} "
                 f"{cell['verdict']}"
             )
+            ac = alt_cells.get((cmp["treatment"], cell["table"]))
+            if ac:
+                ab = ac["ci95_bootstrap"]
+                L.append(
+                    f"    {'':<20}  {alt_metric:<5} "
+                    f"{_fmt(ac['mean_delta_bb100'], '+8.2f')}  "
+                    f"[{_fmt(ab['lo'], '+.2f')}, {_fmt(ab['hi'], '+.2f')}]  "
+                    f"{ac['n_paired']:>6} pairs   {_VERDICT_MARK[ac['verdict']]} "
+                    f"{ac['verdict']}"
+                )
             cov = cell.get("covered")
             if cov and cov["n_paired"]:
                 cb = cov["ci95_bootstrap"]
@@ -1037,6 +1195,40 @@ def _paired_block(L: List[str], report: dict) -> None:
                 f"{_fmt(cell['baseline_mean_bb100'], '+.1f')} → {cmp['treatment']} "
                 f"{_fmt(cell['treatment_mean_bb100'], '+.1f')}"
             )
+
+
+def _aivat_block(L: List[str], report: dict) -> None:
+    """How much variance AIVAT actually removed — the check that was missing.
+
+    Printed whenever the column exists, whichever metric the headline uses: a run
+    summarised on ``--metric raw`` still wants to know what AIVAT would have bought,
+    and a run summarised on AIVAT absolutely wants to know whether it bought
+    anything at all.
+    """
+    ah = report.get("aivat_health")
+    if not ah or not ah.get("available"):
+        return
+    L.append("")
+    L.append(
+        "AIVAT SANITY — variance actually removed  "
+        "(var_x = var(raw)/var(aivat); >1 helps, <1 ADDS variance)"
+    )
+    width = max(len(str(a["condition"])) for a in ah["arms"])
+    for a in ah["arms"]:
+        L.append(
+            f"  {str(a['condition']):<{width}}  var_x {_fmt(a['var_x'], '5.2f')}   "
+            f"CI ×{_fmt(a['ci_shrink'], '.2f')} tighter   "
+            f"sd {_fmt(a['sd_raw'], '.0f')} → {_fmt(a['sd_aivat'], '.0f')}   "
+            f"{a['n_hands']:>6} hands   {_AIVAT_MARK[a['verdict']]} {a['verdict']}"
+        )
+        # Unbiasedness is the estimator's one hard guarantee, so the shift is
+        # reported next to the payoff rather than buried in a flag.
+        L.append(
+            f"  {'':<{width}}  mean shift (aivat−raw) "
+            f"{_fmt(a['mean_shift'], '+.2f')} ± {_fmt(a['mean_shift_ci95'], '.2f')}"
+            + ("   ⚠ clears its own CI — unbiasedness is violated"
+               if a["shift_significant"] else "   (straddles 0 ✓)")
+        )
 
 
 def _range_block(L: List[str], report: dict) -> None:
@@ -1134,16 +1326,35 @@ def build_report(con: sqlite3.Connection, metric: str = "auto") -> dict:
     ``metric`` (``auto`` | ``aivat`` | ``raw``) picks the outcome column for both
     bb/100 headlines — see :func:`_bb100_reader`.
     """
+    aivat_ok = _aivat_fully_populated(con)
     report = {
         "meta": _query_meta(con),
         "strength": _query_strength(con, metric),
         "paired": _query_paired(con, metric),
+        # Both columns, always, whenever AIVAT is available: the headline metric is a
+        # choice, and a reader cannot sanity-check that choice against a number they
+        # cannot see.  The alternate is computed by re-running the same pure queries
+        # under the other metric, so the two can never drift apart.
+        "aivat_health": _query_aivat_health(con),
         "range_quality": _query_range_health(con),
         "hu_coverage": _query_hu_coverage(con),
         "search": _query_search(con),
     }
+    if aivat_ok:
+        alt = "raw" if report["strength"]["used_aivat"] else "aivat"
+        report["strength_alt"] = _query_strength(con, alt)
+        report["paired_alt"] = _query_paired(con, alt)
+        report["alt_metric"] = alt
+    else:
+        report["strength_alt"] = report["paired_alt"] = report["alt_metric"] = None
     report["flags"] = _evaluate_flags(report)
     return report
+
+
+def _aivat_fully_populated(con: sqlite3.Connection) -> bool:
+    """True iff every logged game carries an ``aivat_value``."""
+    row = _rows(con, "SELECT COUNT(*) AS n, COUNT(aivat_value) AS a FROM games")[0]
+    return bool(row["n"]) and row["n"] == row["a"]
 
 
 def summarize(

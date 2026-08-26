@@ -672,3 +672,150 @@ class TestSummarizeEndToEnd:
         sidecars = [p.name for p in tmp_path.iterdir()
                     if p.name.startswith("snap.sqlite-")]
         assert sidecars == []
+
+
+# --------------------------------------------------------------------------- #
+# AIVAT sanity check + dual-metric reporting
+# --------------------------------------------------------------------------- #
+
+def _aivat_arm(report, condition=None):
+    hits = [
+        a for a in report["aivat_health"]["arms"]
+        if condition is None or a["condition"] == condition
+    ]
+    assert len(hits) == 1, f"expected exactly one aivat arm, got {hits}"
+    return hits[0]
+
+
+def _flag_keys(report):
+    return {f["key"] for f in report["flags"]}
+
+
+def _fill(log, raws, aivats, *, condition="vanilla", start=0):
+    """One game per (raw, aivat) pair, all in one arm."""
+    for i, (r, a) in enumerate(zip(raws, aivats)):
+        with log.game():
+            log.log_game(_game(start + i, condition=condition,
+                               hero_chips_delta=r, aivat_value=a,
+                               deck_seed=start + i))
+
+
+class TestAivatVerdict:
+    """``_aivat_verdict`` thresholds — the sign of the answer must not be fuzzy."""
+
+    def test_below_one_is_harmful(self):
+        from evaluation.summarize import _aivat_verdict
+        assert _aivat_verdict(0.99) == "harmful"
+
+    def test_marginal_gain_is_negligible(self):
+        # AIVAT costs real per-hand compute; a 2% variance win does not earn it.
+        from evaluation.summarize import _aivat_verdict
+        assert _aivat_verdict(1.02) == "negligible"
+
+    def test_clear_gain_is_helping(self):
+        from evaluation.summarize import _aivat_verdict
+        assert _aivat_verdict(1.4) == "helping"
+
+    def test_missing_is_na(self):
+        from evaluation.summarize import _aivat_verdict
+        assert _aivat_verdict(None) == "n/a"
+
+
+class TestAivatHealth:
+
+    def test_var_x_is_the_variance_ratio(self, db):
+        log, _ = db
+        # aivat = raw/2 exactly -> var(raw)/var(aivat) == 4.
+        raws = [100.0, -100.0, 300.0, -300.0, 500.0, -500.0]
+        _fill(log, raws, [r / 2 for r in raws])
+        a = _aivat_arm(build_report(log._con))
+        assert math.isclose(a["var_x"], 4.0, rel_tol=1e-9)
+        assert math.isclose(a["ci_shrink"], 2.0, rel_tol=1e-9)
+        assert a["verdict"] == "helping"
+
+    def test_detects_aivat_adding_variance(self, db):
+        log, _ = db
+        raws = [100.0, -100.0, 200.0, -200.0]
+        _fill(log, raws, [r * 2 for r in raws])       # aivat is WORSE
+        report = build_report(log._con)
+        a = _aivat_arm(report)
+        assert math.isclose(a["var_x"], 0.25, rel_tol=1e-9)
+        assert a["verdict"] == "harmful"
+        assert "aivat_harmful" in _flag_keys(report)
+
+    def test_unbiased_shift_straddles_zero(self, db):
+        log, _ = db
+        raws = [100.0, -100.0, 300.0, -300.0]
+        _fill(log, raws, [r / 2 for r in raws])       # mean shift exactly 0
+        a = _aivat_arm(build_report(log._con))
+        assert math.isclose(a["mean_shift"], 0.0, abs_tol=1e-9)
+        assert a["shift_significant"] is False
+
+    def test_flags_a_mean_shift_that_clears_its_ci(self, db):
+        log, _ = db
+        # A constant offset with no spread: the shift cannot be sampling noise, so
+        # it is an implementation bug (the estimator is unbiased by construction).
+        raws = [100.0, 100.0, 100.0, 100.0]
+        _fill(log, raws, [r + 500.0 for r in raws])
+        report = build_report(log._con)
+        assert _aivat_arm(report)["shift_significant"] is True
+        assert "aivat_biased" in _flag_keys(report)
+
+    def test_absent_when_no_aivat_column(self, db):
+        log, _ = db
+        for i in range(4):
+            with log.game():
+                log.log_game(_game(i, condition="vanilla",
+                                   hero_chips_delta=100.0, deck_seed=i))
+        report = build_report(log._con)
+        assert report["aivat_health"]["available"] is False
+        assert not any(k.startswith("aivat_") for k in _flag_keys(report))
+
+    def test_reported_even_when_headline_is_raw(self, db):
+        """A run summarised on --metric raw still wants to know what AIVAT bought."""
+        log, _ = db
+        raws = [100.0, -100.0, 300.0, -300.0]
+        _fill(log, raws, [r / 2 for r in raws])
+        report = build_report(log._con, metric="raw")
+        assert report["strength"]["used_aivat"] is False
+        assert report["aivat_health"]["available"] is True
+        assert math.isclose(_aivat_arm(report)["var_x"], 4.0, rel_tol=1e-9)
+
+
+class TestBothMetricsReported:
+
+    def test_alternate_metric_is_computed(self, db):
+        log, _ = db
+        # Deliberately asymmetric: with a zero-mean series both metrics report 0.0
+        # and the "they differ" assertion below would pass vacuously.
+        raws = [100.0, -100.0, 300.0, -100.0]
+        _fill(log, raws, [r / 2 for r in raws])
+        report = build_report(log._con)                    # auto -> aivat
+        assert report["alt_metric"] == "raw"
+        assert report["strength_alt"]["used_aivat"] is False
+        # The two headlines must differ here, else the test proves nothing.
+        assert (report["strength"]["arms"][0]["mean_bb100"]
+                != report["strength_alt"]["arms"][0]["mean_bb100"])
+
+    def test_alternate_is_none_when_aivat_incomplete(self, db):
+        log, _ = db
+        with log.game():
+            log.log_game(_game(0, condition="v", hero_chips_delta=1.0,
+                               aivat_value=1.0, deck_seed=0))
+        with log.game():
+            log.log_game(_game(1, condition="v", hero_chips_delta=1.0,
+                               deck_seed=1))            # no aivat_value
+        report = build_report(log._con)
+        assert report["alt_metric"] is None
+        assert report["strength_alt"] is None
+
+    def test_human_block_shows_both_and_the_sanity_check(self, db):
+        log, _ = db
+        raws = [100.0, -100.0, 300.0, -300.0]
+        _fill(log, raws, [r / 2 for r in raws])
+        block = _print_human(build_report(log._con))
+        assert "AIVAT SANITY" in block
+        assert "var_x" in block
+        assert "headline metric" in block
+        # both column labels present on the strength line
+        assert "*aivat" in block and "raw" in block

@@ -694,9 +694,27 @@ disagree: both prefer `aivat_value` when every game carries it and fall back to 
 `--metric aivat` forces the other way); a forced choice is stated in the printed
 block and recorded as `metric_mode` in `summary.json`. The override exists because
 AIVAT's benefit is a **property of the run, not of the column**: it is only worth
-using when it actually reduces variance, so compare `sd(aivat_value)` against
-`sd(hero_chips_delta)` per arm before trusting it — a ratio near 1 means the
-estimator is not earning its per-hand cost, and below 1 means it is adding variance.
+using when it actually reduces variance.
+
+Two things follow, and the report does both rather than leaving them to the reader:
+
+- **Both columns are always printed.** Whenever `aivat_value` is fully populated,
+  STRENGTH and PAIRED Δ show the headline metric (marked `*`) *and* the other one
+  side by side. The metric is a choice, and a choice cannot be audited against a
+  number that is not on the page. `summary.json` carries the alternate under
+  `strength_alt` / `paired_alt` / `alt_metric`.
+- **An `AIVAT SANITY` block reports what it actually bought**, per arm:
+  `var_x = var(raw)/var(aivat)` (> 1 helps, < 1 *adds* variance), the CI-shrink
+  factor `sqrt(var_x)`, and `mean(aivat − raw)` with its CI. That mean **must**
+  straddle zero — the estimator is unbiased for any value function, so a shift
+  clearing its own CI is an implementation bug, not a better estimate. The block
+  prints whichever metric is in use: on `raw` it says what AIVAT would have bought,
+  on `aivat` it says whether it bought anything. Flags fire on `var_x < 1`
+  (`aivat_harmful`), on a marginal `var_x < 1.05` (`aivat_negligible` — AIVAT costs
+  real per-hand compute), and on a significant shift (`aivat_biased`).
+
+This exists because a whole run was once summarised on an `aivat_value` that was
+*adding* variance and inflating the paired Δ, and nothing in the report said so.
 The runner (§10.1) calls `summarize(dest)` after the
 final sync-back against the permanent snapshot, wrapped so a summary failure is
 logged rather than failing the already-committed run.
