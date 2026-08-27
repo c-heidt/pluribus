@@ -18,6 +18,7 @@ All fast: small deck, heads-up, tiny solver budget — no ``slow`` / ``requires_
 """
 
 import contextlib
+import copy
 import math
 
 import numpy as np
@@ -30,7 +31,9 @@ from poker_ai.search.agent import SearchAgent
 from poker_ai.search.leaf import LeafConfig
 from poker_ai.search.solver import SolverConfig
 from test.evaluation.test_runner import _stub_session
-from test.search._helpers import UniformPolicy, _flop_env, _policies
+from test.search._helpers import (
+    UniformPolicy, _flop_env, _policies, _preflop_env,
+)
 
 
 class _NonUniformPolicy(UniformPolicy):
@@ -261,11 +264,12 @@ class TestBaselineValueUsesActualHoles:
 # --------------------------------------------------------------------------- #
 
 def _run(tmp_path, *, aivat, run_id="A", n=120, seed=13, rollouts=4,
-         starting_stack=400, blueprint=None):
+         starting_stack=400, blueprint=None, chance=False):
     session = _stub_session(run_id=run_id, run_seed=seed, n_players=2,
                             starting_stack=starting_stack, blueprint=blueprint)
     session.config.aivat = aivat
     session.config.aivat_rollouts = rollouts
+    session.config.aivat_chance = chance
     log = ExperimentLog.open(tmp_path / f"{run_id}.sqlite")
     try:
         run_evaluation(log=log, session=session, max_hands=n)
@@ -296,8 +300,9 @@ class TestAcceptance:
         assert abs(d.mean()) <= 4.0 * se + 1e-9
 
     def test_reduces_variance(self, tmp_path):
-        # The payoff.  The scoped AIVAT (action-node + flop/turn all-in corrections,
-        # no per-street chance MIVAT) reduces variance once the value function is
+        # The payoff.  AIVAT in its default scope (action nodes + the flop/turn
+        # all-in runout; per-street chance corrections off) reduces variance once
+        # the value function is
         # low-noise enough to be a good control variate — so use deeper stacks (fewer
         # uncorrected pre-flop shoves) and more hole samples (a smoother v).  A
         # sign-flipped correction would *inflate* variance and fail this.
@@ -334,6 +339,22 @@ class TestAcceptance:
 # --------------------------------------------------------------------------- #
 # AIVAT runout-coverage knob: max_runout_cards
 # --------------------------------------------------------------------------- #
+
+def test_chance_rollouts_default_is_the_measured_one():
+    """``_CHANCE_ROLLOUTS`` is a measurement, not a guess — see the constant's note.
+
+    A default of 2 (reasoned from the baseline's ``√|remaining|`` averaging alone)
+    was measured to make the correction ADD variance: gain 0.885, 95% CI
+    [0.81, 0.96] over 3105 real-blueprint hands.  Pin it so nobody re-derives the
+    small number from the same wrong argument.
+    """
+    from evaluation.aivat import _CHANCE_ROLLOUTS
+    from evaluation.runner import EvalConfig
+    assert _CHANCE_ROLLOUTS >= 16          # below this the term is measurably harmful
+    acc = AivatAccumulator(0, object(), np.random.default_rng(0), chance=True)
+    assert acc._chance_rollouts == _CHANCE_ROLLOUTS == 48
+    assert EvalConfig(run_id="x").aivat_chance_rollouts == _CHANCE_ROLLOUTS
+
 
 def test_aivat_max_runout_cards_default_unchanged():
     from evaluation.aivat import _MAX_RUNOUT_CARDS
@@ -720,3 +741,322 @@ class TestBaselineProfile:
         mk = lambda b: LeafValue(hero, leaf, np.random.default_rng(2),
                                  n_rollouts=8, seat_bias={opp: b})
         assert mk("fold").child_values(env, legal) != mk("raise").child_values(env, legal)
+
+
+# --------------------------------------------------------------------------- #
+# Per-street (turn/river) chance corrections
+# --------------------------------------------------------------------------- #
+
+class _FakeChanceValue(_FakeValue):
+    """Fake ``v`` that also answers ``chance_values`` from a fixed table."""
+
+    def __init__(self, table, chance=None):
+        super().__init__(table)
+        self._chance = chance
+        self.chance_calls = 0
+
+    def chance_values(self, env_before, action, *, n_rollouts=2):
+        self.chance_calls += 1
+        return self._chance
+
+
+class TestChanceCorrectionArithmetic:
+    """Accumulator-level algebra for the chance term, against a fake ``v``."""
+
+    def test_off_by_default(self):
+        v = _FakeChanceValue({"a": 4.0, "b": 0.0}, chance=(10.0, 3.0))
+        acc = AivatAccumulator(0, v, np.random.default_rng(0))
+        acc.correct_action(None, 0, "a", ["a", "b"], [0.5, 0.5])
+        assert v.chance_calls == 0
+        assert acc.n_chance_terms == 0
+        # Only the action term (4 − 2 = 2) is applied.
+        assert math.isclose(acc.finalize(_FakeTerminal({0: 7.0})), 7.0 - 2.0)
+
+    def test_chance_term_is_subtracted(self):
+        v = _FakeChanceValue({"a": 4.0, "b": 0.0}, chance=(10.0, 3.0))
+        acc = AivatAccumulator(0, v, np.random.default_rng(0), chance=True)
+        acc.correct_action(None, 0, "a", ["a", "b"], [0.5, 0.5])
+        assert acc.n_chance_terms == 1 and acc.n_action_terms == 1
+        # action term 2.0, chance term 10 − 3 = 7.0
+        assert math.isclose(acc.finalize(_FakeTerminal({0: 7.0})), 7.0 - 2.0 - 7.0)
+
+    def test_no_chance_node_means_no_term(self):
+        v = _FakeChanceValue({"a": 4.0, "b": 0.0}, chance=None)
+        acc = AivatAccumulator(0, v, np.random.default_rng(0), chance=True)
+        acc.correct_action(None, 0, "a", ["a", "b"], [0.5, 0.5])
+        assert v.chance_calls == 1 and acc.n_chance_terms == 0
+        assert math.isclose(acc.finalize(_FakeTerminal({0: 7.0})), 7.0 - 2.0)
+
+    def test_a_bad_action_still_takes_the_chance_term(self):
+        # The two families are independent terms: a legal/action mismatch must not
+        # silently drop the chance correction along with the action one.
+        v = _FakeChanceValue({"a": 4.0, "b": 0.0}, chance=(10.0, 3.0))
+        acc = AivatAccumulator(0, v, np.random.default_rng(0), chance=True)
+        acc.correct_action(None, 0, "bogus", ["a", "b"], [0.5, 0.5])
+        assert acc.n_chance_terms == 1 and acc.n_action_terms == 0
+        assert math.isclose(acc.finalize(_FakeTerminal({0: 7.0})), 7.0 - 7.0)
+
+
+class _SeatOnly:
+    """Minimal hero stand-in: ``LeafValue`` reads only ``my_seat`` off it."""
+
+    def __init__(self, seat):
+        self.my_seat = seat
+
+
+def _turn_node(stacks=(2000, 2000)):
+    """A heads-up flop node whose next ``call`` closes the round and deals the turn."""
+    env = _flop_env(low=11, high=14, stacks=stacks, seed=3)
+    env.step_in_place("call")
+    return env
+
+
+def _leaf_value(env, seed=11, **kw):
+    return LeafValue(
+        _SeatOnly(env.player_i), LeafConfig(policies=_policies()),
+        np.random.default_rng(seed), **kw,
+    )
+
+
+class TestChanceValuesScope:
+    """Which nodes get a chance term — and, just as importantly, which do not."""
+
+    def test_turn_deal_is_corrected(self):
+        env = _turn_node()
+        assert _leaf_value(env).chance_values(env, "call", n_rollouts=1) is not None
+
+    def test_no_deal_means_no_term(self):
+        # The flop's FIRST call does not close the round, so no chance node follows.
+        env = _flop_env(low=11, high=14, stacks=(2000, 2000), seed=3)
+        assert _leaf_value(env).chance_values(env, "call", n_rollouts=1) is None
+
+    def test_flop_deal_is_skipped(self):
+        # Three cards at once — an unordered triple, not enumerable; deferred.
+        env = _preflop_env(low=11, high=14, stacks=(2000, 2000), seed=3)
+        env.step_in_place("call")
+        assert _leaf_value(env).chance_values(env, "call", n_rollouts=1) is None
+
+    def test_terminal_step_is_skipped(self):
+        # A fold force-deals the board to five inside ``_settle_terminal``; that
+        # runout is already integrated exactly by ``finalize``'s runout_equity term,
+        # so correcting it here too would double-count.
+        env = _preflop_env(low=11, high=14, stacks=(2000, 2000), seed=3)
+        assert _leaf_value(env).chance_values(env, "fold", n_rollouts=1) is None
+
+
+class TestChanceValuesSupport:
+    """The support and the realised draw — where unbiasedness actually comes from.
+
+    The baseline is an *exact* enumeration, so the correction is zero-mean by
+    arithmetic provided two structural facts hold: the alternatives are exactly the
+    cards the deal can produce, and index 0 is the card the played hand receives.
+    """
+
+    def _alternatives(self, env, monkeypatch):
+        seen = {}
+
+        def spy(self_, env_before, action, *, n_rollouts=2):
+            seen["alts"] = [int(c) for c in env_before.deck.remaining]
+            return orig(self_, env_before, action, n_rollouts=n_rollouts)
+
+        orig = LeafValue.chance_values
+        monkeypatch.setattr(LeafValue, "chance_values", spy)
+        _leaf_value(env).chance_values(env, "call", n_rollouts=1)
+        return seen["alts"]
+
+    def test_alternatives_are_exactly_the_undealt_deck(self, monkeypatch):
+        env = _turn_node()
+        alts = self._alternatives(env, monkeypatch)
+        assert set(alts) == set(int(c) for c in env.deck.remaining)
+        assert len(alts) == len(set(alts))
+
+    def test_support_excludes_every_hole_and_board_card(self, monkeypatch):
+        env = _turn_node()
+        alts = set(self._alternatives(env, monkeypatch))
+        dealt = set(int(c) for c in env.community_cards)
+        for p in env.players:
+            dealt |= set(int(c) for c in p.cards)
+        assert not (alts & dealt)
+
+    def test_first_alternative_is_the_card_the_hand_really_gets(self):
+        env = _turn_node()
+        expected = int(env.deck.remaining[0])
+        probe = copy.deepcopy(env)
+        probe.step_in_place("call")
+        assert int(probe.community_cards[3]) == expected
+
+    def test_env_before_is_not_mutated(self):
+        env = _turn_node()
+        cards = env.deck._cards.copy()
+        idx, community = env.deck._idx, env.community_cards
+        _leaf_value(env).chance_values(env, "call", n_rollouts=2)
+        np.testing.assert_array_equal(env.deck._cards, cards)
+        assert env.deck._idx == idx and env.community_cards == community
+        assert not env.is_terminal
+
+
+class TestChanceCorrectionIsZeroMean:
+    """The whole point: averaged over the deal, the chance term is exactly zero.
+
+    Uses a ``v`` that is a deterministic, injective function of the turn card, which
+    strips out rollout noise and makes the identity exact rather than statistical.
+    It also proves the forcing plumbing works end to end — if ``force_next`` did not
+    actually change the dealt card, every ``v`` would coincide and the sum would be
+    zero for the wrong reason, which
+    ``test_every_card_really_gets_dealt`` rules out.
+    """
+
+    @staticmethod
+    def _card_valued(env, profile, ctx):
+        # The turn card IS the value.  Distinct per card, so the terms cannot
+        # collapse to a trivially-zero sum.
+        return np.full(env.n_players, float(int(env.community_cards[3])))
+
+    def _terms(self, monkeypatch):
+        monkeypatch.setattr("evaluation.aivat.continuation_value", self._card_valued)
+        env = _turn_node()
+        cards = [int(c) for c in env.deck.remaining]
+        out = {}
+        for c in cards:
+            world = copy.deepcopy(env)
+            world.deck.force_next((c,))          # the world where ``c`` comes
+            v_dealt, baseline = _leaf_value(world).chance_values(
+                world, "call", n_rollouts=1
+            )
+            out[c] = (v_dealt, baseline)
+        return cards, out
+
+    def test_terms_average_to_zero_over_the_deal(self, monkeypatch):
+        cards, out = self._terms(monkeypatch)
+        total = sum(v - b for v, b in out.values())
+        assert abs(total) < 1e-9 * max(1.0, sum(cards))
+
+    def test_every_card_really_gets_dealt(self, monkeypatch):
+        # v_dealt == the forced card, for every card in the deck.
+        cards, out = self._terms(monkeypatch)
+        assert {c: out[c][0] for c in cards} == {c: float(c) for c in cards}
+
+    def test_baseline_is_the_uniform_mean_and_does_not_depend_on_the_draw(
+        self, monkeypatch
+    ):
+        cards, out = self._terms(monkeypatch)
+        want = sum(float(c) for c in cards) / len(cards)
+        for c in cards:
+            assert math.isclose(out[c][1], want, rel_tol=1e-12)
+
+    def test_the_terms_are_not_all_zero(self, monkeypatch):
+        cards, out = self._terms(monkeypatch)
+        assert max(abs(v - b) for v, b in out.values()) > 1.0
+
+
+class TestChanceStreamsAreSeparate:
+    """Chance corrections draw from their own stream pair.
+
+    This is what lets the two AIVAT variants be scored on the *same* hand and
+    differenced exactly: switching chance corrections on adds terms without
+    perturbing a single action-node term.  It also keeps the existing (chance-off)
+    numbers bit-identical, since the chance streams are spawned after ``_board_rng``.
+    """
+
+    def test_action_terms_are_unaffected_by_chance_corrections(self):
+        env = _turn_node()
+        legal = list(env.legal_actions)
+        plain = _leaf_value(env, seed=5)
+        alongside = _leaf_value(env, seed=5)
+        alongside.chance_values(env, "call", n_rollouts=2)   # burns the chance pair
+        assert plain.child_values(env, legal) == alongside.child_values(env, legal)
+
+    def test_chance_streams_differ_from_the_action_streams(self):
+        env = _turn_node()
+        v = _leaf_value(env, seed=5)
+        states = [
+            s.bit_generator.state["state"]["state"]
+            for s in (v._rng, v._board_rng, v._chance_rng, v._chance_board_rng)
+        ]
+        assert len(set(states)) == 4
+
+    def test_consumes_no_global_randomness(self):
+        env = _turn_node()
+        np.random.seed(4)
+        before = _global_state()
+        _leaf_value(env).chance_values(env, "call", n_rollouts=2)
+        assert _global_state() == before
+
+
+class TestVariantIdentity:
+    """``finalize() + sum_chance_terms`` reproduces the chance-off ``aivat_value``.
+
+    The A/B relies on this: both estimators are read off one played hand, so the
+    comparison is exactly paired instead of resting on two runs that would each
+    draw their own hands.
+    """
+
+    def test_adding_the_chance_terms_back_recovers_the_chance_off_value(self):
+        table = {"a": 4.0, "b": 0.0}
+        off = AivatAccumulator(0, _FakeChanceValue(table), np.random.default_rng(0))
+        on = AivatAccumulator(
+            0, _FakeChanceValue(table, chance=(10.0, 3.0)),
+            np.random.default_rng(0), chance=True,
+        )
+        for acc in (off, on):
+            acc.correct_action(None, 0, "a", ["a", "b"], [0.5, 0.5])
+            acc.correct_action(None, 1, "b", ["a", "b"], [0.5, 0.5])
+        terminal = _FakeTerminal({0: 7.0})
+        assert math.isclose(
+            on.finalize(terminal) + on.sum_chance_terms, off.finalize(terminal)
+        )
+        assert math.isclose(on.sum_action_terms, off.sum_action_terms)
+
+
+class TestChanceAcceptanceEndToEnd:
+    """Full stub runs with ``--aivat-chance`` on: unbiased, passive, reproducible.
+
+    The chance terms are exactly zero-mean by enumeration (``TestChanceCorrection
+    IsZeroMean``), so what these add is that the *wiring* preserves it — the terms
+    reach ``aivat_value`` with the right sign and nothing else moves.
+
+    Every one uses the realistic :class:`_NonUniformPolicy` blueprint.  Under the
+    uniform stub the whole class would pass **vacuously**: play shoves or folds
+    before a betting round ever closes with cards still to come, so no turn/river
+    chance node exists and the run is bit-identical with the flag on or off.
+    ``test_the_terms_actually_fire`` is the guard on that.
+    """
+
+    def _run(self, tmp_path, **kw):
+        return _run(tmp_path, aivat=True, blueprint=_NonUniformPolicy(), **kw)
+
+    def test_unbiased_with_chance_corrections(self, tmp_path):
+        rows = self._run(tmp_path, chance=True, n=160, run_id="C0")
+        aiv = np.array([r[1] for r in rows], dtype=float)
+        dl = np.array([r[2] for r in rows], dtype=float)
+        assert not np.isnan(aiv).any()
+        d = aiv - dl
+        se = d.std(ddof=1) / math.sqrt(len(d))
+        assert abs(d.mean()) <= 4.0 * se + 1e-9
+
+    def test_still_passive_on_the_played_hand(self, tmp_path):
+        # Chance corrections re-deal streets on throwaway copies and force cards into
+        # a copied deck; none of that may touch the played hand.
+        off = _run(tmp_path, aivat=False, blueprint=_NonUniformPolicy(),
+                   run_id="C1", n=30, seed=21)
+        on = self._run(tmp_path, chance=True, run_id="C2", n=30, seed=21)
+        assert [r[2] for r in off] == [r[2] for r in on]
+
+    def test_reproducible(self, tmp_path):
+        a = self._run(tmp_path, chance=True, run_id="C3", n=30, seed=8)
+        b = self._run(tmp_path, chance=True, run_id="C4", n=30, seed=8)
+        assert [(r[1], r[2]) for r in a] == [(r[1], r[2]) for r in b]
+
+    def test_the_terms_actually_fire(self, tmp_path):
+        off = self._run(tmp_path, run_id="C5", n=40, seed=8)
+        on = self._run(tmp_path, chance=True, run_id="C6", n=40, seed=8)
+        assert [r[1] for r in off] != [r[1] for r in on]
+
+    def test_action_terms_are_untouched(self, tmp_path):
+        # Separate RNG streams: on the hands with NO chance node, turning the flag on
+        # must change nothing at all — that is what makes the two variants exactly
+        # paired rather than merely comparable.
+        off = self._run(tmp_path, run_id="C7", n=40, seed=8)
+        on = self._run(tmp_path, chance=True, run_id="C8", n=40, seed=8)
+        same = [a[1] == b[1] for a, b in zip(off, on)]
+        assert any(same) and not all(same)

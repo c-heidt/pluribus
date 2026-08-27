@@ -45,6 +45,7 @@ RNG sub-stream keeps it from perturbing the played hand.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import datetime
@@ -216,10 +217,16 @@ class EvalConfig:
     # AIVAT variance-reduced strength estimate (§10.2, step 9).  Off by default —
     # it adds per-hand cost (in the experiment budget, off the search hot path) and
     # is driven by a dedicated RNG sub-stream, so a hand's raw ``hero_chips_delta``
-    # is identical whether AIVAT is on or off.  ``aivat_rollouts`` is the number
-    # of belief hole-draws averaged per value-function evaluation.
+    # is identical whether AIVAT is on or off.  ``aivat_rollouts`` is the number of
+    # baseline playouts averaged per value-function evaluation.  ``aivat_chance``
+    # additionally corrects the per-street (turn/river) chance nodes by exact
+    # enumeration over the undealt deck — the only family of term that removes
+    # *board* variance; ``aivat_chance_rollouts`` is its (much smaller) per-
+    # alternative playout count.  See :mod:`evaluation.aivat`.
     aivat: bool = False
     aivat_rollouts: int = 6
+    aivat_chance: bool = False
+    aivat_chance_rollouts: int = 48
 
     def fingerprint_table_policy(self) -> Dict[str, object]:
         """The table-composition + arm identity folded into ``config_fingerprint`` (§6).
@@ -918,6 +925,50 @@ def _reopen_session_after_fork(session: EvalSession) -> None:
         _reopen(pol)
 
 
+@contextlib.contextmanager
+def _parent_lmdb_closed(session: EvalSession):
+    """Close the parent's blueprint LMDB envs for the duration of a fork.
+
+    **The other half of the fork protocol**, and the half
+    :func:`_reopen_session_after_fork` cannot supply.  Reopening in the child is
+    not enough on its own: python-lmdb holds per-environment transaction state
+    that *survives* ``Environment.close()`` in a forked child, so a child that
+    inherits an **open** env trips ``mdb_txn_renew: MDB_BAD_RSLOT`` on its first
+    read transaction even after reopening — see
+    :meth:`~poker_ai.tables.index.InfosetIndex.close_env`, which documents exactly
+    this, and :meth:`~poker_ai.tables.cfr_tables.CFRTables.close_envs`.  Forking
+    while the parent's envs are closed guarantees the child inherits nothing; each
+    side then opens its own.  The training server does the same dance around its
+    worker start (``blueprint/multiprocess/server.py``).
+
+    Measured: without this, a 6-worker parallel eval lost hands to ``BadRslotError``
+    in the first dozen indices — the pool logs the traceback and moves on, so the
+    hands are simply *absent* from the run rather than reported as failures.
+
+    Deduped on the ``CFRTables`` itself, not on the policy: the four §4 bias
+    variants and the blueprint may be distinct objects over one table set, and
+    ``open_envs`` is **not** idempotent (a second call leaks the first handle),
+    even though ``close_envs`` is.  Yields immediately and reopens in a ``finally``,
+    so an exception in the pool still restores the parent.
+
+    Safe when no fork happens (``n_workers == 1`` runs the pool inline): the
+    worker's own :func:`_reopen_session_after_fork` opens the envs it needs before
+    the first hand either way.
+    """
+    tables = {}
+    for pol in (session.blueprint_policy, *session.solver_cfg.leaf.policies.values()):
+        t = getattr(pol, "_tables", None)
+        if t is not None and hasattr(t, "close_envs"):
+            tables[id(t)] = t
+    for t in tables.values():
+        t.close_envs()
+    try:
+        yield
+    finally:
+        for t in tables.values():
+            t.open_envs()
+
+
 # --- Parallel eval: pool hooks (module-level so they are fork-inherited cleanly) ---
 def _eval_worker_setup(worker_id: int, shared: dict):
     """Per-worker init after fork: reopen LMDB, open this worker's node-local DB."""
@@ -1010,11 +1061,16 @@ def run_evaluation_parallel(
         "now_fn": now_fn, "git_sha": git_sha, "hostname": hostname,
         "worker_dir": f"{os.fspath(target_db_path)}.workers",
     }
-    payloads = run_index_pool(
-        n_workers=n_workers, setup=_eval_worker_setup, process=_eval_worker_process,
-        teardown=_eval_worker_teardown, shared=shared,
-        target=target, skip=skip, wall_budget_s=budget_s, stop_event=stop_event,
-    )
+    # Both halves of the fork protocol: the parent's envs are closed across the fork
+    # (here) and each worker opens its own in ``_eval_worker_setup``.  Neither half
+    # is sufficient alone — see :func:`_parent_lmdb_closed`.
+    with _parent_lmdb_closed(session):
+        payloads = run_index_pool(
+            n_workers=n_workers, setup=_eval_worker_setup,
+            process=_eval_worker_process, teardown=_eval_worker_teardown,
+            shared=shared, target=target, skip=skip,
+            wall_budget_s=budget_s, stop_event=stop_event,
+        )
     payloads = [p for p in payloads if p is not None]
     merge_logs(os.fspath(target_db_path), [p["path"] for p in payloads])
     n_ok = sum(p["n_ok"] for p in payloads)
@@ -1097,7 +1153,11 @@ def _play_and_log_one(
                     if lbl in LABEL_TO_BIAS
                 },
             )
-            aivat = AivatAccumulator(hero_seat, value_fn, aivat_rng)
+            aivat = AivatAccumulator(
+                hero_seat, value_fn, aivat_rng,
+                chance=cfg.aivat_chance,
+                chance_rollouts=cfg.aivat_chance_rollouts,
+            )
 
         started_at = now_fn()
         outcome = play_hand(
@@ -1462,6 +1522,20 @@ def _cli():
         help="Baseline rollouts averaged per AIVAT value-function evaluation.",
     )
     @click.option(
+        "--aivat-chance/--no-aivat-chance",
+        default=False,
+        show_default=True,
+        help="Also take AIVAT chance corrections at the per-street (turn/river) "
+        "deals, by exact enumeration over the undealt deck. Requires --aivat.",
+    )
+    @click.option(
+        "--aivat-chance-rollouts",
+        default=48,
+        type=int,
+        show_default=True,
+        help="Baseline rollouts per alternative card in a chance correction.",
+    )
+    @click.option(
         "--condition",
         default="vanilla",
         show_default=True,
@@ -1591,6 +1665,8 @@ def _cli():
             sync_interval_minutes=opts["sync_interval_minutes"],
             aivat=opts["aivat"],
             aivat_rollouts=opts["aivat_rollouts"],
+            aivat_chance=opts["aivat_chance"],
+            aivat_chance_rollouts=opts["aivat_chance_rollouts"],
         )
         db_path = Path(opts["db_path"])
         db_path.parent.mkdir(parents=True, exist_ok=True)

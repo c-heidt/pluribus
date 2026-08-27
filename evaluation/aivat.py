@@ -33,13 +33,26 @@ shrinks variance, it can never skew the mean.  Two families of term are taken:
   board-average — a high-variance chance event, removed for free.  A **pre-flop**
   all-in (5 cards to come) is **skipped**: its exact runout exceeds
   ``runout_equity``'s enumeration cap and would Monte-Carlo sample thousands of
-  boards per hand, so those hands keep only their action-node corrections.  (General
-  per-street MIVAT chance corrections are **not** taken either: this engine has no
-  steppable/enumerable per-street chance node — board cards are dealt inside
-  ``_apply_action_in_place`` off a shuffled deck, with no "re-deal a specific
-  alternative card down the same betting line" primitive — so only the terminal
-  all-in runout, which ``runout_equity`` already integrates, is corrected.  This is
-  documented in evaluation.md §10.2 as a bounded scope.)
+  boards per hand, so those hands keep only their action-node corrections.
+
+- **Per-street chance nodes — the turn and the river** (opt-in, ``EvalConfig
+  .aivat_chance``).  When an action closes a betting round the engine deals the next
+  street inside ``_apply_action_in_place``; ``Deck.force_next`` re-deals that street
+  as each alternative undealt card down the same betting line, giving::
+
+      term = v(h·c_dealt) − Σ_c P(c)·v(h·c)
+
+  with ``P`` **exactly** uniform over ``deck.remaining`` (conditioned on the full
+  history, holes included, that is the true conditional).  A single card means the
+  baseline is an exact enumeration, not a sample.  The **flop** deals three cards at
+  once — an unordered triple, ``C(48,3)`` of them — so it is not enumerable and is
+  left out pending a sampled variant.
+
+  This is the term that can still move the number.  The action-node corrections
+  above remove **no** board variance: each rollout re-copies through
+  ``with_hole_cards``, which reshuffles the undealt deck, so ``v(child_a)`` is
+  already a board-average on both sides of the difference, while ``u(z)`` carries
+  the realised board in full.
 
 **The value function ``v``.**  As in the AIVAT paper: ``v(h)`` is the expected value
 of history ``h`` under a fixed baseline strategy profile, evaluated at the hand's
@@ -109,7 +122,7 @@ import numpy as np
 
 from environment.poker_env import PokerEnv
 from poker_ai.search.leaf import LeafConfig, continuation_value
-from poker_ai.search.rng import spawn_one
+from poker_ai.search.rng import spawn, spawn_one
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +133,25 @@ logger = logging.getLogger(__name__)
 # expensive, log-noisy operation — so it is skipped (the hand keeps its action-node
 # corrections), mirroring the solver's own ``street_at_root != 0`` equity guard.
 _MAX_RUNOUT_CARDS = 2
+
+# Baseline playouts per alternative card in a per-street chance correction.
+#
+# ⚠️MEASURED, not reasoned.  The obvious argument — "the baseline enumerates 12-45
+# cards, so ``√|remaining|`` already suppresses the noise and this can be tiny" — is
+# WRONG, and a default of 2 derived that way was measured to make the correction
+# ADD variance (gain 0.885, 95% CI [0.81, 0.96] over 3105 real-blueprint hands).
+# The flaw: only the BASELINE half of ``v̂(c_dealt) − Σ_c P(c)·v̂(c)`` gets that
+# averaging.  ``v̂(c_dealt)`` stands alone with weight ``(1 − 1/N)`` and its own
+# Monte-Carlo noise is untouched by the enumeration, so it needs real rollouts of
+# its own — the same trap that made the action-node terms harmful before sibling CRN.
+#
+# Measured gain vs chance-off, same played hands (3105 hands, 2p 20-card blueprint):
+#     m=2  0.885 [0.81, 0.96]   m=6  1.007   m=16  1.011   m=48  1.035 [0.99, 1.10]
+# A ``var = a + b/m`` fit puts the m→∞ ceiling at 1.031–1.046 depending on which
+# points it is fitted on — i.e. 48 is already AT the ceiling and raising it further
+# buys nothing.  Cost is not the constraint either: the whole four-value sweep was
+# 2.4% of hand wall-clock, so a single m=48 is well under 1%.
+_CHANCE_ROLLOUTS = 48
 
 
 @contextlib.contextmanager
@@ -244,9 +276,39 @@ class LeafValue:
         self._hero = hero
         self._rng = rng
         self._board_rng = spawn_one(rng)
+        # Chance corrections draw from their OWN pair of streams, not the two
+        # above.  Same "one stream per consumer" rule the search follows
+        # (:mod:`poker_ai.search.rng`), and here it buys something concrete: the
+        # action-node terms come out bit-identical whether chance corrections are
+        # on or off, so the two variants can be scored on the same hand and
+        # differenced exactly.  Spawned *after* ``_board_rng`` so enabling this
+        # leaves the existing streams — and every number they produce — untouched.
+        self._chance_rng, self._chance_board_rng = spawn(rng, 2)
         self._m = int(n_rollouts)
         self._leaf = leaf_cfg
         self._seat_bias = dict(seat_bias or {})
+
+    def _rollout_setup(self, env_before: PokerEnv, *, chance: bool = False):
+        """``(profile, holes, ctx)`` shared by every ``v`` evaluation at this node.
+
+        - ``profile`` — the baseline σ: each seat continues under its ACTUAL bias
+          class where known (see ``seat_bias``), else the unbiased blueprint.
+        - ``holes`` — the hand's real holes, every seat and folded ones included,
+          since ``v(h)`` is the baseline value of the true history ``h``.
+        - ``ctx`` — the duck-typed leaf carrier over the caller's stream pair:
+          the action-node streams, or (``chance=True``) the separate chance pair.
+        """
+        n_players = env_before.n_players
+        profile = {s: self._seat_bias.get(s, "none") for s in range(n_players)}
+        holes = [
+            tuple(int(c) for c in env_before.players[s].cards)
+            for s in range(n_players)
+        ]
+        streams = (
+            (self._chance_rng, self._chance_board_rng) if chance
+            else (self._rng, self._board_rng)
+        )
+        return profile, holes, _LeafCtx(self._leaf, *streams)
 
     def child_values(
         self, env_before: PokerEnv, legal: Sequence[str]
@@ -281,21 +343,8 @@ class LeafValue:
         legal = list(legal)
         sums: Dict[str, float] = {a: 0.0 for a in legal}
         hero_seat = int(self._hero.my_seat)
-        n_players = env_before.n_players
-        # The baseline profile σ: each seat continues under its ACTUAL bias class
-        # where known (see ``seat_bias``), else the unbiased blueprint.
-        profile = {
-            s: self._seat_bias.get(s, "none") for s in range(n_players)
-        }
+        profile, holes, ctx = self._rollout_setup(env_before)
         m = max(self._m, 1)
-        ctx = _LeafCtx(self._leaf, self._rng, self._board_rng)
-        # The hand's real holes — every seat, folded ones included, since ``v(h)`` is
-        # the baseline value of the true history ``h``.  Constant across rollouts, so
-        # it is hoisted out of the loop.
-        holes = [
-            tuple(int(c) for c in env_before.players[s].cards)
-            for s in range(n_players)
-        ]
         with _preserve_global_random():
             for _ in range(m):
                 # Re-copy per rollout: ``with_hole_cards`` reshuffles the undealt
@@ -315,6 +364,126 @@ class LeafValue:
                 # deterministic function of the situation, so the next rollout and
                 # the next node stay reproducible.
         return {a: sums[a] / m for a in legal}
+
+    def chance_values(
+        self, env_before: PokerEnv, action: str, *, n_rollouts: int = 2
+    ) -> Optional[Tuple[float, float]]:
+        """``(v(dealt card), Σ_c P(c)·v(c))`` for the street deal fused into ``action``.
+
+        The engine has no standalone chance node: a street is dealt *inside*
+        ``_apply_action_in_place`` when an action closes the betting round
+        (:meth:`PokerEnv._increment_stage`).  So the chance event that follows
+        ``h·action`` is discovered by taking the step and seeing whether the board
+        grew — no duplication of "does this action close the round?" logic.
+
+        Returns ``None`` — no correction available — unless the step deals
+        **exactly one** card and leaves a non-terminal state.  That restricts this
+        to the **turn and river**:
+
+        - 0 cards → the action did not close the round; there is no chance node.
+        - 3 cards → the flop.  Its event is an unordered triple, ``C(48,3) = 17296``
+          of them on a full deck, so it cannot be enumerated and needs a *sampled*
+          baseline with its own knob; deliberately deferred.
+        - a terminal step → the board is force-dealt to five by
+          :meth:`PokerEnv._settle_terminal`, and that runout is already
+          Rao-Blackwellised exactly by :meth:`AivatAccumulator.finalize`'s
+          ``runout_equity`` term.  Correcting it here as well would double-count.
+
+        **The event's distribution is exactly uniform over** ``deck.remaining``, and
+        that is not an approximation: conditioning on the full history ``h`` — every
+        seat's holes included, as ``v`` already does — the next card is uniform over
+        the cards that are neither dealt to a player nor on the board, which is
+        precisely what ``remaining`` holds.  ``remaining[0]`` is the card the played
+        hand actually receives (``deal_community`` slices from the cursor), so the
+        realised outcome needs no lookahead and is scored as just one more
+        alternative, under the same code path as the rest.
+
+        **Why this is the term that can still pay.**  The action-node correction in
+        :meth:`child_values` removes **no** board variance at all: every rollout
+        there re-copies through ``with_hole_cards``, which reshuffles the undealt
+        deck, so ``v(child_a)`` is already a board-*average* on both sides of
+        ``v(child_taken) − Σ_a π(a)·v(child_a)``.  Meanwhile ``u(z)`` carries the
+        full realised board.  Integrating the street deal is what puts the two on
+        the same footing.
+
+        **Cost, and why ``n_rollouts`` is small.**  One card means the baseline is an
+        exact enumeration over ``|remaining|`` alternatives (12–13 heads-up on the
+        20-card LUT, 44–45 on a full deck), and averaging over that many draws
+        already suppresses rollout noise by ``√|remaining|`` — so this needs far
+        fewer rollouts *per alternative* than the 2–4-way action nodes do.  Siblings
+        are scored under common random numbers exactly as in :meth:`child_values`:
+        both streams are rewound before each alternative, so within a round the
+        boards differ only by the forced card.
+
+        Unbiasedness is the standard control-variate argument and needs nothing from
+        ``v`` beyond consistency: conditioned on ``h·action``, the dealt card ``C``
+        is drawn from ``P``, so ``E[v(C)] = Σ_c P(c)·v(c)`` and the difference the
+        caller forms is zero-mean whatever ``v`` reads or how noisy it is.
+
+        Parameters
+        ----------
+        env_before
+            Pre-action state at the node (never mutated — every rollout works on a
+            ``with_hole_cards`` copy, which is also the only env the deck force is
+            ever applied to).
+        action
+            The action about to be played, whose step may deal the street.
+        n_rollouts
+            Baseline playouts per alternative card.
+
+        Returns
+        -------
+        tuple[float, float] or None
+            ``(v_dealt, baseline)``; the caller's term is ``v_dealt − baseline``.
+        """
+        hero_seat = int(self._hero.my_seat)
+        profile, holes, ctx = self._rollout_setup(env_before, chance=True)
+        rng, board_rng = ctx.rng, ctx.board_rng
+        m = max(int(n_rollouts), 1)
+        n_before = len(env_before.community_cards)
+        # Read the support off the LIVE deck: ``with_hole_cards`` reshuffles the
+        # undealt region, so a copy's order differs — but the undealt *set*, which
+        # is all that defines the event, does not.
+        alternatives = [int(c) for c in env_before.deck.remaining]
+        if not alternatives:
+            return None
+
+        with _preserve_global_random():
+            base = env_before.with_hole_cards(holes, rng=board_rng)
+            # Probe the step for its chance event.  The betting engine is
+            # board-independent, so how many cards this deals and whether the state
+            # is terminal do not depend on the copy's reshuffled deck order.
+            tok = base.step_in_place(action)
+            n_dealt = len(base.community_cards) - n_before
+            terminal = base.is_terminal
+            base.undo(tok)
+            if terminal or n_dealt != 1:
+                return None
+
+            sums = [0.0] * len(alternatives)
+            for r in range(m):
+                if r:
+                    # Fresh copy per round, as in ``child_values``: the reshuffle is
+                    # what makes each round an independent draw of the continuation
+                    # *beyond* the forced card.
+                    base = env_before.with_hole_cards(holes, rng=board_rng)
+                round_rng = rng.bit_generator.state
+                round_board = board_rng.bit_generator.state
+                for i, card in enumerate(alternatives):
+                    rng.bit_generator.state = round_rng
+                    board_rng.bit_generator.state = round_board
+                    forced = base.deck.force_next((card,))
+                    tok = base.step_in_place(action)
+                    v = continuation_value(base, profile, ctx)
+                    sums[i] += float(v[hero_seat])
+                    base.undo(tok)
+                    # ``undo`` restores the deal cursor but NOT ``_cards`` — the
+                    # force has to be reversed by hand (see ``Deck.force_next``).
+                    base.deck.unforce(forced)
+
+        v_dealt = sums[0] / m                       # alternatives[0] == the real card
+        baseline = sum(sums) / (m * len(sums))      # uniform P(c) over ``remaining``
+        return v_dealt, baseline
 
     # ------------------------------------------------------------------ #
     # Belief joint hole sampling (card-disjoint, board-masked)
@@ -421,11 +590,26 @@ class AivatAccumulator:
 
     def __init__(self, hero_seat: int, value_fn: LeafValue, rng: np.random.Generator,
                  *, max_runout_cards: int = _MAX_RUNOUT_CARDS,
-                 runout_cap: int = 5000) -> None:
+                 runout_cap: int = 5000,
+                 chance: bool = False,
+                 chance_rollouts: int = _CHANCE_ROLLOUTS) -> None:
         self._hero_seat = int(hero_seat)
         self._v = value_fn
         self._rng = rng
+        # Kept apart so a caller can score BOTH variants from one played hand:
+        # ``aivat_without_chance == finalize(...) + sum_chance_terms``.  The two
+        # families draw from separate streams, so that identity is exact, not an
+        # approximation (see :class:`LeafValue`).
         self._sum_terms = 0.0
+        self._sum_chance = 0.0
+        # Per-street (turn/river) chance corrections — opt-in, see
+        # :meth:`LeafValue.chance_values`.  Off by default so the estimator's
+        # scope stays the measured one until the A/B says otherwise.
+        self._chance = bool(chance)
+        self._chance_rollouts = int(chance_rollouts)
+        # Diagnostics: how many terms of each family this hand actually took.
+        self.n_action_terms = 0
+        self.n_chance_terms = 0
         # Terminal all-in runout chance-correction reach.  Default 2 (flop/turn all-ins,
         # ``C(deck, <=2)`` under the exact cap) — the played-game default, unchanged.  The
         # calibration raises it to 5 so a PRE-FLOP all-in is also Rao-Blackwellised, with
@@ -446,8 +630,27 @@ class AivatAccumulator:
         ``legal`` / ``probs`` must be aligned (``probs`` sums to 1) and ``action``
         must be in ``legal`` (the sampled action); a mismatch skips the term with a
         warning rather than corrupting the estimate.
+
+        When per-street chance corrections are enabled, this **also** takes the
+        chance term for the street ``action`` deals, if it deals one — the engine
+        fuses the deal into the closing action, so ``h·action`` is where that event
+        lives (:meth:`LeafValue.chance_values`).  The two families are independent
+        terms; a ``legal`` mismatch skips only the action one.
+
+        Coverage note: the play loop calls this at *known-policy* nodes while the
+        hero is still active, so a round closed after the hero folds takes no chance
+        term.  That costs nothing — with the hero folded its payout is already
+        settled, so ``v`` is constant in the board and the term is exactly zero.
         """
         legal = list(legal)
+        if self._chance:
+            chance = self._v.chance_values(
+                env_before, action, n_rollouts=self._chance_rollouts
+            )
+            if chance is not None:
+                v_dealt, baseline = chance
+                self._sum_chance += v_dealt - baseline
+                self.n_chance_terms += 1
         if action not in legal:
             logger.warning(
                 "AIVAT: sampled action %r not in legal %s at seat %d — skipping term",
@@ -457,6 +660,7 @@ class AivatAccumulator:
         vals = self._v.child_values(env_before, legal)
         baseline = sum(float(p) * vals[a] for p, a in zip(probs, legal))
         self._sum_terms += vals[action] - baseline
+        self.n_action_terms += 1
 
     def finalize(self, terminal_env: PokerEnv) -> float:
         """Return ``aivat_value`` for the finished hand.
@@ -477,7 +681,22 @@ class AivatAccumulator:
             with _preserve_global_random():
                 eq = terminal_env.runout_equity(rng=self._rng, cap=self._runout_cap)
             chance_term = hero_delta - float(eq[self._hero_seat])
-        return hero_delta - self._sum_terms - chance_term
+        return hero_delta - self._sum_terms - self._sum_chance - chance_term
+
+    @property
+    def sum_chance_terms(self) -> float:
+        """Σ of this hand's per-street chance terms (0.0 when they are off).
+
+        ``finalize(...) + sum_chance_terms`` is exactly the ``aivat_value`` the same
+        hand would have produced with ``chance=False``, which is what makes the
+        two variants comparable on identical played hands.
+        """
+        return self._sum_chance
+
+    @property
+    def sum_action_terms(self) -> float:
+        """Σ of this hand's action-node terms."""
+        return self._sum_terms
 
     def _cheap_runout(self, terminal_env: PokerEnv) -> bool:
         """Whether the terminal all-in's runout is worth the chance correction.

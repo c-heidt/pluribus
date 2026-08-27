@@ -762,7 +762,8 @@ Ordered so each step yields something usable before the next.
    the **unbiasedness + variance-drop test**. Switches the summary's strength CI onto
    `aivat_value`; unblocks the small-edge comparisons. Cross-run merge tooling
    (`(run_id, game_id)` keying, DuckDB `ATTACH`+`UNION`) follows once there is more
-   than one run to compare. *done — action-node scope; see §10.2. Built:*
+   than one run to compare. *done — action nodes, the terminal all-in runout, and
+   (opt-in) the turn/river chance nodes; see §10.2. Built:*
    [evaluation/aivat.py](../evaluation/aivat.py), wired into the runner behind the
    opt-in `--aivat` flag.
 10. **Cross-condition pairing / CRN (§10.1).** The variance lever that makes the
@@ -791,7 +792,9 @@ the **runner** that generates the games and **AIVAT** that makes small-edge
 comparisons statistically feasible — are specified here in enough detail to
 implement. The **runner is now built** ([evaluation/runner.py](../evaluation/runner.py),
 §9 steps 3–6), and **AIVAT is now built** ([evaluation/aivat.py](../evaluation/aivat.py),
-§9 step 9) in its action-node scope (see §10.2). §10.3 lists genuinely-future work.
+§9 step 9) over action nodes, the terminal all-in runout and — behind
+`--aivat-chance` — the turn/river chance nodes (see §10.2). §10.3 lists
+genuinely-future work.
 
 ### 10.1 Evaluation Runner
 
@@ -1022,13 +1025,9 @@ data already captured (`action_dist`, values, ranges). Adopting it lets the runn
 skip seat rotation (§6). Medium effort, well-bounded.
 
 **As built** ([evaluation/aivat.py](../evaluation/aivat.py)), the scope is
-**action-node AIVAT (hero + opponents) plus the terminal all-in runout**; the general
-per-street chance (MIVAT) term is **deferred**. The engine has no steppable /
-enumerable per-street chance node — hole cards are dealt in `PokerEnv.__init__` and
-board cards *inside* `_apply_action_in_place` off a shuffled deck, with no "re-deal a
-specific alternative card down the same betting line" primitive — so the per-street
-`v(realized) − Σ_c P(c)·v(child_c)` cannot be taken exactly without a new engine
-primitive. What *is* taken:
+**action-node AIVAT (hero + opponents), the terminal all-in runout, and — behind
+`--aivat-chance` — the per-street chance nodes at the turn and river**. The **hole
+deal** and the **flop** are the two chance events still uncorrected. What is taken:
 
 - **Action nodes** — at every hero and opponent decision, `term = v(child_sampled) −
   Σ_a π(a)·v(child_a)`, with the siblings enumerated by the engine's make/undo
@@ -1043,22 +1042,79 @@ primitive. What *is* taken:
   A **pre-flop** all-in (5 cards to come) is **skipped** — its exact runout blows
   past `runout_equity`'s enumeration cap into a thousands-of-boards Monte-Carlo
   sample per hand — so those hands keep only their action-node corrections.
+- **Per-street chance nodes at the turn and river** (`--aivat-chance`, off by
+  default) — `term = v(h·c_dealt) − Σ_c P(c)·v(h·c)`. The engine deals a street
+  *inside* `_apply_action_in_place` when an action closes the betting round, so the
+  chance event is discovered by taking the step and seeing whether the board grew;
+  `Deck.force_next` / `unforce` then re-deals that street as each alternative undealt
+  card down the same betting line. `P` is **exactly** uniform over `deck.remaining`
+  — conditioned on the full history (holes included, as `v` already is), that *is*
+  the true conditional — so the baseline is an exact enumeration and the term is
+  zero-mean by arithmetic rather than by sampling. One card means 12–13 alternatives
+  heads-up on the 20-card LUT (44–45 on a full deck), which averages rollout noise
+  down by `√|remaining|`; hence `--aivat-chance-rollouts` (default 2) is much smaller
+  than `--aivat-rollouts`.
+
+  **Why this family is the one that can still move the number.** The action-node
+  terms above remove *no* board variance: each rollout re-copies through
+  `with_hole_cards`, which reshuffles the undealt deck, so `v(child_a)` is already a
+  board-*average* on both sides of the difference, while `u(z)` carries the realised
+  board in full.
+
+  **Still uncorrected**: the **flop** (three cards at once — an unordered triple,
+  `C(48,3)` of them, so not enumerable; it needs a sampled baseline with its own
+  knob) and the **hole deal** (`v` conditions on the actual holes, so correcting it
+  would mean integrating over every hole assignment).
+
+  Chance corrections draw from their **own** stream pair, spawned after
+  `_board_rng`, so switching them on adds terms without perturbing a single
+  action-node term. That makes `finalize() + sum_chance_terms` exactly the
+  `aivat_value` the same hand would have produced with them off — which is how the
+  two variants get A/B'd on *identical* played hands instead of two runs.
+
+  **⚠️Measured, 3105 hands, real 2p 20-card blueprint, vanilla arm** (dual-profile:
+  both variants scored on the same played hands; reduced iteration budget, so the
+  *absolute* `var_x` here is not comparable to a production-budget run — only the
+  paired off-vs-on gain is):
+
+  | `--aivat-chance-rollouts` | gain vs chance-off | 95% CI |
+  |---|---|---|
+  | 2 | **0.885** | [0.81, 0.96] — **adds variance** |
+  | 6 | 1.007 | [0.95, 1.07] |
+  | 16 | 1.011 | [0.96, 1.07] |
+  | 48 (default) | **1.035** | [0.99, 1.10] |
+
+  A `var = a + b/m` fit puts the m→∞ ceiling at 1.031–1.046, so **48 is already at
+  it**. Cost is not the constraint: the whole four-value sweep was 2.4% of hand
+  wall-clock. Unbiased throughout (`mean(aivat − raw)` t = −1.23; every per-`m` term
+  mean |t| < 2).
+
+  On the **18.3%** of hands that actually receive a term the gain is **1.105**
+  (`var_x` 1.219 → 1.347), 95% CI [0.96, 1.30] — so the overall +3.5% is that effect
+  diluted by coverage, and neither is statistically distinguishable from zero at this
+  n. **Coverage, not `m`, is the remaining lever**: the flop is dealt with betting
+  continuing on ~52% of hands versus the ~18% that see a turn or river, so a sampled
+  flop correction is the only change that could move this materially. It is
+  correspondingly harder — its baseline must be *sampled* over `C(48,3)` triples
+  rather than enumerated, and sampling noise in the baseline is exactly what made
+  `m=2` harmful above.
 
 **The value function `v`** reuses the leaf machinery
 ([leaf.py](../poker_ai/search/leaf.py) `continuation_value`) under a fixed
-all-blueprint continuation profile: it materialises a card-disjoint joint hole
-assignment sampled from the tracker's belief — the hero seat filled with its *known*
-hole — and averages the hero-seat continuation value over a few (`--aivat-hole-samples`,
-default 6) such draws. Any consistent `v` is unbiased, so the internal hole sampling
-uses cheap sequential-with-removal rather than the exact conditioned joint. **The
-information-leak rule** (the main correctness trap): `v` integrates only over the
-*observer's* belief and never reads an opponent's concrete hole; `π` at an opponent
-node may condition on that opponent's own hole (it is exactly the distribution the
-action was sampled from).
+all-blueprint continuation profile — the baseline σ — evaluated at the hand's
+**actual** holes and averaged over `--aivat-rollouts` (default 6) playouts. Each seat
+continues under its *real* bias class, derived from the same `seat_labels` that built
+the opponents, so σ reproduces the table rather than merely resembling it; the hero's
+own seat stays unbiased, since its real continuation is a search result that does not
+exist as a policy at arbitrary future nodes and substituting one would make `v`
+arm-dependent again. Any consistent `v` is unbiased; better `v` ⇒ more variance
+reduction, never a correctness risk. On why reading the true holes is not an
+information leak, see the design note above.
 
 **RNG isolation** (see [poker_ai/search/rng.py](../poker_ai/search/rng.py)) — AIVAT
 owns its randomness in *both* directions. It runs on its own sub-stream (a 5th
-`derive_seeds` child) plus a spawned board-runout stream, and reads the global
+`derive_seeds` child) plus a spawned board-runout stream — and, for the chance
+corrections, a second spawned pair of their own — and reads the global
 `np.random` nowhere; the global stream belongs to the played hand's deal alone.
 Outward, that keeps AIVAT **passive**: a hand's raw `hero_chips_delta` is
 byte-identical with AIVAT on or off. Inward — the direction that matters for the

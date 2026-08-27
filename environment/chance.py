@@ -161,6 +161,95 @@ class Deck:
             self._cards[p_d] = self._cards[p_a]
             self._cards[p_a] = tmp
 
+    def force_next(self, cards) -> list:
+        """Make ``cards`` the next cards :meth:`deal_community` will hand out.
+
+        Swaps each requested card into position ``_idx + k`` of ``_cards``, so a
+        subsequent ``deal_community(len(cards))`` returns exactly ``cards`` in the
+        given order.  Returns a **token** that :meth:`unforce` consumes to put the
+        array back; the two are exact inverses (each swap is a transposition,
+        replayed in reverse).
+
+        This is the engine's *counterfactual board* primitive: it answers "what if
+        this street had come ``c`` instead?" down the same betting line, which is
+        what an offline chance-node control variate needs
+        (:mod:`evaluation.aivat`).  Nothing in the played game calls it.
+
+        .. warning::
+           **Mutates ``_cards``, which no other deal operation does.**
+           :meth:`capture` / :meth:`restore` snapshot only the cursor, precisely
+           because dealing never disturbs the array — so
+           :meth:`PokerEnv.undo` will *not* reverse a force.  Every caller must
+           pair ``force_next`` with :meth:`unforce`, and should only ever force on
+           a throwaway copy (:meth:`PokerEnv.with_hole_cards`), never on the env
+           whose deal is the played hand.
+
+        Parameters
+        ----------
+        cards : Sequence[int]
+            Card integers to pin, in deal order.  Each must still be undealt (at a
+            position ``>= _idx``) and distinct from the others.
+
+        Returns
+        -------
+        list[tuple[int, int]]
+            Swap token for :meth:`unforce`.  Empty when every card already sat in
+            its target position (a no-op force).
+
+        Raises
+        ------
+        ValueError
+            If a card is already dealt, absent from the deck, or requested twice,
+            or if ``cards`` runs past the end of the deck.
+        """
+        n = len(cards)
+        if self._idx + n > self._cards.shape[0]:
+            raise ValueError(
+                f"force_next: {n} cards requested but only "
+                f"{self._cards.shape[0] - self._idx} remain undealt."
+            )
+        swaps: list = []
+        try:
+            for k, card in enumerate(cards):
+                target = self._idx + k
+                card = int(card)
+                # Search from ``target``, not from ``_idx``: cards pinned earlier in
+                # this same call already occupy ``[_idx:target)`` and must not be
+                # re-found.  A card that is dealt (or already pinned) is therefore
+                # simply absent from the searched region — the error we want.
+                hits = np.where(self._cards[target:] == card)[0]
+                if hits.size == 0:
+                    raise ValueError(
+                        f"force_next: card {card} is not available to deal "
+                        f"(already dealt, pinned twice, or not in this deck)."
+                    )
+                pos = target + int(hits[0])
+                if pos != target:
+                    self._cards[target], self._cards[pos] = (
+                        int(self._cards[pos]),
+                        int(self._cards[target]),
+                    )
+                    swaps.append((target, pos))
+        except Exception:
+            # Never leave the deck half-forced: a partial force would silently
+            # corrupt the runout of whatever the caller does next.
+            self.unforce(swaps)
+            raise
+        return swaps
+
+    def unforce(self, token) -> None:
+        """Undo a :meth:`force_next`, restoring ``_cards`` exactly.
+
+        Replays the token's transpositions in reverse.  ``_idx`` is not touched —
+        a caller that also stepped the env restores the cursor through
+        :meth:`PokerEnv.undo` (or :meth:`restore`), in either order.
+        """
+        for target, pos in reversed(token):
+            self._cards[target], self._cards[pos] = (
+                int(self._cards[pos]),
+                int(self._cards[target]),
+            )
+
     def shuffle_undealt(self, rng=None) -> None:
         """Shuffle the undealt segment in place (positions ``>= _idx``).
 

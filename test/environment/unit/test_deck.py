@@ -290,3 +290,137 @@ class TestShuffleUndealtRng:
         deck.shuffle_undealt(np.random.default_rng(1))
         np.testing.assert_array_equal(deck._cards[: deck._idx], drawn_before)
         assert set(int(c) for c in deck.remaining) == undealt_before
+
+
+class TestForceNext:
+    """``force_next`` / ``unforce`` — the counterfactual-board primitive.
+
+    It is the only deal operation that mutates ``_cards``, so the invariants that
+    matter are (a) the forced cards really are what comes out of the next
+    ``deal_community``, and (b) ``unforce`` restores the array **exactly**, since
+    ``capture``/``restore`` (and hence ``PokerEnv.undo``) save only the cursor and
+    will not clean up after it.
+    """
+
+    @staticmethod
+    def _dealt_deck(n_community: int = 3) -> Deck:
+        deck = Deck(2, 14)
+        deck.deal_private_cards([Player(i, 100) for i in range(2)])
+        if n_community:
+            deck.deal_community(n_community)
+        return deck
+
+    def test_forced_card_is_dealt_next(self):
+        deck = self._dealt_deck()
+        target = int(deck.remaining[7])
+        deck.force_next((target,))
+        assert deck.deal_community(1) == (target,)
+
+    def test_every_undealt_card_can_be_forced(self):
+        # The AIVAT chance correction enumerates the whole remaining deck, so a
+        # card that cannot be forced would silently drop an alternative.
+        for i in range(len(self._dealt_deck().remaining)):
+            deck = self._dealt_deck()
+            target = int(deck.remaining[i])
+            deck.force_next((target,))
+            assert deck.deal_community(1) == (target,)
+
+    def test_forcing_the_natural_next_card_is_a_no_op(self):
+        deck = self._dealt_deck()
+        token = deck.force_next((int(deck.remaining[0]),))
+        assert token == []
+
+    def test_multi_card_force_preserves_order(self):
+        deck = self._dealt_deck()
+        want = tuple(int(c) for c in deck.remaining[[5, 1, 9]])
+        deck.force_next(want)
+        assert deck.deal_community(3) == want
+
+    def test_unforce_restores_the_array_exactly(self):
+        import numpy as np
+        deck = self._dealt_deck()
+        before = deck._cards.copy()
+        token = deck.force_next((int(deck.remaining[7]),))
+        assert not np.array_equal(deck._cards, before)   # it really did move
+        deck.unforce(token)
+        np.testing.assert_array_equal(deck._cards, before)
+
+    def test_unforce_restores_exactly_for_every_card(self):
+        import numpy as np
+        deck = self._dealt_deck()
+        before = deck._cards.copy()
+        for i in range(len(deck.remaining)):
+            token = deck.force_next((int(deck.remaining[i]),))
+            deck.unforce(token)
+            np.testing.assert_array_equal(deck._cards, before)
+
+    def test_unforce_restores_exactly_for_a_multi_card_force(self):
+        import numpy as np
+        deck = self._dealt_deck(0)
+        before = deck._cards.copy()
+        token = deck.force_next(tuple(int(c) for c in deck._cards[[11, 4, 30]]))
+        deck.unforce(token)
+        np.testing.assert_array_equal(deck._cards, before)
+
+    def test_force_does_not_move_the_cursor(self):
+        deck = self._dealt_deck()
+        idx = deck._idx
+        token = deck.force_next((int(deck.remaining[7]),))
+        assert deck._idx == idx
+        deck.unforce(token)
+        assert deck._idx == idx
+
+    def test_force_preserves_the_drawn_segment(self):
+        import numpy as np
+        deck = self._dealt_deck()
+        drawn = deck._cards[: deck._idx].copy()
+        deck.force_next((int(deck.remaining[9]),))
+        np.testing.assert_array_equal(deck._cards[: deck._idx], drawn)
+
+    def test_force_preserves_the_undealt_set(self):
+        deck = self._dealt_deck()
+        undealt = set(int(c) for c in deck.remaining)
+        deck.force_next((int(deck.remaining[9]),))
+        assert set(int(c) for c in deck.remaining) == undealt
+
+    def test_forced_card_lands_in_the_board_region(self):
+        # ``board_runout`` reads ``[_board_start : +5]``; a forced street card must
+        # show up there or the compiled FastState twin would see a different board.
+        deck = self._dealt_deck()
+        target = int(deck.remaining[6])
+        deck.force_next((target,))
+        assert int(deck.board_runout(5)[3]) == target
+
+    def test_already_dealt_card_is_rejected(self):
+        deck = self._dealt_deck()
+        dealt = int(deck._cards[0])
+        with pytest.raises(ValueError, match="not available to deal"):
+            deck.force_next((dealt,))
+
+    def test_card_not_in_deck_is_rejected(self):
+        deck = self._dealt_deck()
+        with pytest.raises(ValueError, match="not available to deal"):
+            deck.force_next((123456789,))
+
+    def test_same_card_twice_is_rejected(self):
+        deck = self._dealt_deck()
+        c = int(deck.remaining[3])
+        with pytest.raises(ValueError, match="not available to deal"):
+            deck.force_next((c, c))
+
+    def test_too_many_cards_is_rejected(self):
+        deck = self._dealt_deck()
+        want = [int(c) for c in deck.remaining] + [int(deck._cards[0])]
+        with pytest.raises(ValueError, match="remain undealt"):
+            deck.force_next(want)
+
+    def test_a_rejected_force_leaves_the_deck_untouched(self):
+        # Partial forcing would corrupt the next runout without raising anywhere
+        # the caller can see it.
+        import numpy as np
+        deck = self._dealt_deck()
+        before = deck._cards.copy()
+        good = int(deck.remaining[8])
+        with pytest.raises(ValueError):
+            deck.force_next((good, int(deck._cards[0])))
+        np.testing.assert_array_equal(deck._cards, before)

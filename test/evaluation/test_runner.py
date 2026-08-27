@@ -20,6 +20,7 @@ from evaluation.runner import (
     EvalConfig,
     EvalSession,
     _hu_street,
+    _parent_lmdb_closed,
     _sync_due,
     derive_seeds,
     run_evaluation,
@@ -729,3 +730,103 @@ def test_run_over_real_lut(tmp_path, lut):
         log.close()
     assert n == 2 and games == 2
     assert len(joined) == 2
+
+
+# --------------------------------------------------------------------------- #
+# Fork protocol: the PARENT half (see runner._parent_lmdb_closed)
+# --------------------------------------------------------------------------- #
+
+class _FakeTables:
+    """Stands in for ``CFRTables``' env open/close pair."""
+
+    def __init__(self):
+        self.closed = 0
+        self.opened = 0
+
+    def close_envs(self):
+        self.closed += 1
+
+    def open_envs(self):
+        self.opened += 1
+
+
+class _FakePolicy:
+    def __init__(self, tables):
+        self._tables = tables
+
+
+def _session_over(blueprint_tables, *leaf_tables):
+    session = _stub_session()
+    session.blueprint_policy = _FakePolicy(blueprint_tables)
+    session.solver_cfg.leaf.policies = {
+        f"p{i}": _FakePolicy(t) for i, t in enumerate(leaf_tables)
+    }
+    return session
+
+
+class TestParentLmdbClosed:
+    """Closing the parent's LMDB envs across the fork.
+
+    Reopening in the child is documented as insufficient on its own
+    (``InfosetIndex.close_env``): python-lmdb keeps per-env transaction state that
+    survives ``Environment.close()`` in the child, so a child inheriting an OPEN
+    env trips ``MDB_BAD_RSLOT`` on its first read even after reopening.  Measured
+    on a 6-worker run: hands died in the first dozen indices, and because the pool
+    logs and continues they went *missing* rather than being reported.
+    """
+
+    def test_closes_before_the_body_and_reopens_after(self):
+        t = _FakeTables()
+        with _parent_lmdb_closed(_session_over(t)):
+            assert (t.closed, t.opened) == (1, 0)      # closed for the fork
+        assert (t.closed, t.opened) == (1, 1)
+
+    def test_deduped_on_the_table_set_not_the_policy(self):
+        # The blueprint and the four bias variants are distinct policy objects over
+        # ONE table set.  ``open_envs`` is not idempotent — a second call leaks the
+        # first handle — so it must run exactly once.
+        t = _FakeTables()
+        with _parent_lmdb_closed(_session_over(t, t, t, t)):
+            pass
+        assert (t.closed, t.opened) == (1, 1)
+
+    def test_distinct_table_sets_are_all_covered(self):
+        a, b = _FakeTables(), _FakeTables()
+        with _parent_lmdb_closed(_session_over(a, b)):
+            pass
+        assert (a.closed, a.opened) == (1, 1)
+        assert (b.closed, b.opened) == (1, 1)
+
+    def test_reopens_even_when_the_body_raises(self):
+        # A pool that dies mid-run must still leave the parent able to read.
+        t = _FakeTables()
+        with pytest.raises(RuntimeError):
+            with _parent_lmdb_closed(_session_over(t)):
+                raise RuntimeError("worker died")
+        assert (t.closed, t.opened) == (1, 1)
+
+    def test_lmdb_free_policies_are_skipped(self):
+        # The in-memory UniformPolicy of the stub session exposes no tables.
+        with _parent_lmdb_closed(_stub_session()):
+            pass          # must not raise
+
+    def test_parallel_eval_uses_it(self, tmp_path, monkeypatch):
+        # The wiring, not just the helper: run_evaluation_parallel must close the
+        # envs around its pool.  Asserted from inside the pool call, since that is
+        # the only window in which they are meant to be closed.
+        from evaluation import runner as R
+
+        t = _FakeTables()
+        session = _session_over(t)
+        session.config.max_hands = 1
+        seen = {}
+
+        def fake_pool(**kw):
+            seen["closed_during_pool"] = (t.closed, t.opened)
+            return []
+
+        monkeypatch.setattr("evaluation.hand_pool.run_index_pool", fake_pool)
+        monkeypatch.setattr(R, "_reopen_session_after_fork", lambda s: None)
+        R.run_evaluation_parallel(session, tmp_path / "t.sqlite", n_workers=2)
+        assert seen["closed_during_pool"] == (1, 0)
+        assert (t.closed, t.opened) == (1, 1)
