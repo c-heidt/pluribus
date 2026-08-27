@@ -1,20 +1,15 @@
 """Policy interface for the search package.
 
 A :class:`Policy` is anything the depth-limited solver (§6.5) or the
-continuation-value rollouts (§6.4) can query for an action distribution
-at a given ``PokerEnv`` state.  Two concrete implementations are planned
-in :doc:`docs/subgame_solving`; only :class:`BlueprintPolicy` is shipped
-in this module.  The other — ``SearchPolicy`` (reads in-memory subgame
-regrets) — slots into the same ABC once the solver in §6.5 lands.
+continuation-value rollouts (§6.4) can query for an action distribution at a given
+``PokerEnv`` state.
 
-The four §4 continuation strategies are not separate artifacts: they are
-inference-time reweightings of the single base blueprint.  The base
-distribution σ is the blueprint's normalised *average strategy* (with a
-regret-matching fallback for under-sampled rows — see
-:class:`BlueprintPolicy`); the biased variants multiply the probability
-of one action class by ``bias_multiplier`` (5) and renormalize.  All
-implementations share the same bias-mask and reweighting helpers; the
-only per-implementation logic is *where the base row comes from*.
+The four §4 continuation strategies are not separate artifacts but inference-time
+reweightings of one base blueprint: σ is the blueprint's normalised *average strategy*
+(with a regret-matching fallback for under-sampled rows), and a biased variant
+multiplies one action class's probability by ``bias_multiplier`` and renormalizes.
+All implementations share the bias-mask and reweighting helpers; only *where the base
+row comes from* differs.
 """
 
 from __future__ import annotations
@@ -56,26 +51,13 @@ class Policy(ABC):
     def strategy(self, state: PolicyState, bias: BiasClass = "none") -> np.ndarray:
         """Return the action distribution at ``state``.
 
-        Parameters
-        ----------
-        state : PolicyState
-            Decoupled view of the env's public state plus the
-            actor's info-set key; built from :attr:`PokerEnv.policy_state`
-            (current actor as-is) or :meth:`PokerEnv.policy_state_for`
-            (current actor under a hypothetical hole, for leak-free
-            ``sigma_for_combo`` queries).
-        bias : BiasClass
-            ``"none"`` for the base distribution; ``"fold"`` /
-            ``"call"`` / ``"raise"`` multiply that action class's
-            probability by ``bias_multiplier`` and renormalize (§4).
+        ``state`` is the env's public state plus the actor's info-set key, from
+        :attr:`PokerEnv.policy_state` or :meth:`PokerEnv.policy_state_for` (a
+        hypothetical hole, for leak-free ``sigma_for_combo`` queries).  ``bias``
+        selects the base distribution (``"none"``) or multiplies one action class by
+        ``bias_multiplier`` and renormalizes (§4).
 
-        Returns
-        -------
-        numpy.ndarray
-            Float32 probability vector aligned with
-            ``state.legal_actions``; sums to 1 (or 0 if no actions
-            are legal, which should not occur in a well-formed game
-            state).
+        Returns a float32 vector aligned with ``state.legal_actions``, summing to 1.
         """
 
     @staticmethod
@@ -111,20 +93,9 @@ class Policy(ABC):
     ) -> np.ndarray:
         """Multiply a target action class's probability and renormalize.
 
-        Computes ``σ'(a) ∝ σ(a) · (m if a ∈ biased_class else 1)`` (§4).
-        The input ``sigma`` is an already-regret-matched probability
-        vector (not a regret row); a ``multiplier`` of 1 or an
-        all-false ``bias_mask`` (i.e. ``bias == "none"``) returns it
-        unchanged.
-
-        Parameters
-        ----------
-        sigma : numpy.ndarray
-            Probability vector, canonical-action width; sums to 1.
-        bias_mask : numpy.ndarray
-            Boolean mask of the same length marking the biased class.
-        multiplier : float
-            Reweighting factor ``m`` (5.0 for the §4 variants).
+        ``σ'(a) ∝ σ(a) · (m if a ∈ biased_class else 1)`` (§4).  ``sigma`` is an
+        already-regret-matched probability vector, not a regret row; a ``multiplier``
+        of 1 or an all-false mask returns it unchanged.
 
         Returns
         -------
@@ -142,35 +113,23 @@ class Policy(ABC):
 class BlueprintPolicy(Policy):
     """Reads the blueprint strategy for ``state.info_set`` from a base blueprint.
 
-    The base distribution σ is the blueprint's **average strategy** —
-    the normalised visit counts accumulated by the strategy-sampling
-    traversal (:mod:`poker_ai.blueprint.strategy`).  In CFR only the
-    time-averaged strategy converges to equilibrium; the per-iteration
-    regret-matched strategy oscillates and tends toward near-pure
-    play, so it is used only as a *fallback* for infosets whose
-    average-strategy row carries too little visit mass to be a
-    meaningful estimate (fewer than ``min_strategy_mass`` visits over
-    the legal actions).  The §4 continuation variants multiply the
-    requested action class's probability by ``bias_multiplier`` and
-    renormalize at query time.  A single blueprint on disk backs all
-    four variants.
+    σ is the blueprint's **average strategy** (normalised visit counts).  Only the
+    time-averaged strategy converges to equilibrium in CFR; the per-iteration
+    regret-matched strategy oscillates toward near-pure play, so it serves only as a
+    fallback for rows with too little visit mass.  One blueprint on disk backs all four
+    §4 variants, which reweight at query time.
 
     Parameters
     ----------
     tables : CFRTables
         Loaded base-blueprint tables.
     bias_multiplier : float
-        Reweighting factor applied to the biased action class; only
-        takes effect when :meth:`strategy` is called with
-        ``bias != "none"`` (§4 uses 5.0).
+        Factor applied to the biased action class; inert when ``bias == "none"``.
     min_strategy_mass : int
-        Minimum visit mass over the *legal* actions for the
-        average-strategy row to be trusted.  A row visited once is a
-        single categorical sample — reading it verbatim yields a pure
-        action drawn from one early training iterate, which is worse
-        than regret matching over the (much more heavily updated)
-        regret row.  Below this threshold the policy falls back to
-        regret matching.
+        Minimum visit mass over the *legal* actions for the average-strategy row to be
+        trusted.  A row visited once is a single categorical sample, so reading it
+        verbatim yields a pure action from one early training iterate — worse than
+        regret matching over the much more heavily updated regret row.
     """
 
     def __init__(
@@ -310,25 +269,20 @@ class BlueprintPolicy(Policy):
 class SearchPolicy:
     """Reader over a solved :class:`SolverState` (§6.5).
 
-    A :class:`SearchResult` exposes two of these: the **final-iteration** policy
-    the bot plays, and the **average** policy that feeds the next round's belief
-    update.  Unlike :class:`Policy`, it is keyed by the solver's native
-    ``(public_key, hand_row)`` — the in-memory tables are keyed that way and
-    ``PolicyState`` does not carry ``public_key``/``hand_row`` (the four §4 bias
-    variants are a leaf-continuation concept, not the bot's own play).  The
-    consumer (the search agent) holds the env, so it computes the key and calls
-    :meth:`strategy_for`; this keeps :class:`SearchPolicy` regime-agnostic — it
-    reads the same rows whether they were written by the MCCFR or vector regime.
+    A :class:`SearchResult` exposes two: the **final-iteration** policy the bot plays
+    and the **average** policy that feeds the next round's belief update.  Unlike
+    :class:`Policy` it is keyed by the solver's native ``(public_key, hand_row)``, which
+    ``PolicyState`` does not carry; the agent holds the env, computes the key and calls
+    :meth:`strategy_for`.  That keeps this regime-agnostic — the same rows whether
+    MCCFR or vector wrote them.
 
     Parameters
     ----------
     state : SolverState
         The solved tables.
     use_average : bool
-        ``True`` reads the normalised cumulative strategy (``strat_sum``) — the
-        weighted-average policy for belief updates; ``False`` reads the
-        regret-matched final strategy (with frozen rows pinned) — the policy the
-        bot plays.
+        ``True`` reads the normalised cumulative strategy for belief updates; ``False``
+        the regret-matched final strategy (frozen rows pinned), which the bot plays.
     """
 
     def __init__(self, state: SolverState, *, use_average: bool) -> None:

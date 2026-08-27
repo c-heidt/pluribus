@@ -1,23 +1,14 @@
-"""Per-search context for the depth-limited subgame solver.
+"""Per-search context for the depth-limited subgame solver (§6.1).
 
-:class:`SubgameContext` carries the inputs to one ``solve()`` call that
-do not change during the CFR walk: per-seat ranges (every live seat,
-including the bot), the fold-time ranges of seats that folded before the
-root, the board-conflict mask, bot identity, the depth-limit descriptor,
-leaf config, and RNG.  Construction lives on the dataclass as a
-classmethod because most fields are derived from the env or are simple
-per-hand state — see §6.1 of ``docs/subgame_solving.md`` for the rationale.
+:class:`SubgameContext` carries the inputs to one ``solve()`` call that do not change
+during the CFR walk.  It is frozen and a **passive carrier**: it does not validate
+seat membership (the "every live seat incl. the bot" contract is upheld by the agent /
+range tracker that populates it).
 
-The class is frozen and a **passive carrier**: it does not validate seat
-membership (the "every live seat incl. the bot" contract is upheld by the
-agent / range tracker that populates it).  In addition, the constructed
-instance defends against accidental mutation of the *contents* of its
-container fields: ``ranges`` and ``folded_ranges`` are exposed as
-read-only mappings over arrays whose ``writeable`` flag has been cleared,
-and ``board_compatible`` is a read-only view.  This keeps the solver a
-pure function of ``(root_env, ctx, cfg)`` — an inner loop that
-accidentally writes to a range or the board mask fails fast instead of
-silently corrupting the search.
+Container *contents* are frozen too — ``ranges`` / ``folded_ranges`` are read-only
+mappings over non-writeable arrays, and ``board_compatible`` is a read-only view — so
+the solver stays a pure function of ``(root_env, ctx, cfg)`` and an inner loop that
+writes to a range fails fast instead of silently corrupting the search.
 """
 
 from __future__ import annotations
@@ -34,10 +25,6 @@ from poker_ai.search.ranges import Range
 from poker_ai.search.rng import spawn_one
 
 if TYPE_CHECKING:
-    # LeafConfig is introduced in §6.4 (poker_ai/search/leaf.py) which
-    # is not yet implemented.  The forward reference keeps this module
-    # importable in the meantime; downstream code passes any object
-    # whose duck-typed interface matches what leaf.py will expose.
     from poker_ai.search.leaf import LeafConfig
     from poker_ai.modeling.model import OpponentModel
 
@@ -50,22 +37,13 @@ DepthVerdict = Literal["internal", "leaf", "terminal"]
 class DepthLimit:
     """Round-dependent depth-limit descriptor (§3 table).
 
-    Derived once at the root from ``(street_at_root, players live at round
-    start)``, it classifies any env reached during the walk into one of
-    three verdicts via :meth:`classify`:
+    Derived once at the root, it classifies any env reached during the walk as
+    ``"terminal"`` (``env.payout`` scores it), ``"leaf"`` (a depth-limit leaf, §6.5)
+    or ``"internal"`` (keep recursing).
 
-    - ``"terminal"``  — the hand is over (``env.payout`` scores it);
-    - ``"leaf"``      — a depth-limit leaf (continuation meta-game, §6.5);
-    - ``"internal"``  — keep recursing.
-
-    Attributes
-    ----------
-    street_at_root : int
-        ``env.betting_round`` at the subgame root (0=pre-flop .. 3=river).
-    n_players_at_root : int
-        ``env.n_players_started_round`` at the root — distinguishes the
-        multiway round-2 case (the only one with the after-2nd-raise
-        cutoff) from heads-up round 2.
+    ``n_players_at_root`` is ``env.n_players_started_round``, which distinguishes the
+    multiway round-2 case (the only one with the after-2nd-raise cutoff) from heads-up
+    round 2.
     """
 
     street_at_root: int
@@ -74,8 +52,8 @@ class DepthLimit:
     def classify(self, env: PokerEnv) -> DepthVerdict:
         """Verdict for ``env`` under the §3 depth-limit rules.
 
-        ``is_terminal`` is checked **before** ``betting_round`` because
-        the latter raises at the terminal stage.
+        ``is_terminal`` is checked **before** ``betting_round`` because the latter
+        raises at the terminal stage.
         """
         if env.is_terminal:
             return "terminal"
@@ -103,40 +81,31 @@ class SubgameContext:
 
     Attributes
     ----------
-    my_seat : int
-        Seat index of the bot.
-    my_hole : tuple[int, int]
-        Bot's actual hole cards — the row the agent ultimately plays.
-        The bot's *range* is carried separately in ``ranges`` (observer
-        perspective), so the search solves over its whole range.
+    my_seat, my_hole
+        The bot's seat and its actual hole cards — the row the agent ultimately
+        plays.  Its *range* is carried separately in ``ranges``, so the search
+        solves over the whole range.
     ranges : Mapping[int, Range]
-        Per-seat ranges for every seat still live in the hand, **including
-        ``my_seat``** (the bot's observer-perspective range, excluding only
-        board conflicts).  Seats that folded or busted before the root are
-        not here (see ``folded_ranges``).
+        Per-seat ranges for every seat still live, **including ``my_seat``**
+        (observer perspective, excluding only board conflicts).
     folded_ranges : Mapping[int, Range]
-        Fold-time marginals of seats that folded before the root, retained
-        for card removal.  May be empty.
+        Fold-time marginals of seats that folded before the root, retained for card
+        removal.  May be empty.
     board_compatible : numpy.ndarray
-        Boolean mask of shape ``(env.n_combos,)``.  ``True`` for combos
-        that share no card with the current community.
+        Shape ``(env.n_combos,)``; True for combos sharing no card with the community.
     street_at_root : int
-        ``env.betting_round`` at the root of the search.
+        ``env.betting_round`` at the root.
     depth_limit : DepthLimit
-        Descriptor implementing the §3 depth-limit table; classifies each
-        env reached during the walk as internal / leaf / terminal.
+        Classifies each env reached during the walk as internal / leaf / terminal.
     leaf : LeafConfig
         Continuation-strategy configuration for depth-limit leaves.
     rng : numpy.random.Generator
         Sampling stream: hole draws and the leaf rollout's action draws.
     board_rng : numpy.random.Generator, optional
-        Separate stream for the leaf rollout's **board** runout (the undealt
-        reshuffle inside :meth:`PokerEnv.with_hole_cards`).  Kept apart from
-        ``rng`` for the same reason ``_MCCFRSolver`` keeps its reseat shuffle
-        apart: a board draw interleaved into the sampling stream desyncs the
-        action-sampling trajectory.  :meth:`from_runtime` derives one
-        automatically; ``None`` falls back to ``rng`` (never to the global
-        ``np.random`` — see :mod:`poker_ai.search.rng`).
+        Separate stream for the leaf rollout's **board** runout, because a board draw
+        interleaved into the sampling stream desyncs the sampling trajectory.
+        :meth:`from_runtime` derives one; ``None`` falls back to ``rng`` (never to the
+        global ``np.random`` — see :mod:`poker_ai.search.rng`).
     """
 
     my_seat: int
@@ -148,10 +117,9 @@ class SubgameContext:
     depth_limit: DepthLimit
     leaf: "LeafConfig"
     rng: np.random.Generator
-    #: seat → opponent model (opponent_modeling §5.1).  **Empty by default**, and an
-    #: empty mapping activates no code path in the solver — the clamp early-outs, so
-    #: an unmodeled solve is bit-for-bit vanilla Pluribus (the baseline needs no
-    #: separate code path).  See :func:`poker_ai.search.vform.apply_model_clamp`.
+    #: seat → opponent model (opponent_modeling §5.1).  Empty by default, and an empty
+    #: mapping activates no code path — the clamp early-outs, so an unmodeled solve is
+    #: bit-for-bit vanilla.  See :func:`poker_ai.search.vform.apply_model_clamp`.
     models: Mapping[int, "OpponentModel"] = MappingProxyType({})
     #: Board-runout stream for leaf rollouts; see the class docstring.
     board_rng: Optional[np.random.Generator] = None
@@ -171,24 +139,13 @@ class SubgameContext:
     ) -> "SubgameContext":
         """Build a context for a search rooted at ``env``.
 
-        Derives ``board_compatible`` from the env's combo table and
-        community cards; sets ``street_at_root`` to ``env.betting_round``
-        and ``depth_limit`` from ``env.betting_round`` /
-        ``env.n_players_started_round``.  Does not deepcopy the env — the
-        solver's caller (typically ``SearchAgent``) owns that.
+        Does not deepcopy the env — the caller (typically ``SearchAgent``) owns that.
+        Container fields are wrapped read-only (the caller's own dicts and arrays are
+        unaffected).
 
-        Container fields are wrapped read-only so the solver cannot
-        accidentally mutate ranges or the board mask mid-search:
-        ``ranges`` and ``folded_ranges`` are each exposed as a
-        :class:`MappingProxyType` over defensive array copies whose
-        ``writeable`` flag is cleared, and ``board_compatible`` is set
-        non-writeable.  The caller's original dicts and arrays are
-        unaffected.
-
-        ``board_rng`` defaults to a fresh child of ``rng``.  It is *spawned*
-        (:func:`poker_ai.search.rng.spawn_one`) rather than drawn from, so
-        ``rng`` is not advanced and the solver's sampling trajectory is
-        unchanged by the existence of a separate board stream.
+        ``board_rng`` defaults to a child of ``rng``, *spawned* rather than drawn from,
+        so ``rng`` is not advanced and the solver's sampling trajectory is unchanged by
+        the existence of a separate board stream.
         """
         board_mask = _board_compatible_mask(env)
         board_mask.flags.writeable = False
@@ -210,8 +167,7 @@ class SubgameContext:
 def _freeze_ranges(ranges: Mapping[int, Range]) -> Mapping[int, Range]:
     """Read-only view over defensive, non-writeable copies of ``ranges``.
 
-    The caller's input dict and arrays stay mutable; only the returned
-    mapping (and the arrays it holds) are frozen.
+    The caller's input dict and arrays stay mutable.
     """
     frozen: Dict[int, Range] = {}
     for seat, weights in ranges.items():
@@ -222,11 +178,8 @@ def _freeze_ranges(ranges: Mapping[int, Range]) -> Mapping[int, Range]:
 
 
 def _board_compatible_mask(env: PokerEnv) -> np.ndarray:
-    """Boolean mask over ``env.combo_cards``: True iff the combo shares
-    no card with the current community.
-
-    Pre-flop (empty community) every combo is compatible.
-    """
+    """Boolean mask over ``env.combo_cards``: True iff the combo shares no card with
+    the current community (every combo pre-flop)."""
     if not env.community_cards:
         return np.ones(env.n_combos, dtype=bool)
     board = np.asarray(env.community_cards, dtype=np.int32)

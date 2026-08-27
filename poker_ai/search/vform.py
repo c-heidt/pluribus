@@ -1,17 +1,13 @@
 """Shared vector-form CFR primitives for both search regimes (§6.5).
 
-The heads-up vector regime (:mod:`poker_ai.search.vector`) and the
-traverser-vectorized MCCFR walk (:mod:`poker_ai.search.mccfr`) run the **same**
-per-combo CFR arithmetic on a ``(n_rows, width)`` matrix — regret matching, a
-per-combo ``sigma`` gather on future (cluster) streets, freezing the bot's
-actual-hand row (§5), and the ``cv``/``v``/``delta``/``strat_delta`` update — and
-differ only in how opponents are handled (range-expanded vs sampled) and how
-terminals settle.  That shared arithmetic lives here so neither regime imports the
-other (both depend on this neutral module and on :mod:`cluster_maps`).
+The vector regime and the traverser-vectorized MCCFR walk run the **same** per-combo
+CFR arithmetic on a ``(n_rows, width)`` matrix — regret matching, the per-combo
+``sigma`` gather on cluster streets, freezing the bot's actual-hand row (§5), and the
+``cv``/``v``/``delta``/``strat_delta`` update.  They differ only in how opponents are
+handled (range-expanded vs sampled) and how terminals settle.  The shared arithmetic
+lives here so neither regime imports the other.
 
-``regret_match_matrix`` and its compiled-core rebind moved here verbatim from
-``vector`` (this is Python module organization only — the compiled kernel is
-unchanged); ``vector`` re-exports it for backward compatibility.
+``vector`` re-exports ``regret_match_matrix`` for backward compatibility.
 """
 
 from __future__ import annotations
@@ -57,13 +53,11 @@ except ImportError:
 
 
 def clamp_sigma(sigma, m_rows, c_rows, gof):
-    """In-place ``σ ← σ + c·(σ̂ − σ)`` (the DBR mixture blend); returns ``sigma``.
+    """In-place ``σ ← c·σ̂ + (1−c)·σ`` (the DBR mixture blend); returns ``sigma``.
 
-    Pure-Python reference for the ``_clamp`` kernel (P2).  Uses ``c·σ̂ + (1−c)·σ``
-    verbatim: the cheaper ``σ + c·(σ̂ − σ)`` is NOT exact at ``c = 1``, and
-    naive best response is ``c ≡ 1``.  In-place is safe: ``sigma`` is always a fresh
-    array from the caller (``regret_match_matrix`` at a root node, a fancy-index
-    copy at a clustered one).
+    Pure-Python reference for the ``_clamp`` kernel.  Written that way verbatim: the
+    cheaper ``σ + c·(σ̂ − σ)`` is NOT exact at ``c = 1``, and naive best response is
+    ``c ≡ 1``.  In-place is safe — ``sigma`` is always a fresh array from the caller.
     """
     if gof is None:
         m, c = m_rows, c_rows
@@ -103,19 +97,16 @@ except ImportError:
 def node_sigma(state, pk, legal, actor, is_root, n_rows, row_space, cof, gof=None):
     """Register the node and build its per-combo strategy matrix.
 
-    Ensures the ``(n_rows, width)`` ``vregret``/``vstrat`` matrices exist, regret-
-    matches the regret matrix, and gathers each combo's row: identity for a
-    root-street node, a cluster gather (``cof`` maps combo→dense cluster row, ``-1``
-    on infeasible combos → row 0, harmless since their reach is zeroed) otherwise.
+    Ensures the ``(n_rows, width)`` matrices exist, regret-matches, and gathers each
+    combo's row: identity at a root-street node, a cluster gather otherwise (``cof``
+    maps combo → dense cluster row; ``-1`` on infeasible combos becomes row 0, harmless
+    since their reach is zeroed).
 
-    ``gof`` is the precomputed gather index (:meth:`ClusterMapper.gather_of`) — the
-    same thing as ``np.where(cof >= 0, cof, 0)`` but built once per board in
-    ``refresh`` rather than rebuilt at every node of every iteration.  It is passed
-    by both regimes on the hot path; the ``None`` fallback recomputes it so callers
-    with only ``cof`` (tests, older call sites) stay correct.
+    ``gof`` is the precomputed gather index, built once per board in ``refresh`` rather
+    than rebuilt per node; the ``None`` fallback recomputes it.
 
-    Returns ``(sigma, regret, strat)`` where ``sigma`` is ``(n_combos, width)`` and
-    ``regret``/``strat`` are the node's stored ``(n_rows, width)`` matrices.
+    Returns ``(sigma, regret, strat)``: ``sigma`` is ``(n_combos, width)``,
+    ``regret``/``strat`` the node's stored ``(n_rows, width)`` matrices.
     """
     state.ensure_vnode(pk, legal, actor, n_rows, row_space)
     regret = state.vregret[pk]
@@ -154,33 +145,26 @@ def _fill_model_rows(entry, model, env, width, combo_cards, cof, is_root,
                      row_cluster=None):
     """Lazily build any model rows the *current* board references.
 
-    **Rows, not combos — and this is load-bearing.**  ``public_key`` encodes only
-    ``(stage, action history)``; it carries **no board**.  Both regimes re-sample the
-    completion every iteration (``ClusterMapper.refresh`` / ``reseat_private_cards``),
-    so a cache of *combo*-space model rows keyed by ``public_key`` would be built on
-    one board and silently reused on every later one.
+    **Rows, not combos — this is load-bearing.**  ``public_key`` encodes only
+    ``(stage, history)`` and carries no board, while both regimes re-sample the
+    completion every iteration, so a cache of *combo*-space rows keyed by
+    ``public_key`` would be built on one board and silently reused on every later one.
 
-    The row space is safe where combo space is not: ``n_rows`` comes from
-    ``ClusterMapper._universe`` (built once over *all* completions) and ``refresh``
-    searchsorts into it, so dense **row r ↔ a fixed LUT cluster** on every board —
-    exactly why the regret tables survive across iterations.  And because
-    ``info_set = (cluster, history)``, every combo in a cluster has the *same*
-    info-set, hence the same ``σ̂``/``c``.  So one query per row is both exact and
-    board-stable, and the caller gathers it with the current iteration's ``cof``.
+    Row space is safe where combo space is not: ``n_rows`` comes from
+    ``ClusterMapper._universe`` (built once over all completions) and ``refresh``
+    searchsorts into it, so dense **row r maps to a fixed LUT cluster** on every board.
+    And since ``info_set = (cluster, history)``, every combo in a cluster shares
+    ``σ̂``/``c``, so one query per row is exact and board-stable.
 
-    Only rows reachable on this board are filled (others are never gathered), so the
-    entry fills in incrementally as later iterations expose new completions.
+    Only rows reachable on this board are filled, so the entry fills in incrementally.
 
-    ``row_cluster`` maps **row → raw LUT cluster id**: at the root street rows are
-    combos, so it is ``ClusterMapper.root_cluster_of()``; at a clustered street it is
-    ``ClusterMapper.universe(street)``, the inverse of ``refresh``'s ``searchsorted``.
-    It is what the model is keyed by (see :func:`_policy_state`) — the dense row index
-    is a local relabelling and must never be used as a cluster.
+    ``row_cluster`` maps **row → raw LUT cluster id** (``root_cluster_of()`` at the root
+    street, ``universe(street)`` at a clustered one).  That is what the model is keyed
+    by; the dense row index is a local relabelling and must never be used as a cluster.
 
-    Neither query reads any seat's actual cards, so this is leak-free.  The history is
-    canonicalised exactly as the blueprint reads and the belief-likelihood swap (§6.3)
-    do, so the clamp and the beliefs describe one and the same opponent at one and the
-    same info-set key.
+    Leak-free: neither query reads any seat's actual cards.  The history is
+    canonicalised exactly as the blueprint reads and the belief-likelihood swap do, so
+    the clamp and the beliefs describe the same opponent at the same info-set key.
     """
     m_rows, c_rows, filled = entry
     if is_root:
@@ -194,15 +178,11 @@ def _fill_model_rows(entry, model, env, width, combo_cards, cof, is_root,
         if row_cluster is None:
             need, rep, groups = unf, unf, None       # no cluster map: per-combo
         else:
-            # Board-infeasible combos (cluster -1) share a card with the board, so
-            # they have no info-set to query.  Drop them: their ``m_rows``/``c_rows``
-            # stay zero, and the clamp skips ``c == 0`` — result-neutral anyway, since
-            # their reach is zeroed upstream so their rows never reach a regret or a
-            # value.  Left *unfilled* (not marked filled with a blank row) so ``filled``
-            # keeps meaning "has a real model row", which the row↔cluster test relies
-            # on; the re-filter each iteration is a handful of ops over the infeasible
-            # tail.  (The old combo-keyed query fed the LUT a conflicting hole and used
-            # whatever came back — harmless for the same reach reason, but by accident.)
+            # Board-infeasible combos (cluster -1) have no info-set to query.  Drop
+            # them: their rows stay zero and the clamp skips ``c == 0``, which is
+            # result-neutral since their reach is zeroed upstream.  Left *unfilled*
+            # rather than marked filled with a blank row, so ``filled`` keeps meaning
+            # "has a real model row".
             vals = row_cluster[unf]
             feasible = vals >= 0
             if not feasible.all():
@@ -252,26 +232,23 @@ def _fill_model_rows(entry, model, env, width, combo_cards, cof, is_root,
 def apply_model_clamp(sigma, ctx, state, env, pk, actor, width, combo_cards,
                       cof, n_rows, is_root, gof=None, cmaps=None, street=None,
                       root_cluster=None):
-    """Blend a modeled seat's realized strategy toward its model — the DBR mixture, doc §5.2.
+    """Blend a modeled seat's realized strategy toward its model — the DBR mixture (§5.2).
 
     ``σ̃ = c·σ̂ + (1 − c)·x`` per combo, where ``x`` is the seat's regret-matched free
-    strategy (``sigma`` as produced by :func:`node_sigma`).  This is Data Biased
-    Response (Johanson & Bowling 2009) transplanted into the depth-limited solver:
-    where confidence is high the bot best-responds to the model, where it is zero the
-    seat degenerates to the baseline's adversarial player.
+    strategy.  Data Biased Response (Johanson & Bowling 2009) in the depth-limited
+    solver: where confidence is high the bot best-responds to the model, where it is
+    zero the seat degenerates to the baseline's adversarial player.
 
-    Applies in **both regimes** — MCCFR and vector share this seam, and both consume
-    the returned matrix identically (MCCFR samples one combo's row, the vector regime
-    reach-weights every combo), so no regime-specific blend logic is needed.
+    Applies in **both regimes**, which consume the returned matrix identically.
 
-    Realized-vs-free semantics: the *realized* ``σ̃`` is returned, so the caller's
-    child reach-weighting, ``strat_sum`` accrual and regret baseline all use the
-    mixture, while the accumulated regrets it regret-matches next iteration remain
-    the free component ``x``. That is exactly the restricted-response treatment.
+    Realized-vs-free semantics: the *realized* ``σ̃`` is returned, so child
+    reach-weighting, ``strat_sum`` accrual and the regret baseline all use the mixture,
+    while the accumulated regrets regret-matched next iteration stay the free component
+    ``x`` — the restricted-response treatment.
 
-    **Baseline equivalence:** with no models (or none for ``actor``) this returns
-    ``sigma`` unchanged, before touching the cache or allocating anything — so an
-    unmodeled solve is bit-for-bit the pre-change solver in both regimes.
+    **Baseline equivalence:** with no models for ``actor`` this returns ``sigma``
+    unchanged before touching the cache or allocating, so an unmodeled solve is
+    bit-for-bit the pre-change solver.
     """
     models = getattr(ctx, "models", None)
     if not models:
@@ -292,14 +269,10 @@ def apply_model_clamp(sigma, ctx, state, env, pk, actor, width, combo_cards,
                  np.zeros((n_rows, 1), dtype=np.float64),
                  np.zeros(n_rows, dtype=bool))
         state.model_sigma_cache[key] = entry
-    # Resolve the row → LUT-cluster map LAZILY — only now, after the no-models
-    # early-out.  Evaluating it eagerly at the call site made every *vanilla* node
-    # pay for it (and crashed at a pre-flop root, where ``_cmaps`` is ``None``).
-    #
-    # Root street: rows are combos, so this is the per-combo root cluster.  The
-    # caller may supply it directly (``root_cluster``) for the MCCFR pre-flop /
-    # multiway-flop roots, where ``_cmaps`` is deliberately ``None`` because the
-    # walk never crosses a future street.
+    # Resolve the row → LUT-cluster map LAZILY, after the no-models early-out:
+    # eagerly at the call site made every vanilla node pay for it (and crashed at a
+    # pre-flop root, where ``_cmaps`` is ``None``).  Root street: rows are combos, so
+    # this is the per-combo root cluster, which the caller may supply directly.
     # Clustered street: row r *is* a cluster, recovered from the static universe.
     if is_root:
         row_cluster = root_cluster
@@ -368,24 +341,20 @@ def traverser_update(regret, strat, sigma, child_vs, pi_p, frozen_combo, scatter
 def vr_baseline_estimate(opp_strategy, baseline, sampled_action, sampled_value):
     """On-policy VR-MCCFR baseline-corrected node value (opponent_modeling §5.5).
 
-    At an external-sampling **opponent** node the traverser's per-combo value is the
-    opponent-strategy-weighted expectation ``Σ_a σ(a)·v(·a)``, estimated from the ONE
-    sampled action.  Because sampling is on-policy (``q = σ``), the baseline-corrected
-    estimator has no ``1/q`` term — it is the σ-weighted baseline expectation plus the
-    sampled action's deviation from its baseline:
+    At an external-sampling opponent node the traverser's per-combo value is
+    ``Σ_a σ(a)·v(·a)``, estimated from the ONE sampled action.  Sampling is on-policy
+    (``q = σ``), so the baseline-corrected estimator has no ``1/q`` term::
 
-        ``v̂ = Σ_a σ(a)·b(a) + (v(·a*) − b(a*))``
+        v̂ = Σ_a σ(a)·b(a) + (v(·a*) − b(a*))
 
-    - ``opp_strategy`` ``(n_actions,)`` — the opponent's on-policy sampling row.
-    - ``baseline`` ``(n_actions, n_combos)`` — the per-action control-variate baseline
-      ``b`` (a running estimate of each action's per-combo value).
-    - ``sampled_action`` — the sampled action index ``a*``.
-    - ``sampled_value`` ``(n_combos,)`` — the observed value ``v(·a*)``.
+    with ``opp_strategy`` the sampling row ``(n_actions,)``, ``baseline`` the
+    per-action control variate ``(n_actions, n_combos)``, and ``sampled_value`` the
+    observed ``v(·a*)``.
 
-    **Unbiased for ANY baseline**: ``E_{a*~σ}[v̂] = Σ_a σ(a)·v(·a)`` (the ``Σσb`` term
-    cancels the sampled ``−b(a*)`` in expectation).  ``b = 0`` recovers the plain
-    single-sample value exactly, so the correction only ever *reduces* variance as the
-    baseline learns.  The caller EMA-updates ``b[a*]`` toward ``sampled_value`` AFTER
-    this call (keeping ``b`` independent of the current sample).
+    **Unbiased for ANY baseline**: ``E_{a*~σ}[v̂] = Σ_a σ(a)·v(·a)``, since ``Σσb``
+    cancels the sampled ``−b(a*)`` in expectation.  ``b = 0`` recovers the plain
+    single-sample value, so the correction only ever reduces variance as the baseline
+    learns.  The caller EMA-updates ``b[a*]`` AFTER this call, keeping ``b``
+    independent of the current sample.
     """
     return opp_strategy @ baseline + (sampled_value - baseline[sampled_action])

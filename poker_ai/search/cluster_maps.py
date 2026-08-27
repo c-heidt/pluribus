@@ -1,23 +1,19 @@
 """Per-iteration future-street cluster machinery (§6.5).
 
-Both vector-form regimes — the heads-up :mod:`poker_ai.search.vector` regime and
-the traverser-vectorized :mod:`poker_ai.search.mccfr` walk — store root-street
-decision nodes lossless (one row per ``combo_index``) and future-street nodes per
-LUT cluster, folding the sampled/frozen board into the cluster id (no explicit
-river axis).  This class owns that mapping so the two regimes share one
-implementation:
+Both vector-form regimes store root-street decision nodes lossless (one row per
+``combo_index``) and future-street nodes per LUT cluster, folding the sampled board
+into the cluster id (no explicit river axis).  This class owns that mapping so the two
+share one implementation:
 
-- the deterministic per-street cluster **universe** (the union of cluster ids
-  reachable over *every* candidate completion), fixed for the whole search so
-  parallel replicas derive an identical local row layout and
-  :meth:`SolverState.accumulate` sums aligned rows; and
-- refreshed each iteration for the sampled/frozen completion: the dense
-  combo→cluster row map (``-1`` on board-infeasible combos), the board
-  feasibility mask, and a presorted scatter plan that turns a cluster-row update
-  into an ``np.add.reduceat`` segment-sum (cheaper than ``np.add.at``).
+- the deterministic per-street cluster **universe** (the union of ids reachable over
+  every candidate completion), fixed for the whole search so parallel replicas derive
+  an identical row layout and :meth:`SolverState.accumulate` sums aligned rows;
+- refreshed per iteration for the sampled completion: the dense combo→cluster row map
+  (``-1`` on board-infeasible combos), the feasibility mask, and a presorted scatter
+  plan turning a cluster-row update into an ``np.add.reduceat`` segment-sum.
 
-Bucket-count-agnostic: it reads only the ids the LUT actually produces on the
-reachable boards, never a cluster total.
+Bucket-count-agnostic: it reads only the ids the LUT produces on reachable boards,
+never a cluster total.
 """
 
 from __future__ import annotations

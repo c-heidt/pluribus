@@ -1,20 +1,16 @@
 """Shared state and configuration for the depth-limited subgame solver (§6.5).
 
-This module is the **regime-agnostic foundation** of the solver: it owns the
-in-memory CFR tables and the operations on them (regret matching, accumulation,
-Linear-CFR discount, averaging, freezing), plus the config and the ``Key``
-helpers.  It deliberately imports **nothing** from the rest of the ``search``
-package at runtime — the two CFR regimes (``mccfr.py`` / ``vector.py``) and the
-orchestrator (``solver.py``) import *it*, so keeping it a leaf of the import
-graph is what lets the package split cleanly without an import cycle (the
-``LeafConfig`` reference on :class:`SolverConfig` is a ``TYPE_CHECKING``-only
-annotation for exactly this reason).
+The **regime-agnostic foundation**: the in-memory CFR tables and their operations
+(regret matching, accumulation, Linear-CFR discount, averaging, freezing), the config,
+and the ``Key`` helpers.  It imports **nothing** from the rest of ``search`` at
+runtime — both regimes and the orchestrator import *it* — so it stays a leaf of the
+import graph and the package splits without a cycle (hence the ``TYPE_CHECKING``-only
+``LeafConfig`` annotation).
 
-Both regimes store their tables as per-``public_key`` ``(n_rows, width)`` matrices
-(``vregret``/``vstrat``): the row axis is the acting seat's combo index on the
-**root street** (lossless) or its LUT cluster id on later streets, and ``width`` is
-the node's legal-action count.  ``Key = (public_key, hand_row)`` still names a
-single row — used by ``frozen`` and the policy readers to index one combo's row.
+Both regimes store tables as per-``public_key`` ``(n_rows, width)`` matrices
+(``vregret``/``vstrat``): rows are the acting seat's combo index on the **root street**
+(lossless) or its LUT cluster id later, ``width`` is the node's legal-action count.
+``Key = (public_key, hand_row)`` names a single row.
 """
 
 from __future__ import annotations
@@ -43,30 +39,24 @@ APPROACHES = (VANILLA, DBR, OX)
 # ---------------------------------------------------------------------------- #
 # Per-cell iteration budgets — EXPLICIT, one number per (approach, street, n_live)
 # ---------------------------------------------------------------------------- #
-# There is deliberately NO formula here: no per-live-player base multiplied out, no
-# per-approach scale factor.  Those were convenient but dishonest — they implied a
-# structure the measurements do not have (DBR's cost is not a fixed multiple of
-# vanilla's; it is ~2x slower per iteration on the flop and ~2.1x on the turn, and its
-# convergence point differs per street), and they made a change for one wall-bound cell
-# silently move every other cell that shared the base.  One number per cell means each
-# is independently traceable to what it came from, and editing one edits exactly one.
+# NO formula: no per-live-player base, no per-approach scale factor.  DBR's cost is not
+# a fixed multiple of vanilla's (~2x slower per iteration on the flop, ~2.1x on the
+# turn, and a different convergence point per street), and a shared base made one
+# wall-bound cell
+# move every other cell sharing it.  One number per cell, each traceable to its source.
 #
 # DERIVATION (2026-08 v7 calibration, single worker):
 #     budget = min(v7 convergence suggestion, iterations that fit 630 s at the measured
 #                  throughput of THAT approach on THAT cell), rounded to 50
-# 630 s leaves ~5% headroom under the ~660 s reference (Pluribus's 30 s x 22-core top =
-# 660 core-seconds/search; 4p < 6p).  Cells whose convergence point sits under the wall
-# take the convergence point; cells where the wall bites first are WALL-CLIPPED and
-# marked below — for those the number is what fits, not what converges.
+# 630 s is ~5% under the ~660 s reference (Pluribus's 30 s x 22-core top).  Cells where
+# the wall bites first are marked WALL-CLIPPED: their number is what fits, not what
+# converges.
 #
-# OX-Search is SPLIT across the two tables, because the gadget only exists in one regime:
-#   - VECTOR (its real home, HU turn/river): DBR's numbers.  The gadget root is live there
-#     and costs about what DBR's modelled solve does, so DBR's budget is the right size.
-#   - MCCFR: VANILLA's numbers.  ``beta`` is inert outside the vector regime — solver.py
-#     warns that such a solve is "an ordinary best response, NOT adaptation-safe" — so an
-#     OX-labelled MCCFR solve IS a vanilla solve and should be budgeted as one.  Giving it
-#     DBR's number would spend DBR's wall on a search doing none of DBR's work.
-# Kept as explicit tables rather than aliases so any of the three can diverge later.
+# OX-Search is SPLIT across the tables because the gadget exists in one regime only:
+# VECTOR (its real home) gets DBR's numbers, since the gadget root costs about what a
+# modelled solve does; MCCFR gets VANILLA's, since ``beta`` is inert there and an
+# OX-labelled MCCFR solve IS a vanilla solve.  Explicit tables, not aliases, so any of
+# the three can diverge later.
 
 # (street, n_live) -> per-replica iterations.  street: 0=preflop 1=flop 2=turn 3=river.
 _MCCFR_VANILLA = {
@@ -106,35 +96,22 @@ _VECTOR_DBR = {
     (3, 2): 600,     # exact, same as vanilla
 }
 
-# LIVE-COUNT EXTRAPOLATION (the ``n_live == 4`` entries).  v7 ran n_live=2,3 only, so the
-# 4-player cells are DERIVED, not measured:
+# LIVE-COUNT EXTRAPOLATION (the ``n_live == 4`` entries).  v7 ran n_live=2,3 only, so
+# the 4-player cells are DERIVED, not measured:
 #
 #     budget(n4) = min( budget(n3) * 1.138 ,  630 s * throughput(n3) )
 #
-# The 1.138 is the one live-count trend v7 actually resolved — vanilla flop, 36436 (n2) ->
-# 41475 (n3).  It is a SINGLE pair of points on ONE street: the turn and river ran at n3
-# only, and DBR's flop n3 landed below its ladder (a ceiling, not a convergence point), so
-# neither yields a second estimate.  Treat 1.138 as the best available reading of the
-# pattern, not as an established growth law.
+# 1.138 is the one live-count trend v7 resolved (vanilla flop, 36436 n2 -> 41475 n3) — a
+# single pair of points on one street, so read it as the best available signal, not a
+# growth law.  Throughput at n4 is ASSUMED EQUAL to n3: v7 measured throughput RISING
+# with the live count, so holding it flat only risks leaving wall unused, whereas
+# extrapolating a rise that did not happen would overrun the backstop and truncate.
 #
-# Note how much flatter that is than the ``base * n_live`` model these tables replaced,
-# which grew the budget by 1.333 from n3 to n4: the hot path widens with the live count far
-# more slowly than per-player scaling assumed.  That is why the n4 flop/river budgets move
-# so much here — the old carry-forwards were shaped by the steeper law, not by evidence.
-#
-# Throughput at n4 is ASSUMED EQUAL to n3 rather than extrapolated.  v7 measured throughput
-# RISING with the live count (flop 57.5 -> 144.4 it/s from n2 to n3), so holding it flat is
-# the conservative direction: if n4 is in fact faster, these budgets merely leave wall
-# unused; had the rise been extrapolated and been wrong, the solves would overrun the wall
-# backstop and truncate silently.  Both turn cells are wall-clipped under that assumption
-# and would grow if a real n4 throughput measurement came in higher.
-
-# ⚠ CROSS-ARM COMPARABILITY: on the wall-bound cells DBR runs FEWER iterations than
-# vanilla (flop n2 29800 vs 36250; turn n2 vector 1700 vs 2550; turn n3 28500 vs 59450)
-# purely because it is slower per iteration.  An evaluation that compares the two is
-# therefore NOT budget-controlled on those cells, and a DBR loss there is confounded with
-# the shorter search.  Equalising would mean cutting vanilla to DBR's number — a real
-# option, deliberately not taken here since it would weaken the paper baseline.
+# CROSS-ARM COMPARABILITY: on wall-bound cells DBR runs FEWER iterations than vanilla
+# (flop n2 29800 vs 36250; turn n2 vector 1700 vs 2550) purely because it is slower per
+# iteration, so an evaluation comparing the two is NOT budget-controlled there and a DBR
+# loss is confounded with the shorter search.  Equalising would mean cutting vanilla to
+# DBR's number, which would weaken the paper baseline — deliberately not done.
 MCCFR_BUDGET: Mapping[str, Mapping[Tuple[int, int], int]] = MappingProxyType({
     VANILLA: MappingProxyType(dict(_MCCFR_VANILLA)),
     DBR: MappingProxyType(dict(_MCCFR_DBR)),
@@ -167,57 +144,33 @@ class SolverConfig:
     """
 
     leaf: "LeafConfig"
-    # ``max_iterations`` is the ABSOLUTE per-replica hard ceiling and the SINGLE upper
-    # bound on the structural budget (:mod:`poker_ai.search.budget`) — the primary stop
-    # is the structural budget itself, and this only clips it in pathology (e.g. a deep
-    # multiway flop that would otherwise request more).  Set below where MCCFR converges
-    # it silently throttles every HU-flop / multiway search — the pre-2026-08 bug, where
-    # a 5_000 cap capped them regardless of the per-street numbers below.  It doubles as
-    # the pinned iteration count when ``auto_budget`` is off (tests/digests).
-    max_iterations: int = 60_000  # the one ceiling; a true bound, not a throttle (raised
-                                  # 2026-08 from 30k so the DBR deep-cell scale below can
-                                  # actually reach depth on HU flop / multiway; 4p vanilla
-                                  # is unaffected — its budgets are all ≤24k)
-    # LOOSE per-search wall backstop, NOT the primary stop: a single flat cap sized
-    # above the DEEPEST shipped search's wall cost so it does not clip the iteration
-    # budget in normal operation — it only catches a genuinely stuck subgame.  Flat (not
-    # per-street): the 2026-08 calibration measured only the HU vector turn/river, whose
-    # tiny river cap would butcher multiway river MCCFR; the eval path sizes this to the
-    # multiway-flop worst case (~1000 s, see evaluation/runner.py).
+    # ABSOLUTE per-replica ceiling and the single upper bound on the structural budget
+    # (:mod:`poker_ai.search.budget`); it should only clip in pathology.  Set it below
+    # where MCCFR converges and it silently throttles every HU-flop / multiway search.
+    # Doubles as the pinned iteration count when ``auto_budget`` is off (tests/digests).
+    max_iterations: int = 60_000
+    # LOOSE wall backstop, NOT the primary stop: sized above the deepest shipped
+    # search so it only catches a genuinely stuck subgame.  Flat rather than per-street
+    # because the calibration measured only the HU vector turn/river, whose tiny river
+    # cap would butcher multiway river MCCFR.
     max_wall_seconds: float = 300.0
     # Linear-CFR discount cadence.  Each firing scales EVERY vregret/vstrat matrix
-    # (O(table)), so under the 2026-08 structural budgets (10k-40k iters/solve) the old
-    # cadence of 10 fired 1000-4000 times per solve — a nontrivial runtime slice for a
-    # weighting profile that barely differs at these depths.  100 keeps the Linear-CFR
-    # weighting (piecewise k/(k+1), k = t/interval) with 10-400 firings per solve; even
-    # the smallest structural budget (vector river 850) still discounts 8 times.
-    # ⚠ Results-affecting (different discount points → different tables): golden digests
-    # regenerated for this change; the equilibrium oracle is the correctness gate.
+    # (O(table)), so a cadence of 10 fired 1000-4000 times per solve under the current
+    # budgets.  100 keeps the Linear-CFR weighting (piecewise k/(k+1), k = t/interval)
+    # at 10-400 firings; even the smallest budget still discounts 8 times.
+    # Results-affecting: different discount points give different tables.
     discount_interval: int = 100
-    # Structural iteration budget (§6.5) — the *primary* stop.  A real subgame is far
-    # too large for any single sampled replica to reach a tight equilibrium online, so
-    # there is **no online convergence test**; instead the per-subgame iteration count
-    # is derived from the subgame's *structure*, which is machine-independent (unlike a
-    # wall cap) and known up front.  ``poker_ai.search.budget.iteration_budget`` reads
-    # these; ``max_iterations`` is the absolute safety ceiling and ``max_wall_seconds``
-    # a loose backstop.  **On by default** so every production solve (search + eval) is
-    # driven by the structural budget without the caller having to opt in.  The tests /
-    # pinned digests that need a fixed iteration count set ``auto_budget=False``
-    # explicitly, and then a flat ``max_iterations`` is honoured verbatim.
+    # Structural iteration budget (§6.5) — the *primary* stop, derived from the
+    # subgame's structure rather than an online convergence test.  On by default so
+    # every production solve is budget-driven; tests / pinned digests that need a fixed
+    # count set ``auto_budget=False``, and then ``max_iterations`` is honoured verbatim.
     auto_budget: bool = True
     # Per-cell iteration budgets — EXPLICIT tables, one number per
-    # ``(approach, street, n_live)``; see MCCFR_BUDGET / VECTOR_BUDGET at module level for
-    # the numbers and their derivation.  There is no formula and no multiplier: the budget
-    # is looked up, not computed.  ``poker_ai.search.budget.iteration_budget`` reads these,
-    # picking the table by regime and the row by the approach it infers from the solve's
-    # own inputs (models ⇒ DBR, ``beta`` ⇒ OX, neither ⇒ vanilla).
-    #
-    # Per-replica, and production runs one replica per hand (``workers=1``, one hand per
-    # core), so these ARE the per-search numbers.  With ``workers > 1`` the MCCFR budget is
-    # divided across replicas (more cores ⇒ shorter wall at ~constant work); the vector
-    # budget is not divisible — each full-width replica needs the whole horizon.
-    #
-    # Overridable per solve, so a caller can pin a cell without editing the module tables.
+    # ``(approach, street, n_live)``; see MCCFR_BUDGET / VECTOR_BUDGET above.  Looked up,
+    # never computed.  Per-replica, and production runs one replica per hand, so these
+    # ARE the per-search numbers; with ``workers > 1`` the MCCFR budget divides across
+    # replicas but the vector budget does not (each full-width replica needs the whole
+    # horizon).  Overridable per solve, to pin a cell without editing the module tables.
     mccfr_budget: "Mapping[str, Mapping[Tuple[int, int], int]]" = MCCFR_BUDGET
     vector_budget: "Mapping[str, Mapping[Tuple[int, int], int]]" = VECTOR_BUDGET
     # OX-Search safety parameter β (Approach B, PO-CES-HU; Ge et al. ICML 2024,
@@ -240,15 +193,12 @@ class SolverConfig:
 
 
 class _CountingCache:
-    """A dict-backed memo that counts ``get`` hits and misses (eval doc §6, §9.1).
+    """A dict-backed memo that counts ``get`` hits and misses.
 
-    Wraps the search-lifetime ``leaf_value_cache`` so its hit/miss rate can be
-    logged without threading counters through every call site.  Only the
-    operations the cache (and the tests) actually use are implemented —
-    ``get``/``[]``/``in``/``len``/iteration — so a plain ``dict`` stays a valid
-    drop-in wherever counting is not wanted (leaf's standalone per-call memo when
-    no shared cache is supplied).  ``__slots__`` keeps it deepcopy-/pickle-friendly
-    for the parallel replicas (§6.7).
+    Wraps the search-lifetime ``leaf_value_cache`` so its hit rate can be logged without
+    threading counters through every call site.  Only the operations actually used are
+    implemented, so a plain ``dict`` stays a valid drop-in.  ``__slots__`` keeps it
+    deepcopy-/pickle-friendly for the parallel replicas.
     """
 
     __slots__ = ("_data", "hits", "misses")
@@ -283,14 +233,12 @@ class _CountingCache:
 
 @dataclass
 class SearchStats:
-    """Per-search instrumentation counters (eval doc §6 ``decisions`` grain, §9.1).
+    """Per-search instrumentation counters (eval doc §6 ``decisions`` grain).
 
-    Snapshotted off a solved :class:`SolverState` (:meth:`SolverState.stats_snapshot`)
-    and carried on :class:`~poker_ai.search.solver.SearchResult` so the evaluation
-    logger (doc §9.2) can persist tree shape (``node_count`` / ``unique_pubkeys``)
-    and cache behaviour without reaching into solver internals.  ``cache_hits`` /
-    ``cache_misses`` roll both caches together for the single schema columns of
-    the same name; the per-cache fields stay available for finer analysis.
+    Snapshotted off a solved :class:`SolverState` and carried on ``SearchResult`` so the
+    evaluation logger can persist tree shape and cache behaviour without reaching into
+    solver internals.  ``cache_hits`` / ``cache_misses`` roll both caches together for
+    the schema columns of the same name.
     """
 
     node_count: int = 0           # decision-node visits over the whole search
@@ -331,12 +279,10 @@ class SolverState:
     # :class:`SearchPolicy`); on a future street it is the LUT-cluster index.
     vregret: Dict[PublicKey, np.ndarray] = field(default_factory=dict)
     vstrat: Dict[PublicKey, np.ndarray] = field(default_factory=dict)
-    # Row space of each vector node: ``"combo"`` (root street — lossless, one row
-    # per ``combo_index``, externally readable by :class:`SearchPolicy`) or
-    # ``"cluster"`` (a future street — one row per LUT cluster reachable in the
-    # subgame, §6.5 lossy abstraction; internal to the solve, never read
-    # externally).  The read guards in :meth:`sigma` / :meth:`average_sigma`
-    # consult this so a cluster node cannot be mis-read as if keyed by combo.
+    # Row space per vector node: ``"combo"`` (root street, lossless, externally
+    # readable) or ``"cluster"`` (a future street, lossy, internal to the solve).  The
+    # read guards in :meth:`sigma` / :meth:`average_sigma` consult this so a cluster
+    # node cannot be mis-read as if keyed by combo.
     vrow_space: Dict[PublicKey, str] = field(default_factory=dict)
     # Search-lifetime leaf cache (§6.4.2, §6.7 Tier 1).  Holds values that are
     # **invariant across CFR iterations** for a fixed key, so it is *not* touched

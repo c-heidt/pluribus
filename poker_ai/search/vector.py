@@ -1,50 +1,38 @@
 """Vector-form Linear CFR regime for the subgame solver (§6.5).
 
-The vector regime is the *small / late* path: **heads-up** subgames rooted on the
-flop, turn, or river.  It is the designed-in counterpart to :mod:`mccfr`, and
-persists into the **same** :class:`SolverState` (read by the same
-:class:`SearchPolicy`) — only the *storage shape* differs (per-public-node
-matrices, see below).
+The *small / late* path: **heads-up** subgames rooted on the flop, turn or river.
+Counterpart to :mod:`mccfr`, persisting into the **same** :class:`SolverState` (read
+by the same :class:`SearchPolicy`) — only the storage shape differs.
 
-Design (per §6.5):
+Design:
 
-- Carry a **per-combo reach vector per player** (``reach[p] = ctx.ranges[p]`` at
-  the root), not a sampled concrete hand.
-- **Expand every action at every decision node** (no action sampling); **sample
-  one board completion per iteration** at the chance nodes (chance-sampled CFR),
-  leaving the tree deterministic for that iteration.  A flop root samples a
-  *(turn, river)* pair; a turn root samples a river; a river root samples
-  nothing.  The betting tree is hole- and card-independent, so a single make/undo
-  env walk serves every combo at once; the engine's own board deal is **ignored**
-  and the completion sampled from the deck (via ``ctx.rng``) is used as that
-  iteration's public runout — the correct chance distribution over ranges, free
-  of global-RNG dependence, and only one completion's work per iteration.
+- Carry a **per-combo reach vector per player** (``reach[p] = ctx.ranges[p]`` at the
+  root), not a sampled concrete hand.
+- **Expand every action at every decision node**; **sample one board completion per
+  iteration** at the chance nodes, leaving the tree deterministic for that iteration.
+  The betting tree is hole- and card-independent, so one make/undo env walk serves
+  every combo at once.  The engine's own board deal is **ignored** and the completion
+  is sampled from the deck via ``ctx.rng`` — the correct chance distribution over
+  ranges, free of global-RNG dependence, at one completion's work per iteration.
+- Regret / strategy-sum updates are **reach-weighted per combo** (float64): the
+  counterfactual value carries the opponent reach (folded into the terminals, with
+  card removal), the strategy sum the player's own reach.  Alternating updates, one
+  tree pass per seat per ``iterate``.
+- **Settlement is the env's job** — :meth:`PokerEnv.vector_payout` handles matched
+  stake, showdown vs fold, board completion, card removal and ranking.  This regime
+  never imports the showdown primitives.
 
-Storage — root street lossless, future streets clustered (§6.5):
+Storage — root street lossless, future streets clustered:
 
-- A **root-street** decision node is ``(n_combos, width)``, one row per
-  ``combo_index`` (lossless).  These are the rows :class:`SearchPolicy` reads for
-  the bot's actual hand, keyed ``(public_key, combo_index)`` — unchanged.
-- A **future-street** decision node is ``(n_clusters, width)``, one row per LUT
-  cluster reachable in the subgame.  The sampled board is folded into the cluster
-  id (``cluster_for`` keys on the full community), so there is **no explicit river
-  axis** — different runouts land in different clusters, and holes sharing a
-  cluster share a row (the paper's lossy future-street abstraction).  The walk
-  stays per-combo: it *gathers* each combo's cluster row to form a per-combo
-  strategy, then *scatters* the per-combo regret/strategy deltas back into the
-  cluster rows (a segment-sum).  These nodes are internal to the solve (the next
-  round is a fresh subgame) and are never read externally — the ``vrow_space``
-  guard in :class:`SolverState` enforces that.
-
-- Regret / strategy-sum updates are **reach-weighted per combo** (float64).  The
-  per-combo counterfactual value carries the opponent reach (folded into the
-  terminals, with card removal); the strategy sum carries the player's own reach.
-  Alternating updates: each ``iterate`` runs one tree pass per seat.
-- **Settlement is the env's job.**  At a terminal the regime calls
-  :meth:`environment.poker_env.PokerEnv.vector_payout`, passing the traverser
-  seat, the opponent reach, and the sampled runout.  The env handles the matched
-  stake, showdown vs fold, board completion, card removal, and ranking (cached);
-  this regime does no settlement and never imports the showdown primitives.
+- A **root-street** node is ``(n_combos, width)``, one row per ``combo_index``.  These
+  are the rows :class:`SearchPolicy` reads for the bot's actual hand.
+- A **future-street** node is ``(n_clusters, width)``.  The sampled board is folded
+  into the cluster id, so there is **no explicit river axis** — different runouts land
+  in different clusters and holes sharing a cluster share a row (the paper's lossy
+  future-street abstraction).  The walk stays per-combo: it *gathers* each combo's
+  cluster row to form a per-combo strategy, then *scatters* the deltas back as a
+  segment-sum.  These nodes are internal to the solve and never read externally; the
+  ``vrow_space`` guard in :class:`SolverState` enforces that.
 """
 
 from __future__ import annotations
@@ -216,15 +204,12 @@ class _VectorSolver:
         if self._ox:
             # Defense in depth for the adaptation-safety guarantee (Thm 4.3): the
             # in-subgame opponent must be a true regret-matching adversary, with the
-            # DBR model entering ONLY via the reach belief p̂ at the gadget root
-            # (docs/opponent_modeling.md Part II — no confidence/mixture machinery
-            # inside S). `_walk` calls `apply_model_clamp` unconditionally, so a
-            # populated `ctx.models` would silently blend the opponent's in-subgame
-            # strategy toward its model at every interior node, invalidating the
-            # safety proof with no crash. The production driver (runner.py's
-            # `EvalConfig.for_condition`) already rejects OX+model_spec combinations
-            # upstream — this raises here too so the invariant can't be silently
-            # violated by a future/alternate caller that skips that guard.
+            # DBR model entering ONLY via the reach belief p̂ at the gadget root.
+            # ``_walk`` calls ``apply_model_clamp`` unconditionally, so populated
+            # ``ctx.models`` would silently blend the opponent toward its model at
+            # every interior node and invalidate the proof without crashing.  The
+            # production driver rejects OX+model_spec upstream; this raises too, so an
+            # alternate caller cannot skip the guard.
             if getattr(ctx, "models", None):
                 raise ValueError(
                     "OX-Search (cfg.beta set) requires ctx.models to be empty — the "

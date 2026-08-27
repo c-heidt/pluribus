@@ -1,30 +1,22 @@
 """Depth-limit leaf continuation-value evaluation (§6.4).
 
-At a depth-limit leaf the subgame solver has already sampled a **concrete**
-hand for every seat (the joint root draw, §6.5) and the continuation
-meta-game has already fixed each active seat's bias class.  :func:`continuation_value`
-evaluates that **fixed profile of concrete hands** by Monte-Carlo rollout to
+At a depth-limit leaf the solver has already sampled a **concrete** hand for every
+seat and the continuation meta-game has fixed each active seat's bias class.
+:func:`continuation_value` evaluates that fixed profile by Monte-Carlo rollout to
 terminal, returning the mean per-seat chip delta.
 
-The leaf does **no** hole resampling — the hands are inherited from
-``frontier_env``; only the sampled action line and board runout vary.  Exactly
-**one** action line is played to a terminal on one sampled board — matching
-the paper's design (one action sampled per infoset; stochasticity recovered
-in aggregate across CFR's per-iteration hole draws, not by per-leaf
-averaging) and the traverser-vectorized walk's leaf rollout
-(:func:`continuation_value_vector`/``continuation_value_vector_fast``), which
-never supported anything else.  An exact decision-free board-average and a
-multi-rollout-per-leaf average were both tried and dropped (perf; see the
-"decision-free settlement dropped" decision), so this Python path and the
-compiled core now agree exactly: one rollout, one sampled board, no averaging.
+The leaf does **no** hole resampling — hands are inherited from ``frontier_env``, and
+only the sampled action line and board runout vary.  Exactly **one** action line is
+played on one sampled board, matching the paper (stochasticity is recovered in
+aggregate across CFR's per-iteration hole draws, not by per-leaf averaging).  A
+decision-free board-average and a multi-rollout average were both tried and dropped on
+perf, so this path and the compiled core agree exactly.
 
-The module is a pure consumer of :class:`PokerEnv`, :class:`Policy`, and
-:class:`SubgameContext`; ``ctx.rng`` drives the action sampling and
-``ctx.board_rng`` the board runout.  The two are deliberately separate streams,
-and **neither is the global** ``np.random``: a rollout board is a hypothetical
-re-deal, so drawing it from the played game's stream would make the search's
-randomness depend on unrelated consumers (and theirs on the search's iteration
-count).  See :mod:`poker_ai.search.rng`.
+A pure consumer of :class:`PokerEnv`, :class:`Policy` and :class:`SubgameContext`.
+``ctx.rng`` drives action sampling, ``ctx.board_rng`` the board runout — separate
+streams, and **neither is the global** ``np.random``: a rollout board is a hypothetical
+re-deal, so drawing it from the played game's stream would couple the search's
+randomness to unrelated consumers.  See :mod:`poker_ai.search.rng`.
 """
 
 from __future__ import annotations
@@ -79,23 +71,18 @@ def continuation_value(
     Parameters
     ----------
     frontier_env : PokerEnv
-        State at the depth-limit leaf.  Every seat already holds a concrete
-        hole (the solver's root draw); an already-terminal env is handled by a
-        fast path returning :attr:`PokerEnv.payout`.
+        State at the depth-limit leaf; every seat already holds a concrete hole.  An
+        already-terminal env takes a fast path returning :attr:`PokerEnv.payout`.
     profile : Mapping[int, BiasClass]
-        One bias class per seat that can still act, fixed by the continuation
-        meta-game.  The acting seat plays ``ctx.leaf.policies[profile[seat]]``
-        with ``bias=profile[seat]``.  A seat that acts but is absent raises
-        ``ValueError``.
+        One bias class per seat that can still act.  The acting seat plays
+        ``ctx.leaf.policies[profile[seat]]``; a seat that acts but is absent raises.
     ctx : SubgameContext
-        Search context; ``ctx.rng`` is the sole RNG for action sampling and
-        ``ctx.leaf`` carries the policy fleet.
+        ``ctx.rng`` drives action sampling, ``ctx.leaf`` carries the policy fleet.
 
     Returns
     -------
     numpy.ndarray
-        Float64 vector of shape ``(frontier_env.n_players,)``; entry ``i`` is
-        the chip delta for seat ``i`` on the single sampled continuation.
+        Float64 ``(n_players,)`` chip deltas on the single sampled continuation.
     """
     n = frontier_env.n_players
     cfg = ctx.leaf

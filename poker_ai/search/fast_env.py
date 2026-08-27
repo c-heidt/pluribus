@@ -8,13 +8,11 @@ read-only + step/undo surface :meth:`poker_ai.search.vector._VectorSolver._walk`
 Python walk produces byte-identical ``vregret`` / ``vstrat`` tables whether it walks a
 ``PokerEnv`` or this adapter (proven by the record/replay differential + the golden digest).
 
-**Scope — canonical histories only.**  ``FastState``'s history is a compact byte-code
-stream with no code for off-tree *injected* raise strings, so :attr:`FastState.public_key`
-is exact only for on-tree histories.  The solver therefore uses this adapter **only when
-the search has no off-tree injections** (``root_env._extra_legal_actions`` empty); a
-re-search that injected an off-tree size falls back to the Python ``PokerEnv`` walk.  This
-keeps the (dominant) fresh-search path in-core without an overlay merge, and never risks
-byte-identity on the rare injected re-search.  See :func:`build_fast_walk_env`.
+**Scope — canonical histories only.**  ``FastState``'s history is a byte-code stream
+with no code for off-tree injected raise strings, so its ``public_key`` is exact only
+for on-tree histories.  The adapter is therefore used **only when the search has no
+off-tree injections**; a re-search that injected one falls back to the Python walk.
+That keeps the dominant fresh-search path in-core without an overlay merge.
 """
 
 from __future__ import annotations

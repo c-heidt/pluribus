@@ -1,22 +1,19 @@
 """Traverser-vectorized external-sampling Linear MCCFR regime (§6.5).
 
-The MCCFR regime is the *large / early* path — round 1, all of round 2, and any
-large multiway later subgame.  The traverser's private hand is solved in **vector
-form**: one walk updates every combo's row at once (killing the per-row
-starvation the scalar external-sampling walk suffered), while opponents still
-**sample one** action from their single sampled hole's regret-matched row (keeping
-multiway tractable) and chance is the engine's frozen per-iteration board runout.
-Regret and average strategy fold into a single pass — ``pi_p`` is exact because the
-traverser's actions are expanded — writing the shared ``vregret``/``vstrat``
-matrices (keyed by ``public_key``; combo rows on the root street, LUT-cluster rows
-on future streets) that the vector regime and :class:`SearchPolicy` also read.
+The *large / early* path — round 1, all of round 2, and any large multiway later
+subgame.  The traverser's private hand is solved in **vector form** (one walk updates
+every combo's row, killing the per-row starvation of a scalar external-sampling walk),
+while opponents **sample one** action from their single sampled hole's regret-matched
+row (keeping multiway tractable) and chance is the engine's frozen per-iteration board
+runout.  Regret and average strategy fold into a single pass — ``pi_p`` is exact
+because the traverser's actions are expanded — writing the shared ``vregret`` /
+``vstrat`` matrices that the vector regime and :class:`SearchPolicy` also read.
 
-Depth-limit leaves are the §6.4 continuation meta-game, valued per-combo by
-:func:`poker_ai.search.leaf.continuation_value_vector`; terminals settle against
-the concrete sampled opponents via :meth:`PokerEnv.vector_payout_concrete`.  This
-mirrors :meth:`poker_ai.search.vector._VectorSolver._walk`, specialized to sampled
-(rather than range-expanded) opponents.  CFR-P pruning is omitted (it never
-engages in a short search, §6.5).
+Depth-limit leaves are the §6.4 continuation meta-game valued per-combo by
+:func:`continuation_value_vector`; terminals settle against the concrete sampled
+opponents via :meth:`PokerEnv.vector_payout_concrete`.  Mirrors
+``vector._VectorSolver._walk``, specialized to sampled rather than range-expanded
+opponents.  CFR-P pruning is omitted (it never engages in a short search).
 """
 
 from __future__ import annotations
@@ -68,18 +65,15 @@ except ImportError:
 def _leaf_fn(frontier_env):
     """The leaf rollout to use for ``frontier_env`` — the walk engine decides.
 
-    The module-global binding above is resolved at **import** time, but whether the
-    walk actually runs on the core is decided per solver (``_use_core``) and per
-    iteration (``build_fast_mccfr_env`` may return ``None``).  When the flag is set
-    after this module is imported, those disagree: the walk hands the leaf a
-    ``FastMCCFRAdapter`` while the global still points at the pure-Python rollout,
-    which reaches for ``PokerEnv``-only members (``with_hole_cards``) and raises —
-    swallowed by ``SearchAgent._solve_and_store`` into a silent blueprint fallback.
+    The module-global binding is resolved at **import** time, but whether the walk runs
+    on the core is decided per solver and per iteration.  If the flag is set after this
+    module is imported those disagree, and the walk would hand a ``FastMCCFRAdapter``
+    to the pure-Python rollout, which reaches for ``PokerEnv``-only members and raises
+    (swallowed upstream into a silent blueprint fallback).
 
-    So: a compiled frontier always gets the compiled leaf.  Deliberately one-way —
-    never downgrade a ``PokerEnv`` frontier to the Python rollout when the global
-    selected the fast one, because the two consume ``ctx.rng`` differently and that
-    would move ``GOLDEN_DIGEST_MCCFR``.
+    So a compiled frontier always gets the compiled leaf.  Deliberately one-way: never
+    downgrade a ``PokerEnv`` frontier to the Python rollout, because the two consume
+    ``ctx.rng`` differently and that would move ``GOLDEN_DIGEST_MCCFR``.
     """
     if getattr(frontier_env, "_fast", None) is not None:
         from poker_ai.search.leaf_fast import continuation_value_vector_fast
@@ -112,15 +106,11 @@ class _MCCFRSolver:
         self._combo_cards = root_env.combo_cards
         self._my_hole = tuple(sorted(int(c) for c in ctx.my_hole))
 
-        # Densified card-removal slots (once per solver, not per node/iteration):
-        # card ints are Cactus-Kev encoded (not ``0..51``), so a dense boolean
-        # exclusion mask needs each combo's two cards mapped to a compact
-        # ``0..deck_size-1`` slot first — the same densification
-        # ``range_showdown.removal_index`` uses for showdown settlement, reused
-        # here so root-hole sampling's card-removal checks (`np.isin` against a
-        # tiny per-call exclusion set, confirmed hot by profiling) become a
-        # dense-mask lookup instead. ``removal_for``/``deck_slots`` are
-        # ``lru_cache``d per deck, so this is cheap even recomputed elsewhere.
+        # Densified card-removal slots, once per solver: card ints are Cactus-Kev
+        # encoded, so a dense exclusion mask needs each combo's cards mapped to a
+        # compact ``0..deck_size-1`` slot first.  Same densification
+        # ``range_showdown.removal_index`` uses, reused so the card-removal checks
+        # (profiled hot as ``np.isin``) become a dense-mask lookup.
         low, high = root_env.low_card_rank, root_env.high_card_rank
         self._combo_slot0, self._combo_slot1, self._deck_size = (
             range_showdown.removal_for(low, high)
@@ -152,24 +142,20 @@ class _MCCFRSolver:
             if total <= 0.0:
                 raise ValueError(f"MCCFR root: seat {s} has zero board-compatible reach.")
             self._weights[s] = w / total
-        # Precomputed inverse-CDF for the root-hole draw: the joint belief weights
-        # are fixed for the whole solve, so a per-seat cumulative built once here
-        # lets ``_sample_root_holes`` draw with one ``rng.random()`` + searchsorted
-        # instead of ``rng.choice(p=)`` rebuilding and revalidating a CDF per call.
-        # The cumulative is normalised to end exactly at 1.0 so the draw mirrors
-        # ``Generator.choice`` bit-for-bit (numpy's own p-path is cumsum → /cdf[-1]
-        # → random() → searchsorted(side="right")); the search stays byte-identical.
+        # Precomputed inverse-CDF for the root-hole draw: the belief weights are fixed
+        # for the solve, so one cumulative built here lets ``_sample_root_holes`` draw
+        # with ``rng.random()`` + searchsorted instead of ``rng.choice(p=)`` rebuilding
+        # a CDF per call.  Normalised to end exactly at 1.0 so the draw mirrors
+        # ``Generator.choice`` bit-for-bit and the search stays byte-identical.
         self._cdf: Dict[int, np.ndarray] = {}
         for s, w in self._weights.items():
             cdf = np.cumsum(w)
             cdf /= cdf[-1]
             self._cdf[s] = cdf
         # Single-copy walk: the traversal reseat-mutates ``root_env`` in place per
-        # iteration (§6.5) instead of deepcopying it, so snapshot its pristine
-        # card-state now — before any walk — to rewind afterwards, honouring
-        # solve()'s "never mutates root_env" contract and keeping warm re-search /
-        # downstream reads correct.  Only the cards + deal cursor change (reseat);
-        # the betting state is restored by the walk's own make/undo balance.
+        # iteration instead of deepcopying, so snapshot its pristine card state here to
+        # rewind afterwards and honour solve()'s "never mutates root_env" contract.
+        # Only cards + deal cursor change; betting state is restored by make/undo.
         self._pristine_holes = [tuple(int(c) for c in p._cards) for p in root_env.players]
         self._pristine_cards = root_env.deck._cards.copy()
         self._pristine_idx = int(root_env.deck._idx)
@@ -178,38 +164,21 @@ class _MCCFRSolver:
         self._full_deck = make_deck_arr(
             root_env._low_card_rank, root_env._high_card_rank
         )
-        # Dedicated board-shuffle RNG.  reseat re-randomises the undealt deck each
-        # iteration, but that draw must NOT come from ``self.rng`` — that stream
-        # drives hole + action sampling, and polluting it with per-iteration board
-        # shuffles desyncs the traversal and wrecks convergence.  The old
-        # per-iteration ``with_hole_cards`` shuffled on the *global* ``np.random``
-        # (a separate stream) for exactly this reason; we keep the separation but
-        # derive an independent child from ``self.rng``'s seed sequence so parallel
-        # replicas stay decorrelated (each replica's ``rng`` is its own seeded
-        # substream), rather than sharing fork-inherited global state.  Spawn from
-        # the seed sequence so ``self.rng`` itself is NOT advanced — the sampling
-        # stream (hole + action draws) must stay bit-identical to a board-free
-        # baseline, or the traversal desyncs.
-        #
-        # Derived via ``search.rng.spawn_one``, NOT a bare ``_seed_seq.spawn(1)``:
-        # the pinned numpy (1.17.4) drops ``spawn_key`` when generating state, so
-        # the bare call handed back a child bit-identical to ``self.rng`` and the
-        # separation this comment describes was silently not happening.
+        # Dedicated board-shuffle RNG: reseat re-randomises the undealt deck every
+        # iteration, and that draw must NOT come from ``self.rng`` (hole + action
+        # sampling) or the traversal desyncs.  Spawned, not drawn, so ``self.rng`` is
+        # not advanced.  Via ``search.rng.spawn_one``, NOT a bare
+        # ``_seed_seq.spawn(1)``: numpy 1.17.4 drops ``spawn_key``, so the bare call
+        # returns a child bit-identical to the parent.
         self._board_rng = spawn_one(self.rng)
 
         # ---- Traverser-vectorized walk (all MCCFR subgames) ------------------
-        # The traverser's private hand is solved in VECTOR form: every combo's row
-        # updates every iteration (killing the per-row starvation), while opponents
-        # still SAMPLE one action (external sampling — keeps multiway tractable) and
-        # the board is the frozen reseat runout.  Decision + strategy fold into one
-        # walk.  Two mutually-exclusive shapes by root street:
-        #   * turn/river root (>=2): leaf-free, so the walk plays to real terminals
-        #     and crosses chance nodes → future streets stored per LUT cluster
-        #     (``_cmaps``); it never reaches a depth-limit leaf.
-        #   * pre-flop / multiway-flop root (<2): the depth limit cuts to a leaf
-        #     BEFORE any future-street decision node, so the walk only ever visits
-        #     root-street (combo) decision nodes + the continuation meta-game leaf
-        #     (also combo-keyed) — no cluster machinery is reached.
+        # Two mutually-exclusive shapes by root street:
+        #   * turn/river (>=2): leaf-free — plays to real terminals, crosses chance
+        #     nodes, future streets stored per LUT cluster (``_cmaps``).
+        #   * pre-flop / multiway-flop (<2): the depth limit cuts to a leaf BEFORE any
+        #     future-street decision node, so only root-street (combo) nodes and the
+        #     meta-game leaf are visited — no cluster machinery.
         self._n_combos = int(self._combo_cards.shape[0])
         self._combo_index = root_env.combo_index
         self._my_seat = ctx.my_seat
@@ -221,13 +190,11 @@ class _MCCFRSolver:
             for s in self._live_seats
         }
         self._root_len = len(root_env.community_cards)
-        # Cluster machinery is needed exactly when the subgame is LEAF-FREE, i.e.
-        # the walk can cross to a future (clustered) street — every subgame except
-        # the depth-limited round-1 (pre-flop) and multiway round-2 (flop) roots
-        # (§3).  Note a HEADS-UP flop is leaf-free (the multiway guard needs >2
-        # seats), so it too crosses turn+river and needs ``_cmaps`` — the router
-        # sends it to the vector regime in production, but the MCCFR walk must still
-        # handle it correctly (the differential harness drives it directly).
+        # Cluster machinery is needed exactly when the subgame is LEAF-FREE, i.e. the
+        # walk can cross to a future (clustered) street — every subgame except the
+        # depth-limited pre-flop and multiway-flop roots.  A HEADS-UP flop is leaf-free
+        # (the multiway guard needs >2 seats), so it needs ``_cmaps`` too even though
+        # the router sends it to the vector regime in production.
         street = ctx.street_at_root
         n_at_root = (ctx.depth_limit.n_players_at_root if ctx.depth_limit is not None
                      else root_env.n_players_started_round)
@@ -237,15 +204,13 @@ class _MCCFRSolver:
             else ClusterMapper(root_env.card_info_lut, root_env.combo_cards,
                                root_env.community_cards, street)
         )
-        # Search Cython core (Phase 3): when enabled and the search is overlay-free,
-        # the walk runs on the compiled FastState engine (make/undo + concrete
-        # settlement in-core, leaf rollout via the cloned frontier).  The walk
-        # re-holes the root every iteration, so the FastState is rebuilt per
-        # traversal (:meth:`_make_walk_env`); a build that returns ``None`` falls
-        # back to the PokerEnv walk for that iteration.  Equilibrium-gated, not
-        # byte-identical (the FastState leaf's board draw diverges the RNG stream).
-        # Modeled solves run on the core too: the clamp keys the model by *cluster*
-        # (``policy_state_for_cluster``), served identically by both engines.
+        # Search Cython core: when enabled and the search is overlay-free, the walk
+        # runs on the compiled FastState (make/undo + concrete settlement in-core).
+        # Rebuilt per traversal since the walk re-holes the root each iteration; a
+        # build returning ``None`` falls back to the PokerEnv walk for that iteration.
+        # Equilibrium-gated, not byte-identical (the leaf's board draw diverges the
+        # RNG stream).  Modeled solves run on the core too — the clamp keys the model
+        # by cluster, served identically by both engines.
         self._use_core = False
         try:
             from poker_ai._core import CORE_AVAILABLE
@@ -281,17 +246,13 @@ class _MCCFRSolver:
                                   and self._my_combo is not None)
 
         # VR-MCCFR baseline (opponent_modeling §5.5): a control variate on the sampled
-        # opponent-action counterfactual values.  DBR-only — gated on both the config
-        # flag and the presence of opponent models — so a vanilla solve (no models) is
-        # byte-identical regardless of the flag.  ``_vbaseline[(p, pk)]`` is a per-
-        # traverser-per-opponent-node ``(n_legal, n_combos)`` baseline, EMA-updated from
-        # observed child values and reset per search (fresh solve).  Unbiased for any
-        # baseline.  Keyed by ``(p, pk)`` and not just ``pk``: with 3+ live seats the
-        # traverser rotates every iteration, and a bare ``pk`` node is "opponent" from
-        # more than one traverser's perspective — those are different value functions
-        # (different traverser's per-combo payoff) over the same combo-index space, so
-        # collapsing them into one baseline array would silently mix incompatible
-        # values instead of reducing variance.
+        # opponent-action counterfactual values.  DBR-only — gated on the flag AND the
+        # presence of models — so a vanilla solve is byte-identical either way.
+        # ``_vbaseline[(p, pk)]`` is ``(n_legal, n_combos)``, EMA-updated and reset per
+        # search.  Keyed by ``(p, pk)`` not ``pk``: with 3+ live seats the traverser
+        # rotates, and one ``pk`` node is "opponent" from several traversers'
+        # perspectives — different value functions over the same combo space, so a
+        # shared array would mix incompatible values instead of reducing variance.
         self._vr = (bool(getattr(cfg, "variance_reduction", False))
                     and bool(getattr(ctx, "models", None)))
         self._vr_decay = float(getattr(cfg, "vr_baseline_decay", 0.5))
@@ -355,13 +316,10 @@ class _MCCFRSolver:
     def restore_root(self) -> None:
         """Rewind ``root_env`` to its pristine card-state after the in-place walk.
 
-        The traversal reseat-mutates ``root_env`` (holes + deck order + cursor)
-        rather than deepcopying it, so ``solve()`` calls this once the loop ends to
-        leave ``root_env`` byte-identical — the documented "never mutates root_env"
-        contract that warm re-search and any downstream reader rely on.  The
-        betting state is already root-restored by the walk's make/undo balance, so
-        only the cards + deal cursor are rewound here.  Idempotent; a no-op if the
-        solve ran zero iterations (root_env never reseated).
+        The traversal reseat-mutates holes + deck order + cursor rather than
+        deepcopying, so ``solve()`` calls this at the end to honour the "never mutates
+        root_env" contract.  Betting state is already restored by the walk's make/undo
+        balance.  Idempotent.
         """
         deck = self.root_env.deck
         deck._cards[:] = self._pristine_cards
@@ -376,25 +334,22 @@ class _MCCFRSolver:
     def _draw_index(self, cdf: np.ndarray) -> int:
         """Inverse-CDF draw ∝ the weights whose cumulative sum is ``cdf``.
 
-        One ``rng.random()`` + ``searchsorted`` in place of ``rng.choice(p=w)``:
-        the weights are fixed for the whole solve, so the cumulative is built once
-        (:attr:`_cdf`, normalised to end at 1.0) rather than rebuilt and revalidated
-        on every draw.  This is exactly what ``Generator.choice`` does internally, so
-        the draw is bit-for-bit identical; ``side="right"`` gives ``P(i) == w[i]`` and
-        never selects a zero-mass entry (a flat cdf step).  ``cdf[-1] == 1.0`` exactly
-        and ``rng.random() < 1.0``, so the index can never run past the last bin.
+        One ``rng.random()`` + ``searchsorted`` instead of ``rng.choice(p=w)``, which
+        would rebuild the cumulative per call.  Bit-for-bit identical to ``choice``
+        (that is what it does internally); ``side="right"`` gives ``P(i) == w[i]`` and
+        never selects a zero-mass entry, and ``cdf[-1] == 1.0`` with
+        ``rng.random() < 1.0`` means the index cannot run past the last bin.
         """
         return int(np.searchsorted(cdf, self.rng.random(), side="right"))
 
     def _sample_root_holes(self) -> Dict[int, Tuple[int, int]]:
         """Draw one card-disjoint assignment from the joint belief.
 
-        Rejection sampling: draw each seat's combo independently ∝ its marginal,
-        reject the whole draw on any inter-seat card conflict, retry.  This is
-        exact for the joint ``P(h) ∝ Π_s w_s[h_s]·1[disjoint]`` (the product
-        conditioned on the no-conflict event).  Zero-mass hands are never drawn.
-        A bounded retry budget falls back to sequential-with-removal (a mild,
-        logged approximation) only under pathological range concentration.
+        Rejection sampling: draw each seat's combo ∝ its marginal, reject the whole
+        draw on any inter-seat conflict, retry.  Exact for
+        ``P(h) ∝ Π_s w_s[h_s]·1[disjoint]``.  A bounded retry budget falls back to
+        sequential-with-removal (a logged approximation) under pathological
+        concentration.
         """
         cc = self._combo_cards
         for _ in range(256):
@@ -421,10 +376,8 @@ class _MCCFRSolver:
     def _disjoint_mask(self, excluded) -> np.ndarray:
         """``(n_combos,)`` bool: combos sharing no card with any card in ``excluded``.
 
-        Card-removal check via the precomputed densified slots (``__init__``)
-        instead of ``np.isin`` against the small, per-call ``excluded`` set —
-        confirmed by profiling as a hot cost (12-20% of MCCFR wall) across every
-        call site below. ``excluded`` may be empty.
+        Uses the precomputed densified slots rather than ``np.isin``, which profiling
+        showed at 12-20% of MCCFR wall.  ``excluded`` may be empty.
         """
         mask = np.zeros(self._deck_size, dtype=bool)
         if excluded:
@@ -434,14 +387,13 @@ class _MCCFRSolver:
     def _sample_root_holes_vectorized(self, traverser: int) -> Dict[int, Tuple[int, int]]:
         """Root holes for the vectorized walk: real opponents, phantom traverser.
 
-        Every seat except ``traverser`` is drawn from its belief (used concretely —
-        opponent action sampling + the terminal ranks).  The traverser's hole is a
-        **phantom**: the walk sweeps all of its combos and never reads it, so it
-        serves only to partition the deck for ``reseat_private_cards``.  It is drawn
-        **uniformly** over combos card-disjoint from the opponents and board — NOT
-        from the traverser's range — because reseat excludes the traverser hole from
-        the frozen runout pool, so a range-weighted phantom would bias the future
-        board's marginal (range-frequent cards under-sampled as board cards).  A
+        Every seat except ``traverser`` is drawn from its belief and used concretely
+        (opponent action sampling + terminal ranks).  The traverser's hole is a
+        **phantom** — the walk sweeps all its combos and never reads it — serving only
+        to partition the deck for ``reseat_private_cards``.  It is drawn **uniformly**
+        over combos disjoint from the opponents and board, NOT from the traverser's
+        range: reseat excludes that hole from the frozen runout pool, so a
+        range-weighted phantom would bias the future board's marginal.  A
         uniform phantom keeps the runout hole-independent: the public-chance-sampling
         property the vector regime has by construction.  Opponents are sampled
         *without* conditioning on the phantom, so no combo's card removal is skewed
@@ -518,13 +470,10 @@ class _MCCFRSolver:
         """
         runout = None
         if self._cmaps is not None:
-            # Frozen board for this iteration — reseat has already dealt the WHOLE
-            # 5-card runout before the walk starts, and it never changes again this
-            # iteration (leaf-free root: no depth-limit leaf re-deals mid-walk).
-            # Read it off the PokerEnv root (``env`` here may be the deck-less
-            # FastState adapter). Only turn/river/HU-flop roots reach here;
-            # leaf-containing roots (preflop / multiway-flop, cmaps is None) deal
-            # the board PROGRESSIVELY as betting advances instead — see below.
+            # Frozen board for this iteration: reseat dealt the whole 5-card runout
+            # before the walk, and no depth-limit leaf re-deals mid-walk here.  Read off
+            # the PokerEnv root (``env`` may be the deck-less FastState adapter).
+            # Leaf-containing roots (cmaps is None) deal progressively instead.
             runout = self.root_env.deck.board_runout(5)
             if self._cmaps.n_completion:
                 # Future-street cluster ids past the root community, folded in
@@ -541,20 +490,14 @@ class _MCCFRSolver:
         disjoint = self._disjoint_mask(excl)
         pi_p0 = self._reach[i] * disjoint
 
-        # Fixed per-iteration payout-feasibility mask: every terminal reached
-        # during THIS iteration's walk settles the SAME traverser (``i``) against
-        # the SAME frozen board + the SAME other-seats' holes, so the card-removal
-        # mask ``vector_payout_concrete`` needs is identical at every one of those
-        # terminals (measured ~33 calls/iteration on a HU-flop cell) — compute it
-        # ONCE here instead of rebuilding it at each terminal.  Valid ONLY when the
-        # board is genuinely fixed for the whole iteration (leaf-free roots,
-        # ``runout is not None``): a leaf-containing root (preflop / multiway-flop)
-        # deals its board PROGRESSIVELY as the walk advances streets, so a terminal
-        # reached mid-walk may hold fewer board cards than the eventual full
-        # board — precomputing against the wrong (future) board there would
-        # silently rule out combos on cards not yet actually dealt at that
-        # terminal. Those roots pass ``feasible=None`` and keep computing the mask
-        # fresh per terminal (the pre-existing, always-correct behavior).
+        # Fixed per-iteration payout-feasibility mask: every terminal in THIS
+        # iteration settles the same traverser against the same frozen board and the
+        # same other-seat holes, so the card-removal mask is identical at all of them
+        # (~33 calls/iteration on a HU-flop cell) — compute it once.  Valid ONLY when
+        # the board is fixed for the whole iteration (``runout is not None``): a
+        # leaf-containing root deals progressively, so a terminal reached mid-walk may
+        # hold fewer board cards and precomputing against the future board would rule
+        # out combos on cards not yet dealt.  Those roots pass ``feasible=None``.
         self._iter_feasible = (
             self._disjoint_mask(set(int(c) for c in runout) | excl)
             if runout is not None else None
@@ -599,14 +542,11 @@ class _MCCFRSolver:
         )
 
         if actor != p:
-            # Opponent node: sample one action from its single sampled hole's row
-            # (external sampling).  The traverser's per-combo value below is the
-            # opponent-strategy-weighted expectation ``Σ_a σ_opp(a)·v(·a)``; the sampled
-            # child ``v`` is an unbiased single-sample estimate of it.
-            # ``holes[actor]`` is already ``(c0, c1)`` with ``c0 < c1`` by
-            # construction (every sampler draws it straight from ``combo_cards``
-            # rows, which ``combo_index`` keys match verbatim) — sorting it here
-            # would be a no-op on every call.
+            # Opponent node: sample one action from its sampled hole's row (external
+            # sampling).  The traverser's per-combo value below is
+            # ``Σ_a σ_opp(a)·v(·a)``, of which the sampled child is an unbiased
+            # single-sample estimate.  ``holes[actor]`` is already sorted ``(c0 < c1)``
+            # by construction, so sorting here would be a no-op.
             opp_ci = self._combo_index[holes[actor]]
             opp_row = sigma[opp_ci]                       # (n_legal,) opponent strategy
             a_idx = sample_index(self.rng, opp_row)
@@ -616,15 +556,12 @@ class _MCCFRSolver:
             if not self._vr:
                 return v
             # VR-MCCFR baseline (opponent_modeling §5.5).  Sampling is ON-POLICY
-            # (q = σ_opp), so the baseline-corrected estimator reduces to the
-            # σ-weighted baseline expectation plus the sampled child's deviation from
-            # its baseline — no ``1/q`` blow-up.  Unbiased for ANY baseline:
+            # (q = σ_opp), so there is no ``1/q`` blow-up and the estimator is unbiased
+            # for ANY baseline:
             #   E_a*[Σ_a σ(a)·b(a) + (v(·a*) − b(a*))] = Σ_a σ(a)·v(·a).
-            # ``b = 0`` (first visit) recovers the plain single-sample value exactly, so
-            # this only ever *reduces* variance as the baseline learns.  EMA-update the
-            # sampled action's baseline AFTER forming the estimate (keeps it independent
-            # of this sample → unbiased).  Both the returned value and — via the parent
-            # traverser node's ``child_vs`` — its regret update inherit the lower variance.
+            # ``b = 0`` recovers the plain single-sample value, so this only reduces
+            # variance as the baseline learns.  EMA-update AFTER forming the estimate,
+            # keeping ``b`` independent of this sample.
             bkey = (p, pk)
             b = self._vbaseline.get(bkey)
             if b is None:

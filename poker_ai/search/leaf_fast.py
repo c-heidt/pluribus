@@ -9,27 +9,17 @@ leaf and make/undo-walked per rollout (the per-leaf deepcopy collapses), and the
 reached terminal settles **per traverser combo** in-core via
 :meth:`FastState.vector_payout_concrete`.
 
-**Equilibrium-gated, not byte-identical.**  The rollout draws a fresh 5-card board
-per call (the undealt-deck runout), and the core draws its *own* sample rather than
-reproducing ``PokerEnv``'s shuffle byte-stream — exactly as ``_traverse.pyx`` declined
-RNG parity for the blueprint core.  A byte-identical action-line differential is
-therefore infeasible: the fast path consumes ``ctx.rng`` for the per-rollout board
-draw while the Python reference consumes it inside ``deck.shuffle_undealt()``, so the
-two action-sampling streams diverge even under one seed.  Instead the value is gated
-**statistically and componentwise**: (1) the fast rollout is an unbiased estimator of
-the Python rollout's per-combo value
-(``test_leaf_fast::test_rollout_vector_unbiased_vs_python`` — grand means agree
-within the combined standard error); (2) the per-combo settlement it adds is proven
-exactly — ``FastState.vector_payout_concrete`` is byte-identical to ``PokerEnv``
-(``test_faststate_vector_payout_concrete``), and the drawn-board ``PolicyState``
-(clusters via :meth:`FastState.refresh_clusters` + info-set/valid-mask via
-:func:`_policy_state`) matches ``PokerEnv.policy_state`` at the frontier **and across
-turn/river rollout nodes**
-(``test_leaf_fast::test_policy_state_matches_env_across_streets``).  The **policy
-stays a Python callback** unless the fleet is a cache-backed ``BlueprintPolicy``, in
-which case the info-set read is served in-core (``core_sigma``); either way the
-clusters are recomputed for the drawn board so a real ``BlueprintPolicy`` reads a
-correct info-set.
+**Equilibrium-gated, not byte-identical.**  The core draws its own board sample rather
+than reproducing ``PokerEnv``'s shuffle byte-stream, so the two action-sampling streams
+diverge even under one seed and a byte-identical differential is infeasible.  The value
+is gated **statistically and componentwise** instead: the fast rollout is an unbiased
+estimator of the Python rollout's per-combo value (grand means within the combined
+standard error), and the per-combo settlement it adds is proven exactly —
+``FastState.vector_payout_concrete`` is byte-identical to ``PokerEnv``, and the
+drawn-board ``PolicyState`` matches ``PokerEnv.policy_state`` at the frontier and
+across turn/river rollout nodes.  The **policy stays a Python callback** unless the
+fleet is a cache-backed ``BlueprintPolicy``, which is served in-core; either way the
+clusters are recomputed for the drawn board.
 
 Falls back to the pure-Python :func:`continuation_value_vector` when the core is
 unavailable, the frontier carries off-tree injections (its byte-code history /

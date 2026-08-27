@@ -10,21 +10,18 @@ It is a best-response expectimax, not CFR: player 2 (the bot) is *fixed* to the
 blueprint, so the game collapses to a single-maximiser problem for player 1 (the
 opponent), whose value is obtained by one backward pass:
 
-- **Opponent decision node** → per-combo **max** over actions.  The opponent's
-  infoset at the (lossless) root is its exact hole, and the river is enumerated
-  (below), so a per-combo max *is* the exact lossless best response — the strongest
-  opponent, i.e. the exploitability reference the safety guarantee is stated against.
-- **Bot decision node** → blueprint-weighted sum: the bot's blueprint σ (queried per
-  LUT cluster, expanded to combos — exactly as the belief update / model clamp
-  vectorise a σ query) is folded into the **counterfactual reach** ``π_bot``.
-- **Chance (the river on a turn root)** → **enumerated** and averaged *in place in the
-  tree*, so the opponent's turn decision maxes over the river *expectation* (it does
-  not see the river before acting).  A turn all-in showdown integrates the river the
-  same way at the terminal.
-- **Terminal** → :meth:`PokerEnv.vector_payout` (range-vs-range, dead money included),
-  the same settlement the vector regime uses — so ``CBV_ref`` is in the *same
-  counterfactual-value units* as the solver's own node values, which is what lets the
-  gadget's per-entry shift cancel in every interior regret delta (step 11).
+- **Opponent decision node** → per-combo **max** over actions.  Its infoset at the
+  lossless root is its exact hole and the river is enumerated, so a per-combo max IS
+  the exact lossless best response — the exploitability reference the safety guarantee
+  is stated against.
+- **Bot decision node** → blueprint-weighted sum, with σ (queried per LUT cluster,
+  expanded to combos) folded into the counterfactual reach ``π_bot``.
+- **Chance (the river on a turn root)** → **enumerated** and averaged in place, so the
+  opponent's turn decision maxes over the river *expectation* rather than seeing it.
+- **Terminal** → :meth:`PokerEnv.vector_payout`, the same settlement the vector regime
+  uses, so ``CBV_ref`` is in the same counterfactual-value units as the solver's own
+  node values — which is what lets the gadget's shift cancel in every interior regret
+  delta (step 11).
 
 Scope: heads-up **turn/river** only (the vector regime; §6.5).  These subgames run to
 game end with terminal leaves only (:meth:`DepthLimit.classify` never returns

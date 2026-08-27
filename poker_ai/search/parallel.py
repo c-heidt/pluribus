@@ -56,16 +56,11 @@ def run_loop(solver, state: SolverState, cfg: SolverConfig,
              on_iteration=None) -> Tuple[int, str]:
     """Drive ``solver`` under the dual stop; return ``(iterations, stop_reason)``.
 
-    This *is* the orchestrator's search loop (Linear-CFR discount on the
-    ``discount_interval`` cadence, stop on ``max_iterations`` **or**
-    ``max_wall_seconds``); :func:`solve` calls it.  The binding ``max_iterations`` is the
-    **structural iteration budget** :func:`solve` computed for this subgame
-    (:mod:`poker_ai.search.budget`) — a real subgame is too large for a single replica to
-    reach a tight equilibrium online, so the stop is a machine-independent per-subgame
-    iteration count, not an online convergence test.  ``stop_reason`` is which cap ended
-    the loop (eval doc §6 ``decisions.stop_reason``): ``'wall_cap'`` if the wall-clock
-    backstop broke early, else ``'iteration_cap'`` (the loop ran the full budget,
-    including the degenerate 0-iteration case).
+    The orchestrator's search loop: Linear-CFR discount on the ``discount_interval``
+    cadence, stopping on ``max_iterations`` or ``max_wall_seconds``.  The binding
+    ``max_iterations`` is the structural budget :func:`solve` computed for this subgame.
+    ``stop_reason`` is ``'wall_cap'`` if the backstop broke early, else
+    ``'iteration_cap'`` (including the degenerate 0-iteration case).
     """
     start = time.perf_counter()
     delta = cfg.discount_interval
@@ -97,19 +92,15 @@ def run_loop(solver, state: SolverState, cfg: SolverConfig,
 def _limit_worker_threads(n_threads: int = 1) -> None:
     """Pin this forked worker's BLAS/OpenMP thread pools to ``n_threads``.
 
-    The per-hand pool forks one worker per core; numpy's OpenBLAS defaults to one thread
-    per core, so ``W`` workers on a ``C``-core box spin up ~``W*C`` threads that busy-wait
-    and thrash the scheduler.  Measured impact on this box (22 cores, 8 workers): the
-    vector solve ran *slower* than serial and the compiled core's per-iteration win
-    inverted into a net loss (core-on became slower than core-off) purely from the
-    oversubscription.  Each search is a single fine-grained CFR walk over tiny
-    (n_combos,) arrays that never benefits from intra-op BLAS threads, so **one thread
-    per worker is optimal**.
+    One worker per core times OpenBLAS's own thread-per-core default is ~``W*C`` threads
+    busy-waiting.  Measured on this box (22 cores, 8 workers): the vector solve ran
+    *slower* than serial and the compiled core's win inverted into a net loss, purely
+    from oversubscription.  A search is a fine-grained CFR walk over tiny arrays that
+    never benefits from intra-op BLAS threads, so one thread per worker is optimal.
 
-    Best-effort and never raises (pinning is an optimisation, not correctness): sets the
-    standard env vars (for any pool that re-reads them) AND calls OpenBLAS's runtime
-    setter on numpy's bundled library — the reliable path in a forked child, whose BLAS
-    pool is already initialised so the env var alone may be ignored.
+    Best-effort, never raises: sets the standard env vars AND calls OpenBLAS's runtime
+    setter, which is the reliable path in a forked child whose pool is already
+    initialised and may ignore the env var.
     """
     import os as _os
 
@@ -136,22 +127,19 @@ def _limit_worker_threads(n_threads: int = 1) -> None:
 def _reopen_leaf_fleet_lmdb(ctx: SubgameContext) -> None:
     """Reopen the leaf fleet's LMDB-backed blueprint envs after a ``fork`` (§6.7).
 
-    LMDB's reader-lock table is a **process-shared mmap** (``lock.mdb``), so a ``fork``
-    is not reader-safe: a child that touches the inherited env clobbers the reader slot
-    that belongs to the *parent's* thread, and the next read on that slot — in *either*
-    process — trips ``mdb_txn_renew: MDB_BAD_RSLOT``.  Reopening gets a fresh env handle
-    bound to a clean slot.  Called by each forked worker before its first leaf query (the
-    per-hand pool) and by the calibration sweep's parent after its pool joins.
+    LMDB's reader-lock table is a process-shared mmap, so a fork is not reader-safe: a
+    child touching the inherited env clobbers the parent's reader slot and the next read
+    in *either* process trips ``MDB_BAD_RSLOT``.  Reopening binds a fresh env to a clean
+    slot.  Called by each forked worker before its first leaf query, and by the
+    calibration sweep's parent after its pool joins.  (The other half of the protocol —
+    the parent closing its envs *before* forking — lives at the fork site.)
 
-    Policies without an LMDB backend (the in-memory ``UniformPolicy`` in tests, a
-    ``SearchPolicy``) expose no ``reopen_after_fork`` and are skipped; the four §4 bias
-    variants share one blueprint object, so it is reopened once (deduped by id).
+    Policies with no LMDB backend expose no ``reopen_after_fork`` and are skipped; the
+    four §4 bias variants share one blueprint, so it is reopened once (deduped by id).
 
-    **Covers ``ctx.models`` too** (opponent_modeling §5.1): a modeled seat's ``σ̂`` is
-    typically a *blueprint-backed* policy, and the clamp queries it inside the walk — i.e.
-    inside the forked worker.  An opponent model left out of this sweep would trip the
-    very same ``MDB_BAD_RSLOT`` on its first query.  The dedup set is shared, so a
-    blueprint reached through both the leaf fleet and a model is reopened exactly once.
+    **Covers ``ctx.models`` too**: a modeled seat's ``σ̂`` is typically blueprint-backed
+    and the clamp queries it inside the forked walk, so leaving models out would trip the
+    same error.  The dedup set is shared across both.
     """
     seen: set = set()
 

@@ -1,16 +1,12 @@
 """Depth-limited subgame solver — public entry point (§6.5).
 
 :func:`solve` runs one real-time search over a subgame root and returns a
-:class:`SearchResult`.  It is a **thin orchestrator** over the composition pieces:
-:class:`~poker_ai.search.solver_state.SolverState` holds the shared CFR tables,
-one regime class owns the iteration body (MCCFR now; the vector regime is a
-documented seam, :mod:`poker_ai.search.vector`), and :class:`SearchPolicy` reads
-the result.  The orchestrator only selects the regime, runs the iteration loop
-with the Linear-CFR discount cadence and the dual stop, and packages the result.
+:class:`SearchResult`.  A **thin orchestrator**: :class:`SolverState` holds the shared
+CFR tables, one regime class owns the iteration body, and :class:`SearchPolicy` reads
+the result.  This module only selects the regime, runs the loop with the Linear-CFR
+discount cadence and the dual stop, and packages the result.
 
-``SolverConfig`` / ``SolverState`` are re-exported here so callers have a single
-public surface: ``from poker_ai.search.solver import solve, SolverConfig,
-SolverState, SearchResult``.
+``SolverConfig`` / ``SolverState`` are re-exported here for a single public surface.
 """
 
 from __future__ import annotations
@@ -61,18 +57,14 @@ class SearchResult:
     regime : str
         Which CFR regime ran: ``'mccfr'`` or ``'vector'`` (eval doc §6).
     n_live : int
-        Number of live ranges the solver sized the subgame on (``len(ctx.ranges)``)
-        — the exact axis the MCCFR budget scales by (and the vector/MCCFR split keys
-        on).  Logged per decision so calibration can group throughput/budget by the
-        live-player count; distinct from the table-active ``num_live`` (all-in
-        contestants keep a range here but are not table-active).
+        Live ranges the subgame was sized on (``len(ctx.ranges)``) — the axis the MCCFR
+        budget scales by and the regime split keys on.  Distinct from the table-active
+        ``num_live``: all-in contestants keep a range here but are not table-active.
     stop_reason : str
-        Which cap ended the search: ``'iteration_cap'`` (ran the full structural
-        iteration budget — the normal case) or ``'wall_cap'`` (the wall backstop
-        broke early).
+        ``'iteration_cap'`` (ran the full structural budget, the normal case) or
+        ``'wall_cap'`` (the backstop broke early).
     stats : SearchStats
-        Walk/cache instrumentation counters (node/tree size, cache hit/miss),
-        snapshotted for the ``decisions`` grain (eval doc §9.1).
+        Walk/cache instrumentation counters for the ``decisions`` grain.
     """
 
     policy: SearchPolicy
@@ -102,24 +94,17 @@ class SearchResult:
 def _select_regime(ctx: SubgameContext) -> str:
     """Regime for ``ctx`` (§6.5): vector iff heads-up **turn/river**, else MCCFR.
 
-    Vector-form CFR is the *small / late* path — a heads-up (two live seats)
-    subgame with **at most one future chance node** left to resolve: a **turn** root
-    (river ahead) or a **river** root (nothing ahead).  There it is full-width and
-    cheap, and its exactness-per-iteration is a real quality win.
+    Vector-form CFR is the *small / late* path: heads-up with at most one future chance
+    node left, where it is full-width, cheap, and exact per iteration.
 
-    A heads-up **flop** root, though, still has **two** future chance nodes
-    (turn *and* river): the vector walk is full-width across the whole flop→turn→river
-    betting tree (~10^5 nodes/iteration), which is ~1 iteration/second even on the
-    compiled core — its per-replica budget (1500) would need ~minutes/replica, and the
-    budget is *not* divisible across workers (each full-width replica needs the whole
-    horizon), so more cores do not shorten it.  So the flop goes to **external-sampling
-    MCCFR** instead: sampled opponent actions make each iteration ~100× cheaper, and the
-    MCCFR budget is a global pool *divided* across replicas, so it scales down with the
-    worker count on the 64-core target.  (The vector regime still *supports* a flop root
-    — the differential/oracle harness drives it directly — it is just no longer routed
-    there in production.)
+    A heads-up **flop** root has two chance nodes ahead, so the full-width walk spans
+    ~10^5 nodes/iteration (~1 it/s even on the compiled core) and its budget does not
+    divide across workers — more cores do not shorten it.  It goes to external-sampling
+    MCCFR instead, whose sampled opponent actions are ~100x cheaper per iteration and
+    whose budget IS divisible.  The vector regime still supports a flop root for the
+    differential/oracle harness; it is just not routed there in production.
 
-    Everything else — the pre-flop root, and any multiway subgame — is MCCFR too.
+    Everything else — pre-flop, and any multiway subgame — is MCCFR too.
     """
     if len(ctx.ranges) == 2 and ctx.street_at_root in (2, 3):
         return "vector"
@@ -183,17 +168,13 @@ def solve(
         A prior state to re-search in place (reusing rows, growing widened
         nodes, carrying the freeze map).  ``None`` starts fresh.
     regime_override : {'vector', 'mccfr'}, optional
-        Force the CFR regime instead of the ``_select_regime`` routing.  For
-        **A/B harnesses** (e.g. the calibration's turn regime comparison), where
-        the same root is solved under both regimes at equal budget to compare
-        results — both regimes are street-general, production just routes each
-        street to one of them.  ``None`` (default) uses the production routing, so
-        every existing caller is unchanged.  **OX-Search note:** the gadget root
-        (``cfg.beta`` set) lives only in the vector regime, so forcing ``'mccfr'``
-        with ``beta`` set would silently solve the *vanilla* tree (no gadget); the
-        caller must not do that (the calibration gates the A/B off when ``beta`` is
-        set).  With ``auto_budget`` on, the structural budget still derives the
-        per-stage count from ``ctx`` (not the override); the A/B path forces
+        Force the CFR regime instead of the ``_select_regime`` routing, for A/B
+        harnesses that solve one root under both at equal budget.  ``None`` uses the
+        production routing.  **OX-Search note:** the gadget root (``cfg.beta`` set)
+        exists only in the vector regime, so forcing ``'mccfr'`` with ``beta`` set would
+        silently solve the *vanilla* tree; callers must not do that.  With
+        ``auto_budget`` on the structural budget still derives from ``ctx``, not the
+        override; the A/B path forces
         ``auto_budget=False`` so the two regimes run an identical per-replica count.
 
     Returns

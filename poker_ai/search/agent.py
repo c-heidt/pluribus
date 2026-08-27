@@ -1,26 +1,25 @@
 """Search-aware play agent (§6.6) — the online orchestrator (Algorithm 2).
 
-:class:`SearchAgent` ties the already-landed search pieces (range tracking,
-subgame context, the two CFR regimes behind :func:`solve`, the policy readers and
-the leaf evaluator) into a per-hand play lifecycle.  It owns no game dynamics and
-**never sees chips** — action strings in, an action string out:
+:class:`SearchAgent` ties range tracking, the subgame context, the two CFR regimes
+behind :func:`solve`, the policy readers and the leaf evaluator into a per-hand play
+lifecycle.  It owns no game dynamics and **never sees chips** — action strings in, an
+action string out:
 
-- ``on_hand_start`` resets the per-hand state and snapshots the round-1 root.
-- ``on_board_update`` runs the round-boundary Bayes belief update over every
-  seat's range, then immediately solves the new round's subgame (so the search is
-  ready *before* the bot is asked to act).
+- ``on_hand_start`` resets per-hand state and snapshots the round-1 root.
+- ``on_board_update`` runs the round-boundary Bayes belief update over every seat's
+  range, then solves the new round's subgame, so the search is ready *before* the bot
+  is asked to act.
 - ``on_observed_action`` buffers each observed action for the next boundary update
-  and, on rounds 2–4, re-searches the same root (warm-started) when an opponent
-  takes an action far enough outside the subgame's action abstraction (pot-fraction
-  gap > ``offtree_threshold``); a near-canonical off-tree raise is translated onto
-  the solved canonical branch (pseudo-harmonic) instead, at no re-solve cost.
-- ``act`` plays the blueprint on round 1 (unless a round-1 search was triggered)
-  and the searched final-iteration strategy on rounds 2–4, pinning the bot's
-  actual-hand action so a re-search keeps it fixed.
+  and, on rounds 2-4, re-searches the same root (warm-started) when an opponent acts
+  far enough outside the action abstraction (pot-fraction gap > ``offtree_threshold``);
+  a near-canonical off-tree raise is translated onto the solved canonical branch
+  (pseudo-harmonic) instead, at no re-solve cost.
+- ``act`` plays the blueprint on round 1 (unless a round-1 search was triggered) and
+  the searched final-iteration strategy on rounds 2-4, pinning the bot's actual-hand
+  action so a re-search keeps it fixed.
 
-Runner / play-loop wiring lives outside this module: a runner instantiates the
-agent and drives these four hooks (plus :meth:`search_round1` if it owns the
-chip-denominated round-1 trigger).  See ``docs/subgame_solving.md`` §4–§6.6.
+A runner instantiates the agent and drives these four hooks (plus
+:meth:`search_round1` if it owns the chip-denominated round-1 trigger).
 """
 
 from __future__ import annotations
@@ -67,29 +66,18 @@ class SearchAgent:
         self._leaf_policies = leaf_policies     # the four §4 variants (== cfg.leaf.policies)
         self._blueprint = blueprint_policy      # round-1 play + round-1->2 Bayes
         self._cfg = solver_cfg                  # carries .leaf (the LeafConfig)
-        # Two independent sub-streams off the caller's ``rng``, never one shared
-        # stream.  ``_play_rng`` draws the action actually played; ``_solve_rng``
-        # feeds the solver (hole draws, leaf rollouts, and — via
-        # ``SubgameContext.from_runtime`` — a further board sub-stream).
-        #
-        # The split exists because the two consume at wildly different, *approach-
-        # dependent* rates: a DBR solve, an OX solve and a vanilla solve burn
-        # different amounts of randomness at the same node, and a failed or skipped
-        # solve burns none.  Sharing one stream would make the played action depend
-        # on that, so two CRN-paired arms would diverge at the first decision even
-        # where their strategies agree exactly — destroying the pairing the
-        # evaluation's paired Δ is built on.  Split, the play draws stay aligned
-        # across arms for as long as the strategies themselves do.
-        #
+        # Two independent sub-streams: ``_play_rng`` draws the action actually
+        # played, ``_solve_rng`` feeds the solver.  They must not share, because the
+        # solver's consumption is approach-dependent (DBR, OX and vanilla burn
+        # different amounts at the same node; a skipped solve burns none) — sharing
+        # would make the played action depend on that, so two CRN-paired arms would
+        # diverge at the first decision even where their strategies agree exactly.
         # Spawned (not drawn), so ``rng``'s own byte-stream is untouched.
         self._play_rng, self._solve_rng = spawn(rng, 2)
-        # When ``False`` the agent never solves — every boundary/observed-action
-        # search trigger is skipped, so ``play_distribution`` always returns the
-        # blueprint.  This is the **blueprint-only pipeline test** (no search): NOT
-        # an approach and NOT the baseline — real vanilla Pluribus *searches*.  The
-        # default ``True`` leaves every search path exactly as before (byte-identical),
-        # so vanilla (search, no model) and A (search + model) are unaffected.  Belief
-        # tracking still runs (cheap, harmless), but with no search it is never used.
+        # When ``False`` the agent never solves, so ``play_distribution`` always
+        # returns the blueprint.  This is the **blueprint-only pipeline test**: NOT an
+        # approach and NOT the baseline — real vanilla Pluribus searches.  Belief
+        # tracking still runs but is never used.
         self._search_enabled = bool(search_enabled)
         self._round1_threshold = float(round1_offtree_threshold)
         self._round1_max_players = int(round1_max_players)
@@ -192,18 +180,13 @@ class SearchAgent:
     def on_observed_action(self, env_before: PokerEnv, seat: int, action: str) -> None:
         """Record an observed action and re-search on an off-tree opponent raise.
 
-        ``env_before`` must be the pre-action env where ``env_before.player_i ==
-        seat`` (the caller deepcopies before stepping).  The action is buffered for
-        the next boundary's Bayes update.  A (re-)search is a reaction to an
-        **opponent's** action only — the bot's own action never triggers one, and a
-        bot fold puts the agent dormant for the rest of the hand.  On rounds 2–4 a
-        genuinely off-abstraction opponent raise (one the runtime injected into the
-        shared overlay, so legal here yet off the canonical set) triggers a
-        warm-started re-search of the same root **only when it is far enough off
-        the canonical grid** (pot-fraction gap > ``offtree_threshold``); a
-        near-canonical off-tree raise is instead translated onto the solved
-        canonical branch at read time (§7), so it costs no re-solve.  On round 1 it
-        may trigger a round-1 search.
+        ``env_before`` must be the pre-action env with ``env_before.player_i == seat``.
+        The action is buffered for the next boundary's Bayes update.  A (re-)search
+        reacts to an **opponent's** action only; the bot's own never triggers one, and a
+        bot fold puts the agent dormant for the hand.  On rounds 2-4 an off-abstraction
+        opponent raise triggers a warm-started re-search of the same root only when the
+        pot-fraction gap exceeds ``offtree_threshold``; a near-canonical one is
+        translated onto the solved canonical branch at read time instead (§7).
         """
         if self._folded:
             return
@@ -278,21 +261,15 @@ class SearchAgent:
     ) -> Tuple[List[str], np.ndarray, bool]:
         """The exact ``(legal, probs, searched)`` the bot plays at ``env``.
 
-        The single source of truth for the played σ — shared by :meth:`act` and the
-        runner's decision logging / AIVAT correction, which must agree with what was
-        actually played.  Returns the searched strategy for the bot's actual hand
-        (``searched=True``) whenever the search covers this node; the played σ is the
-        raw search read, no blend toward the blueprint (a covered row is trained —
-        traverser-vectorized MCCFR updates every root-street combo every iteration).
+        The single source of truth for the played σ, shared by :meth:`act` and the
+        runner's decision logging / AIVAT correction.  Returns the searched strategy
+        for the bot's actual hand whenever the search covers this node — the raw read,
+        with no blend toward the blueprint (a covered row is trained).
 
-        The blueprint fallback fires **only** on a hard failure — the search produced
-        **no** usable strategy for this decision: round 1 with no search, a failed
-        solve (``last_search is None``), or a node the solved tree does not contain: a
-        decision *past a depth-limit leaf* (the multiway within-round gap), or an
-        off-tree line neither injected nor translatable (``_solved_public_key``'s
-        key absent from ``legal_at``).  In every such case the bot plays the
-        blueprint (``searched=False``) rather than a uniform guess over its legal
-        actions (§6.6).
+        The blueprint fallback fires **only** when the search produced no usable
+        strategy: round 1 with no search, a failed solve, a decision past a depth-limit
+        leaf (the multiway within-round gap), or an off-tree line neither injected nor
+        translatable.  Then the bot plays the blueprint, not a uniform guess.
         """
         if self.last_search is not None:
             pk = self._solved_public_key(env)
@@ -386,19 +363,16 @@ class SearchAgent:
     ) -> Callable[[int], np.ndarray]:
         """Closure mapping a combo row ``h`` → its action distribution at ``env_before``.
 
-        Aligned to ``[a for a in env_before.legal_actions if a is not None]`` for
-        the hypothetical hole ``env_before.combo_cards[h]`` — the contract
+        Aligned to ``[a for a in env_before.legal_actions if a is not None]`` for the
+        hypothetical hole ``env_before.combo_cards[h]``, as
         :meth:`RangeTracker.on_action` requires.  ``ranges.py`` never imports
         ``policy.py``; the agent owns this bridge.
 
-        **Per-seat (opponent_modeling §6.3, the belief-likelihood swap).**  When
-        ``seat`` has a model in the hand-start snapshot, the likelihood is the model
-        ``σ̂`` — *not* the solver's mixture ``σ̃``: beliefs estimate what the opponent
-        **actually does**, while the mixture is only the solver's hedge.  This is
-        design-doc §5 integration point 1 — reach beliefs and behavioral models
-        agree, so the bot infers a modeled opponent's range under the same strategy
-        it best-responds to.  Unmodeled seats and the bot's own range keep the
-        baseline path below (last search's average, else the blueprint) unchanged.
+        **Per-seat belief-likelihood swap** (opponent_modeling §6.3): a modeled ``seat``
+        uses the model ``σ̂``, not the solver's mixture ``σ̃`` — beliefs estimate what
+        the opponent actually does, while the mixture is only the solver's hedge, so
+        this makes the bot infer a modeled opponent's range under the same strategy it
+        best-responds to.  Unmodeled seats keep the baseline path below.
         """
         model = self._models.get(int(seat)) if seat is not None else None
         if model is not None:
@@ -458,24 +432,18 @@ class SearchAgent:
     ) -> Callable[[int], np.ndarray]:
         """Memoise a per-combo policy read ``row_fn(h)`` by LUT cluster.
 
-        The belief sweep queries a blueprint / model row for every combo still in a
-        seat's range (:meth:`RangeTracker.on_action`), but that row is a function of
-        the info-set ``(cluster, history)`` alone — the history is fixed at
-        ``env_before`` and only the cluster varies with the hole.  So combos sharing a
-        cluster share the row, and one read per distinct cluster suffices (P1, the same
-        collapse the solver clamp does via :meth:`ClusterMapper.root_cluster_of`).  At
-        production bucket counts this is ~``n_combos / n_buckets`` fewer LMDB reads.
+        The belief sweep queries a row per combo in a seat's range, but that row is a
+        function of the info-set ``(cluster, history)`` alone — history is fixed at
+        ``env_before``, only the cluster varies — so one read per distinct cluster
+        suffices, ~``n_combos / n_buckets`` fewer LMDB reads at production bucket counts.
 
-        ``clusters_for_board`` is bit-exact with the cluster :meth:`PokerEnv.policy_state_for`
-        embeds in the info-set (both are the same LUT combinadic lookup — the seam
-        tests gate it), so the grouping is exact, not approximate.  Board-conflicting
-        combos (cluster ``-1``) share no info-set key, so they bypass the cache and read
-        directly; in practice they are never queried (they carry zero range mass, so
-        ``on_action`` skips them).
+        ``clusters_for_board`` is bit-exact with the cluster
+        :meth:`PokerEnv.policy_state_for` embeds in the info-set, so the grouping is
+        exact.  Board-conflicting combos (cluster ``-1``) bypass the cache; in practice
+        they are never queried, carrying zero range mass.
 
-        The cached row is returned by reference to multiple combos; callers must treat
-        it read-only, which the :meth:`RangeTracker.on_action` contract already does
-        (it reads a single action column and never mutates the vector).
+        The cached row is shared by reference across combos, so callers must treat it
+        read-only — which :meth:`RangeTracker.on_action` already does.
         """
         clusters = clusters_for_board(
             env_before.card_info_lut[_STREET_NAME[env_before.betting_round]],
