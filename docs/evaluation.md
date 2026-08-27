@@ -1102,7 +1102,7 @@ deal** and the **flop** are the two chance events still uncorrected. What is tak
 **The value function `v`** reuses the leaf machinery
 ([leaf.py](../poker_ai/search/leaf.py) `continuation_value`) under a fixed
 all-blueprint continuation profile — the baseline σ — evaluated at the hand's
-**actual** holes and averaged over `--aivat-rollouts` (default 6) playouts. Each seat
+**actual** holes and averaged over `--aivat-rollouts` (default 48) playouts. Each seat
 continues under its *real* bias class, derived from the same `seat_labels` that built
 the opponents, so σ reproduces the table rather than merely resembling it; the hero's
 own seat stays unbiased, since its real continuation is a search result that does not
@@ -1110,6 +1110,27 @@ exist as a policy at arbitrary future nodes and substituting one would make `v`
 arm-dependent again. Any consistent `v` is unbiased; better `v` ⇒ more variance
 reduction, never a correctness risk. On why reading the true holes is not an
 information leak, see the design note above.
+
+**`--aivat-rollouts` is the estimator's dominant knob** — by an order of magnitude the
+largest lever measured. 1555 hands, real 2p blueprint, every `m` scored on the *same*
+played hands (so no hand-set confound):
+
+| `--aivat-rollouts` | `var_x` | gain vs 6 |
+|---|---|---|
+| 3 | 1.114 | 0.872 [0.71, 1.06] |
+| 6 (old default) | 1.278 | — |
+| 16 | 1.559 | 1.220 [1.06, 1.41] |
+| **48** (default) | **1.817** | **1.422 [1.21, 1.68]** |
+| 144 | 1.755 | 1.373 [1.19, 1.60] |
+
+A `var = a + b/m` fit puts the m→∞ ceiling at 1.78–1.84 on either fitting set, so 48 is
+essentially at it and 144 landing below 48 is noise between independent estimates.
+Unbiased throughout (all |t| < 0.71). Cost is ~5% of hand wall-clock at a reduced search
+budget and less at production budgets — so this was pure headroom, not a trade.
+
+Note **m=3 reduces no variance at all** (`var_x` ≈ 1.0): the working range is narrower
+than it looks, and the same trap caught the chance corrections at m=2. When `v̂` is too
+noisy, a control variate stops cancelling and starts contributing.
 
 **RNG isolation** (see [poker_ai/search/rng.py](../poker_ai/search/rng.py)) — AIVAT
 owns its randomness in *both* directions. It runs on its own sub-stream (a 5th

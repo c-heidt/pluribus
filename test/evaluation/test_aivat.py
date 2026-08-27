@@ -340,6 +340,24 @@ class TestAcceptance:
 # AIVAT runout-coverage knob: max_runout_cards
 # --------------------------------------------------------------------------- #
 
+def test_action_rollouts_default_is_the_measured_one():
+    """``_ACTION_ROLLOUTS`` is the estimator's dominant variance knob.
+
+    Measured over 1555 real-blueprint hands, every ``m`` scored on the same played
+    hands: ``var_x`` 1.114 (m=3), 1.278 (m=6), 1.559 (m=16), **1.817 (m=48)**.
+    Raising the old default of 6 to 48 gained 1.422, 95% CI [1.21, 1.68], and a
+    ``var = a + b/m`` fit puts the ceiling at 1.78-1.84 — so 48 is at it.  m=3
+    reduces NO variance at all, so the working range is narrow; pin the floor.
+    """
+    from evaluation.aivat import _ACTION_ROLLOUTS
+    from evaluation.runner import EvalConfig
+    assert _ACTION_ROLLOUTS >= 16          # below this the estimator barely works
+    v = LeafValue(_SeatOnly(0), LeafConfig(policies=_policies()),
+                  np.random.default_rng(0))
+    assert v._m == _ACTION_ROLLOUTS == 48
+    assert EvalConfig(run_id="x").aivat_rollouts == _ACTION_ROLLOUTS
+
+
 def test_chance_rollouts_default_is_the_measured_one():
     """``_CHANCE_ROLLOUTS`` is a measurement, not a guess — see the constant's note.
 

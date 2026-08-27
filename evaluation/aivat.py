@@ -79,6 +79,16 @@ logger = logging.getLogger(__name__)
 # all-in (5 to come) would Monte-Carlo thousands of boards per hand, so it is skipped.
 _MAX_RUNOUT_CARDS = 2
 
+# Baseline playouts averaged per action-node ``v`` evaluation.
+# MEASURED (1555 real-blueprint hands, every m scored on the same played hands):
+#     m=3  var_x 1.114   m=6  1.278   m=16  1.559   m=48  1.817   m=144  1.755
+# Raising this from the old default of 6 to 48 is the single largest variance-reduction
+# win available to the estimator: gain 1.422, 95% CI [1.21, 1.68].  A ``var = a + b/m``
+# fit puts the m->inf ceiling at 1.78-1.84, so 48 is essentially at it.  Note m=3 gives
+# var_x ~1.0 — no reduction at all — so the working range is narrower than it looks.
+# Cost is ~5% of hand wall-clock at a reduced search budget, less at production budgets.
+_ACTION_ROLLOUTS = 48
+
 # Baseline playouts per alternative card in a per-street chance correction.
 # MEASURED, not reasoned (3105 real-blueprint hands): m=2 makes the correction
 # *add* variance (gain 0.885, CI [0.81, 0.96]).  The tempting argument — "the baseline
@@ -146,7 +156,9 @@ class LeafValue:
         giving chance its own pair means the action-node terms are bit-identical
         whether chance corrections are on or off.
     n_rollouts
-        Baseline playouts averaged per ``v`` evaluation.
+        Baseline playouts averaged per ``v`` evaluation.  See ``_ACTION_ROLLOUTS``:
+        this is the estimator's dominant variance knob, and small values are
+        measurably useless (m=3 reduces no variance at all).
     seat_bias
         ``seat → BiasClass`` for σ.  Supply the table's actual composition so σ
         *reproduces* the opponents rather than resembling them — their true policy is
@@ -164,7 +176,7 @@ class LeafValue:
         leaf_cfg: LeafConfig,
         rng: np.random.Generator,
         *,
-        n_rollouts: int = 6,
+        n_rollouts: int = _ACTION_ROLLOUTS,
         seat_bias: Optional[Mapping[int, str]] = None,
     ) -> None:
         self._hero = hero

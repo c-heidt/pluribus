@@ -218,13 +218,14 @@ class EvalConfig:
     # it adds per-hand cost (in the experiment budget, off the search hot path) and
     # is driven by a dedicated RNG sub-stream, so a hand's raw ``hero_chips_delta``
     # is identical whether AIVAT is on or off.  ``aivat_rollouts`` is the number of
-    # baseline playouts averaged per value-function evaluation.  ``aivat_chance``
+    # baseline playouts averaged per value-function evaluation, and is the estimator's
+    # dominant variance knob (measured var_x 1.28 at 6 vs 1.82 at 48).  ``aivat_chance``
     # additionally corrects the per-street (turn/river) chance nodes by exact
     # enumeration over the undealt deck — the only family of term that removes
-    # *board* variance; ``aivat_chance_rollouts`` is its (much smaller) per-
-    # alternative playout count.  See :mod:`evaluation.aivat`.
+    # *board* variance; ``aivat_chance_rollouts`` is its per-alternative playout count.
+    # See :mod:`evaluation.aivat` for both measurements.
     aivat: bool = False
-    aivat_rollouts: int = 6
+    aivat_rollouts: int = 48
     aivat_chance: bool = False
     aivat_chance_rollouts: int = 48
 
@@ -1516,10 +1517,11 @@ def _cli():
     )
     @click.option(
         "--aivat-rollouts",
-        default=6,
+        default=48,
         type=int,
         show_default=True,
-        help="Baseline rollouts averaged per AIVAT value-function evaluation.",
+        help="Baseline rollouts averaged per AIVAT value-function evaluation. The "
+        "estimator's dominant variance knob; below ~6 it reduces no variance at all.",
     )
     @click.option(
         "--aivat-chance/--no-aivat-chance",
