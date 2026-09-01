@@ -22,6 +22,7 @@ import environment.dynamics as dynamics
 from environment.player import Player
 from environment.poker_env import PokerEnv
 from environment.pot import Pot
+from test.abstraction_helpers import passive_action, raise_until_shove_legal
 
 
 def _env(stacks, low=11, high=14, seed=0):
@@ -54,7 +55,12 @@ def _shove_to_runout(env):
     all-in contract: one player shoves and the opponent then calls all-in (a
     shove is no longer terminal on its own — the opponent must first respond).
     No-op if the shove already ended the hand (e.g. an all-in on a complete
-    board, where the opponent's response leaves nothing to run out)."""
+    board, where the opponent's response leaves nothing to run out).
+
+    Pre-flop the abstraction has no shove at the open or the 3-bet, so the
+    helper first raises up to the 4-bet level where it re-enters — keeping the
+    board (and so the runout length) exactly where the caller left it."""
+    raise_until_shove_legal(env)
     env.step_in_place("all_in")
     if not env.is_terminal:
         env.step_in_place("all_in" if "all_in" in env.legal_actions else "call")
@@ -132,7 +138,7 @@ class TestIsDecisionFree:
         env = _env([10000, 10000])
         guard = 0
         while env.betting_round < 3 and not env.is_terminal and guard < 30:
-            env.step_in_place("check" if "check" in env.legal_actions else "call")
+            env.step_in_place(passive_action(env))
             guard += 1
         assert env.betting_round == 3 and len(env.community_cards) == 5
         env.step_in_place("all_in")
@@ -181,7 +187,7 @@ class TestRunoutEquityExact:
         env = PokerEnv(players=[Player(i, 10000) for i in range(2)])
         guard = 0
         while env.betting_round < 1 and guard < 10:
-            env.step_in_place("call" if "call" in env.legal_actions else "check")
+            env.step_in_place(passive_action(env))
             guard += 1
         assert env.betting_round == 1 and len(env.community_cards) == 3
         _shove_to_runout(env)
@@ -276,6 +282,8 @@ class TestMakeUndoRoundTrip:
 
     def test_undo_clears_runout_info(self):
         env = _env([10000, 10000], seed=3)
+        # Raise up to the level where the shove is in the abstraction.
+        raise_until_shove_legal(env)
         env.step_in_place("all_in")  # shove: not terminal, no runout yet
         assert env._runout_info is None
         before = copy.deepcopy(env)

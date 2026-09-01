@@ -24,6 +24,8 @@ import random
 import numpy as np
 import pytest
 
+from test.abstraction_helpers import passive_action, shove_prelude
+
 from poker_ai import _core
 
 pytestmark = pytest.mark.skipif(
@@ -38,13 +40,18 @@ if _core.CORE_AVAILABLE:
         _STAGE_ID,
         RAISE_SIZES_BY_STAGE,
         MAX_RAISES_PER_ROUND,
+        ALL_IN_ALLOWED_BY_STAGE,
+        CALL_ALLOWED_BY_STAGE,
     )
     from poker_ai._core._state_ref import FastStateRef
     from poker_ai._core import _state as _cystate
 
     # Dump the live alphabet + raise grid into the compiled engine (never
     # hard-coded — same anti-drift discipline as the Phase-1 kernels).
-    _cystate.configure(_STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND)
+    _cystate.configure(
+        _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
+        CALL_ALLOWED_BY_STAGE, ALL_IN_ALLOWED_BY_STAGE,
+    )
     FastState = _cystate.FastState
 
 
@@ -193,9 +200,10 @@ def test_heads_up_postflop_order_matches():
     env = _new_env(2, 10000, seed=1)
     cs = _fs(env)
     assert env.player_i == cs.player_i == 0  # SB / button acts first pre-flop
-    for _ in range(2):  # call down to the flop
-        env.step_in_place("call")
-        cs.step_in_place("call")
+    for _ in range(2):  # open + call to the flop (level 0 has no limp)
+        action = passive_action(env)
+        env.step_in_place(action)
+        cs.step_in_place(action)
     assert env.betting_round == cs.betting_round == 1
     assert env.player_i == cs.player_i == 1  # BB leads post-flop
 
@@ -205,9 +213,10 @@ def test_over_the_top_all_in_response_matches():
     responder may only call/fold (no raise) — engine mirrors the env."""
     env = _new_env(2, 10000, seed=2, small_blind=50, big_blind=100)
     cs = _fs(env)
-    env.step_in_place("raise:1.0")
-    cs.step_in_place("raise:1.0")
-    env.step_in_place("all_in")
+    for action in shove_prelude(env):   # raise up to where a shove is legal
+        env.step_in_place(action)
+        cs.step_in_place(action)
+    env.step_in_place("all_in")         # shove over the last raise
     cs.step_in_place("all_in")
     assert not env.is_terminal and not cs.is_terminal
     assert env.player_i == cs.player_i
@@ -219,6 +228,9 @@ def test_fold_terminal_payout_matches():
     """Folding to a shove forfeits only the committed chips — payout matches."""
     env = _new_env(2, 10000, seed=3)
     cs = _fs(env)
+    for action in shove_prelude(env):   # raise up to where a shove is legal
+        env.step_in_place(action)
+        cs.step_in_place(action)
     env.step_in_place("all_in")
     cs.step_in_place("all_in")
     env.step_in_place("fold")
@@ -231,6 +243,9 @@ def test_called_all_in_full_stack_payout_matches():
     """A called all-in contests full stacks — zero-sum payout matches the env."""
     env = _new_env(2, 10000, seed=4)
     cs = _fs(env)
+    for action in shove_prelude(env):   # raise up to where a shove is legal
+        env.step_in_place(action)
+        cs.step_in_place(action)
     env.step_in_place("all_in")
     cs.step_in_place("all_in")
     env.step_in_place("all_in")  # opponent calls the shove
@@ -301,8 +316,9 @@ def test_genuine_sidepot_payout_matches():
             assert le == _ref_legal(ref) == _cy_legal(cs)
             # Full-stack commitments (not just calling the short shove) create
             # the unequal contributions a side pot needs.
+            raises = [a for a in le if a.startswith("raise:")]
             action = "all_in" if "all_in" in le else (
-                "call" if "call" in le else le[0])
+                "call" if "call" in le else (raises[-1] if raises else le[0]))
             env.step_in_place(action)
             ref.step_in_place(action)
             cs.step_in_place(action)

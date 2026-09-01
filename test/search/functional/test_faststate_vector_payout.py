@@ -35,11 +35,14 @@ if _core.CORE_AVAILABLE:
         _STAGE_ID,
         RAISE_SIZES_BY_STAGE,
         MAX_RAISES_PER_ROUND,
+        ALL_IN_ALLOWED_BY_STAGE,
+        CALL_ALLOWED_BY_STAGE,
     )
     from poker_ai._core import _state as _cystate
 
     _cystate.configure(
-        _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND
+        _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
+        CALL_ALLOWED_BY_STAGE, ALL_IN_ALLOWED_BY_STAGE
     )
     FastState = _cystate.FastState
 

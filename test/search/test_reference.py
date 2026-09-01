@@ -387,7 +387,7 @@ def test_cbv_ref_river_cluster_abstracted():
     Exercises the ``is_root`` cluster query/broadcast in ``_blueprint_sigma`` with real
     multi-combo-per-cluster grouping — invisible under the lossless-LUT gates.
     """
-    env = _real_lut_env(3, stacks=(200, 200), seed=1)
+    env = _real_lut_env(3, stacks=(2000, 2000), seed=1)
     support0, support1 = _spread_support(env)
     rc = _raw_clusters(env, 3, [int(c) for c in env.community_cards])
     assert len({int(rc[b]) for b in support0}) > 1, "support not cluster-diverse"
@@ -414,7 +414,7 @@ def test_cbv_ref_turn_cluster_abstracted():
     ``rows[gof]``).  The oracle recovers the same clusters straight from
     ``clusters_for_board``, so a dense-row ↔ raw-cluster mismatch would diverge here.
     """
-    env = _real_lut_env(2, stacks=(200, 200), seed=1)
+    env = _real_lut_env(2, stacks=(2000, 2000), seed=1)
     support0, support1 = _spread_support(env)
     tboard = [int(c) for c in env.community_cards]
     assert len({int(c) for c in _raw_clusters(env, 2, tboard)[support0]}) > 1, (

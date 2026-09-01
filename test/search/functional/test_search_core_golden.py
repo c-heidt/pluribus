@@ -73,8 +73,16 @@ _N_ITERS = 50
 #   3. ``SubgameContext.from_runtime`` now derives a board child, which advances the
 #      parent's spawn counter and so shifts WHICH child (2) receives.
 # The vector digest is unchanged: that fixture roots on the turn, which is leaf-free.
-GOLDEN_DIGEST_MCCFR = "fee362b119ec094ea1e3e9c82dccf37e63b6a196138ff73a68840d9a5613e3ec"
-GOLDEN_DIGEST_VECTOR = "7e6e3da6534d92c5e9a808a48b9da06054558cbb4a7ee8727fab0efa23113db2"
+#
+# BOTH regenerated 2026-08-31 for the per-raise-level action abstraction (the
+# situation-indexed grid in ``environment/poker_env.py``: pre-flop open/3-bet/
+# 4-bet, post-flop first-in vs facing a bet, no pre-flop limp).  Every node's
+# legal set, and so the subgame tree the solver builds and the regret rows it
+# writes, is different by construction — the digests MUST move.  Previous:
+#   MCCFR  fee362b119ec094ea1e3e9c82dccf37e63b6a196138ff73a68840d9a5613e3ec
+#   vector 7e6e3da6534d92c5e9a808a48b9da06054558cbb4a7ee8727fab0efa23113db2
+GOLDEN_DIGEST_MCCFR = "47f077d65e9f70e00492ae6f2c637dd6ed246718e56f56a475c0337805a3c585"
+GOLDEN_DIGEST_VECTOR = "2ad7afdd79a3d50cbf3f982dd73cef029990b6b38f3df122e4f5ce1b69b3937c"
 
 
 def _digest_tables(*tables) -> str:

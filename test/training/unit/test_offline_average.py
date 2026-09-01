@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from environment.action_space import MAX_ACTIONS_PER_STREET
+from environment.poker_env import INFO_SET_ENCODING
 from poker_ai.blueprint.offline_average import (
     SIGMA_SCALE_DEFAULT,
     average_chunk,
@@ -404,7 +405,10 @@ def _write_state(cp_dir, tables, t):
         "t": t,
         "n_players": 2,
         "chunk_size": 4_000_000,
-        "info_set_encoding": "test-enc",
+        # The live tag, not a placeholder: the restore path validates it (a
+        # blueprint written under a different action abstraction has both
+        # differently-coded keys and differently-shaped rows).
+        "info_set_encoding": INFO_SET_ENCODING,
         "sync_interval": 1000,
         "checkpoint_start_cycles": 0,
         "n_chunks_per_street": tables.n_chunks_per_street(),
@@ -421,7 +425,9 @@ class TestBuildFinalBlueprint:
         # Turn (street 2) rows, and a pre-flop (street 0) average-strategy row.
         turn_keys = ["t0", "t1", "t2"]
         preflop_key = "pf0"
-        preflop_phi = np.array([7, 3, 0, 0, 0, 0], dtype=np.int32)  # street 0 width 6
+        # Rows are sized from the live action abstraction, never a literal width.
+        preflop_phi = np.zeros(MAX_ACTIONS_PER_STREET[0], dtype=np.int32)
+        preflop_phi[:2] = (7, 3)
 
         tables = _new_tables(index_path, "shm_w")
         try:
@@ -443,12 +449,15 @@ class TestBuildFinalBlueprint:
             tables.close()
 
         # Craft distinct turn regrets per snapshot (rows in allocation order).
-        r1 = np.array([[9, 1, 0, 0, 0],
-                       [0, 4, 4, 0, 0],
-                       [1, 1, 1, 1, 0]], dtype=np.int32)
-        r2 = np.array([[1, 9, 0, 0, 0],
-                       [8, 0, 0, 0, 0],
-                       [0, 0, 0, 0, 5]], dtype=np.int32)
+        w2 = MAX_ACTIONS_PER_STREET[2]
+        r1 = np.zeros((3, w2), dtype=np.int32)
+        r1[0, :2] = (9, 1)
+        r1[1, 1:3] = (4, 4)
+        r1[2, :4] = 1
+        r2 = np.zeros((3, w2), dtype=np.int32)
+        r2[0, :2] = (1, 9)
+        r2[1, 0] = 8
+        r2[2, 4] = 5
         np.save(cp1 / "regret_2_chunk_000000.npy", r1)
         np.save(cp2 / "regret_2_chunk_000000.npy", r2)
 

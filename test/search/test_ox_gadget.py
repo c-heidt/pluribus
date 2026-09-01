@@ -278,8 +278,18 @@ def test_ox_safety_margin_bound(_seeded):
         res = solve(env, ctx, _cfg(ctx.leaf, beta=beta, iters=iters, discount=50))
         sigma = _solver_sigma(res.state, env, sub)
         exp_prime = br_value(sub, opp, sigma)              # opp BR vs the refined bot
-        dev = max(np.abs(row - 1.0 / len(row)).max()
-                  for k, row in sigma.items() if k[0] == bot)
+        # Deviation from the blueprint, AGGREGATED over the bot's rows: the
+        # mean total-variation distance from uniform.  Not the max over rows
+        # of the max element — that reports whichever single row happens to
+        # be the most concentrated, which is noise rather than a measure of
+        # how far the strategy moved, and it saturates (one fully-committed
+        # width-2 row pins it at 0.5 no matter what the rest of σ' does).
+        # Measured on all five seeds: the mean-TV metric orders β=0.5 above
+        # β=50 every time, while the max metric inverts on two of them.
+        dev = float(np.mean([
+            0.5 * np.abs(row - 1.0 / len(row)).sum()
+            for k, row in sigma.items() if k[0] == bot
+        ]))
         return sigma, exp_prime, dev
 
     tol = 0.03 * delta
@@ -298,5 +308,5 @@ def test_ox_safety_margin_bound(_seeded):
     )
     # (3) Small β genuinely exploits — the refined bot deviates from the uniform blueprint.
     assert dev_small > 0.05, (
-        f"small β did not exploit (max deviation from uniform {dev_small:.3f})"
+        f"small β did not exploit (mean TV distance from uniform {dev_small:.3f})"
     )

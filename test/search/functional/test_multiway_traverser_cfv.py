@@ -21,6 +21,7 @@ import pytest
 
 from environment.player import Player
 from environment.poker_env import PokerEnv
+from test.abstraction_helpers import passive_action
 
 
 def _stub_lut(env):
@@ -37,12 +38,12 @@ def _river_env(seed, stacks, low=11, high=14):
     _stub_lut(env)
     g = 0
     while env.betting_round < 3 and not env.is_terminal and g < 80:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         g += 1
     return env
 
 
-def _river_env_folded_seat(seed, stacks=(600, 600, 600), low=11, high=14):
+def _river_env_folded_seat(seed, stacks=(6000, 6000, 6000), low=11, high=14):
     """3-player river root with seat 2 folded on the flop (dead money in the pot)."""
     np.random.seed(seed)
     env = PokerEnv(players=[Player(i, s) for i, s in enumerate(stacks)],
@@ -50,7 +51,7 @@ def _river_env_folded_seat(seed, stacks=(600, 600, 600), low=11, high=14):
     _stub_lut(env)
     g = 0
     while env.betting_round < 1 and not env.is_terminal and g < 80:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         g += 1
     if env.betting_round != 1 or env.is_terminal:
         return None
@@ -68,13 +69,13 @@ def _river_env_folded_seat(seed, stacks=(600, 600, 600), low=11, high=14):
             env.step_in_place(raise_act)
             raised = True
         else:
-            env.step_in_place("call" if "call" in legal else "check")
+            env.step_in_place(passive_action(env))
         g += 1
     if env.players[2].is_active:
         return None
     g = 0
     while env.betting_round < 3 and not env.is_terminal and g < 20:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         g += 1
     if env.betting_round != 3 or env.is_terminal:
         return None
@@ -108,10 +109,29 @@ def _terminal_via(root, line, holes):
     return e if e.is_terminal else None
 
 
+def _prefer(legal, *wanted):
+    """First of ``wanted`` that is legal, else the cheapest raise, else ``None``.
+
+    Keeps a scripted line playable whatever the abstraction offers at the node:
+    a level with no ``call`` (pre-flop open) or no ``all_in`` still has a raise.
+    """
+    for a in wanted:
+        if a in legal:
+            return a
+    raises = sorted(
+        (a for a in legal if a.startswith("raise:")),
+        key=lambda a: float(a.split(":", 1)[1]),
+    )
+    return raises[0] if raises else None
+
+
 _LINES = {
-    "passive": lambda la: "check" if "check" in la else ("call" if "call" in la else None),
-    "fold": lambda la: "fold" if "fold" in la else ("check" if "check" in la else ("call" if "call" in la else None)),
-    "allin": lambda la: "all_in" if "all_in" in la else ("call" if "call" in la else ("check" if "check" in la else None)),
+    # Each policy names the actions it wants in preference order and falls back
+    # to the cheapest raise, so a level that drops call/all_in from the
+    # abstraction still yields a playable line instead of ``None``.
+    "passive": lambda la: _prefer(la, "call"),
+    "fold": lambda la: _prefer(la, "fold", "call"),
+    "allin": lambda la: _prefer(la, "all_in", "call"),
 }
 
 
@@ -183,7 +203,7 @@ def _check_scenario(root, seat, opp_holes):
     return checked
 
 
-@pytest.mark.parametrize("stacks", [(300, 300), (150, 600)])
+@pytest.mark.parametrize("stacks", [(3000, 3000), (1500, 6000)])
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_heads_up_matches_concrete(stacks, seed):
     """HU river: showdown / fold / all-in terminals, equal and unequal stacks."""
@@ -215,7 +235,7 @@ def test_side_pot_matches_concrete(seed):
     still net the traverser correctly across both side pots."""
     from environment.pot import Pot
 
-    root = _river_env(seed, stacks=(90, 400, 400))
+    root = _river_env(seed, stacks=(900, 4000, 4000))
     if root.betting_round != 3 or root.is_terminal:
         pytest.skip("river root not reached on this seed")
     board = list(root.community_cards)

@@ -25,6 +25,7 @@ pytestmark = pytest.mark.skipif(
 from environment.player import Player
 from environment.poker_env import PokerEnv
 from information_abstraction.lookup import MemmapLookup, load_info_set_lut
+from test.abstraction_helpers import passive_action
 
 LUT_PATH = "data/20cards_exact"
 _STREETS = {1: "flop", 2: "turn", 3: "river"}
@@ -47,7 +48,7 @@ def _env_at(street: int, seed: int) -> PokerEnv:
     )
     guard = 0
     while env.betting_round < street and not env.is_terminal and guard < 60:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         guard += 1
     return env
 

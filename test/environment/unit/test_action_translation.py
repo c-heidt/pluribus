@@ -20,6 +20,12 @@ from environment.poker_env import (
 )
 from poker_ai.blueprint.tree_utils import calculate_strategy_from_row
 from poker_ai.search.policy import BlueprintPolicy
+from test.abstraction_helpers import (
+    advance_to_round,
+    bracketing_sample,
+    grid,
+    level_exclusive_fraction,
+)
 
 
 def _env(n_players: int = 2, low: int = 2, high: int = 14, seed: int = 0):
@@ -81,63 +87,77 @@ class TestNeighbours:
 
 
 class TestTranslateFraction:
+    """Every case reads its sample points off the LIVE grid (via
+    ``bracketing_sample`` / ``grid``), so re-cutting
+    :data:`RAISE_SIZES_BY_STAGE` never edits this class."""
 
     def test_deterministic_picks_below_half_side(self):
-        # turn first_raise grid [0.5, 1.0]; x=0.75 -> P_A=3/7 < 0.5 -> B.
+        # Just above the P_A = 0.5 crossing of the first bracket -> B.
+        a, x, b, expected = bracketing_sample("turn", 0, side="above")
+        assert expected == b
         env = _env()
-        assert env._translate_fraction(0.75, "turn", 0, randomized=False) == 1.0
+        assert env._translate_fraction(x, "turn", 0, randomized=False) == b
 
     def test_deterministic_picks_above_half_side(self):
-        # x=0.55 in [0.5,1.0]: P_A = 3(1-.55)/(1+.55) = 1.35/1.55 ≈ 0.871 -> A.
+        # Just below the crossing -> A.
+        a, x, b, expected = bracketing_sample("turn", 0, side="below")
+        assert expected == a
         env = _env()
-        assert env._translate_fraction(0.55, "turn", 0, randomized=False) == 0.5
+        assert env._translate_fraction(x, "turn", 0, randomized=False) == a
 
     def test_deterministic_crossing_at_half(self):
-        # P_A crosses 0.5 at x=5/7≈0.7143 on the [0.5,1.0] grid.  Just
-        # below the crossing P_A>0.5 -> A; just above P_A<0.5 -> B.  This
-        # exercises the `>= 0.5` decision boundary without depending on an
-        # exact-0.5 float (unreachable through a real grid).
+        # Straddle the P_A = 0.5 crossing: below it P_A > 0.5 -> A, above it
+        # P_A < 0.5 -> B.  Exercises the `>= 0.5` decision boundary without
+        # depending on an exact-0.5 float (unreachable through a real grid).
         env = _env()
-        assert env._pseudo_harmonic_prob(0.5, 0.71, 1.0) > 0.5
-        assert env._pseudo_harmonic_prob(0.5, 0.72, 1.0) < 0.5
-        assert env._translate_fraction(0.71, "turn", 0, randomized=False) == 0.5
-        assert env._translate_fraction(0.72, "turn", 0, randomized=False) == 1.0
+        a, x_lo, b, _ = bracketing_sample("turn", 0, side="below")
+        _, x_hi, _, _ = bracketing_sample("turn", 0, side="above")
+        assert env._pseudo_harmonic_prob(a, x_lo, b) > 0.5
+        assert env._pseudo_harmonic_prob(a, x_hi, b) < 0.5
+        assert env._translate_fraction(x_lo, "turn", 0, randomized=False) == a
+        assert env._translate_fraction(x_hi, "turn", 0, randomized=False) == b
 
     def test_deterministic_below_and_above(self):
         env = _env()
-        assert env._translate_fraction(0.2, "turn", 0, randomized=False) == 0.5
-        assert env._translate_fraction(9.0, "turn", 0, randomized=False) == 1.0
+        cell = grid("turn", 0)
+        assert env._translate_fraction(cell[0] / 2, "turn", 0,
+                                       randomized=False) == cell[0]
+        assert env._translate_fraction(cell[-1] * 4, "turn", 0,
+                                       randomized=False) == cell[-1]
 
     def test_empty_grid_returns_x(self):
-        # subsequent_raise on turn is [1.0]; raise_index>=1 grid has one
-        # element -> below/above clamp, never empty.  Force empty via a
-        # stage with no cell.
+        # Every configured (stage, level) cell is non-empty -> below/above
+        # clamp, never empty.  Force empty via a stage with no cell.
         env = _env()
         assert env._translate_fraction(0.7, "show_down", 0, randomized=False) == 0.7
 
     def test_randomized_requires_rng(self):
+        _, x, _, _ = bracketing_sample("turn", 0)
         env = _env()
         with pytest.raises(ValueError, match="rng"):
-            env._translate_fraction(0.75, "turn", 0, randomized=True, rng=None)
+            env._translate_fraction(x, "turn", 0, randomized=True, rng=None)
 
     def test_randomized_exact_hit_consumes_no_rng(self):
+        on_tree = grid("turn", 0)[0]
         env = _env()
         rng = np.random.default_rng(123)
         before = rng.bit_generator.state
-        out = env._translate_fraction(0.5, "turn", 0, randomized=True, rng=rng)
-        assert out == 0.5
+        out = env._translate_fraction(on_tree, "turn", 0, randomized=True, rng=rng)
+        assert out == on_tree
         assert rng.bit_generator.state == before  # no draw consumed
 
     def test_randomized_matches_formula_frequency(self):
+        a, x, b, _ = bracketing_sample("turn", 0)
         env = _env()
         rng = np.random.default_rng(0)
         n = 40000
         a_count = sum(
-            env._translate_fraction(0.75, "turn", 0, randomized=True, rng=rng) == 0.5
+            env._translate_fraction(x, "turn", 0, randomized=True, rng=rng) == a
             for _ in range(n)
         )
-        # Expected P(A) = 3/7 ≈ 0.4286; binomial std ≈ 0.0025, allow 5σ.
-        assert abs(a_count / n - 3 / 7) < 0.0125
+        # Binomial std <= 0.5/sqrt(n) = 0.0025; allow 5 sigma.
+        expected = env._pseudo_harmonic_prob(a, x, b)
+        assert abs(a_count / n - expected) < 0.0125
 
 
 # ---------------------------------------------------------------------------
@@ -149,39 +169,46 @@ class TestCanonicalizeHistory:
 
     def test_no_op_on_on_tree_history(self):
         env = _env()
+        pf, fl = f"raise:{grid(0, 0)[0]}", f"raise:{grid(1, 0)[0]}"
         hist = {
-            "pre_flop": ["call", "raise:1.0", "call"],
-            "flop": ["raise:1.0", "call"],
+            "pre_flop": ["call", pf, "call"],
+            "flop": [fl, "call"],
         }
         out = env._canonicalize_history(hist)
         assert out == [
-            ("pre_flop", ["call", "raise:1.0", "call"]),
-            ("flop", ["raise:1.0", "call"]),
+            ("pre_flop", ["call", pf, "call"]),
+            ("flop", [fl, "call"]),
         ]
 
     def test_off_tree_raise_snaps_deterministically(self):
-        # flop first_raise grid [0.5,1.0,1.5]; 0.6 in (0.5, 1.0):
-        # P_A = ((1.0-0.6)(1+0.5)) / ((1.0-0.5)(1+0.6)) = 0.6/0.8 = 0.75 >= 0.5
-        # -> A = 0.5.
+        # A fraction strictly inside the flop's first bracket snaps to the
+        # pseudo-harmonic neighbour the formula picks.
+        _, x, _, expected = bracketing_sample("flop", 0)
         env = _env()
-        out = env._canonicalize_history({"flop": ["raise:0.6"]})
-        assert out == [("flop", ["raise:0.5"])]
+        out = env._canonicalize_history({"flop": [f"raise:{x}"]})
+        assert out == [("flop", [f"raise:{expected}"])]
 
     def test_raise_index_advances_to_subsequent_grid(self):
-        # 1.5 is in flop first_raise but NOT in subsequent_raise
-        # ([1.0]); so the 2nd raise's 1.5 is off-tree and snaps
-        # (above-grid -> 1.0), proving the index advanced.
+        # A fraction on-tree at level 0 but NOT at level 1: played twice, the
+        # second one is off-tree and snaps — proving the index advanced.
+        pair = level_exclusive_fraction("flop", 0, 1)
+        if pair is None:
+            pytest.skip("flop levels 0 and 1 share every fraction")
+        f, image = pair
         env = _env()
-        out = env._canonicalize_history({"flop": ["raise:1.5", "raise:1.5"]})
-        assert out == [("flop", ["raise:1.5", "raise:1.0"])]
+        out = env._canonicalize_history({"flop": [f"raise:{f}", f"raise:{f}"]})
+        assert out == [("flop", [f"raise:{f}", f"raise:{image}"])]
 
     def test_all_in_advances_raise_index(self):
-        # subsequent_raise on flop is [1.0]; first_raise is [0.5, 1.0, 1.5].
-        # 0.33 snaps to 0.5 on the first grid but to 1.0 on the subsequent
-        # grid, so the result 1.0 proves all_in advanced the raise index.
+        # Same fraction, but the index is advanced by an ``all_in`` instead of
+        # a raise — it must snap to the level-1 image just the same.
+        pair = level_exclusive_fraction("flop", 0, 1)
+        if pair is None:
+            pytest.skip("flop levels 0 and 1 share every fraction")
+        f, image = pair
         env = _env()
-        out = env._canonicalize_history({"flop": ["all_in", "raise:0.33"]})
-        assert out == [("flop", ["all_in", "raise:1.0"])]
+        out = env._canonicalize_history({"flop": ["all_in", f"raise:{f}"]})
+        assert out == [("flop", ["all_in", f"raise:{image}"])]
 
     def test_fold_call_skip_pass_through(self):
         env = _env()
@@ -195,10 +222,13 @@ class TestCanonicalizeHistory:
 
 
 def _play_to_flop_with(env, flop_action):
-    """Preflop call/call to the flop, then apply ``flop_action`` (injecting
-    it first if off-tree).  Leaves the env at the opponent's flop decision."""
-    env.step_in_place("call")
-    env.step_in_place("call")
+    """Preflop open/call to the flop, then apply ``flop_action`` (injecting
+    it first if off-tree).  Leaves the env at the opponent's flop decision.
+
+    The pre-flop open is a raise, not a limp: ``call`` is not in the
+    abstraction at pre-flop raise level 0.
+    """
+    advance_to_round(env, 1)
     assert env.betting_round == 1
     if flop_action not in env.legal_actions:
         assert env.inject_action(flop_action) is True
@@ -211,22 +241,24 @@ class TestBlueprintInfoSet:
     def test_no_op_equals_compute_info_set_on_tree(self):
         env = _env()
         _stub_lut(env)
-        _play_to_flop_with(env, "raise:1.0")  # on-tree
+        _play_to_flop_with(env, f"raise:{grid(1, 0)[0]}")  # on-tree
         combo = (int(env.combo_cards[0, 0]), int(env.combo_cards[0, 1]))
         assert env._blueprint_info_set(combo) == env._compute_info_set(combo)
 
     def test_off_tree_resolves_to_on_tree_key(self):
-        # An off-tree raise:0.6 flop history must yield the SAME blueprint
-        # key as the env where the canonical neighbour (0.5) was played.
-        off = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.6")
-        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.5")
+        # An off-tree raise flop history must yield the SAME blueprint key as
+        # the env where its canonical neighbour was played.
+        _, x, _, neighbour = bracketing_sample("flop", 0)
+        off = _play_to_flop_with(_stub_and_return(_env(seed=1)), f"raise:{x}")
+        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), f"raise:{neighbour}")
         combo = (int(off.combo_cards[0, 0]), int(off.combo_cards[0, 1]))
         assert off._blueprint_info_set(combo) == on._compute_info_set(combo)
         # And the non-canonicalised key differs (off-tree fraction present).
         assert off._compute_info_set(combo) != on._compute_info_set(combo)
 
     def test_policy_state_for_blueprint_flag_threads_canonicalisation(self):
-        env = _play_to_flop_with(_stub_and_return(_env(seed=2)), "raise:0.6")
+        env = _play_to_flop_with(_stub_and_return(_env(seed=2)),
+                             f"raise:{bracketing_sample('flop', 0)[1]}")
         combo = (int(env.combo_cards[0, 0]), int(env.combo_cards[0, 1]))
         ps_bp = env.policy_state_for(combo, for_blueprint=True)
         ps_raw = env.policy_state_for(combo)
@@ -248,14 +280,16 @@ class TestCanonicalPublicKey:
     subgame the solver built."""
 
     def test_no_op_on_tree(self):
-        env = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:1.0")
+        env = _play_to_flop_with(_stub_and_return(_env(seed=1)),
+                                 f"raise:{grid(1, 0)[0]}")
         assert env.canonical_public_key == env.public_key
 
     def test_off_tree_snaps_to_canonical_neighbour(self):
-        # The off-tree (0.6) env's canonical key equals the raw key of the env
-        # that actually played the canonical neighbour (0.6 -> 0.5).
-        off = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.6")
-        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), "raise:0.5")
+        # The off-tree env's canonical key equals the raw key of the env that
+        # actually played the canonical neighbour.
+        _, x, _, neighbour = bracketing_sample("flop", 0)
+        off = _play_to_flop_with(_stub_and_return(_env(seed=1)), f"raise:{x}")
+        on = _play_to_flop_with(_stub_and_return(_env(seed=1)), f"raise:{neighbour}")
         assert off.canonical_public_key == on.public_key
         # The raw key still differs — the off-tree fraction is present verbatim.
         assert off.public_key != on.public_key
@@ -288,8 +322,9 @@ class TestBlueprintLookupHit:
     to uniform."""
 
     def test_for_blueprint_hits_populated_row(self):
-        off = _play_to_flop_with(_stub_and_return(_env(seed=3)), "raise:0.6")
-        on = _play_to_flop_with(_stub_and_return(_env(seed=3)), "raise:0.5")
+        _, x, _, neighbour = bracketing_sample("flop", 0)
+        off = _play_to_flop_with(_stub_and_return(_env(seed=3)), f"raise:{x}")
+        on = _play_to_flop_with(_stub_and_return(_env(seed=3)), f"raise:{neighbour}")
         combo = (int(off.combo_cards[0, 0]), int(off.combo_cards[0, 1]))
         r = 1
         key = on._compute_info_set(combo)

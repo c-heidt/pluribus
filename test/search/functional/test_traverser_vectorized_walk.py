@@ -29,6 +29,7 @@ from poker_ai.search.policy import Policy
 from poker_ai.search.solver import _select_regime
 from poker_ai.search.solver_state import SolverConfig, SolverState
 from poker_ai.search.vector import _regret_match_matrix
+from test.abstraction_helpers import passive_action
 
 
 class _UniformPolicy(Policy):
@@ -43,7 +44,7 @@ def _stub_lut(env):
     )
 
 
-def _turn_env_3p(seed, low=9, high=14, stacks=(200, 200, 200)):
+def _turn_env_3p(seed, low=9, high=14, stacks=(2000, 2000, 2000)):
     """3-player small-deck env advanced to the turn root (all calls/checks)."""
     np.random.seed(seed)
     env = PokerEnv(players=[Player(i, s) for i, s in enumerate(stacks)],
@@ -51,7 +52,7 @@ def _turn_env_3p(seed, low=9, high=14, stacks=(200, 200, 200)):
     _stub_lut(env)
     g = 0
     while env.betting_round < 2 and not env.is_terminal and g < 80:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         g += 1
     return env
 

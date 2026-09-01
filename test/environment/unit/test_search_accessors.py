@@ -7,6 +7,7 @@ from collections import defaultdict
 
 from environment.player import Player
 from environment.poker_env import PokerEnv
+from test.abstraction_helpers import advance_to_round, passive_action
 
 
 def _env(n_players: int = 2):
@@ -29,10 +30,14 @@ class TestPublicKey:
 
     def test_reflects_history_and_is_hashable(self):
         env = _env()
-        env_next = copy.deepcopy(env); env_next.step_in_place("call")
+        env_next = copy.deepcopy(env)
+        action = passive_action(env_next)
+        env_next.step_in_place(action)
         # Full cross-street history: each touched stage carried as
         # (stage, actions), led by the current betting stage.
-        assert env_next.public_key == ("pre_flop", (("pre_flop", ("call",)),))
+        assert env_next.public_key == (
+            "pre_flop", (("pre_flop", (action,)),)
+        )
         # Hashable → usable as a solver table key.
         _ = {env.public_key: 1, env_next.public_key: 2}
 
@@ -43,8 +48,7 @@ class TestPublicKey:
         # ("river", ()) and silently sharing CFR rows / crashing widening).
         def to_river(raise_flop: bool) -> PokerEnv:
             env = _env()
-            env.step_in_place("call")          # pre-flop
-            env.step_in_place("call")
+            advance_to_round(env, 1)           # pre-flop open + call
             if raise_flop:                     # flop: build a bigger pot on one line
                 env.step_in_place(_first_raise(env))
                 env.step_in_place("call")
@@ -140,9 +144,7 @@ class TestClusterFor:
     def test_folds_board_into_lookup_on_flop(self):
         # On the flop the LUT lookup must include the board cards.
         env = _env()
-        env.step_in_place("call")
-        env.step_in_place("call")
-        assert env.betting_round == 1
+        advance_to_round(env, 1)
         assert len(env.community_cards) == 3
         board = set(int(c) for c in env.community_cards)
         combo = next(

@@ -20,6 +20,7 @@ from environment.poker_env import (
     _ACTION_BYTE,
     _INFO_SET_DEFAULT,
 )
+from test.abstraction_helpers import advance_to_round, bracketing_sample
 
 
 def _env(n_players: int = 2, low: int = 2, high: int = 14, seed: int = 0):
@@ -108,9 +109,8 @@ class TestEncoderInjectivity:
 
 
 def _play_to_flop_with(env, flop_action):
-    env.step_in_place("call")
-    env.step_in_place("call")
-    assert env.betting_round == 1
+    # Pre-flop level 0 has no limp: the opener raises, the BB calls.
+    advance_to_round(env, 1)
     if flop_action not in env.legal_actions:
         assert env.inject_action(flop_action) is True
     env.step_in_place(flop_action)
@@ -119,11 +119,13 @@ def _play_to_flop_with(env, flop_action):
 
 class TestCanonicalizationEquivalence:
     def test_off_tree_blueprint_key_equals_on_tree(self):
-        # flop grid first_raise=[0.5,1.0,1.5]; 0.6 snaps to 0.5.
+        # An off-tree fraction inside the flop's first bracket and the
+        # neighbour it canonicalises to — both read off the live grid.
+        _, x, _, neighbour = bracketing_sample("flop", 0)
         off = _stub_lut(_env(seed=3))
-        _play_to_flop_with(off, "raise:0.6")
+        _play_to_flop_with(off, f"raise:{x}")
         on = _stub_lut(_env(seed=3))
-        _play_to_flop_with(on, "raise:0.5")
+        _play_to_flop_with(on, f"raise:{neighbour}")
         combo = (int(off.combo_cards[0, 0]), int(off.combo_cards[0, 1]))
         # Byte-identical: off-tree blueprint key == on-tree raw key.
         assert off._blueprint_info_set(combo) == on._compute_info_set(combo)

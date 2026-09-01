@@ -8,6 +8,7 @@ import pytest
 
 from environment.player import Player
 from environment.poker_env import PokerEnv
+from test.abstraction_helpers import passive_action
 from poker_ai.search.ranges import (
     RangeTracker,
     _initial_uniform,
@@ -42,7 +43,7 @@ def _env_with_seat1_acting():
     Returned env satisfies ``env.player_i == 1``."""
     env = _env()
     _stub_lut(env)
-    env.step_in_place("call")
+    env.step_in_place(passive_action(env))
     assert env.player_i == 1
     return env
 

@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 from poker_ai import _core
+from test.abstraction_helpers import passive_action
 
 pytestmark = pytest.mark.skipif(
     not _core.CORE_AVAILABLE, reason="compiled core extension not built"
@@ -32,11 +33,14 @@ if _core.CORE_AVAILABLE:
         _STAGE_ID,
         RAISE_SIZES_BY_STAGE,
         MAX_RAISES_PER_ROUND,
+        ALL_IN_ALLOWED_BY_STAGE,
+        CALL_ALLOWED_BY_STAGE,
     )
     from poker_ai._core import _state as _cystate
 
     _cystate.configure(
-        _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND
+        _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
+        CALL_ALLOWED_BY_STAGE, ALL_IN_ALLOWED_BY_STAGE
     )
     FastState = _cystate.FastState
 
@@ -60,7 +64,7 @@ def _root(seed, stacks):
     _stub_lut(env)
     g = 0
     while env.betting_round < 1 and not env.is_terminal and g < 20:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         g += 1
     return env
 
@@ -84,8 +88,8 @@ def _drive(env, cs, seed):
 
 @pytest.mark.parametrize(
     "stacks",
-    [(200, 200), (150, 400), (300, 300),
-     (200, 200, 200), (150, 400, 900), (100, 250, 600)],
+    [(2000, 2000), (1500, 4000), (3000, 3000),
+     (2000, 2000, 2000), (1500, 4000, 9000), (1000, 2500, 6000)],
 )
 def test_runout_equity_matches_env(stacks):
     """Over many all-in terminals: is_decision_free / runout_key / runout_equity all
@@ -118,7 +122,7 @@ def test_runout_equity_matches_env(stacks):
 def test_is_decision_free_false_off_terminal_and_on_fold():
     """Not decision-free at a live node, a fold-out (1 active), or a complete-board
     river showdown — matching PokerEnv."""
-    env = _root(0, (200, 200))
+    env = _root(0, (2000, 2000))
     cs = FastState.from_poker_env(env)
     assert not cs.is_decision_free and cs.runout_key is None
     with pytest.raises(ValueError):
@@ -134,7 +138,7 @@ def test_runout_equity_under_runout_kernel_flag():
     (both env and FastState route through the same module-level ``_settle_runout``)."""
     # (Wiring is import-time; this test documents intent — the suite is run under
     # PLURIBUS_CORE_KERNELS=runout in CI.  Here we just re-check one seed.)
-    env = _root(3, (150, 400, 900))
+    env = _root(3, (1500, 4000, 9000))
     cs = FastState.from_poker_env(env)
     if _drive(env, cs, 3) and env.is_decision_free:
         assert cs.runout_equity() == env.runout_equity()

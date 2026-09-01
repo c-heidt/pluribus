@@ -340,11 +340,27 @@ class _VectorSolver:
             self._iterate_ox()
             return
         s0, s1 = self._seats
-        # Alternating updates: one full tree pass per traverser.  ``_walk_env`` is
-        # the compiled FastState adapter under PLURIBUS_SEARCH_CORE (else the
-        # PokerEnv root) — same walk, only make/undo speed differs.
-        v0 = self._walk(self._walk_env, s0, self._reach[s0], self._reach[s1])
-        v1 = self._walk(self._walk_env, s1, self._reach[s1], self._reach[s0])
+        # Condition the WHOLE pass on this iteration's sampled completion.  The
+        # completion is drawn before the walk, so a combo holding one of its cards
+        # simply does not occur in this sample and must not be updated at all.
+        #
+        # Without this the iteration conditions INCONSISTENTLY across branches: a
+        # showdown masks by ``feas_full`` (below), and every crossing masks by the
+        # new street's feasibility, but a branch that terminates BEFORE any chance
+        # node — a fold at the root — is not masked by anything.  A combo holding a
+        # completion card then contributes ~0 to the continuation while its fold
+        # branch still carries full value, so regret matching credits calling with a
+        # neutral 0 in exactly the deals where it should be credited a loss.  That
+        # bias accumulates and the solver calls off hands it should fold: measured
+        # on a lossless-LUT flop oracle it valued a drawing-dead JJ at -555.79
+        # against the enumerating oracle's exact -305.00 (its committed chips).
+        # Masking both reaches here makes every branch condition on the same
+        # sampled chance outcome, which is what the sampled-runout scheme means.
+        ff = self._cmaps.feas_full
+        reach = (self._reach if ff is None
+                 else {s: r * ff for s, r in self._reach.items()})
+        v0 = self._walk(self._walk_env, s0, reach[s0], reach[s1])
+        v1 = self._walk(self._walk_env, s1, reach[s1], reach[s0])
         if self._opp_mass is not None:
             self._record_root_value(s0, v0)
             self._record_root_value(s1, v1)

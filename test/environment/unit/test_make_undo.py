@@ -12,6 +12,7 @@ import pytest
 
 from environment.player import Player
 from environment.poker_env import PokerEnv
+from test.abstraction_helpers import advance_to_round, passive_action
 
 
 def _env(n_players: int = 2, low: int = 2, high: int = 14, seed: int = 0) -> PokerEnv:
@@ -137,8 +138,7 @@ class TestStepUndo:
                 token = env.step_in_place(action)
                 env.undo(token)
                 assert_env_equal(env, before)
-            nxt = "check" if "check" in env.legal_actions else "call"
-            env.step_in_place(nxt)
+            env.step_in_place(passive_action(env))
             steps += 1
         assert env.is_terminal
 
@@ -151,11 +151,7 @@ class TestStepUndo:
         for _ in range(4):
             if env.is_terminal:
                 break
-            action = "call" if "call" in env.legal_actions else (
-                "check" if "check" in env.legal_actions else
-                [a for a in env.legal_actions if a][0]
-            )
-            tokens.append(env.step_in_place(action))
+            tokens.append(env.step_in_place(passive_action(env)))
         for token in reversed(tokens):
             env.undo(token)
         assert_env_equal(env, root)
@@ -190,12 +186,9 @@ class TestStepUndo:
         # __dict__ attr), not a curated field list, so a future mutable
         # field missing from the UndoToken is caught here.
         env = _env(n_players=3, seed=0)
-        env.step_in_place("call")
-        env.step_in_place("call")  # to the flop: richer mid-hand state
+        advance_to_round(env, 1)  # to the flop: richer mid-hand state
         before = _generic_state(env)
-        token = env.step_in_place(
-            "call" if "call" in env.legal_actions else "check"
-        )
+        token = env.step_in_place(passive_action(env))
         env.undo(token)
         assert _generic_state(env) == before
 
@@ -262,9 +255,7 @@ class TestCardDealingTransitions:
                 env.undo(token)
                 # Full reversal incl. deck cursor + community + bets.
                 assert_env_equal(env, before)
-            env.step_in_place(
-                "check" if "check" in env.legal_actions else "call"
-            )
+            env.step_in_place(passive_action(env))
             steps += 1
         # A calldown crosses all three post-flop streets, so both a 3-card
         # (flop) and a 1-card (turn/river) deal must have been exercised.
@@ -333,7 +324,7 @@ class TestSettleWinnersFlag:
         prev, last = None, None
         steps = 0
         while not env.is_terminal and steps < 60:
-            a = "call" if "call" in env.legal_actions else "check"
+            a = passive_action(env)
             prev, last = copy.deepcopy(env), a
             env.step_in_place(a)
             steps += 1

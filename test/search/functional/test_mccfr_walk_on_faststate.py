@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 
 from poker_ai import _core
+from test.abstraction_helpers import passive_action
 
 pytestmark = pytest.mark.skipif(
     not _core.CORE_AVAILABLE, reason="compiled core extension not built"
@@ -68,7 +69,7 @@ def _root(target_round, stacks, seed):
     _stub_lut(env)
     g = 0
     while env.betting_round < target_round and not env.is_terminal and g < 60:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         g += 1
     return env
 
@@ -93,7 +94,7 @@ def _solve(target_round, stacks, seed, use_core, iters=80):
     return snapshot(st.vregret), snapshot(st.vstrat)
 
 
-@pytest.mark.parametrize("stacks", [(200, 200, 200), (120, 300, 300)])
+@pytest.mark.parametrize("stacks", [(2000, 2000, 2000), (1200, 3000, 3000)])
 @pytest.mark.parametrize("target_round,label", [
     (0, "preflop-leaf"),
     (2, "turn-leaf-free"),
@@ -113,7 +114,7 @@ def test_multiway_flop_leaf_byte_identical():
     """A multiway FLOP root exercises the after-2nd-raise depth-limit leaf on the
     FastState frontier clone — the hardest leaf handoff — byte-identically."""
     for seed in range(4):
-        reg_py, strat_py = _solve(1, (200, 200, 200), seed, use_core=False)
-        reg_core, strat_core = _solve(1, (200, 200, 200), seed, use_core=True)
+        reg_py, strat_py = _solve(1, (2000, 2000, 2000), seed, use_core=False)
+        reg_core, strat_core = _solve(1, (2000, 2000, 2000), seed, use_core=True)
         assert_tables_equal(reg_py, reg_core)
         assert_tables_equal(strat_py, strat_core)

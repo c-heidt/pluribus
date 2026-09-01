@@ -462,7 +462,14 @@ P(map to A) = ((B − x) · (1 + A)) / ((B − A) · (1 + x))
   env.step_in_place(action_str)
   agent.on_observed_action(seat, env_before, action_str)
   ```
-- Fold / call / all-in are always on-tree — only raise sizes can deviate.
+- Fold is always on-tree.  Call and all-in usually are, but a raise level
+  may drop them from the abstraction (pre-flop level 0 has neither: the
+  opener folds or opens), and an opponent is not bound by that — so
+  `inject_action` accepts `"call"` / `"all_in"` at such a node exactly
+  like an off-tree raise size.  Without the injection an observed limp
+  would remap to a fold and the runtime would model the opponent as
+  having folded a hand they are still playing.  A *free* check is never
+  gated, so it needs no injection.
 
 ### 6.4 Continuation-value evaluation (`leaf.py`)
 

@@ -22,7 +22,8 @@ from poker_ai.search.agent import SearchAgent
 from poker_ai.search.leaf import LeafConfig
 from poker_ai.search.solver import SolverConfig
 
-from test.search._helpers import UniformPolicy, _policies, _stub_lut
+from test.search._helpers import _HU_STACKS, UniformPolicy, _policies, _stub_lut
+from test.abstraction_helpers import passive_action
 
 
 # --------------------------------------------------------------------------- #
@@ -30,7 +31,10 @@ from test.search._helpers import UniformPolicy, _policies, _stub_lut
 # --------------------------------------------------------------------------- #
 
 def _env(n_players=2, stacks=None, low=11, high=14) -> PokerEnv:
-    stacks = stacks or [200] * n_players
+    # 10 bb against the env's 50/100 blinds.  The abstraction has no pre-flop
+    # limp, so a stack must cover the ~2.6 bb open on top of the blind or every
+    # hand ends pre-flop as a fold-or-shove and never reaches a post-flop node.
+    stacks = stacks or [_HU_STACKS[0]] * n_players
     env = PokerEnv(
         players=[Player(i, s) for i, s in enumerate(stacks)],
         low_card_rank=low,
@@ -64,8 +68,8 @@ def _to_flop(env, agent=None, buffer=False):
     (deepcopying the pre-action env, as a runner would) before being applied.
     """
     pre = {int(c) for c in env.community_cards}
-    while env.betting_round < 1 and not env.is_terminal:
-        action = "call" if "call" in env.legal_actions else "check"
+    while not env.is_terminal and env.betting_round < 1:
+        action = passive_action(env)
         if buffer and agent is not None:
             agent.on_observed_action(copy.deepcopy(env), env.player_i, action)
         env.step_in_place(action)
@@ -76,12 +80,12 @@ def _advance_to_my_turn(env, seat, max_round):
     """Call/check opponents until ``seat`` is to act (or the round/hand ends)."""
     guard = 0
     while (
-        env.player_i != seat
-        and not env.is_terminal
+        not env.is_terminal
+        and env.player_i != seat
         and env.betting_round == max_round
         and guard < 12
     ):
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         guard += 1
 
 
@@ -283,7 +287,7 @@ def test_boundary_search_branch_uses_average_policy(_seeded):
     # Buffer a flop action, then cross to the turn.
     pre = {int(c) for c in env.community_cards}
     while env.betting_round == 1 and not env.is_terminal:
-        action = "call" if "call" in env.legal_actions else "check"
+        action = passive_action(env)
         agent.on_observed_action(copy.deepcopy(env), env.player_i, action)
         env.step_in_place(action)
     if env.betting_round != 2 or not agent.pending_actions:
@@ -421,7 +425,7 @@ def test_is_off_tree_classification(_seeded):
     # Advance to a node that has a non-empty canonical raise set.
     guard = 0
     while not env.canonical_raise_fractions() and not env.is_terminal and guard < 8:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         guard += 1
     # An off-canonical raise is off-tree; canonical raises and the always-legal
     # actions are on-tree.
@@ -486,7 +490,7 @@ def test_offtree_gap_gate(_seeded, monkeypatch, threshold, expect_research):
 @pytest.mark.parametrize("n_players", [2, 3])
 def test_act_always_legal(_seeded, n_players):
     # End-to-end act()-legality across HU + multiway, with the real solver.
-    env = _env(n_players=n_players, stacks=[300] * n_players)
+    env = _env(n_players=n_players, stacks=[_HU_STACKS[0]] * n_players)
     agent = _agent()
     agent.on_hand_start(env, my_seat=0)
 

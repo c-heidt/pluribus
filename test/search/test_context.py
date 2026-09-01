@@ -12,6 +12,7 @@ from poker_ai.search.context import (
     SubgameContext,
     _board_compatible_mask,
 )
+from test.abstraction_helpers import advance_to_round
 
 
 def _env(low: int = 2, high: int = 14, n_players: int = 2):
@@ -111,11 +112,11 @@ class TestFromRuntime:
         assert ctx.board_compatible.shape == (env.n_combos,)
 
     def test_from_runtime_on_flop_env(self):
-        # Walk HU pre-flop to flop via two calls; assert from_runtime
-        # reports the right street and a non-trivial board mask.
+        # Walk HU pre-flop to the flop (open + call — the abstraction has no
+        # limp); assert from_runtime reports the right street and a
+        # non-trivial board mask.
         env = _env()
-        env.step_in_place("call")
-        env.step_in_place("call")
+        advance_to_round(env, 1)
         assert env.betting_round == 1
         assert len(env.community_cards) == 3
         ctx = _ctx_from(env)

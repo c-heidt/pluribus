@@ -22,6 +22,7 @@ import numpy as np
 import pytest
 
 from poker_ai import _core
+from test.abstraction_helpers import passive_action
 
 pytestmark = pytest.mark.skipif(
     not _core.CORE_AVAILABLE, reason="compiled core extension not built"
@@ -37,6 +38,8 @@ if _core.CORE_AVAILABLE:
     from environment.poker_env import (
         PokerEnv, PolicyState,
         _ACTION_BYTE, _STAGE_ID, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
+        ALL_IN_ALLOWED_BY_STAGE,
+        CALL_ALLOWED_BY_STAGE,
     )
     from poker_ai._core import _state as _cystate
     from poker_ai.search.context import SubgameContext
@@ -49,7 +52,10 @@ if _core.CORE_AVAILABLE:
     from poker_ai.tables.index import lmdb_map_size_for_players
     from test.search._helpers import UniformPolicy
 
-    _cystate.configure(_STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND)
+    _cystate.configure(
+        _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
+        CALL_ALLOWED_BY_STAGE, ALL_IN_ALLOWED_BY_STAGE,
+    )
     FastState = _cystate.FastState
     _CAPS = {r: 1 << 14 for r in range(4)}
     _BIASES = ("none", "fold", "call", "raise")
@@ -67,7 +73,7 @@ def _flop_frontier(seed, n=3):
     _stub_lut(env)
     g = 0
     while env.betting_round < 1 and not env.is_terminal and g < 20:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         g += 1
     return env
 

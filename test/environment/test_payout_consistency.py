@@ -23,6 +23,7 @@ from environment import range_showdown
 from environment.player import Player
 from environment.poker_env import PokerEnv
 from environment.pot import Pot
+from test.abstraction_helpers import passive_action
 
 
 def _stub_lut(env):
@@ -38,7 +39,7 @@ def _river_env(seed, stacks):
     _stub_lut(env)
     g = 0
     while env.betting_round < 3 and not env.is_terminal and g < 60:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         g += 1
     return env
 
@@ -83,14 +84,33 @@ def _engine_net(root, line, i, j, p, stacks):
     return e.players[p].n_chips - stacks[p]
 
 
+def _prefer(legal, *wanted):
+    """First of ``wanted`` that is legal, else the cheapest raise, else ``None``.
+
+    Keeps a scripted line playable whatever the abstraction offers at the node:
+    a level with no ``call`` (pre-flop open) or no ``all_in`` still has a raise.
+    """
+    for a in wanted:
+        if a in legal:
+            return a
+    raises = sorted(
+        (a for a in legal if a.startswith("raise:")),
+        key=lambda a: float(a.split(":", 1)[1]),
+    )
+    return raises[0] if raises else None
+
+
 _LINES = {
-    "passive": lambda la: "check" if "check" in la else ("call" if "call" in la else None),
-    "fold": lambda la: "fold" if "fold" in la else ("check" if "check" in la else ("call" if "call" in la else None)),
-    "allin": lambda la: "all_in" if "all_in" in la else ("call" if "call" in la else ("check" if "check" in la else None)),
+    # Each policy names the actions it wants in preference order and falls back
+    # to the cheapest raise, so a level that drops call/all_in from the
+    # abstraction still yields a playable line instead of ``None``.
+    "passive": lambda la: _prefer(la, "call"),
+    "fold": lambda la: _prefer(la, "fold", "call"),
+    "allin": lambda la: _prefer(la, "all_in", "call"),
 }
 
 
-@pytest.mark.parametrize("stacks", [(300, 300), (150, 600)])
+@pytest.mark.parametrize("stacks", [(600, 600), (400, 1600)])
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_vector_payout_matches_concrete_settlement(stacks, seed):
     root = _river_env(seed, stacks)
@@ -142,7 +162,7 @@ def _river_env_with_folded_seat(seed, stacks=(600, 600, 600)):
     _stub_lut(env)
     g = 0
     while env.betting_round < 1 and not env.is_terminal and g < 60:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         g += 1
     assert env.betting_round == 1 and not env.is_terminal
     # Flop: a contesting seat raises once; seat 2 folds facing it; others call.
@@ -159,13 +179,13 @@ def _river_env_with_folded_seat(seed, stacks=(600, 600, 600)):
             env.step_in_place(raise_act)
             raised = True
         else:
-            env.step_in_place("call" if "call" in legal else "check")
+            env.step_in_place(passive_action(env))
         g += 1
     assert not env.players[2].is_active
     # Turn: check it down to the river root.
     g = 0
     while env.betting_round < 3 and not env.is_terminal and g < 20:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         g += 1
     assert env.betting_round == 3 and not env.is_terminal
     return env
@@ -236,7 +256,13 @@ def test_vector_payout_includes_dead_money(seed):
                 opp[j_idx] = 1.0
                 vij = term.vector_payout(0, 1, opp, runout=None)[i_idx]
                 eng = _engine_net3(root, line, i, j, cc[k_idx], 0, stacks)
-                assert abs(float(vij) - float(eng)) < 1e-9, (
+                # Exact to the chip, except on a split of an ODD total pot:
+                # the engine hands the odd chip to one seat while the
+                # vectorised value is the exact half.  That half-chip is the
+                # integer tie-break, not a dropped ``dead`` term (which would
+                # be off by the whole 255-chip contribution).
+                tol = 1e-9 if sum(tc) % 2 == 0 else 0.5 + 1e-9
+                assert abs(float(vij) - float(eng)) <= tol, (
                     f"combo {i_idx} vs {j_idx} on line {line}: "
                     f"vector={vij} engine={eng} (dead={dead})"
                 )
@@ -258,7 +284,7 @@ def _turn_fold_env(seed, stacks):
     _stub_lut(env)
     g = 0
     while env.betting_round < 2 and not env.is_terminal and g < 60:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         g += 1
     assert env.betting_round == 2
     turn_board = list(env.community_cards)
@@ -281,7 +307,7 @@ def test_turn_fold_value_is_river_independent(seed):
     a river, so its per-combo value is river-independent and must equal the card
     removal computed on the **four-card turn board**.
     """
-    env, turn_board = _turn_fold_env(seed, (300, 300))
+    env, turn_board = _turn_fold_env(seed, (600, 600))
     assert len(env.community_cards) == 5          # engine force-dealt the river
     assert env.terminal_board_len == 4            # but the fold saw only the turn
 
@@ -332,7 +358,7 @@ def _flop_allin_showdown(seed, stacks=(10000, 10000)):
     _stub_lut(env)
     g = 0
     while env.betting_round < 1 and not env.is_terminal and g < 60:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         g += 1
     assert env.betting_round == 1
     flop = list(env.community_cards)
@@ -421,7 +447,7 @@ def _fold_env_at(seed, stacks, street):
     _stub_lut(env)
     g = 0
     while env.betting_round < street and not env.is_terminal and g < 60:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         g += 1
     assert env.betting_round == street
     board_at_fold = list(env.community_cards)
@@ -463,7 +489,7 @@ def test_flop_fold_value_is_independent_of_both_runout_cards(seed):
     on the three-card flop board, for every completion.  The pre-existing binary
     ``real_len == 5`` test could not express this case.
     """
-    env, flop_board = _fold_env_at(seed, (300, 300), street=1)
+    env, flop_board = _fold_env_at(seed, (600, 600), street=1)
     assert len(env.community_cards) == 5      # engine force-dealt turn + river
     assert env.terminal_board_len == 3        # but the fold saw only the flop
 
@@ -496,7 +522,7 @@ def test_turn_fold_from_flop_root_uses_only_the_first_runout_card(seed):
     value must track ``runout[0]`` (the turn it saw) and ignore ``runout[1]``.
     Getting this wrong leaks a card that was never dealt into card removal.
     """
-    env, turn_board = _fold_env_at(seed, (300, 300), street=2)
+    env, turn_board = _fold_env_at(seed, (600, 600), street=2)
     assert env.terminal_board_len == 4
     flop_board = turn_board[:3]
     turn_card = int(turn_board[3])
@@ -532,15 +558,15 @@ def test_turn_fold_from_flop_root_uses_only_the_first_runout_card(seed):
 
 def test_terminal_board_len_round_trips_through_make_undo():
     """``terminal_board_len`` survives ``step_in_place`` / ``undo`` (LIFO)."""
-    env, _ = _turn_fold_env(0, (300, 300))
+    env, _ = _turn_fold_env(0, (600, 600))
     # Re-drive to just before the fold so we can step into the terminal and back.
     np.random.seed(0)
-    fresh = PokerEnv(players=[Player(i, 300) for i in range(2)],
+    fresh = PokerEnv(players=[Player(i, 600) for i in range(2)],
                      low_card_rank=11, high_card_rank=14)
     _stub_lut(fresh)
     g = 0
     while fresh.betting_round < 2 and not fresh.is_terminal and g < 60:
-        fresh.step_in_place("call" if "call" in fresh.legal_actions else "check")
+        fresh.step_in_place(passive_action(fresh))
         g += 1
     raise_act = next(a for a in fresh.legal_actions if a and a.startswith("raise"))
     fresh.step_in_place(raise_act)

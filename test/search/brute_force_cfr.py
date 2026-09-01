@@ -518,12 +518,19 @@ class BruteForceTurnCFR:
             row = self.sub.payoff[node["leaf"]]
             return row[(a, b)] if river is None else row.get((a, b, river), 0.0)
         if ntype == "chance":
-            rivers = self.sub.rivers
+            # Card removal RENORMALISES: given both holes, the next card is uniform
+            # over the cards neither player holds.  Skipping the conflicts while
+            # normalising by the unfiltered count would leave a sub-probability
+            # measure — and, critically, one that is NOT a uniform rescaling of the
+            # tree: a terminal reached WITHOUT crossing a chance node (an immediate
+            # fold) keeps weight 1 while a showdown below two chance nodes keeps
+            # only ~0.46.  That prices folds against showdowns wrongly and flips
+            # fold/call-off decisions in lopsided spots.
+            rivers = [r for r in self.sub.rivers
+                      if r not in self.sub.holes[a] and r not in self.sub.holes[b]]
             inv = 1.0 / len(rivers)
             val = 0.0
             for r in rivers:
-                if r in self.sub.holes[a] or r in self.sub.holes[b]:
-                    continue  # impossible deal → contributes 0 (1/R convention)
                 val += inv * self._cfr(node["child"], a, b, r0, r1, w * inv, t, int(r))
             return val
         seat = node["actor"]
@@ -578,13 +585,11 @@ def turn_game_value(sub: TurnSubgame, sigma: Mapping[TInfoset, np.ndarray]) -> f
             row = sub.payoff[node["leaf"]]
             return row[(a, b)] if river is None else row.get((a, b, river), 0.0)
         if ntype == "chance":
-            inv = 1.0 / len(sub.rivers)
-            v = 0.0
-            for r in sub.rivers:
-                if r in sub.holes[a] or r in sub.holes[b]:
-                    continue
-                v += inv * ev(node["child"], a, b, int(r))
-            return v
+            # Renormalised over the cards neither player holds (see BruteForceCFR._cfr).
+            rivers = [r for r in sub.rivers
+                      if r not in sub.holes[a] and r not in sub.holes[b]]
+            inv = 1.0 / len(rivers)
+            return sum(inv * ev(node["child"], a, b, int(r)) for r in rivers)
         seat = node["actor"]
         hole = a if seat == 0 else b
         row = _turn_sigma_row(sigma, seat, hole, node, river)
@@ -616,14 +621,23 @@ def turn_br_value(sub: TurnSubgame, br_player: int, sigma_opp: Mapping[TInfoset,
                     v += r * (p0 if br_player == 0 else -p0)
             return v
         if ntype == "chance":
-            inv = 1.0 / len(sub.rivers)
+            # Per-opponent-hand renormalisation: conditional on MY hole and on the
+            # opponent holding ``ob``, the river is uniform over the cards neither
+            # of us holds — so the divisor depends on ``ob``, not on the card.
+            # Fold it into the reach once, then card-removal-filter per river.
+            denom = {
+                ob: len([r for r in sub.rivers
+                         if r not in sub.holes[my_hole] and r not in sub.holes[ob]])
+                for ob in opp_reach
+            }
+            scaled = {ob: rv / denom[ob] for ob, rv in opp_reach.items() if denom[ob]}
             v = 0.0
             for rr in sub.rivers:
                 if rr in sub.holes[my_hole]:
                     continue  # my hand cannot see its own card as the river
-                sub_reach = {ob: rv for ob, rv in opp_reach.items() if rr not in sub.holes[ob]}
+                sub_reach = {ob: rv for ob, rv in scaled.items() if rr not in sub.holes[ob]}
                 if sub_reach:
-                    v += inv * rec(node["child"], my_hole, sub_reach, int(rr))
+                    v += rec(node["child"], my_hole, sub_reach, int(rr))
             return v
         seat = node["actor"]
         legal = node["legal"]
@@ -868,12 +882,15 @@ class BruteForceFlopCFR:
         if ntype == "term":
             return self.sub.payoff[node["leaf"]].get((a, b) + runout, 0.0)
         if ntype == "chance":
-            cands = [c for c in self.sub.avail if c not in runout]
+            # Renormalised over the cards neither player holds (see the note in
+            # ``BruteForceCFR._cfr``); the old 1/N convention under-weighted every
+            # showdown relative to a pre-chance fold.
+            cands = [c for c in self.sub.avail
+                     if c not in runout and c not in self.sub.holes[a]
+                     and c not in self.sub.holes[b]]
             inv = 1.0 / len(cands)
             val = 0.0
             for c in cands:
-                if c in self.sub.holes[a] or c in self.sub.holes[b]:
-                    continue  # impossible deal → contributes 0 (1/N convention)
                 val += inv * self._cfr(
                     node["child"], a, b, r0, r1, w * inv, t, runout + (int(c),)
                 )
@@ -929,14 +946,12 @@ def flop_game_value(sub: FlopSubgame, sigma: Mapping[FInfoset, np.ndarray]) -> f
         if ntype == "term":
             return sub.payoff[node["leaf"]].get((a, b) + runout, 0.0)
         if ntype == "chance":
-            cands = [c for c in sub.avail if c not in runout]
+            # Renormalised over the cards neither player holds (see BruteForceCFR._cfr).
+            cands = [c for c in sub.avail
+                     if c not in runout and c not in sub.holes[a]
+                     and c not in sub.holes[b]]
             inv = 1.0 / len(cands)
-            v = 0.0
-            for c in cands:
-                if c in sub.holes[a] or c in sub.holes[b]:
-                    continue
-                v += inv * ev(node["child"], a, b, runout + (int(c),))
-            return v
+            return sum(inv * ev(node["child"], a, b, runout + (int(c),)) for c in cands)
         seat = node["actor"]
         hole = a if seat == 0 else b
         row = _flop_sigma_row(sigma, seat, hole, node, runout)
@@ -964,15 +979,23 @@ def flop_br_value(sub: FlopSubgame, br_player: int, sigma_opp: Mapping[FInfoset,
                     v += r * (p0 if br_player == 0 else -p0)
             return v
         if ntype == "chance":
-            cands = [c for c in sub.avail if c not in runout]
-            inv = 1.0 / len(cands)
+            # Per-opponent-hand renormalisation (see the turn BR above): the divisor
+            # is the count of cards neither I nor ``ob`` holds, so it belongs in the
+            # reach, not in a single card-independent ``inv``.
+            denom = {
+                ob: len([c for c in sub.avail
+                         if c not in runout and c not in sub.holes[my_hole]
+                         and c not in sub.holes[ob]])
+                for ob in opp_reach
+            }
+            scaled = {ob: rv / denom[ob] for ob, rv in opp_reach.items() if denom[ob]}
             v = 0.0
-            for c in cands:
-                if c in sub.holes[my_hole]:
+            for c in sub.avail:
+                if c in runout or c in sub.holes[my_hole]:
                     continue  # my hand cannot see its own card on the board
-                sub_reach = {ob: rv for ob, rv in opp_reach.items() if c not in sub.holes[ob]}
+                sub_reach = {ob: rv for ob, rv in scaled.items() if c not in sub.holes[ob]}
                 if sub_reach:
-                    v += inv * rec(node["child"], my_hole, sub_reach, runout + (int(c),))
+                    v += rec(node["child"], my_hole, sub_reach, runout + (int(c),))
             return v
         seat = node["actor"]
         legal = node["legal"]

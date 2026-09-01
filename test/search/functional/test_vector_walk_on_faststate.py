@@ -59,7 +59,7 @@ def _run(env, ctx, *, use_core, seed, iters):
 
 @pytest.mark.parametrize(
     "target_round,stacks",
-    [(2, (200, 200)), (2, (150, 400)), (3, (200, 200)), (3, (300, 120))],
+    [(2, (2000, 2000)), (2, (1500, 4000)), (3, (2000, 2000)), (3, (3000, 1200))],
 )
 def test_vector_walk_byte_identical(target_round, stacks):
     """Turn (with river chance) and river subgames, equal + unequal stacks: the
@@ -83,7 +83,7 @@ def test_adapter_falls_back_when_overlay_present():
     """An injected off-tree action makes the histories un-representable in the
     byte-code engine — ``build_fast_walk_env`` must return ``None`` (→ Python walk),
     never a FastState that would mis-key the node."""
-    env = _late_env(2, stacks=(200, 200), seed=0)
+    env = _late_env(2, stacks=(2000, 2000), seed=0)
     assert build_fast_walk_env(env) is not None  # clean root → adapter
     # Simulate a re-search that injected an off-tree raise somewhere in the tree
     # (a non-empty overlay is exactly the guard's trigger; the byte-code engine

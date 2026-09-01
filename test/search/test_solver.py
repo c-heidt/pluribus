@@ -41,6 +41,7 @@ from poker_ai.search.vector import _VectorSolver, _regret_match_matrix
 # --------------------------------------------------------------------------- #
 
 from test.search._helpers import (  # noqa: E402  (shared test builders)
+    _HU_STACKS,
     UniformPolicy,
     _advance_to,
     _ctx,
@@ -669,7 +670,11 @@ class TestVectorRegime:
         # min (the bigger stack's excess is uncalled) — no parent reconstruction,
         # and a naive max() over the standing bet would overstate it.
         np.random.seed(1)  # a decisive call-all-in-for-less showdown
-        start = [200, 2000]
+        # 10 bb vs 100 bb: deep enough for seat 0 to make the pre-flop open
+        # (there is no limp in the abstraction), short enough that the river
+        # bet exceeds its remaining stack — so its all-in is a CALL for less,
+        # which is what this test is about.
+        start = [_HU_STACKS[0], 10000]
         env = PokerEnv(players=[Player(0, start[0]), Player(1, start[1])],
                        low_card_rank=11, high_card_rank=14)
         _stub_lut(env)
@@ -770,7 +775,7 @@ class TestSearchLifetimeCaches:
     runout integrated once per ``(holes, snapshot)`` — persisting across a
     warm-started re-search, and never breaking same-seed determinism."""
 
-    def _preflop_env(self, low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
+    def _preflop_env(self, low=11, high=14, stacks=_HU_STACKS, seed=0) -> PokerEnv:
         # street_at_root == 0 → the depth limit makes the flop a continuation
         # meta-game leaf, so ``continuation_value`` is exercised.
         np.random.seed(seed)

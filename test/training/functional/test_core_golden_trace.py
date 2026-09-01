@@ -58,11 +58,16 @@ _LUT_PATH = "data/20cards_exact"
 #     traversal takes a different (equally valid) trajectory.
 # Verified at re-baseline time: digest is identical with PLURIBUS_CORE_KERNELS
 # unset vs "all", and reproducible across runs.
+# Re-baselined again 2026-08-31 for the per-raise-level action abstraction (the
+# situation-indexed grid: pre-flop open / 3-bet / 4-bet, post-flop first-in vs
+# facing a bet, with no pre-flop limp).  A different action set means different
+# rows, different widths, and a different traversal — the digest MUST move.
 # Previous digests:
+#   00cb45e7dc0c67a2a2a7beb14068c3061a8f26be952ecf1c546be42ff147aed2  (pre per-level grid)
 #   7fef05fc8c7c421e8c667bd049530aeb3121c16aeb41ecbeb7f33bdd83243022  (pre preflop-only phi)
 #   4ca50490d570bd4a8318b03112dd40f0466796d89c4fd8ee5a9ddb350b4f99c9  (after _hand_over all-in fix)
 #   e23d93b6b08842048d37b58ee0c166e3c9260fd803712ead082d8efe5f221251  (pre all-in fixes)
-GOLDEN_DIGEST = "00cb45e7dc0c67a2a2a7beb14068c3061a8f26be952ecf1c546be42ff147aed2"
+GOLDEN_DIGEST = "2239cb1b5ff88c7a3b3be1aea26a7bee55ecc72c25d25aadada7ac9bfd225b2e"
 
 
 def train_and_digest(save_path: Path, *, n_iterations: int = N_ITERATIONS):

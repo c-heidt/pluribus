@@ -23,6 +23,7 @@ import numpy as np
 import pytest
 
 from poker_ai import _core
+from test.abstraction_helpers import passive_action
 
 pytestmark = pytest.mark.skipif(
     not _core.CORE_AVAILABLE, reason="compiled core extension not built"
@@ -32,6 +33,8 @@ if _core.CORE_AVAILABLE:
     from environment.player import Player
     from environment.poker_env import (
         PokerEnv, _ACTION_BYTE, _STAGE_ID, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
+        ALL_IN_ALLOWED_BY_STAGE,
+        CALL_ALLOWED_BY_STAGE,
     )
     from poker_ai._core import _state as _cystate
     from poker_ai.search.context import SubgameContext
@@ -42,7 +45,10 @@ if _core.CORE_AVAILABLE:
     from poker_ai.search.mccfr import _BIAS_CLASSES
     from test.search._helpers import UniformPolicy, _real_lut
 
-    _cystate.configure(_STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND)
+    _cystate.configure(
+        _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
+        CALL_ALLOWED_BY_STAGE, ALL_IN_ALLOWED_BY_STAGE,
+    )
     FastState = _cystate.FastState
 
 
@@ -70,7 +76,7 @@ def _flop_frontier(seed, n=3, lut=None):
         lambda: collections.defaultdict(lambda: 0))
     g = 0
     while env.betting_round < 1 and not env.is_terminal and g < 20:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
         g += 1
     return env
 
@@ -140,8 +146,7 @@ def test_refresh_clusters_matches_lut_memmap(seed, n):
     env = new_game(n, card_info_lut=lut, initial_chips=10000)
     g = 0
     while env.betting_round < 1 and not env.is_terminal and g < 60:
-        legal = [a for a in env.legal_actions if a is not None]
-        env.step_in_place("call" if "call" in legal else legal[0])
+        env.step_in_place(passive_action(env))
         g += 1
     assert env.betting_round == 1, f"seed={seed} n={n}: stuck at {env.betting_round}"
 
@@ -231,7 +236,7 @@ def test_policy_state_matches_env_across_streets():
             ps = roll.policy_state
             nodes.append((ps.player_i, ps.betting_round, ps.info_set,
                           ps.valid_mask.copy(), ps.legal_actions))
-            a = "check" if "check" in roll.legal_actions else "call"
+            a = passive_action(roll)
             line.append(a)
             roll.step_in_place(a)
             g += 1

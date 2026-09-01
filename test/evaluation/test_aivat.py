@@ -157,7 +157,7 @@ class TestAccumulatorArithmetic:
 # Baseline value function (LeafValue.child_values)
 # --------------------------------------------------------------------------- #
 
-def _hero_on_flop(seed=0, low=11, high=14, stacks=(300, 300)):
+def _hero_on_flop(seed=0, low=11, high=14, stacks=(3000, 3000)):
     """A heads-up flop env + a hero SearchAgent whose tracker is initialised."""
     env = _flop_env(low=low, high=high, stacks=stacks, seed=seed)
     leaf = LeafConfig(policies=_policies())

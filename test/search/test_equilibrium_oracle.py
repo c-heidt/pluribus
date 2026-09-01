@@ -49,7 +49,12 @@ from test.search.brute_force_cfr import (
     turn_exploitability,
     turn_game_value,
 )
-from test.search._helpers import _ctx, _flop_env, _late_env
+from test.search._helpers import (
+    _HU_STACKS_SHALLOW,
+    _ctx,
+    _flop_env,
+    _late_env,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -263,7 +268,7 @@ def test_mccfr_regime_reaches_equilibrium(_seeded):
 # Turn subgame: river-conditioned vector regime vs the river-enumerating oracle
 # --------------------------------------------------------------------------- #
 
-def _turn_subgame(seed: int, stacks=(200, 200)):
+def _turn_subgame(seed: int, stacks=_HU_STACKS_SHALLOW):
     """Heads-up **turn** env + 2-combo-per-seat ranges over card-disjoint holes.
 
     The mirror of :func:`_river_subgame` one street earlier: the board is four
@@ -400,7 +405,7 @@ def _turn_scale(sub) -> float:
 # Flop subgame — two nested chance levels (turn + river), §6.5
 # =========================================================================== #
 
-def _flop_subgame(seed: int, stacks=(200, 200)):
+def _flop_subgame(seed: int, stacks=_HU_STACKS_SHALLOW):
     """Heads-up **flop** env + 2-combo-per-seat ranges over card-disjoint holes.
 
     The mirror of :func:`_turn_subgame` one street earlier: the board is three

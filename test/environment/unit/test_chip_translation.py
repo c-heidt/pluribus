@@ -13,6 +13,7 @@ from environment.poker_env import (
     MAX_RAISES_PER_ROUND,
     PokerEnv,
 )
+from test.abstraction_helpers import advance_to_round
 
 
 def _env(low: int = 10, high: int = 14, n_players: int = 2):
@@ -228,9 +229,7 @@ class TestStringForChips:
         # Walk to the flop and verify canonical mapping uses the
         # flop's raise grid, not pre-flop's.
         env = _env()
-        env.step_in_place("call")
-        env.step_in_place("call")
-        assert env.betting_round == 1
+        advance_to_round(env, 1)
         fractions = env.canonical_raise_fractions()
         assert fractions, "expected playable flop fractions"
         f = fractions[0]

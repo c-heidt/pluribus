@@ -17,6 +17,7 @@ import pytest
 
 from environment.player import Player
 from environment.poker_env import PokerEnv, new_game
+from test.abstraction_helpers import passive_action
 
 
 # ---------------------------------------------------------------------------
@@ -24,15 +25,18 @@ from environment.poker_env import PokerEnv, new_game
 # ---------------------------------------------------------------------------
 
 def _play_step(env):
-    """Advance one action in place: prefer call, else first legal action."""
-    action = "call" if "call" in env.legal_actions else env.legal_actions[0]
-    env.step_in_place(action)
+    """Advance one action in place: check/call, else the cheapest raise.
+
+    ``call`` is not in the abstraction at pre-flop raise level 0, so a plain
+    ``"call"`` there would map to a fold and end the hand before any of these
+    invariants get exercised."""
+    env.step_in_place(passive_action(env))
     return env
 
 
 def _raise_step(env):
-    """Advance one action in place: prefer raise:0.5, else fall back to call."""
-    raise_actions = [a for a in env.legal_actions if a and a.startswith("raise:0.5")]
+    """Advance one action in place: prefer the smallest legal raise, else call."""
+    raise_actions = [a for a in env.legal_actions if a and a.startswith("raise:")]
     if raise_actions:
         env.step_in_place(raise_actions[0])
         return env
@@ -79,10 +83,10 @@ def _play_fold_first(env, max_steps=500):
 
 
 def _play_all_raises(env, max_steps=500):
-    """Prefer raise:0.5 when available, else call."""
+    """Prefer the smallest legal raise when available, else call."""
     steps = 0
     while not env.is_terminal and steps < max_steps:
-        raise_actions = [a for a in env.legal_actions if a and a.startswith("raise:0.5")]
+        raise_actions = [a for a in env.legal_actions if a and a.startswith("raise:")]
         if raise_actions:
             env.step_in_place(raise_actions[0])
         else:

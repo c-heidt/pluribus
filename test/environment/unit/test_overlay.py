@@ -7,10 +7,23 @@ import pytest
 from environment.action_space import ACTION_TO_IDX, CANONICAL_ACTIONS
 from environment.player import Player
 from environment.poker_env import PokerEnv
+from test.abstraction_helpers import off_tree_fractions
 
 
 def _env(n_players: int = 2):
     return PokerEnv(players=[Player(i, 10000) for i in range(n_players)])
+
+
+def _off_tree_actions(env, count: int = 4):
+    """``count`` ``raise:<f>`` strings the abstraction does NOT contain here.
+
+    Read off the live grid so re-cutting the raise sizes cannot turn one of
+    these injections into a canonical action and quietly defeat the test.
+    """
+    return [
+        f"raise:{f}"
+        for f in off_tree_fractions(env.betting_round, env.n_raises_this_round, count)
+    ]
 
 
 class TestInjectAction:
@@ -180,7 +193,7 @@ class TestLegalActionsOrdering:
     def test_overlay_actions_sorted_lex(self):
         env = _env()
         # Inject in a non-sorted order to prove the env re-sorts.
-        for a in ("raise:9.9", "raise:2.3", "raise:1.1", "raise:1.7"):
+        for a in reversed(_off_tree_actions(env)):
             env.inject_action(a)
         legal = [a for a in env.legal_actions if a is not None]
         overlay_in_legal = [
@@ -190,7 +203,7 @@ class TestLegalActionsOrdering:
 
     def test_legal_actions_deterministic_across_calls(self):
         env = _env()
-        for a in ("raise:1.1", "raise:9.9", "raise:1.7", "raise:1.3"):
+        for a in _off_tree_actions(env):
             env.inject_action(a)
         # Multiple calls on the same env must return identical lists.
         first = env.legal_actions
@@ -200,9 +213,10 @@ class TestLegalActionsOrdering:
     def test_order_independent_of_insertion_order(self):
         env_a = _env()
         env_b = _env()
-        for a in ("raise:1.1", "raise:9.9", "raise:1.7", "raise:1.3"):
+        actions = _off_tree_actions(env_a)
+        for a in actions:
             env_a.inject_action(a)
-        for a in ("raise:1.3", "raise:1.7", "raise:9.9", "raise:1.1"):
+        for a in reversed(actions):
             env_b.inject_action(a)
         assert env_a.legal_actions == env_b.legal_actions
 
@@ -300,7 +314,7 @@ class TestInjectApplyRoundTrip:
         # Inject several distinct off-tree raises and verify each one
         # round-trips cleanly from a fresh env.  Catches edge cases
         # where one fraction works but a neighboring one corrupts state.
-        for action in ("raise:1.1", "raise:1.3", "raise:1.7", "raise:9.9"):
+        for action in _off_tree_actions(_env()):
             env = _env()
             env.inject_action(action)
             assert action in env.legal_actions, action

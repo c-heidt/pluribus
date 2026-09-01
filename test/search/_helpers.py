@@ -53,6 +53,7 @@ def _stub_lut(env: PokerEnv) -> None:
 import functools
 import os
 from pathlib import Path
+from test.abstraction_helpers import passive_action
 
 
 @functools.lru_cache(maxsize=1)
@@ -74,6 +75,23 @@ def _real_lut():
     return joblib.load(str(path))
 
 
+# Default heads-up stacks for the small-deck helpers, in chips against the
+# env's 50/100 blinds.  The abstraction has no pre-flop limp, so a stack must
+# at least cover the ~2.6 bb open on top of the blind or every hand would end
+# pre-flop as a fold-or-shove and no test would ever see a post-flop street.
+# 10 bb clears that with room for post-flop betting while keeping the subgame
+# trees (and so these tests) small.
+_HU_STACKS = (1000, 1000)
+
+# For fixtures whose test ENUMERATES the subgame exhaustively (the equilibrium
+# oracle's best-response walks).  Their cost grows steeply with depth — every
+# extra chip that lets one more raise size fit multiplies the tree — so these
+# take the shallowest stack that still clears the pre-flop open: 4 bb.  Measured
+# on the current grid this yields 8 turn / 12 flop betting nodes, exactly what
+# the pre-abstraction fixtures had, so the oracle tests keep their old cost.
+_HU_STACKS_SHALLOW = (400, 400)
+
+
 def _real_lut_env(target_round: int, stacks=(10000, 10000), seed=0) -> PokerEnv:
     """Heads-up 20-card env at ``target_round`` under the REAL LUT.
 
@@ -85,9 +103,8 @@ def _real_lut_env(target_round: int, stacks=(10000, 10000), seed=0) -> PokerEnv:
     np.random.seed(seed)
     env = new_game(2, card_info_lut=_real_lut(), initial_chips=stacks[0])
     guard = 0
-    while env.betting_round < target_round and not env.is_terminal and guard < 60:
-        legal = [a for a in env.legal_actions if a is not None]
-        env.step_in_place("call" if "call" in legal else legal[0])
+    while not env.is_terminal and env.betting_round < target_round and guard < 60:
+        env.step_in_place(passive_action(env))
         guard += 1
     assert env.betting_round == target_round, (
         f"could not reach round {target_round} (got {env.betting_round})"
@@ -95,7 +112,7 @@ def _real_lut_env(target_round: int, stacks=(10000, 10000), seed=0) -> PokerEnv:
     return env
 
 
-def _flop_env(low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
+def _flop_env(low=11, high=14, stacks=_HU_STACKS, seed=0) -> PokerEnv:
     """Heads-up env advanced to the flop over a small deck (exact runouts)."""
     np.random.seed(seed)
     env = PokerEnv(
@@ -105,13 +122,13 @@ def _flop_env(low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
     )
     _stub_lut(env)
     guard = 0
-    while env.betting_round < 1 and not env.is_terminal and guard < 20:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+    while not env.is_terminal and env.betting_round < 1 and guard < 20:
+        env.step_in_place(passive_action(env))
         guard += 1
     return env
 
 
-def _preflop_env(low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
+def _preflop_env(low=11, high=14, stacks=_HU_STACKS, seed=0) -> PokerEnv:
     """Heads-up small-deck env at the preflop root (``street_at_root == 0``)."""
     np.random.seed(seed)
     env = PokerEnv(
@@ -126,13 +143,13 @@ def _preflop_env(low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
 def _advance_to(env: PokerEnv, target_round: int) -> PokerEnv:
     """Walk a heads-up env (calls/checks only) to ``target_round``."""
     guard = 0
-    while env.betting_round < target_round and not env.is_terminal and guard < 60:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+    while not env.is_terminal and env.betting_round < target_round and guard < 60:
+        env.step_in_place(passive_action(env))
         guard += 1
     return env
 
 
-def _late_env(target_round, low=11, high=14, stacks=(200, 200), seed=0) -> PokerEnv:
+def _late_env(target_round, low=11, high=14, stacks=_HU_STACKS, seed=0) -> PokerEnv:
     """Heads-up small-deck env advanced to ``target_round`` (2=turn, 3=river)."""
     np.random.seed(seed)
     env = PokerEnv(

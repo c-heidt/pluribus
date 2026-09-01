@@ -272,6 +272,12 @@ def apply_warm_start_to_tables(
     src_cp = _latest_checkpoint(warm_start_path)
     state_dict = joblib.load(src_cp / "server_state.pkl")
     _validate_n_players(state_dict, expected_n_players)
+    # Same structural gate the multi-process path applies (and for the same
+    # reason): a blueprint written under a different action abstraction has
+    # differently-coded keys AND differently-shaped rows.  Without this the
+    # restore reaches numpy and dies as an opaque "could not broadcast input
+    # array from shape (n,6) into shape (n,8)" instead of naming the cause.
+    _validate_info_set_encoding(state_dict)
 
     ncs = _extract_n_chunks(state_dict)
     tables.restore_chunks(src_cp, ncs)

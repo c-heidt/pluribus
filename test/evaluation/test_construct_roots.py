@@ -35,7 +35,10 @@ def _session(n_players, *, run_seed=7):
     cfg = EvalConfig(
         run_id="t", run_seed=run_seed, table_policy="all_blueprint", fixed_seats=None,
         n_players=n_players, time_budget_hours=0.0, big_blind=100, small_blind=50,
-        starting_stack=600, low_card_rank=11, high_card_rank=14,
+        # 60 bb.  The abstraction has no pre-flop limp, so a stack that cannot
+        # cover the ~2.6 bb open leaves fold-or-shove as the only pre-flop
+        # lines and the deeper cells (river, 3 live) become unreachable.
+        starting_stack=6000, low_card_rank=11, high_card_rank=14,
     )
     session = EvalSession(config=cfg, solver_cfg=scfg,
                           blueprint_policy=_Uniform(), card_info_lut=lut)

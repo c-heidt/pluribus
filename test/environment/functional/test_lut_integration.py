@@ -17,6 +17,7 @@ import copy
 import pytest
 
 from environment.poker_env import new_game
+from test.abstraction_helpers import passive_action
 from environment.utils import card_rank_int
 
 
@@ -95,7 +96,7 @@ class TestInfoSetWithLUT:
         # Player 0 info set
         info_0 = env.info_set
         # Advance to player 1's turn
-        env2 = copy.deepcopy(env); env2.step_in_place("call")
+        env2 = copy.deepcopy(env); env2.step_in_place(passive_action(env2))
         if not env2.is_terminal:
             info_1 = env2.info_set
             # Different players hold different hole cards so info sets differ
@@ -105,7 +106,7 @@ class TestInfoSetWithLUT:
         env = new_game(n_players=2, card_info_lut=lut)
         # Play through pre-flop
         while env.betting_stage == "pre_flop":
-            env.step_in_place("call")
+            env.step_in_place(passive_action(env))
         if env.betting_stage == "flop":
             cluster, _ = env.info_set_fields()
             assert isinstance(cluster, int)
@@ -127,7 +128,7 @@ class TestInfoSetWithLUT:
             assert isinstance(env.info_set, bytes) and len(env.info_set) > 0
             cluster, _ = env.info_set_fields()
             assert isinstance(cluster, int)
-            env.step_in_place("call")
+            env.step_in_place(passive_action(env))
             steps += 1
         # Must have passed through at least pre_flop and flop
         assert "pre_flop" in visited_stages

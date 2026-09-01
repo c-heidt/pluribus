@@ -57,7 +57,8 @@ from information_abstraction.lookup import MemmapLookup
 # ---------------------------------------------------------------------------
 DEF MAX_PLAYERS = 32
 DEF MAX_STAGE_ACTIONS = 2048   # history entries per betting round (skips + actions)
-DEF MAX_FRACS = 8              # raise fractions per stage in the grid
+DEF MAX_FRACS = 8              # raise fractions per (stage, raise level) cell
+DEF MAX_LEVELS = 8             # raise levels per stage in the grid
 DEF N_DECISION_STAGES = 4      # pre_flop, flop, turn, river (rounds 0..3)
 
 # Internal stage enumeration (canonical play order), mirroring the PokerEnv
@@ -84,25 +85,39 @@ cdef int _MAX_RAISES = 0
 cdef int _STAGE_BYTE[N_DECISION_STAGES]      # internal stage idx -> _STAGE_ID byte
 cdef object _ACTION_CODE = None              # list[4] of {token_str: int code}
 cdef object _CODE_ACTION = None              # list[4] of {int code: token_str} (public_key)
-cdef int _FIRST_N[N_DECISION_STAGES]
-cdef int _SUB_N[N_DECISION_STAGES]
-cdef double _FIRST_FRAC[N_DECISION_STAGES][MAX_FRACS]
-cdef double _SUB_FRAC[N_DECISION_STAGES][MAX_FRACS]
-cdef object _FIRST_STR = None                # list[4] of list[str] "raise:<f>"
-cdef object _SUB_STR = None
+cdef int _N_LEVELS[N_DECISION_STAGES]        # configured raise levels per stage
+cdef int _LEVEL_N[N_DECISION_STAGES][MAX_LEVELS]
+cdef double _LEVEL_FRAC[N_DECISION_STAGES][MAX_LEVELS][MAX_FRACS]
+cdef bint _ALLOW_CALL[N_DECISION_STAGES][MAX_LEVELS]
+cdef bint _ALLOW_ALL_IN[N_DECISION_STAGES][MAX_LEVELS]
+cdef object _LEVEL_STR = None                # list[4] of list[level] of "raise:<f>"
 
 _STAGE_NAMES = ("pre_flop", "flop", "turn", "river")
 
 
-def configure(stage_id, action_byte, raise_sizes_by_stage, max_raises):
-    """Install the encoding alphabet + raise grid dumped from ``poker_env``.
+cdef inline int _level_index(int st, int n_raises):
+    """Raise-level index for ``n_raises`` at stage ``st`` (last level repeats).
+
+    The C twin of ``poker_env.raise_level``.
+    """
+    if _N_LEVELS[st] <= 0:
+        return 0
+    if n_raises >= _N_LEVELS[st]:
+        return _N_LEVELS[st] - 1
+    return n_raises
+
+
+def configure(stage_id, action_byte, raise_sizes_by_stage, max_raises,
+              call_allowed_by_stage, all_in_allowed_by_stage):
+    """Install the encoding alphabet + action abstraction dumped from ``poker_env``.
 
     Call once at wire time with the live ``_STAGE_ID`` / ``_ACTION_BYTE`` /
-    ``RAISE_SIZES_BY_STAGE`` / ``MAX_RAISES_PER_ROUND`` — never a hard-coded copy
-    (they derive from the raise grid and would silently drift otherwise).
+    ``RAISE_SIZES_BY_STAGE`` / ``MAX_RAISES_PER_ROUND`` /
+    ``CALL_ALLOWED_BY_STAGE`` / ``ALL_IN_ALLOWED_BY_STAGE`` — never a hard-coded
+    copy (they derive from the raise grid and would silently drift otherwise).
     """
-    global _configured, _MAX_RAISES, _ACTION_CODE, _CODE_ACTION, _FIRST_STR, _SUB_STR
-    cdef int si, k
+    global _configured, _MAX_RAISES, _ACTION_CODE, _CODE_ACTION, _LEVEL_STR
+    cdef int si, li, k
     cdef double f
     _MAX_RAISES = int(max_raises)
     _ACTION_CODE = [dict(action_byte[name]) for name in _STAGE_NAMES]
@@ -112,27 +127,35 @@ def configure(stage_id, action_byte, raise_sizes_by_stage, max_raises):
     _CODE_ACTION = [
         {code: token for token, code in (<dict>tbl).items()} for tbl in _ACTION_CODE
     ]
-    _FIRST_STR = [[] for _ in range(N_DECISION_STAGES)]
-    _SUB_STR = [[] for _ in range(N_DECISION_STAGES)]
+    _LEVEL_STR = [[] for _ in range(N_DECISION_STAGES)]
     for si in range(N_DECISION_STAGES):
         name = _STAGE_NAMES[si]
         _STAGE_BYTE[si] = int(stage_id[name])
-        cfg = raise_sizes_by_stage.get(name, {})
-        first = list(cfg.get("first_raise", [1.0]))
-        sub = list(cfg.get("subsequent_raise", [1.0]))
-        if len(first) > MAX_FRACS or len(sub) > MAX_FRACS:
-            raise RuntimeError("raise grid exceeds MAX_FRACS — raise the bound")
-        _FIRST_N[si] = len(first)
-        _SUB_N[si] = len(sub)
-        for k in range(len(first)):
-            f = float(first[k])
-            _FIRST_FRAC[si][k] = f
-            # f"raise:{f}" — the identical formatting poker_env / FastStateRef use.
-            (<list>_FIRST_STR[si]).append("raise:{}".format(f))
-        for k in range(len(sub)):
-            f = float(sub[k])
-            _SUB_FRAC[si][k] = f
-            (<list>_SUB_STR[si]).append("raise:{}".format(f))
+        levels = [list(cell) for cell in raise_sizes_by_stage.get(name, [])] or [[1.0]]
+        calls = list(call_allowed_by_stage.get(name, [])) or [True] * len(levels)
+        shoves = list(all_in_allowed_by_stage.get(name, [])) or [True] * len(levels)
+        if len(levels) > MAX_LEVELS:
+            raise RuntimeError("raise grid exceeds MAX_LEVELS — raise the bound")
+        if len(calls) != len(levels) or len(shoves) != len(levels):
+            raise RuntimeError(
+                "action abstraction tables disagree on the level count for "
+                "{!r}".format(name)
+            )
+        _N_LEVELS[si] = len(levels)
+        for li in range(len(levels)):
+            cell = levels[li]
+            if len(cell) > MAX_FRACS:
+                raise RuntimeError("raise grid exceeds MAX_FRACS — raise the bound")
+            _LEVEL_N[si][li] = len(cell)
+            _ALLOW_CALL[si][li] = 1 if calls[li] else 0
+            _ALLOW_ALL_IN[si][li] = 1 if shoves[li] else 0
+            strs = []
+            for k in range(len(cell)):
+                f = float(cell[k])
+                _LEVEL_FRAC[si][li][k] = f
+                # f"raise:{f}" — the identical formatting poker_env / FastStateRef use.
+                strs.append("raise:{}".format(f))
+            (<list>_LEVEL_STR[si]).append(strs)
     _configured = True
 
 
@@ -639,14 +662,24 @@ cdef class FastState:
         cdef long biggest_bet = self._biggest_bet()
         cdef long n_chips_to_call = biggest_bet - self.n_bet_chips[seat]
         cdef long chips_available = self.n_chips[seat]
+        cdef int st = self.betting_stage
+        cdef int li
         actions = ["fold"]
         if n_chips_to_call >= chips_available:
             if chips_available > 0:
                 actions.append("all_in")
         else:
-            actions.append("call")
+            li = _level_index(st, self.n_raises) if st < N_DECISION_STAGES else 0
+            # A free check is never gated (mirrors PokerEnv).
+            if (st >= N_DECISION_STAGES or n_chips_to_call == 0
+                    or _ALLOW_CALL[st][li]):
+                actions.append("call")
             if self.n_raises < _MAX_RAISES and self._n_players_with_moves() >= 2:
                 actions += self._get_available_raise_sizes()
+            if len(actions) == 1:
+                # Only "fold" left — the level drops the passive actions and no
+                # raise fits.  Mirrors PokerEnv._compute_legal_actions.
+                actions.append("all_in")
         return actions
 
     cdef long _compute_raise_chip_amount(self, double pot_fraction, bint enforce_minimum):
@@ -677,18 +710,12 @@ cdef class FastState:
         cdef int n_added = 0
         cdef int j
         cdef bint dup
+        cdef int li = _level_index(st, self.n_raises)
         raise_actions = []
-        if self.n_raises == 0:
-            n = _FIRST_N[st]
-            frac_strs = <list>_FIRST_STR[st]
-        else:
-            n = _SUB_N[st]
-            frac_strs = <list>_SUB_STR[st]
+        n = _LEVEL_N[st][li]
+        frac_strs = <list>(<list>_LEVEL_STR[st])[li]
         for k in range(n):
-            if self.n_raises == 0:
-                frac = _FIRST_FRAC[st][k]
-            else:
-                frac = _SUB_FRAC[st][k]
+            frac = _LEVEL_FRAC[st][li][k]
             chips_raw = self._compute_raise_chip_amount(frac, False)
             actual_raise = chips_raw - n_chips_to_call
             if actual_raise < self.last_raise_amount:
@@ -706,7 +733,7 @@ cdef class FastState:
             added[n_added] = chips
             n_added += 1
             raise_actions.append(frac_strs[k])
-        if chips_available > 0 and chips_available >= n_chips_to_call:
+        if _ALLOW_ALL_IN[st][li] and chips_available > 0 and chips_available >= n_chips_to_call:
             dup = False
             for j in range(n_added):
                 if added[j] == chips_available:

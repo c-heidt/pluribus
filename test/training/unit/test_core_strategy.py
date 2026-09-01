@@ -42,6 +42,8 @@ from environment.poker_env import (
     _ACTION_BYTE,
     _STAGE_ID,
     new_game,
+    ALL_IN_ALLOWED_BY_STAGE,
+    CALL_ALLOWED_BY_STAGE,
 )
 from poker_ai.blueprint.cfr import merge_local_strategy_delta
 from poker_ai.tables.cfr_tables import CFRTables
@@ -55,7 +57,10 @@ from test.training.core_diff import (
 )
 
 # Dump the encoding alphabet + raise grid into the compiled state engine once.
-cy.configure(_STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND)
+cy.configure(
+    _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
+    CALL_ALLOWED_BY_STAGE, ALL_IN_ALLOWED_BY_STAGE,
+)
 
 N_PLAYERS = 2
 _CAPS = {r: 1 << 16 for r in range(4)}

@@ -19,6 +19,7 @@ from environment.poker_env import PokerEnv, PolicyState
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.leaf import LeafConfig, board_rng_for, continuation_value
 from poker_ai.search.policy import BiasClass, Policy
+from test.abstraction_helpers import passive_action
 
 
 def _full_deck_env(n_players: int = 2) -> PokerEnv:
@@ -32,7 +33,7 @@ def _stub_lut(env: PokerEnv) -> None:
 def _to_flop(env: PokerEnv) -> None:
     """Calldown pre-flop so a 3-card board is dealt."""
     while env.betting_round < 1 and not env.is_terminal:
-        env.step_in_place("call" if "call" in env.legal_actions else "check")
+        env.step_in_place(passive_action(env))
 
 
 class UniformPolicy(Policy):

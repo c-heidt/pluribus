@@ -97,6 +97,8 @@ class CoreDriver:
             RAISE_SIZES_BY_STAGE,
             _ACTION_BYTE,
             _STAGE_ID,
+            ALL_IN_ALLOWED_BY_STAGE,
+            CALL_ALLOWED_BY_STAGE,
         )
         from poker_ai._core import _state as _cy_state
         from poker_ai._core import _traverse as _cy_traverse
@@ -115,7 +117,8 @@ class CoreDriver:
         # grid and would silently drift.  Idempotent across processes.
         if not _cy_state.is_configured():
             _cy_state.configure(
-                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND
+                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
+                CALL_ALLOWED_BY_STAGE, ALL_IN_ALLOWED_BY_STAGE
             )
 
         self._FastState = _cy_state.FastState
