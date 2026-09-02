@@ -64,11 +64,31 @@ import numpy as np
 # (one bias everywhere) would make d_C identical in every class and the per-class
 # machinery pointless, which is exactly what this table avoids.
 # --------------------------------------------------------------------------- #
+# Each entry is ``(bias_class, kernel_centre, kernel_width)`` in EQUITY units.  The bias
+# is applied with an effective multiplier ``1 + (m-1)*w(e)`` where ``w`` is a Gaussian in
+# the hand's expected equity --- so the leak fades smoothly toward air and toward the nuts
+# instead of switching off at a threshold.  That is what makes a type a *coherent player*
+# rather than a uniform shift: a calling station calls too wide with MARGINAL hands, it
+# does not also call more with the nuts (which the old flat bias did, incoherently).
+#
+# ⚠The leak conditions FINER than the belief.  The belief classes stay (street,
+# facing-a-bet) --- the HUD partition the model can actually track --- while the leak also
+# conditions on hand strength.  So the opponent is heterogeneous WITHIN a belief class and
+# the type mixture can never reproduce sigma exactly, even at q=1: an irreducible model
+# error floor, which is what real models have.
+_MARGINAL = (0.50, 0.12)   # centre, width: genuinely marginal holdings
+_STRONG = (0.75, 0.12)     # hands worth slowplaying then jamming
 PROFILES = {
     "blueprint":   {},
-    "station":     {("flop", 1): "call", ("turn", 1): "call", ("river", 1): "call"},
-    "fit_or_fold": {("flop", 1): "call", ("turn", 1): "fold", ("river", 1): "fold"},
-    "trap":        {("flop", 1): "call", ("turn", 0): "raise", ("river", 0): "raise"},
+    "station":     {("flop", 1): ("call", *_MARGINAL),
+                    ("turn", 1): ("call", *_MARGINAL),
+                    ("river", 1): ("call", *_MARGINAL)},
+    "fit_or_fold": {("flop", 1): ("call", *_MARGINAL),
+                    ("turn", 1): ("fold", *_MARGINAL),
+                    ("river", 1): ("fold", *_MARGINAL)},
+    "trap":        {("flop", 1): ("call", *_MARGINAL),
+                    ("turn", 0): ("raise", *_STRONG),
+                    ("river", 0): ("raise", *_STRONG)},
 }
 
 _STREETS = ("pre_flop", "flop", "turn", "river")
@@ -82,9 +102,50 @@ def _class_of(env) -> tuple:
     return (stage, raise_level(stage, env.n_raises_this_round))
 
 
-def _bias_for(profile: dict, cls: tuple) -> str:
-    """The bias class ``profile`` applies at ``cls`` (``"none"`` where it is unbiased)."""
-    return profile.get(cls, "none")
+def _entry(profile: dict, cls: tuple) -> tuple:
+    """``(bias, centre, width)`` for ``cls`` — ``("none", ...)`` where unbiased."""
+    return profile.get(cls, ("none", 0.0, 1.0))
+
+
+def cluster_strength(lut_path) -> dict:
+    """Per-cluster **expected equity** in [0, 1], per post-flop street.
+
+    KMeans labels are arbitrary — sklearn does not order them by centroid — so a cluster
+    id carries no strength information and any ``cluster // m`` banding would be
+    meaningless.  The centroids do carry it: each is a normalised EHS *histogram*, so its
+    mean under the bin centres is that cluster's expected equity.  That recovers the
+    strength axis the leak needs without touching the LUT build.
+    """
+    import joblib
+
+    cents = joblib.load(Path(lut_path) / "centroids.joblib")
+    out = {}
+    for street, arr in cents.items():
+        a = np.asarray(arr, dtype=np.float64)
+        out[street] = a @ ((np.arange(a.shape[1]) + 0.5) / a.shape[1])
+    return out
+
+
+def _cluster_of(env):
+    """The acting player's cluster id, or ``None`` (pre-flop / terminal / no LUT entry)."""
+    stage = env.betting_stage
+    if stage in ("pre_flop", "terminal", "show_down"):
+        return None
+    try:
+        key = tuple(sorted(env.current_player.cards) + sorted(env.community_cards))
+        return int(env.card_info_lut[stage][key])
+    except Exception:
+        return None
+
+
+def _kernel_weight(strength: dict, street: str, cluster, centre: float,
+                   width: float) -> float:
+    """Gaussian kernel in expected equity: 1.0 at the centre, tapering both ways."""
+    tbl = strength.get(street)
+    if tbl is None or cluster is None or not (0 <= cluster < len(tbl)):
+        return 0.0
+    z = (float(tbl[cluster]) - centre) / max(width, 1e-9)
+    return float(np.exp(-0.5 * z * z))
 
 
 def _kl(p: np.ndarray, q: np.ndarray, floor: float = 1e-12) -> float:
@@ -137,14 +198,32 @@ def main() -> None:
     tables = CFRTables(index_path=index_root, actions_per_street=MAX_ACTIONS_PER_STREET)
     apply_warm_start_to_tables(tables, args.blueprint_path, args.n_players)
     mults = [float(x) for x in str(args.bias_multiplier).split(",") if x.strip()]
-    policies = {m: BlueprintPolicy(tables, bias_multiplier=m) for m in mults}
-    walker = policies[mults[0]]   # bias "none" ignores the multiplier — any will do
+    strength = cluster_strength(args.lut_path)
+    for st in sorted(strength):
+        e = strength[st]
+        print("equity per cluster — %-5s n=%d  min=%.3f  median=%.3f  max=%.3f"
+              % (st, len(e), e.min(), np.median(e), e.max()))
+    # The kernel makes the effective multiplier continuous, so cache one policy per
+    # distinct value (a BlueprintPolicy is a thin wrapper over the shared tables).  Going
+    # through the real policy keeps the production bias path exact: applying the reweight
+    # to the already-legal-filtered row would renormalise in the wrong order.
+    pol_cache: dict = {}
+
+    def policy_at(mult: float):
+        key = round(float(mult), 4)
+        p = pol_cache.get(key)
+        if p is None:
+            p = pol_cache[key] = BlueprintPolicy(tables, bias_multiplier=key)
+        return p
+
+    walker = policy_at(1.0)   # bias "none" ignores the multiplier
 
     names = list(PROFILES)
     pairs = list(itertools.combinations(names, 2))
     # multiplier -> class -> pair -> list of symmetric KLs; class -> node count.
     kls: dict = {m: defaultdict(lambda: defaultdict(list)) for m in mults}
     n_nodes: dict = defaultdict(int)
+    touch: dict = defaultdict(list)   # per class: how much of it the kernel reaches
 
     for hand in range(args.hands):
         np.random.seed(args.seed * 1_000_003 + hand)
@@ -165,13 +244,30 @@ def main() -> None:
             cls = _class_of(env)
             n_nodes[cls] += 1
 
-            # One policy row per (multiplier, type) at this node, then every pairwise
-            # divergence.  All multipliers share this node because the walk below does not
-            # depend on them.
+            # The kernel weight depends only on the acting hand's equity, so resolve it
+            # once per type here and reuse across multipliers.
+            cl = _cluster_of(env)
+            base = np.asarray(walker.strategy(ps, "none"), dtype=np.float64)
+            spec = {}
+            for t in names:
+                bias, centre, width = _entry(PROFILES[t], cls)
+                w = (0.0 if bias == "none"
+                     else _kernel_weight(strength, env.betting_stage, cl, centre, width))
+                spec[t] = (bias, w)
+            touch[cls].append(max((w for _, w in spec.values()), default=0.0))
+
+            # One policy row per (multiplier, type), then every pairwise divergence.  All
+            # multipliers share this node because the walk below does not depend on them.
             for m in mults:
-                rows_m = {t: np.asarray(
-                    policies[m].strategy(ps, _bias_for(PROFILES[t], cls)),
-                    dtype=np.float64) for t in names}
+                rows_m = {}
+                for t in names:
+                    bias, w = spec[t]
+                    if bias == "none" or w <= 0.0:
+                        rows_m[t] = base      # m_eff == 1 ⇒ the reweight is a no-op
+                    else:
+                        rows_m[t] = np.asarray(
+                            policy_at(1.0 + (m - 1.0) * w).strategy(ps, bias),
+                            dtype=np.float64)
                 for a, b in pairs:
                     ra, rb = rows_m[a], rows_m[b]
                     if ra.shape != rb.shape or ra.size == 0:
@@ -182,8 +278,7 @@ def main() -> None:
 
             # Advance under the UNBIASED blueprint: reach(C) is then a property of
             # baseline play, the common reference every type is measured against.
-            probs = np.clip(np.asarray(walker.strategy(ps, "none"), dtype=np.float64),
-                            0.0, None)
+            probs = np.clip(base, 0.0, None)
             c = np.cumsum(probs)
             idx = (int(np.searchsorted(c, rng.random_sample() * c[-1]))
                    if c[-1] > 0 else int(rng.randint(len(legal))))
@@ -199,14 +294,15 @@ def main() -> None:
     for m in mults:
         print("\nd_C — symmetric KL between type policies, per strategic class")
         print("bias_multiplier=%.2f  hands=%d  nodes=%d\n" % (m, args.hands, total))
-        head = "%-16s %7s %7s  " % ("class", "nodes", "reach")
+        head = "%-16s %7s %7s %7s  " % ("class", "nodes", "reach", "kernel")
         head += "  ".join("%-22s" % ("%s|%s" % (a[:9], b[:9])) for a, b in pairs)
         print(head)
         print("-" * len(head))
         per_class = {}
         for cls in order:
             n = n_nodes[cls]
-            row = "%-16s %7d %6.1f%%  " % ("%s L%d" % cls, n, 100.0 * n / total)
+            tw = float(np.mean(touch[cls])) if touch[cls] else 0.0
+            row = "%-16s %7d %6.1f%% %7.3f  " % ("%s L%d" % cls, n, 100.0 * n / total, tw)
             cell = {}
             for a, b in pairs:
                 v = kls[m][cls].get((a, b), [])
@@ -214,9 +310,15 @@ def main() -> None:
                 cell["%s|%s" % (a, b)] = mean
                 row += "%-22.4f" % mean
             print(row)
-            per_class["%s L%d" % cls] = {"nodes": n, "reach": n / total, "d_C": cell}
+            per_class["%s L%d" % cls] = {"nodes": n, "reach": n / total,
+                                         "kernel_touch": tw, "d_C": cell}
         result["by_multiplier"]["%g" % m] = per_class
 
+    print("\n'kernel' = mean weight the strength kernel gives nodes in that class:"
+          "\nhow much of the class the leak actually reaches (1.0 = all of it, 0.0 = none)."
+          "\nA low value with a nonzero d_C is the intended shape — a leak confined to the"
+          "\nhands it should apply to.  Near 0 everywhere means the kernel misses the"
+          "\nreachable strength range: check the equity spread printed above.")
     print("\nReading it: 0.0 = the two profiles are the SAME object in that class"
           "\n(nothing to learn, nothing to exploit).  What you want is a MIXED picture —"
           "\nzero where the profiles agree, clearly nonzero where they disagree."
