@@ -727,6 +727,17 @@ opponent model enters solely through the tracked beliefs ($\hat p$), so Part II
 consumes exactly one Part I component — the belief-likelihood swap (§6.3) — and
 none of the confidence/mixture machinery.
 
+That split is enforced, not just documented: an `OX(k_beta=B,error=E)` arm builds the
+same `SyntheticOpponentModel` a DBR arm does — **always**, `E = 0` included, where it is
+the exact model of the seat — but attaches it under
+`model_scope='belief_only'`, so `SearchAgent` hands it to the belief likelihood and
+**withholds it from the solve** (`ctx.models` stays empty — which the gadget requires
+anyway, `vector._ox_setup`). Hence OX honours `error`/`seed`, which shape $\hat\sigma$
+itself, and *rejects* `p_max`/`confidence` on its label rather than quietly adopting
+DBR's clamp. This is what makes the model-error sweep comparable across approaches:
+both arms consume the same injected model quality, DBR through the clamp, OX through
+the reach. See [evaluation.md](evaluation.md) §10.1 "Arm labels".
+
 ### 11.1 Components
 
 - **Settlement correctness** *(landed)*: `PokerEnv.vector_payout` /

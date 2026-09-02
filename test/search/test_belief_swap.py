@@ -21,6 +21,7 @@ import hashlib
 import numpy as np
 import pytest
 
+import poker_ai.search.agent as agent_mod
 from poker_ai.search.agent import SearchAgent
 
 from test.search._helpers import _policies, _real_lut_env
@@ -44,13 +45,14 @@ class _RecordingModel:
         return self._c
 
 
-def _agent(models=None, seed=0):
+def _agent(models=None, seed=0, model_scope="full"):
     return SearchAgent(
         leaf_policies=_policies(),
         blueprint_policy=_policies()["none"],
         solver_cfg=_cfg(auto_budget=False, max_iterations=4, max_wall_seconds=1e9),
         rng=np.random.default_rng(seed),
         models=models,
+        model_scope=model_scope,
     )
 
 
@@ -249,3 +251,59 @@ def test_dedup_actually_collapses_queries():
     )
     n_clusters = len(set(int(clusters[h]) for h in feasible.tolist()))
     assert calls["n"] == n_clusters < feasible.size
+
+
+# --------------------------------------------------------------------------- #
+# 5. model_scope — how far a model reaches (OX-Search is BELIEF-ONLY)
+# --------------------------------------------------------------------------- #
+
+def _captured_ctx(monkeypatch, ag, env):
+    """``ag``'s ``SubgameContext`` for one solve, with the solve itself stubbed out."""
+    seen = {}
+
+    def _fake_solve(root_env, ctx, cfg):
+        seen["ctx"] = ctx
+        return None
+
+    monkeypatch.setattr(agent_mod, "solve", _fake_solve)
+    ag._solve_and_store(env)
+    return seen["ctx"]
+
+
+@pytest.mark.requires_lut
+def test_belief_only_scope_withholds_the_models_from_the_solve(monkeypatch):
+    """OX-Search reach-only: the model shapes beliefs, and never reaches ``ctx.models``.
+
+    The gadget solve REFUSES a non-empty ``ctx.models`` (``vector._ox_setup``) and OX
+    consumes none of DBR's clamp machinery, so an OX arm with an error-injected model
+    must hand that model to the belief likelihood alone.  Were the scope ignored, an
+    ``OX(error=…)`` arm would either crash in the solver or quietly run as DBR.
+    """
+    env = _real_lut_env(0)
+    model = _RecordingModel()
+    ag = _agent(models={1: model}, model_scope="belief_only")
+    ag.on_hand_start(env, my_seat=0)
+
+    assert dict(_captured_ctx(monkeypatch, ag, env).models) == {}
+    # ...yet the belief likelihood for that seat still reads σ̂ (the whole point).
+    ag._make_sigma_for_combo(env, 1)(0)
+    assert model.seen, "belief-only model was never queried for the likelihood"
+
+
+@pytest.mark.requires_lut
+def test_full_scope_hands_the_same_models_to_the_solve(monkeypatch):
+    """DBR (the default scope): one frozen snapshot feeds BOTH belief and clamp (§6.3)."""
+    env = _real_lut_env(0)
+    model = _RecordingModel()
+    ag = _agent(models={1: model})
+    ag.on_hand_start(env, my_seat=0)
+
+    ctx = _captured_ctx(monkeypatch, ag, env)
+    assert dict(ctx.models) == {1: model}
+    assert ctx.models[1] is ag._models[1]
+
+
+def test_unknown_model_scope_is_rejected():
+    """A typo'd scope must fail loudly, not silently pick a behaviour."""
+    with pytest.raises(ValueError):
+        _agent(model_scope="beliefs")

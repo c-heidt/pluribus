@@ -65,8 +65,8 @@ def _cfg(leaf, *, beta=None, kbeta=None, iters=400, discount=10):
 #: ``C(15,2) = 105`` on this 20-card test deck.
 #:
 #: The paper specifies ``1/(kβ+1)`` directly: 1/16 (Leduc), 1/51 (Flop Hold'em).
-#: ``DEFAULT_OX_BETA = 0.05`` gives ``kβ ≈ 54`` on the production deck, i.e. the paper's
-#: FHP setting — so ``_KB_SAFE = 50`` sits at production's operating point and
+#: The eval's ``DEFAULT_OX_KBETA = 50`` is exactly the paper's FHP setting on any deck
+#: — so ``_KB_SAFE = 50`` sits at production's operating point and
 #: ``_KB_EXPLOIT = 1`` is well to the exploitative side of it.
 #:
 #: Raw β would NOT survive a deck change: at β=0.5/50 on this deck, kβ is 52.5/5250, i.e.
@@ -202,7 +202,7 @@ def _ctx_with_blueprint(env, ranges, blueprint, seed=7):
 # --------------------------------------------------------------------------- #
 # Gate: β = 0 is a plain best response to the belief p̂.
 # --------------------------------------------------------------------------- #
-def test_ox_beta_zero_matches_belief_best_response(_seeded):
+def test_ox_kbeta_zero_matches_belief_best_response(_seeded):
     """β = 0 ⇒ the gadget entry reach is exactly ``p̂`` (c_safe = 0), so the BOT's
     solved tables are byte-identical to a vanilla solve whose opponent range is ``p̂``.
 
@@ -431,7 +431,7 @@ def test_ox_safety_margin_bound(_seeded):
     vs uniform over ``k``): there is no intermediate strategy to interpolate toward.
 
     The mixture WIRING is covered without that assertion, at both ends:
-    :func:`test_ox_beta_zero_matches_belief_best_response` pins kβ→0 (byte-identical to a
+    :func:`test_ox_kbeta_zero_matches_belief_best_response` pins kβ→0 (byte-identical to a
     vanilla solve against ``p̂``) and :func:`test_ox_large_beta_ignores_belief` pins kβ→∞
     (belief-independent).  A swapped ``c_expl``/``c_safe``, or a bad β-from-kβ
     derivation, fails one of those immediately.  What a monotonicity assertion would add

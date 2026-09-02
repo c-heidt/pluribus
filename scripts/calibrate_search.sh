@@ -58,11 +58,11 @@ LUT_PATH=${LUT_PATH:-"$WORKSPACE/exact"}
 
 # Calibration parameters (see `python -m evaluation.calibrate run --help`).
 N_PLAYERS=${N_PLAYERS:-4}
-CONDITIONS=${CONDITIONS:-vanilla,DBR,OX}   # any of: vanilla | DBR | blueprint_only | OX | OX(beta=X).
+CONDITIONS=${CONDITIONS:-vanilla,DBR,OX}   # any of: vanilla | DBR | blueprint_only | OX | OX(k_beta=X).
                                            # OX arms are auto-split into their OWN calibrate run (gadget = a
                                            # different game tree, β must agree → cannot share a solver_cfg with
                                            # vanilla/DBR) and calibrate VECTOR cells only (OX's MCCFR path == vanilla).
-                                           # Bare "OX" uses the code-default β (runner.DEFAULT_OX_BETA).
+                                           # Bare "OX" uses the code-default kβ (runner.DEFAULT_OX_KBETA).
 # DBR model realism (opponent_modeling.md §3/§6.2).  A calibration on a PERFECT model
 # (error 0.0, p_max 1.0) is condition B1 — the exact-model, unconstrained "unsafe EV
 # ceiling", the sharpest/most-polarised exploitation and NOT what production runs.  We

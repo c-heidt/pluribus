@@ -60,6 +60,7 @@ class SearchAgent:
         round1_max_players: int = 4,
         offtree_threshold: float = 0.25,
         models: Optional[Mapping[int, "OpponentModel"]] = None,
+        model_scope: str = "full",
         search_enabled: bool = True,
     ) -> None:
         # --- session-static ---
@@ -91,6 +92,17 @@ class SearchAgent:
         # ``None``/empty ⇒ every model code path is inert and the agent is exactly
         # vanilla Pluribus (search, no opponent model — the baseline).
         self._models_source: Mapping[int, "OpponentModel"] = models or {}
+        # How far those models reach.  ``'full'`` (DBR) is both consumers: the belief
+        # likelihood AND the solve (``ctx.models`` ⇒ clamp, σ̂ leaf rollouts, VR
+        # baseline).  ``'belief_only'`` (OX-Search) is the belief likelihood ALONE —
+        # OX exploits **reach-only**, and its gadget solve refuses a non-empty
+        # ``ctx.models`` outright (``vector._ox_setup``), so the split is load-bearing,
+        # not cosmetic.
+        if model_scope not in ("full", "belief_only"):
+            raise ValueError(
+                f"model_scope must be 'full' or 'belief_only', got {model_scope!r}"
+            )
+        self._model_scope = model_scope
 
         # --- per-hand (initialised in on_hand_start) ---
         #: The hand-start model snapshot.  **The invariant of §6.3:** the belief
@@ -116,11 +128,13 @@ class SearchAgent:
 
     @property
     def has_models(self) -> bool:
-        """Whether this hand's frozen snapshot models any opponent (a DBR hand).
+        """Whether this hand's frozen snapshot models any opponent (a modeled hand).
 
         Read after :meth:`on_hand_start`.  The runner uses it to mark a hero
         decision as model-informed (``decisions.modeled_decision``) so the summary
-        can restrict the exploitation slice to decisions where the model applied.
+        can restrict the exploitation slice to decisions where the model applied —
+        through the clamp *and* the belief for DBR, through the belief alone under
+        ``model_scope='belief_only'`` (OX-Search).
         """
         return bool(self._models)
 
@@ -346,7 +360,10 @@ class SearchAgent:
             self._solve_rng,
             # The SAME hand-start snapshot the belief likelihood used (§6.3
             # invariant): infer the opponent's range under the strategy we clamp to.
-            models=self._models,
+            # Under ``belief_only`` (OX-Search) the solve gets NO models at all — the
+            # model has already done its whole job in the beliefs the ranges above
+            # carry, and the gadget requires an empty ``ctx.models``.
+            models=self._models if self._model_scope == "full" else None,
         )
         try:
             self.last_search = solve(root_env, self._ctx, self._cfg)
@@ -372,7 +389,10 @@ class SearchAgent:
         uses the model ``σ̂``, not the solver's mixture ``σ̃`` — beliefs estimate what
         the opponent actually does, while the mixture is only the solver's hedge, so
         this makes the bot infer a modeled opponent's range under the same strategy it
-        best-responds to.  Unmodeled seats keep the baseline path below.
+        best-responds to.  Unmodeled seats keep the baseline path below.  This swap is
+        also the ONLY place a ``model_scope='belief_only'`` (OX-Search) model is read:
+        there the solve carries no clamp, so the model's whole effect on play is the
+        range it shapes here.
         """
         model = self._models.get(int(seat)) if seat is not None else None
         if model is not None:

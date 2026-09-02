@@ -42,6 +42,20 @@
 #   → both arms share one db + run-seed (CRN-paired on deck_seed), each under its own
 #     run-id; a paired summary is printed at the end.
 #
+#   The MODEL-ERROR SWEEP this eval exists for — one baseline plus each approach at
+#   each model quality, all on the same deals:
+#
+#     export CONDITIONS='vanilla;DBR(confidence=0.8,error=0.2);DBR(confidence=0.8,error=0.3);OX(error=0.2);OX(error=0.3)'
+#     export MAX_HANDS=3000 N_PLAYERS=2 OX_KBETA=50
+#     sbatch --export=ALL,WORKSPACE=...,RUN_ID=error_sweep,BLUEPRINT_PATH=... scripts/evaluation.sh
+#
+#   ⚠ Export CONDITIONS into the ENVIRONMENT (as above) rather than inlining it in
+#     --export=...: sbatch splits its own --export list on commas, so a label's
+#     parameter list ('DBR(confidence=0.8,error=0.2)') would be torn apart before this
+#     script ever sees it.  `--export=ALL` forwards the exported value intact.
+#   → kβ and p_max come from OX_KBETA / MODEL_P_MAX below (held FIXED across the sweep);
+#     each label overrides only what it names, so `error` is the axis that varies.
+#
 #SBATCH --job-name=pluribus-eval
 #SBATCH --output=logs/evaluation-%j.out
 #SBATCH --error=logs/evaluation-%j_error.out
@@ -78,27 +92,49 @@ FIXED_SEATS=${FIXED_SEATS:-}                       # JSON array of n_players-1 o
                                                     # e.g. '["bp_fold","bp_call","bp_raise"]'
 TIME_BUDGET_HOURS=${TIME_BUDGET_HOURS:-71.5}
 
-# Experiment arms (docs/evaluation.md §10.1).  A comma-separated list runs each arm
-# in turn into the SAME node-local db, so the summary pairs them on deck_seed (CRN).
+# Experiment arms (docs/evaluation.md §10.1).  A ';'- or ','-separated list runs each
+# arm in turn into the SAME node-local db, so the summary pairs them on deck_seed (CRN).
 # Each arm gets its own per-arm run-id — the resume cursor is keyed per run_id, so a
 # shared id would make later arms skip every hand.  A single value = the classic
-# one-arm run.  Model-free arms: vanilla | blueprint_only | OX (or OX(beta=X)).  A
-# DBR arm (e.g. 'DBR(p_max=0.8)') additionally consumes the MODEL_* knobs below.
+# one-arm run.
+#
+# An arm is 'NAME' or 'NAME(key=value,...)':
+#   vanilla                        the baseline (search, NO model)
+#   blueprint_only                 no search — pipeline / blueprint-quality test
+#   OX  | OX(k_beta=B,error=E)     OX-Search, reach-only: the model shapes the tracked
+#                                  beliefs ONLY (so it takes error/seed, never p_max or
+#                                  confidence); k_beta defaults to OX_KBETA
+#   DBR | DBR(p_max=P,confidence=C,error=E)
+#                                  Data-Biased Response: model drives beliefs AND the
+#                                  solver clamp; unnamed knobs default to MODEL_* below
+# Whatever a label omits falls back to the run-wide defaults, which is what makes the
+# MODEL-ERROR SWEEP a plain list: hold k_beta / p_max / confidence fixed, vary `error`.
 #   e.g. CONDITIONS=vanilla,blueprint_only  — the search-vs-pure-blueprint sanity test.
+#   e.g. CONDITIONS='vanilla;DBR(error=0.2);DBR(error=0.3);OX(error=0.2);OX(error=0.3)'
+# ⚠ QUOTE the value when a label carries parameters — it contains commas, and the
+# splitter below only breaks on a ',' outside parentheses (or on ';').  And export it
+# into the environment rather than inlining it in sbatch's own comma-separated
+# --export list (see the header usage note).
 CONDITIONS=${CONDITIONS:-vanilla}
 # Paired fixed hand count (§10.1).  When set it is the SOLE stop criterion (every arm
 # covers hand_index 0..MAX_HANDS-1 → CRN-paired) and TIME_BUDGET_HOURS is ignored.
 # Leave empty for the time-budgeted sweep.  A vanilla/DBR/OX comparison REQUIRES it.
 MAX_HANDS=${MAX_HANDS:-}
-# DBR model knobs — consumed ONLY by a DBR(...) arm; model-free arms never receive
-# them (a DBR arm with MODEL_P_MAX unset aborts rather than silently running vanilla).
-MODEL_P_MAX=${MODEL_P_MAX:-}
-MODEL_ERROR=${MODEL_ERROR:-0.2}
-MODEL_CONFIDENCE=${MODEL_CONFIDENCE:-0.8}
-MODEL_SEED=${MODEL_SEED:-0}
+# Run-wide model defaults, passed to EVERY arm; each condition label overrides what it
+# names, and the runner decides what an arm actually consumes (vanilla / blueprint_only
+# consume none; OX takes MODEL_ERROR and MODEL_SEED only — it is reach-only, and never
+# reads a cap or a confidence).  These are the knobs held FIXED while `error` sweeps.
+MODEL_P_MAX=${MODEL_P_MAX:-1.0}          # DBR confidence CAP; 1.0 = inert, confidence rules
+MODEL_ERROR=${MODEL_ERROR:-0.0}          # default target ℓ1 model error (the sweep axis)
+MODEL_CONFIDENCE=${MODEL_CONFIDENCE:-0.8} # DBR mixture weight c (inert for OX)
+MODEL_SEED=${MODEL_SEED:-0}              # per-info-set perturbation seed (offset per seat)
+# Default OX-Search safety parameter kβ for an OX arm whose label gives none.  Empty =
+# the code default (DEFAULT_OX_KBETA = 50, the paper's FHP gadget mix; evaluation/runner.py).
+# kβ, not β: the solver derives β = kβ / k, so this carries across decks unchanged.
+OX_KBETA=${OX_KBETA:-}
 # Auto-run the paired CRN summary over the permanent snapshot once all arms finish.
 SUMMARIZE=${SUMMARIZE:-true}
-N_PLAYERS=${N_PLAYERS:-6}
+N_PLAYERS=${N_PLAYERS:-4}
 BIG_BLIND=${BIG_BLIND:-100}
 SMALL_BLIND=${SMALL_BLIND:-50}
 STARTING_STACK=${STARTING_STACK:-10000}
@@ -398,6 +434,8 @@ echo "Starting evaluation with:"
 echo "  - Run id (base):          $RUN_ID"
 echo "  - Conditions:             $CONDITIONS"
 echo "  - Max hands (paired):     ${MAX_HANDS:-(time-budgeted)}"
+echo "  - Model defaults:         p_max=$MODEL_P_MAX error=$MODEL_ERROR confidence=$MODEL_CONFIDENCE seed=$MODEL_SEED"
+echo "  - OX k_beta default:      ${OX_KBETA:-(runner default)}"
 echo "  - Run seed:               $RUN_SEED"
 echo "  - Table policy:           $TABLE_POLICY"
 echo "  - Time budget (hours):    $TIME_BUDGET_HOURS"
@@ -496,14 +534,49 @@ run_arm() {
   return "$code"
 }
 
-# One arm per condition (comma-separated CONDITIONS), into the shared db.
-IFS=',' read -ra COND_ARR <<< "$CONDITIONS"
+# Split CONDITIONS into arms on ';' or on a ',' at PAREN DEPTH 0, then trim each and
+# drop the empties.  A parameterised label carries its own commas
+# ('DBR(confidence=0.8,error=0.2)'), so the old `IFS=',' read -ra` would tear every
+# such arm in half and hand the runner fragments.  Empties are dropped HERE rather
+# than skipped in the loop, because a trailing separator would otherwise count as an
+# arm and flip MULTI — silently slugging the run-id of a one-arm run and breaking its
+# resume cursor.  Depth is compared `-le 0` so a stray ')' cannot swallow the rest of
+# the list; a stray '(' leaves one malformed label, which the runner rejects by name.
+split_conditions() {
+  local s=$1 cur="" depth=0 i ch
+  local -a raw=()
+  COND_ARR=()
+  for (( i = 0; i < ${#s}; i++ )); do
+    ch=${s:i:1}
+    case "$ch" in
+      '(') depth=$((depth + 1)); cur+="$ch" ;;
+      ')') depth=$((depth - 1)); cur+="$ch" ;;
+      ','|';')
+        if [ "$depth" -le 0 ]; then raw+=("$cur"); cur=""; else cur+="$ch"; fi ;;
+      *) cur+="$ch" ;;
+    esac
+  done
+  raw+=("$cur")
+  for cur in "${raw[@]}"; do
+    cur="${cur#"${cur%%[![:space:]]*}"}"      # ltrim
+    cur="${cur%"${cur##*[![:space:]]}"}"      # rtrim
+    [ -n "$cur" ] && COND_ARR+=("$cur")
+  done
+  # Explicit: a dropped LAST fragment (any trailing separator) leaves the `[ -n ]` test
+  # as the function's exit status, and `set -e` would abort the whole job on it.
+  return 0
+}
+
+# One arm per condition, into the shared db.
+split_conditions "$CONDITIONS"
+if [ "${#COND_ARR[@]}" -eq 0 ]; then
+  echo "ERROR: CONDITIONS is empty — no experiment arm to run." >&2
+  exit 1
+fi
 MULTI=0
 [ "${#COND_ARR[@]}" -gt 1 ] && MULTI=1
 EXIT_CODE=0
-for raw_cond in "${COND_ARR[@]}"; do
-  cond="$(echo "$raw_cond" | xargs)"        # trim surrounding whitespace
-  [ -z "$cond" ] && continue
+for cond in "${COND_ARR[@]}"; do
 
   # Per-arm run-id: base id + a filesystem-safe slug of the condition, so arms in one
   # db never share a run_id (which would make later arms resume-skip every hand).  A
@@ -514,18 +587,13 @@ for raw_cond in "${COND_ARR[@]}"; do
     arm_run_id="${RUN_ID}__${arm_slug}"
   fi
 
-  # A DBR arm consumes the model knobs; model-free arms must NOT receive them.
-  ARM_ARGS=()
-  case "$(echo "$cond" | tr '[:upper:]' '[:lower:]')" in
-    dbr*)
-      if [ -z "$MODEL_P_MAX" ]; then
-        echo "ERROR: condition '$cond' is a DBR arm but MODEL_P_MAX is unset." >&2
-        exit 1
-      fi
-      ARM_ARGS+=(--model-p-max "$MODEL_P_MAX" --model-error "$MODEL_ERROR" \
-                 --model-confidence "$MODEL_CONFIDENCE" --model-seed "$MODEL_SEED")
-      ;;
-  esac
+  # The model knobs are run-wide DEFAULTS, so every arm receives them: the runner's
+  # arm dispatch decides which ones the condition actually consumes (none for vanilla /
+  # blueprint_only, error+seed for OX, all four for DBR) and the label overrides any it
+  # names.  That is what keeps a whole error sweep in one CONDITIONS string.
+  ARM_ARGS=(--model-p-max "$MODEL_P_MAX" --model-error "$MODEL_ERROR" \
+            --model-confidence "$MODEL_CONFIDENCE" --model-seed "$MODEL_SEED")
+  [ -n "$OX_KBETA" ] && ARM_ARGS+=(--ox-k-beta "$OX_KBETA")
 
   echo "=== Arm: condition='$cond'  run-id='$arm_run_id' ==="
   run_arm "$cond" "$arm_run_id" "${ARM_ARGS[@]}"

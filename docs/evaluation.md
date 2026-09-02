@@ -180,9 +180,10 @@ and queried with `json_extract` / `->>` when needed).
 CREATE TABLE games (
     game_id            INTEGER PRIMARY KEY,
     run_id             TEXT    NOT NULL,   -- groups games of one experiment batch
-    condition          TEXT,               -- experiment arm: 'vanilla' (baseline: search, no
-                                           --   model) | 'DBR(p_max=...)' | 'blueprint_only' (no-search
-                                           --   test) — the cross-condition GROUP BY; NULL for single-arm (§10.1)
+    condition          TEXT,               -- experiment arm label: 'vanilla' (baseline: search, no
+                                           --   model) | 'DBR(confidence=..,error=..)' | 'OX(k_beta=..,error=..)'
+                                           --   | 'blueprint_only' (no-search test) — the cross-condition
+                                           --   GROUP BY; NULL for single-arm (§10.1 "Arm labels")
     hand_index         INTEGER NOT NULL,   -- 0-based position within the run; the resume cursor (§10.1)
     schema_version     INTEGER NOT NULL,   -- bump on schema change; lets analysis span runs
     config_fingerprint TEXT    NOT NULL,   -- hash(solver + leaf + table composition)
@@ -961,9 +962,10 @@ locks it:
   than a reducer of it. Gated by `test_aivat.py::TestCrnPairing`.
 - **Fixed `max_hands`, not a time budget** (see the loop note above), so every
   condition contains the same `hand_index` set to pair against. Each condition is
-  its own `run_id`; a `condition` label column on `games` (e.g. `vanilla|DBR|blueprint_only`,
-  with the `(p_max, τ)` cell for A) makes the paired join self-describing without a
-  run_id→method side table.
+  its own `run_id`; a `condition` label column on `games` (the full arm label —
+  `vanilla` / `DBR(confidence=0.8,error=0.2)` / `OX(k_beta=50,error=0.2)` /
+  `blueprint_only`, see "Arm labels" below) makes the paired join self-describing
+  without a run_id→method side table.
 - **What reproducibility actually guarantees.** Every hand's *inputs* are a pure
   function of `hand_index` (deal, seating, all five seed sub-streams), so results do
   not depend on worker count or execution order. Whether the *outputs* reproduce
@@ -988,6 +990,48 @@ locks it:
 `max_hands` (paired mode; mutually exclusive with `time_budget`), `condition`,
 `big_blind`, `starting_stack`, `n_players = 6`, `sync_interval`, scratch/permanent
 paths.
+
+**Arm labels (the model-error sweep).** The eval's question is *how good must the
+opponent model be* for each approach to gain ([opponent_modeling.md](opponent_modeling.md),
+design §6.2), so a run is a set of arms that differ **only** in model quality. An arm
+is written `NAME` or `NAME(key=value, ...)` and carries its whole configuration:
+
+| label | behaviour | takes |
+|---|---|---|
+| `vanilla` | search, **no** model — THE baseline | — |
+| `blueprint_only` | no search (pipeline / blueprint-quality test, not an approach) | — |
+| `OX` / `OX(k_beta=B,error=E)` | OX-Search (Approach B), gadget at safety parameter kβ (the solver derives β = kβ / k) | `k_beta`, `error`, `seed` |
+| `DBR` / `DBR(p_max=P,confidence=C,error=E)` | Data-Biased Response (Approach A) | `p_max`, `confidence`, `error`, `seed` |
+
+Whatever a label omits falls back to the **run-wide** default (`--model-p-max`,
+`--model-error`, `--model-confidence`, `--model-seed`, `--ox-k-beta`), so the knobs held
+fixed across a comparison are set once and provably identical in every arm, and only
+the swept axis is repeated per label:
+
+```
+CONDITIONS='vanilla;DBR(confidence=0.8,error=0.2);DBR(confidence=0.8,error=0.3);OX(error=0.2);OX(error=0.3)'
+```
+
+Two consequences worth stating, because both are silent if you assume otherwise:
+
+- **OX-Search is reach-only** (its plan's decision 6) — a statement about *where* the
+  model is consumed, not whether there is one. OX needs a model exactly as DBR does; it
+  enters *only* through the tracked beliefs, and `p̂` is what the gadget weights its
+  exploitation branch by. So `error`/`seed` shape `σ̂` and are honoured, while
+  `p_max`/`confidence` (clamp machinery OX never reads) are pinned inert and are
+  **rejected** if named on an OX label. The solve itself gets no models at all
+  (`ctx.models` stays empty, which the gadget requires), so an `OX(error=…)` arm is
+  genuinely OX with a worse belief, not a DBR arm in disguise. `model_scope` on the
+  config records which of the two it is, and joins the `config_fingerprint`.
+- **Every exploiting arm carries a model at `error=0`, including OX** — there it is the
+  *exact* model of the seat, so the e=0 ceiling means the same thing on both curves.
+  Only `vanilla` is genuinely model-free. (Dropping OX's spec at e=0 would not give it a
+  perfect model but a *different* one: the agent's unmodeled likelihood reads the
+  blueprint at bias `"none"`, never the seat's actual `bp_fold`/`bp_call`/`bp_raise`
+  bias, and prefers the last search's average policy whenever a search ran that round.)
+- An unknown or unparseable key is a **hard error**, never a silent default — a
+  mistyped knob would otherwise run a whole arm at the wrong model quality and surface
+  only as a puzzling curve.
 
 **Cluster launch script** ([scripts/evaluation.sh](../scripts/evaluation.sh)) — the
 SLURM (or equivalent) wrapper around the runner: stages the LUT **and blueprint** to
