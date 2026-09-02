@@ -68,6 +68,7 @@ from evaluation.runner import (
     build_blueprint_session,
     derive_seeds,
     play_hand,
+    split_conditions,
 )
 from poker_ai.search.agent import SearchAgent
 from poker_ai.search.budget import iteration_budget
@@ -1359,10 +1360,10 @@ def _production_regime(street: int, n_live: int) -> str:
 def _approach_of(condition: str) -> str:
     """Map a calibration condition label onto a budget-table approach key.
 
-    Conditions are user-facing labels (``'vanilla'``, ``'DBR'``, ``'OX(beta=3.0)'``); the
+    Conditions are user-facing labels (``'vanilla'``, ``'DBR'``, ``'OX(k_beta=50)'``); the
     tables are keyed by the approach :func:`poker_ai.search.budget.search_approach` infers
     at solve time.  Keeping the mapping here, rather than assuming the label IS the key,
-    is what lets an ``OX(beta=...)`` arm land in the OX row instead of silently missing.
+    is what lets an ``OX(k_beta=...)`` arm land in the OX row instead of silently missing.
     """
     c = str(condition).strip().lower()
     if c.startswith("ox"):
@@ -1673,19 +1674,19 @@ def run_calibration(
     # opened exactly once (opening the same blueprint twice in a process corrupts it).
     # ``build_models`` reads ``session.config.model_spec``, so we replace the session's
     # config per condition (cheap dataclass swap) rather than rebuilding the session.
-    # Build each condition's config through ``for_condition`` so its guards fire PER
-    # ARM — OX-Search REJECTS a model_spec, DBR REQUIRES one, and only OX sets ``beta``.
-    # The old ``dataclasses.replace(base_cfg, condition=..., model_spec=...)`` bypassed
-    # those guards: an ``OX(beta=X)`` arm silently kept ``beta`` from ``conditions[0]``
-    # (usually None) *and* picked up the DBR ``model_spec``, i.e. it ran as DBR
-    # mislabelled "OX" — a silent DBR/OX conflation.
+    # Build each condition's config through ``for_condition`` so the arm dispatch runs
+    # PER ARM — OX-Search takes no clamp model (reach-only) and sets ``k_beta``; DBR
+    # takes the model and no ``k_beta``.  The old ``dataclasses.replace(base_cfg,
+    # condition=..., model_spec=...)`` bypassed that: an ``OX(k_beta=X)`` arm silently kept
+    # ``k_beta`` from ``conditions[0]`` (usually None) *and* picked up the DBR
+    # ``model_spec``, i.e. it ran as DBR mislabelled "OX" — a silent DBR/OX conflation.
     def _cfg_for(condition: str) -> EvalConfig:
-        low = condition.strip().lower()
-        # vanilla / blueprint_only / OX take NO opponent model; DBR arms require one.
-        spec = (None if (low in ("vanilla", "blueprint_only") or low.startswith("ox"))
-                else model_spec)
+        # ``model_spec`` is only the run-wide DEFAULT bundle; ``for_condition`` decides
+        # what each arm consumes of it — nothing for vanilla / blueprint_only, error and
+        # seed only for OX (reach-only), the full clamp spec for DBR — with the label's
+        # own parameters overriding it.
         return EvalConfig.for_condition(
-            condition, model_spec=spec,
+            condition, model_spec=model_spec,
             run_id="calibrate", run_seed=run_seed, table_policy=table_policy,
             fixed_seats=fixed_seats,
             n_players=n_players, big_blind=big_blind, small_blind=small_blind,
@@ -1962,8 +1963,11 @@ def _cli():
     @click.option("--lut-path", required=True, type=str)
     @click.option("--n-players", default=4, type=int, show_default=True)
     @click.option("--conditions", default="vanilla", show_default=True,
-                  help="Comma list: 'vanilla', 'DBR', 'blueprint_only'. Both vanilla "
-                  "and DBR share the tree, so running both verifies equal budgets.")
+                  help="Comma- or semicolon-separated arm labels: 'vanilla', 'DBR', "
+                  "'blueprint_only', 'OX(k_beta=X)'; a label may carry its own parameters "
+                  "(e.g. 'DBR(p_max=0.8,error=0.2)'), which override the --model-* "
+                  "defaults. Both vanilla and DBR share the tree, so running both "
+                  "verifies equal budgets.")
     @click.option("--model-p-max", default=1.0, type=float, show_default=True,
                   help="DBR confidence cap (used only for a DBR condition; 1.0 = "
                   "naive best response).")
@@ -2095,7 +2099,9 @@ def _cli():
         """Collect roots, sweep budgets, and emit a suggested SolverConfig block."""
         logging.basicConfig(level=logging.INFO,
                             format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-        conditions = [c.strip() for c in o["conditions"].split(",") if c.strip()]
+        # Paren-aware: an arm label carries its own comma-separated parameter list
+        # ('DBR(p_max=0.8,error=0.2)'), which a plain split(',') would tear in half.
+        conditions = split_conditions(o["conditions"])
         if not (0 < o["ladder_lo"] < 1):
             raise click.BadParameter("need 0 < --ladder-lo < 1 (a fraction of the top rung)")
         def _secs(raw, flag):
@@ -2106,6 +2112,7 @@ def _cli():
         top_secs = _secs(o["ladder_top_seconds"], "--ladder-top-seconds")
         top_secs_vec = _secs(o["ladder_top_seconds_vector"], "--ladder-top-seconds-vector")
         need_model = any(c.strip().lower() not in ("vanilla", "blueprint_only")
+                         and not c.strip().lower().startswith("ox")
                          for c in conditions)
         model_spec = (ModelSpec(p_max=float(o["model_p_max"]),
                                 error=float(o["model_error"]),

@@ -130,7 +130,14 @@ def config_fingerprint(
             "max_iterations": cfg.max_iterations,
             "max_wall_seconds": cfg.max_wall_seconds,
             "discount_interval": cfg.discount_interval,
+            # BOTH OX safety knobs, under separate keys.  They are mutually exclusive
+            # (``vector._ox_setup`` rejects setting both) but NOT interchangeable —
+            # ``beta=50`` and ``ox_kbeta=50`` are wildly different settings — so folding
+            # them into one slot would let those two arms collide.  The evaluation layer
+            # sets ``ox_kbeta``; omitting it here would fingerprint every OX arm of a
+            # kβ sweep identically and silently pair arms that are not comparable.
             "beta": getattr(cfg, "beta", None),
+            "ox_kbeta": getattr(cfg, "ox_kbeta", None),
         },
         "leaf": {
             "policies": sorted(str(k) for k in cfg.leaf.policies),

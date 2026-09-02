@@ -116,39 +116,227 @@ _BOARD_LEN_TO_STREET: Mapping[int, str] = {0: "preflop", 3: "flop", 4: "turn", 5
 
 import re as _re
 
-_OX_BETA_RE = _re.compile(r"beta\s*=\s*([0-9][0-9.eE+\-]*)")
+# ---------------------------------------------------------------------------
+# Experiment-arm labels (docs/evaluation.md §10.1)
+# ---------------------------------------------------------------------------
+# An arm is written ``NAME`` or ``NAME(key=value, ...)``.  Every knob an arm needs
+# rides in its own label, so the sweep this eval exists to run — *model quality at a
+# fixed approach* — is a plain list of conditions:
+#
+#   vanilla ; DBR(confidence=0.8,error=0.2) ; DBR(confidence=0.8,error=0.3)
+#           ; OX(k_beta=50,error=0.2) ; OX(k_beta=50,error=0.3)
+#
+# What a label omits falls back to the run-wide default (the ``--model-*`` /
+# ``--ox-k-beta`` options), which is why kβ and ``p_max`` need not be repeated on every
+# arm: they are held FIXED across the sweep while ``error`` is the axis that varies.
+_CONDITION_RE = _re.compile(
+    r"^\s*(?P<kind>[A-Za-z_][A-Za-z0-9_]*)\s*(?:\((?P<params>[^()]*)\))?\s*$"
+)
+
+# Per-kind label vocabulary.  An unknown key is a typo, not a silent no-op:
+# ``OX(p_max=0.8)`` would otherwise read as a configured safety cap that OX never
+# consumes (it is reach-only — see :meth:`EvalConfig.for_condition`), and the arm would
+# run at the wrong setting without a word.
+_ARM_PARAMS: Mapping[str, frozenset] = {
+    "vanilla": frozenset(),
+    "blueprint_only": frozenset(),
+    "ox": frozenset({"k_beta", "error", "seed"}),
+    "dbr": frozenset({"p_max", "error", "confidence", "seed"}),
+}
+
+# ``_ARM_PARAMS`` is also the arm-NAME vocabulary: a name outside it is a typo and
+# raises, rather than falling back to a default approach.  That closes the same hole the
+# per-kind parameter check closes, one level up — an eval whose whole purpose is
+# comparing approaches cannot afford ``OXX(error=0.2)`` to run silently as a DBR arm and
+# land in the results as though the intended approach had been measured.
 
 
-# Code default β for a bare 'OX' condition (safety param, Ge et al. 2024, Thm 4.6:
-# exp(σ') − exp(σ) ≤ Δ/β).  Chosen to reproduce the paper's OX-Search gadget mix: their
-# FHP setting (Appendix B) fixes the root entry weight 1/(kβ+1) = 1/51, i.e. kβ = 50.
-# `vector._ox_setup` uses the SAME formula with k = board-compatible root combos (LOSSLESS
-# root — see vector.py:243), which on HU turn/river is ≈ C(46,2)=1035 / C(45,2)=990 ≈ 1000,
-# so β = 50/k ≈ 0.05 gives that same 1/51 mix.  (The paper's literal β=0.125 came from their
-# 400-BUCKET k=400; our lossless k is ~2.5× larger, so a matching β is ~2.5× smaller.)
-DEFAULT_OX_BETA = 0.05
+# Code default **kβ** for a bare 'OX' condition.  kβ — not β — is the knob, because β's
+# meaning moves with ``k`` and would silently mean different things on different decks:
+# ``vector._ox_setup`` derives ``β = kβ / k`` once k is known, where k = the
+# board-compatible opponent root combos (LOSSLESS root), i.e. ``C(deck − board, 2)``.
+# The hero's own hole is NOT removed by that mask.  So the SAME β=0.05 is kβ≈56 on the
+# 52-card deck (turn k=C(48,2)=1128) but kβ=6 on the 20-card test deck (k=C(16,2)=120)
+# — an 8× different regime.  Fixing kβ instead makes an arm label portable.
+#
+# 50 reproduces the paper's OX-Search gadget mix: their FHP setting (Appendix B) fixes
+# the root entry weight 1/(kβ+1) = 1/51, i.e. kβ = 50.  It is a STARTING point, not a
+# derived optimum: Thm 4.6's bound (exp(σ') − exp(σ) ≤ Δ/β) is vacuous at any usable
+# setting here — with Δ ≈ 2 × stack = 200 bb, kβ=50 gives Δ/β ≈ 4500 bb, and making the
+# bound worth 0.1 bb would need kβ ≈ 2.3e6, at which the exploitation branch weight
+# 1/(kβ+1) ≈ 4e-7 and OX degenerates into pure safe resolving.  The operative constraint
+# is Thm 4.5 instead: raise kβ only while ``decisions.ox_enter_prob`` saturates at ≈ 1
+# (λ* clipped at the β boundary ⇒ safety may be violated).  Going higher than that costs
+# exploitation for nothing.
+DEFAULT_OX_KBETA = 50.0
+
+# Code default ``p_max`` for a DBR arm that names none (neither in its label nor via
+# ``--model-p-max``).  1.0 leaves the cap INERT so ``confidence`` alone sets the DBR
+# mixture — the predictable reading of ``DBR(confidence=0.8, error=0.2)`` — and keeps
+# ``p_max`` as the ceiling that matters when confidence is a *schedule*.  (Naive best
+# response needs p_max=1 AND confidence=1 AND error=0, i.e. an unclamped exact model;
+# p_max=1 on its own is not it.)
+DEFAULT_DBR_P_MAX = 1.0
 
 
-def _parse_ox_beta(condition: str) -> float:
-    """Extract ``β`` from an OX-Search condition label like ``'OX(beta=3.0)'``.
+def _parse_condition(condition: str) -> Tuple[str, Dict[str, float]]:
+    """Split an arm label into ``(kind, params)``: ``'DBR(error=0.2)'`` → ``('dbr', {...})``.
 
-    OX-Search requires a finite non-negative β (the safety parameter, Thm 4.6).  A
-    **bare** ``'OX'`` takes the code default :data:`DEFAULT_OX_BETA`; but a label that
-    *looks* like a (botched) spec — parentheses or the word ``beta`` with no parseable
-    value — is a typo, so raise rather than silently defaulting.
+    ``kind`` is the lower-cased name, which must be one of :data:`_ARM_PARAMS`; ``params``
+    holds the label's ``key=value`` floats, empty for a bare name.  Both an unknown NAME
+    (``'OXX'``, ``'oxsearch'``) and an unknown KNOB (``'OX(p_max=1)'``) raise, as does a
+    label that *looks* like a spec but does not parse (``'OX(3.0)'``, ``'DBR(error=)'``).
+    Nothing silently defaults: a mistyped knob would otherwise run a whole arm at the
+    wrong model quality, and a mistyped name would run a whole arm as the *wrong
+    approach* — both surface only as a puzzling curve, and the second is worse because
+    the results table still says the approach you asked for.
     """
-    m = _OX_BETA_RE.search(condition)
-    if m is not None:
-        beta = float(m.group(1))
-        if beta < 0.0:
-            raise ValueError(f"OX-Search beta must be >= 0, got {beta} in {condition!r}.")
-        return beta
-    if "(" in condition or "beta" in condition.lower():
+    m = _CONDITION_RE.match(condition or "")
+    if m is None:
         raise ValueError(
-            f"OX-Search condition {condition!r} has a malformed 'beta=' — expected e.g. "
-            f"'OX(beta=3.0)', or bare 'OX' for the default β={DEFAULT_OX_BETA}."
+            f"malformed condition {condition!r} — expected 'NAME' or 'NAME(key=value,...)', "
+            "e.g. 'vanilla', 'OX(k_beta=50,error=0.2)', 'DBR(confidence=0.8,error=0.2)'."
         )
-    return DEFAULT_OX_BETA
+    kind = m.group("kind").lower()
+    if kind not in _ARM_PARAMS:
+        raise ValueError(
+            f"unknown arm {m.group('kind')!r} in condition {condition!r} — expected one "
+            f"of {sorted(_ARM_PARAMS)}. (It is NOT treated as a DBR arm: a mistyped "
+            f"approach name would otherwise run and be reported as the approach you "
+            f"asked for.)"
+        )
+    params: Dict[str, float] = {}
+    for item in (m.group("params") or "").split(","):
+        if not item.strip():
+            continue
+        key, sep, value = item.partition("=")
+        key = key.strip().lower()
+        if not sep or not key or not value.strip():
+            raise ValueError(
+                f"malformed parameter {item.strip()!r} in condition {condition!r} — "
+                "expected 'key=value' (e.g. 'error=0.2')."
+            )
+        if key in params:
+            raise ValueError(f"duplicate parameter {key!r} in condition {condition!r}.")
+        try:
+            params[key] = float(value)
+        except ValueError:
+            raise ValueError(
+                f"parameter {key}={value.strip()!r} in condition {condition!r} is not a number."
+            ) from None
+    unknown = sorted(set(params) - _ARM_PARAMS[kind])
+    if unknown:
+        raise ValueError(
+            f"condition {condition!r} sets {unknown}, which is not a parameter of a "
+            f"'{kind}' arm; accepted here: {sorted(_ARM_PARAMS[kind]) or '(none)'}."
+        )
+    return kind, params
+
+
+def split_conditions(raw: str) -> List[str]:
+    """Split a multi-arm string into labels, on ``;`` or on a **top-level** ``,``.
+
+    A condition's own parameter list contains commas
+    (``'DBR(confidence=0.8,error=0.2)'``), so a naive ``split(',')`` would tear every
+    parameterised arm in half.  Splitting only at paren depth 0 keeps the historical
+    comma-separated form working for bare labels while making the parameterised form
+    expressible; ``;`` is accepted as the unambiguous separator.
+    """
+    out: List[str] = []
+    cur: List[str] = []
+    depth = 0
+    for ch in raw or "":
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch in ",;" and depth <= 0:
+            out.append("".join(cur))
+            cur = []
+            continue
+        cur.append(ch)
+    out.append("".join(cur))
+    return [c.strip() for c in out if c.strip()]
+
+
+def _parse_ox_kbeta(condition: str, *, default: Optional[float] = None) -> float:
+    """Extract ``kβ`` from an OX-Search condition label like ``'OX(k_beta=50)'``.
+
+    OX-Search requires a finite non-negative kβ (the safety parameter; the solver
+    derives ``β = kβ / k`` once k is known).  A label with no ``k_beta=`` takes
+    ``default`` — the run-wide ``--ox-k-beta`` — which itself falls back to
+    :data:`DEFAULT_OX_KBETA`: kβ is held fixed while ``error`` sweeps, so it belongs on
+    the run rather than on every arm.  A label that *looks* like a (botched) spec still
+    raises, via :func:`_parse_condition`.
+    """
+    _, params = _parse_condition(condition)
+    kbeta = float(params.get("k_beta", DEFAULT_OX_KBETA if default is None else default))
+    if kbeta < 0.0:
+        raise ValueError(f"OX-Search k_beta must be >= 0, got {kbeta} in {condition!r}.")
+    return kbeta
+
+
+def _arm_model_spec(
+    kind: str,
+    condition: str,
+    params: Mapping[str, float],
+    defaults: Optional["ModelSpec"],
+) -> "ModelSpec":
+    """The opponent model an arm runs with: run-wide ``defaults`` overridden by its label.
+
+    ``defaults`` is the run's shared ``--model-*`` bundle; the label's own parameters win
+    over it, which is exactly what makes an error sweep a list of conditions.  Called only
+    for the two EXPLOITING kinds, both of which always get a spec — the model-free arms
+    (``vanilla``, ``blueprint_only``) are settled in :meth:`EvalConfig.for_condition`
+    without reaching here.
+
+    **DBR** takes the full spec — ``p_max`` cap, ``confidence`` mixture, ``error`` — the
+    model driving both the belief likelihood and the solver clamp.
+
+    **OX-Search is reach-only** (plan decision 6), which is a statement about *where* the
+    model is consumed, not whether one exists: OX needs a model exactly as DBR does, and
+    it enters SOLELY through the tracked beliefs.  So only ``error``/``seed`` — the two
+    knobs that shape ``σ̂`` itself — are honoured, and ``p_max``/``confidence`` are pinned
+    to their inert 1.0 (they are read through ``OpponentModel.confidence``, which nothing
+    on the OX path calls).
+
+    An OX arm therefore ALWAYS carries a spec, ``error = 0`` included — there it is the
+    *exact* model of the seat, and the e=0 ceiling of the OX curve means the same thing
+    as DBR's.  Returning ``None`` there instead would silently drop the arm onto the
+    agent's unmodeled likelihood, which is a different distribution, not a perfect one:
+    it reads the blueprint at bias ``"none"`` (never the seat's actual ``bp_fold`` /
+    ``bp_call`` / ``bp_raise`` bias) and prefers the last search's average policy over the
+    opponent's strategy whenever a search ran that round.
+    """
+    base = defaults if defaults is not None else ModelSpec(p_max=DEFAULT_DBR_P_MAX)
+    # A scalar in the label + a schedule on the run is ambiguous in the direction that
+    # loses data: ``ModelSpec.resolve`` lets the schedule win, so the per-arm value the
+    # sweep is built around would be silently discarded.  Refuse instead.
+    if "error" in params and base.error_schedule:
+        raise ValueError(
+            f"condition {condition!r} sets error={params['error']} but the run carries "
+            "--model-error-schedule, which overrides it; drop one of the two."
+        )
+    error = float(params.get("error", base.error))
+    seed = int(params.get("seed", base.seed))
+    if kind == "ox":
+        return ModelSpec(
+            p_max=1.0, confidence=1.0, error=error, seed=seed,
+            error_schedule=base.error_schedule,
+        )
+    if "confidence" in params and base.confidence_schedule:
+        raise ValueError(
+            f"condition {condition!r} sets confidence={params['confidence']} but the run "
+            "carries --model-confidence-schedule, which overrides it; drop one of the two."
+        )
+    return ModelSpec(
+        p_max=float(params.get("p_max", base.p_max)),
+        error=error,
+        confidence=float(params.get("confidence", base.confidence)),
+        seed=seed,
+        error_schedule=base.error_schedule,
+        confidence_schedule=base.confidence_schedule,
+    )
 
 
 @dataclass
@@ -169,13 +357,17 @@ class EvalConfig:
     #   vanilla       : search_enabled=True,  model_spec=None   (vanilla Pluribus —
     #                   real-time search, NO opponent model; THE baseline)
     #   DBR           : search_enabled=True,  model_spec=<spec> (Data-Biased Response;
-    #                   naive best response is DBR at p_max=1)
+    #                   naive best response is the unclamped exact model — p_max=1 AND
+    #                   confidence=1 AND error=0)
     #   blueprint_only: search_enabled=False, model_spec=None   (NOT an approach —
     #                   a no-search pipeline / blueprint-quality test only)
-    #   OX(beta=X)    : search_enabled=True,  model_spec=None, beta=X  (OX-Search /
-    #                   Approach B — adaptation-safe exploitation; REACH-ONLY, so NO
-    #                   model, the belief enters via the tracked ranges; the gadget is
-    #                   HU turn/river only, inactive elsewhere).  Multiplayer OX cancelled.
+    #   OX(k_beta=X)  : search_enabled=True,  model_spec=<spec>, k_beta=X,
+    #                   model_scope='belief_only' (OX-Search / Approach B —
+    #                   adaptation-safe exploitation; the gadget is HU turn/river only,
+    #                   inactive elsewhere).  REACH-ONLY names WHERE the model is
+    #                   consumed, not whether there is one: OX needs a model as DBR
+    #                   does, it just never reaches the solve — it shapes the tracked
+    #                   ranges alone.  Multiplayer OX cancelled.
     # Vanilla Pluribus *searches*; only the blueprint-only test skips search.  Kept
     # independent of ``condition`` so a caller can label freely; the CLI and
     # :meth:`for_condition` set both together so they never disagree.  Defaults
@@ -183,10 +375,19 @@ class EvalConfig:
     # unchanged.
     search_enabled: bool = True
     model_spec: Optional[ModelSpec] = None
-    # OX-Search safety parameter β (Approach B); ``None`` for every non-OX arm, so the
-    # gadget is OFF and the solve is byte-identical vanilla/DBR.  Threaded into the
-    # ``SolverConfig`` built by :func:`build_blueprint_session`.
-    beta: Optional[float] = None
+    # How that ``model_spec`` is CONSUMED.  ``'full'`` (DBR) hands the models to both the
+    # belief likelihood and the solver clamp.  ``'belief_only'`` (OX-Search) hands them to
+    # the belief likelihood ALONE and leaves ``ctx.models`` empty, so the gadget solve
+    # carries no DBR clamp, no σ̂ leaf rollouts and no VR baseline — the reach-only
+    # exploitation of the OX plan (decision 6), and what ``vector._ox_setup`` asserts.
+    # Inert when ``model_spec is None``.
+    model_scope: str = "full"
+    # OX-Search safety parameter **kβ** (Approach B); ``None`` for every non-OX arm, so
+    # the gadget is OFF and the solve is byte-identical vanilla/DBR.  Threaded into the
+    # ``SolverConfig`` built by :func:`build_blueprint_session` as ``ox_kbeta``, which is
+    # where ``β = kβ / k`` is derived — see :data:`DEFAULT_OX_KBETA` for why the knob is
+    # kβ rather than β.
+    k_beta: Optional[float] = None
     table_policy: str = "all_blueprint"       # all_blueprint | random | fixed
     # required for table_policy='fixed': an ordered list of exactly n_players - 1
     # opponent identities (e.g. ["bp_fold", "bp_call", "bp_raise"]), one per
@@ -243,6 +444,9 @@ class EvalConfig:
             "search_enabled": self.search_enabled,
             "model_spec": (self.model_spec.as_json()
                            if self.model_spec is not None else None),
+            # Same spec, different consumer: a belief-only (OX) model and a DBR clamp
+            # model are genuinely different configs, so they must not share a hash.
+            "model_scope": (self.model_scope if self.model_spec is not None else None),
         }
 
     @classmethod
@@ -251,49 +455,54 @@ class EvalConfig:
         condition: str,
         *,
         model_spec: Optional[ModelSpec] = None,
+        ox_k_beta: Optional[float] = None,
         **kwargs,
     ) -> "EvalConfig":
         """Build a config for an experiment arm, keeping label and behaviour in sync.
 
-        ``condition='vanilla'`` ⇒ vanilla Pluribus: **search, no opponent model** (THE
-        baseline).  ``'blueprint_only'`` ⇒ no search at all — a pipeline / blueprint-
-        quality test, not an approach.  ``'OX(beta=X)'`` ⇒ OX-Search (Approach B):
-        search with the gadget root at safety parameter ``β=X`` and **no** model
-        (reach-only exploitation; the belief enters via the tracked ranges).  Anything
-        else (a ``DBR`` arm, e.g. ``'DBR(p_max=0.8)'`` — naive best response is DBR at
-        ``p_max=1``) ⇒ search **with** the given ``model_spec`` (required — a modeled
-        arm with no spec is a mistake, not vanilla Pluribus).
+        The label is the whole arm spec — ``NAME`` or ``NAME(key=value, ...)``, parsed by
+        :func:`_parse_condition`:
+
+        - ``'vanilla'`` ⇒ vanilla Pluribus: **search, no opponent model** (THE baseline).
+        - ``'blueprint_only'`` ⇒ no search at all — a pipeline / blueprint-quality test,
+          not an approach.
+        - ``'OX'`` / ``'OX(k_beta=X, error=e)'`` ⇒ OX-Search (Approach B): search with the
+          gadget root at safety parameter β, exploiting **reach-only** — the (optionally
+          error-injected) model shapes the tracked beliefs and nothing else.
+        - anything else ⇒ a DBR arm, e.g. ``'DBR(confidence=0.8, error=0.2)'``: search
+          **with** a model driving both the beliefs and the solver clamp.
+
+        ``model_spec`` and ``ox_k_beta`` are the run-wide **defaults**; each label overrides
+        what it names (see :func:`_arm_model_spec`).  That is what lets one submission
+        sweep model quality — ``vanilla, DBR(error=0.2), DBR(error=0.3), OX(error=0.2),
+        OX(error=0.3)`` — with β and ``p_max`` set once for the whole run.  A DBR arm no
+        longer *requires* an explicit ``p_max``: it falls back to
+        :data:`DEFAULT_DBR_P_MAX`.
         """
-        low = condition.strip().lower()
-        beta = None
-        if low == "vanilla":
+        kind, params = _parse_condition(condition)
+        k_beta = None
+        scope = "full"
+        if kind == "vanilla":
             search_enabled, spec = True, None      # real Pluribus: search, no model
-        elif low == "blueprint_only":
+        elif kind == "blueprint_only":
             search_enabled, spec = False, None     # pipeline test only (no search)
-        elif low.startswith("ox"):
-            # OX-Search is REACH-ONLY: search on, β set, NO model.  A model_spec here
-            # is a wiring mistake (OX consumes no DBR machinery).
-            if model_spec is not None:
-                raise ValueError(
-                    f"condition {condition!r} is OX-Search (reach-only) but a "
-                    "model_spec was given; OX takes no opponent model."
-                )
-            beta = _parse_ox_beta(condition)
-            search_enabled, spec = True, None
+        elif kind == "ox":
+            k_beta = _parse_ox_kbeta(condition, default=ox_k_beta)
+            search_enabled = True
+            spec = _arm_model_spec(kind, condition, params, model_spec)
+            # Reach-only: whatever model this arm has informs the BELIEF, never the
+            # solve, so ``ctx.models`` stays empty — the invariant ``vector._ox_setup``
+            # asserts, and the reason OX consumes none of DBR's clamp machinery.
+            scope = "belief_only"
         else:
-            if model_spec is None:
-                raise ValueError(
-                    f"condition {condition!r} is a modeled (DBR) arm but no "
-                    "model_spec was given ('vanilla' is the model-free search "
-                    "baseline; 'blueprint_only' is the no-search pipeline test; "
-                    "'OX(beta=X)' is the reach-only safe-exploitation arm)"
-                )
-            search_enabled, spec = True, model_spec
+            search_enabled = True
+            spec = _arm_model_spec(kind, condition, params, model_spec)
         return cls(
             condition=condition,
             search_enabled=search_enabled,
             model_spec=spec,
-            beta=beta,
+            model_scope=scope,
+            k_beta=k_beta,
             **kwargs,
         )
 
@@ -360,10 +569,11 @@ class EvalSession:
         """A hero :class:`SearchAgent` seeded by ``rng`` (fresh per hand).
 
         ``models`` (from :meth:`build_models`) attaches the opponent models for a
-        DBR hand; ``None``/empty is vanilla Pluribus (search, no model).
+        modeled hand; ``None``/empty is vanilla Pluribus (search, no model).
         ``search_enabled`` comes from the config: it is ``True`` for both vanilla and
         DBR (both search), and only the ``blueprint_only`` pipeline test turns search
-        off.
+        off.  ``model_scope`` decides how far those models reach — everywhere for DBR,
+        the belief likelihood only for OX-Search (reach-only).
         """
         return SearchAgent(
             leaf_policies=self.solver_cfg.leaf.policies,
@@ -371,6 +581,7 @@ class EvalSession:
             solver_cfg=self.solver_cfg,
             rng=rng,
             models=models,
+            model_scope=self.config.model_scope,
             search_enabled=self.config.search_enabled,
         )
 
@@ -454,16 +665,18 @@ def _opponent_models_json(
     """Provenance for ``games.opponent_models`` — which seats were modeled + how.
 
     ``None`` when the hand has no models (vanilla), so the column reads NULL
-    for every baseline row and a non-NULL row is exactly a DBR hand.
-    Otherwise a compact JSON object: the shared model spec plus the per-seat bias
-    the model was built under, keyed by seat.  This is what lets the summary confirm
-    *which* opponents the exploitation slice covers.
+    for every baseline row and a non-NULL row is exactly a modeled hand.
+    Otherwise a compact JSON object: the shared model spec, how far it reached
+    (``scope``: DBR's full clamp vs OX's belief-only), plus the per-seat bias the model
+    was built under, keyed by seat.  This is what lets the summary confirm *which*
+    opponents the exploitation slice covers, and at what model quality.
     """
     if not models:
         return None
     return json.dumps(
         {
             "spec": cfg.model_spec.as_json() if cfg.model_spec is not None else None,
+            "scope": cfg.model_scope,
             "seats": {str(s): seat_labels.get(s) for s in sorted(models)},
         },
         sort_keys=True,
@@ -1362,7 +1575,9 @@ def build_blueprint_session(
         leaf=leaf,
         max_iterations=max_iterations,
         max_wall_seconds=max_wall_seconds,
-        beta=cfg.beta,          # OX-Search gadget (Approach B); None ⇒ off (vanilla/DBR)
+        # OX-Search gadget (Approach B); None ⇒ off (vanilla/DBR).  ``ox_kbeta`` is the
+        # deck-agnostic form: the solver derives β = kβ / k once k is known.
+        ox_kbeta=cfg.k_beta,
         # VR-MCCFR control-variate baseline (opponent_modeling §5.5).  Requested
         # unconditionally here, same as evaluation/calibrate.py: the flag is
         # self-gating on ``ctx.models`` in mccfr.py (``self._vr = variance_reduction
@@ -1548,35 +1763,52 @@ def _cli():
         "--condition",
         default="vanilla",
         show_default=True,
-        help="Experiment arm: 'vanilla' (vanilla Pluribus — search, no opponent "
-        "model; the baseline), 'blueprint_only' (no search — pipeline / blueprint-"
-        "quality test), or a DBR arm (e.g. 'DBR(p_max=0.8)'; naive best response is "
-        "DBR at p_max=1) which then REQUIRES --model-p-max. Arms sharing "
+        help="Experiment arm, as 'NAME' or 'NAME(key=value,...)': 'vanilla' (vanilla "
+        "Pluribus — search, no opponent model; the baseline), 'blueprint_only' (no "
+        "search — pipeline / blueprint-quality test), 'OX(k_beta=50,error=0.2)' "
+        "(OX-Search, reach-only), or a DBR arm 'DBR(confidence=0.8,error=0.2)'. Label "
+        "parameters override the run-wide --model-* / --ox-k-beta defaults, so a sweep "
+        "varies error per arm and sets p_max/k_beta once. Arms sharing "
         "--run-seed/--table-policy pair on deck_seed in the summary.",
     )
     @click.option(
-        "--model-p-max",
+        "--ox-k-beta",
         default=None,
         type=float,
-        help="Confidence cap for a DBR arm. Presence selects a modeled arm; omit "
-        "for vanilla / blueprint_only. '1.0' with --model-error=0 is naive best "
-        "response (the unsafe EV ceiling).",
+        help="Default OX-Search safety parameter kβ for an OX arm whose label does not "
+        f"give one (code default {DEFAULT_OX_KBETA}). The solver derives β = kβ / k, so "
+        "this is deck-agnostic where a raw β is not. Inert for every non-OX arm.",
+    )
+    @click.option(
+        "--model-p-max",
+        default=DEFAULT_DBR_P_MAX,
+        type=float,
+        show_default=True,
+        help="Default confidence cap for a DBR arm (overridable per arm as "
+        "'DBR(p_max=...)'). The cap is inert at 1.0, leaving --model-confidence as the "
+        "DBR mixture knob; naive best response is p_max=1 AND confidence=1 AND error=0. "
+        "Ignored by vanilla / blueprint_only / OX (reach-only) arms.",
     )
     @click.option(
         "--model-error",
         default=0.0,
         type=float,
         show_default=True,
-        help="Constant target ℓ1 perturbation of each opponent model (0 = exact). "
-        "Overridden by --model-error-schedule when given.",
+        help="Default constant target ℓ1 perturbation of each opponent model (0 = "
+        "exact) — the sweep's independent variable, overridable per arm as "
+        "'DBR(error=...)' / 'OX(error=...)'. Overridden by --model-error-schedule when "
+        "given (in which case a per-arm 'error=' is rejected rather than silently "
+        "dropped).",
     )
     @click.option(
         "--model-confidence",
         default=1.0,
         type=float,
         show_default=True,
-        help="Constant confidence c before the --model-p-max clamp. Overridden by "
-        "--model-confidence-schedule when given.",
+        help="Default constant confidence c before the --model-p-max clamp, "
+        "overridable per arm as 'DBR(confidence=...)'. Overridden by "
+        "--model-confidence-schedule when given. Inert for an OX arm: OX-Search is "
+        "reach-only and never reads a model's confidence.",
     )
     @click.option(
         "--model-error-schedule",
@@ -1599,7 +1831,8 @@ def _cli():
         default=0,
         type=int,
         show_default=True,
-        help="Seed for the per-info-set model perturbation (offset per seat).",
+        help="Default seed for the per-info-set model perturbation (offset per seat); "
+        "overridable per arm as 'DBR(seed=...)' / 'OX(seed=...)'.",
     )
     @click.option(
         "--parallel-workers",
@@ -1624,41 +1857,40 @@ def _cli():
         fixed_seats = None
         if opts["fixed_seats"]:
             fixed_seats = json.loads(opts["fixed_seats"])
-        # Experiment arm: a DBR (modeled) arm is signalled by --model-p-max.  Guard
-        # the easy mistake — a modeled-looking --condition with no p_max would
-        # silently run as vanilla Pluribus (search, no model), i.e. a mislabeled
-        # baseline.
-        cond = opts["condition"]
-        model_spec = None
-        if opts["model_p_max"] is not None:
-            model_spec = ModelSpec(
-                p_max=float(opts["model_p_max"]),
-                error=float(opts["model_error"]),
-                confidence=float(opts["model_confidence"]),
-                seed=int(opts["model_seed"]),
-                error_schedule=opts["model_error_schedule"] or None,
-                confidence_schedule=opts["model_confidence_schedule"] or None,
+        # Experiment arm.  The --model-* / --ox-k-beta options are the run-wide DEFAULTS;
+        # the condition's own label overrides whatever it names, and ``for_condition``
+        # decides which of them the arm actually consumes (vanilla and blueprint_only
+        # consume none; OX takes error/seed only — it is reach-only).  So a sweep is a
+        # list of labels sharing one set of defaults, rather than one flag set per arm.
+        model_defaults = ModelSpec(
+            p_max=float(opts["model_p_max"]),
+            error=float(opts["model_error"]),
+            confidence=float(opts["model_confidence"]),
+            seed=int(opts["model_seed"]),
+            error_schedule=opts["model_error_schedule"] or None,
+            confidence_schedule=opts["model_confidence_schedule"] or None,
+        )
+        # Fail fast on a malformed schedule descriptor — before setup / any hands.
+        try:
+            model_defaults.resolve()
+        except Exception as exc:
+            raise click.UsageError(f"invalid model schedule: {exc}") from exc
+        try:
+            arm = EvalConfig.for_condition(
+                opts["condition"],
+                model_spec=model_defaults,
+                ox_k_beta=opts["ox_k_beta"],
+                run_id=opts["run_id"],
             )
-            # Fail fast on a malformed schedule descriptor — before setup / any hands.
-            try:
-                model_spec.resolve()
-            except Exception as exc:
-                raise click.UsageError(f"invalid model schedule: {exc}") from exc
-        elif cond.strip().lower().startswith("ox"):
-            pass   # OX-Search is reach-only (no model); β is parsed in for_condition
-        elif cond.strip().lower() not in ("vanilla", "blueprint_only"):
-            raise click.UsageError(
-                f"--condition={cond!r} is a DBR arm but --model-p-max was not "
-                "given ('vanilla', 'blueprint_only', and 'OX(beta=X)' are the "
-                "model-free arms)."
-            )
-        arm = EvalConfig.for_condition(cond, model_spec=model_spec, run_id=opts["run_id"])
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
         cfg = EvalConfig(
             run_id=opts["run_id"],
             condition=arm.condition,
             search_enabled=arm.search_enabled,
             model_spec=arm.model_spec,
-            beta=arm.beta,
+            model_scope=arm.model_scope,
+            k_beta=arm.k_beta,
             run_seed=opts["run_seed"],
             table_policy=opts["table_policy"],
             fixed_seats=fixed_seats,

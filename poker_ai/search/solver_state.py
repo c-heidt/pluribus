@@ -239,9 +239,8 @@ class SolverConfig:
     # the exploitation weight at fixed β).
     #
     # ``kβ`` IS what the paper specifies: Ge et al. give ``1/(kβ+1)`` directly — 1/16 for
-    # Leduc, 1/51 for Flop Hold'em.  ``DEFAULT_OX_BETA = 0.05`` gives ``kβ ≈ 54`` on a
-    # 52-card river, i.e. essentially the paper's FHP setting — correct for THAT deck, and
-    # only for that deck.  Prefer this knob for anything that must hold across decks or
+    # Leduc, 1/51 for Flop Hold'em.  The eval's ``DEFAULT_OX_KBETA = 50`` sets it
+    # directly, matching the paper's FHP setting on any deck.  Prefer this knob for anything that must hold across decks or
     # board sizes; ``beta`` is kept as the raw, deck-dependent form.
     # Setting either one enables the gadget; setting BOTH is an error.
     ox_kbeta: "float | None" = None
