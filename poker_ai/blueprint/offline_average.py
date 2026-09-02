@@ -75,7 +75,7 @@ import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import joblib
 import numpy as np
@@ -98,6 +98,32 @@ _TASK_PEAK_MB = 800
 #: stored row sums to ~``SIGMA_SCALE`` — far above ``min_strategy_mass`` and
 #: well within ``int32`` range.
 SIGMA_SCALE_DEFAULT = 1_000_000
+
+#: How the retained snapshots are weighted when averaged.  ``"linear"`` — the
+#: default — weights snapshot ``s`` by its iteration count ``t_s``, echoing Linear
+#: CFR's ``t``-weighting of the running average: the true average strategy is
+#: ``sum_t pi^t sigma^t / sum_t pi^t`` (``t``-weighted under Linear CFR), so the
+#: ``"equal"`` mean lets an early, less-converged snapshot count as much as the
+#: final one.  ``"linear"`` recovers the recency half of that; the reach (``pi``)
+#: half is not available offline without a forward pass per snapshot.
+#:
+#: ``"equal"`` is the historical behaviour, kept for reproducing older blueprints.
+#:
+#: The default was flipped to ``"linear"`` on measured evidence, not theory — a
+#: duplicate-paired head-to-head over 600k hands on the 20-card 2p blueprint:
+#: linear beat equal by **+2.53 +/- 1.29 bb/100**, and a reverse-weighted control
+#: (early snapshots heavy) *lost* to equal by **-3.70 +/- 1.61**, giving the
+#: monotone ordering reverse < equal < linear.  The opposite-signed control is
+#: what makes it recency rather than "any perturbation helps".
+#:
+#: ⚠The size of the effect is set by the spread of ``t`` across the retained
+#: snapshots (13.3x in that run: 26 snapshots, t from 940k to 12.5M).  A run with
+#: a different checkpoint schedule will not see the same magnitude.
+#: ⚠Do NOT try to settle this kind of question with
+#: ``evaluation/blueprint_metrics.py`` — its post-flop numbers cannot distinguish
+#: the two artifacts at all (see that module's ``play_freq`` note).
+SNAPSHOT_WEIGHTING_DEFAULT = "linear"
+SNAPSHOT_WEIGHTINGS = ("equal", "linear")
 
 #: Minimum number of RETAINED SNAPSHOTS that must independently record a
 #: positive-regret action for a post-flop row before its averaged strategy is
@@ -205,6 +231,7 @@ def average_chunk(
     min_confirming_snapshots: int = MIN_CONFIRMING_SNAPSHOTS_DEFAULT,
     min_confirming_fraction: float = MIN_CONFIRMING_FRACTION_DEFAULT,
     min_snapshot_regret_magnitude: Optional[int] = MIN_SNAPSHOT_REGRET_MAGNITUDE_DEFAULT,
+    snapshot_weights: Optional[Sequence[float]] = None,
 ) -> bool:
     """Average one ``(street, chunk)`` across snapshots; the unit of work.
 
@@ -227,6 +254,12 @@ def average_chunk(
     Short of the confirmation requirement, the row is written all-zero,
     deferring to the live regret-match fallback.
 
+    ``snapshot_weights`` (aligned with *snapshot_dirs*) makes the per-row mean a
+    **weighted** mean.  ``None`` — the default — is an unweighted mean, byte-for-byte
+    the historical behaviour.  The weights scale only the averaging; the
+    confirmation tally stays an unweighted **count** of snapshots, so a heavy
+    snapshot cannot publish a row on its own.
+
     Returns
     -------
     bool
@@ -246,9 +279,20 @@ def average_chunk(
         final_dir / f"{prefix}_chunk_{chunk_id:06d}.npy", mmap_mode="r"
     ).shape
     acc = np.zeros((n_rows, n_actions), dtype=np.float64)
-    count = np.zeros(n_rows, dtype=np.int64)
+    count = np.zeros(n_rows, dtype=np.int64)   # unweighted: the confirmation tally
+    wsum = np.zeros(n_rows, dtype=np.float64)  # weighted: the mean's divisor
 
-    for snap in snapshot_dirs:
+    if snapshot_weights is None:
+        weights: Sequence[float] = [1.0] * len(snapshot_dirs)
+    elif len(snapshot_weights) != len(snapshot_dirs):
+        raise ValueError(
+            f"snapshot_weights has {len(snapshot_weights)} entries but there are "
+            f"{len(snapshot_dirs)} snapshots — they must align positionally."
+        )
+    else:
+        weights = snapshot_weights
+
+    for snap, w in zip(snapshot_dirs, weights):
         path = snap / f"{prefix}_chunk_{chunk_id:06d}.npy"
         if not path.exists():
             # This snapshot had not allocated this chunk yet.
@@ -273,8 +317,9 @@ def average_chunk(
             has_signal = pos_sum > 0.0
         if has_signal.any():
             sigma = sigma_from_regret_chunk(chunk)
-            acc[:k][has_signal] += sigma[has_signal]
+            acc[:k][has_signal] += float(w) * sigma[has_signal]
             count[:k][has_signal] += 1
+            wsum[:k][has_signal] += float(w)
         del arr  # release the ~80 MB snapshot chunk before the next load
 
     # The fraction requirement scales with THIS run's own snapshot count, so
@@ -288,7 +333,7 @@ def average_chunk(
     out = np.zeros((n_rows, n_actions), dtype=np.int32)
     present = count >= required
     if present.any():
-        mean = acc[present] / count[present][:, None]
+        mean = acc[present] / wsum[present][:, None]
         out[present] = np.rint(scale * mean).astype(np.int32)
     # Rows present in no snapshot, present but never showing (sufficient)
     # positive regret, or confirmed by fewer than `required` independent
@@ -354,6 +399,7 @@ def average_street(
     min_confirming_snapshots: int = MIN_CONFIRMING_SNAPSHOTS_DEFAULT,
     min_confirming_fraction: float = MIN_CONFIRMING_FRACTION_DEFAULT,
     min_snapshot_regret_magnitude: Optional[int] = MIN_SNAPSHOT_REGRET_MAGNITUDE_DEFAULT,
+    snapshot_weights: Optional[Sequence[float]] = None,
 ) -> int:
     """Average the regret-matched strategy of street *r* across snapshots.
 
@@ -389,7 +435,7 @@ def average_street(
     tasks = [
         (snapshot_dirs, final_dir, r, chunk_id, out_dir, scale, resume,
          min_confirming_snapshots, min_confirming_fraction,
-         min_snapshot_regret_magnitude)
+         min_snapshot_regret_magnitude, snapshot_weights)
         for chunk_id in _chunk_ids(final_dir, f"regret_{r}")
     ]
     return _run_chunk_tasks(tasks, workers, desc=f"street {r}")
@@ -488,6 +534,7 @@ def build_final_blueprint(
     min_confirming_snapshots: int = MIN_CONFIRMING_SNAPSHOTS_DEFAULT,
     min_confirming_fraction: float = MIN_CONFIRMING_FRACTION_DEFAULT,
     min_snapshot_regret_magnitude: Optional[int] = MIN_SNAPSHOT_REGRET_MAGNITUDE_DEFAULT,
+    snapshot_weighting: str = SNAPSHOT_WEIGHTING_DEFAULT,
 ) -> Path:
     """Build a final blueprint by averaging a run's retained snapshots.
 
@@ -569,6 +616,28 @@ def build_final_blueprint(
             f"below the warm-up. Lower --min_t (e.g. 0) to average the "
             f"available checkpoints anyway."
         )
+    if snapshot_weighting not in SNAPSHOT_WEIGHTINGS:
+        raise ValueError(
+            f"unknown snapshot_weighting {snapshot_weighting!r}; expected one of "
+            f"{SNAPSHOT_WEIGHTINGS}"
+        )
+    if snapshot_weighting == "linear":
+        # Normalised by the largest t purely to keep the accumulator O(1)-scaled;
+        # any positive rescaling leaves the weighted mean unchanged.
+        t_max = float(states[avg_snapshots[-1]]["t"])
+        snapshot_weights: Optional[List[float]] = [
+            float(states[cp]["t"]) / t_max for cp in avg_snapshots
+        ]
+        log.info(
+            "Snapshot weighting 'linear': weights span %.3f (t=%s) to %.3f (t=%s) "
+            "— a %.1fx spread the equal-weight mean would have flattened.",
+            snapshot_weights[0], f"{states[avg_snapshots[0]]['t']:,}",
+            snapshot_weights[-1], f"{states[avg_snapshots[-1]]['t']:,}",
+            snapshot_weights[-1] / snapshot_weights[0] if snapshot_weights[0] else float("inf"),
+        )
+    else:
+        snapshot_weights = None
+
     effective_required = max(
         min_confirming_snapshots,
         int(np.ceil(min_confirming_fraction * len(avg_snapshots))),
@@ -634,7 +703,7 @@ def build_final_blueprint(
     tasks = [
         (avg_snapshots, final_dir, r, chunk_id, out_cp, scale, resume,
          min_confirming_snapshots, min_confirming_fraction,
-         min_snapshot_regret_magnitude)
+         min_snapshot_regret_magnitude, snapshot_weights)
         for r in _POSTFLOP_STREETS
         for chunk_id in _chunk_ids(final_dir, f"regret_{r}")
     ]

@@ -250,6 +250,27 @@ class TestArmGrain:
         assert _range(rep, "DBR")["overall"]["snapshots"] == 1
         assert rep["hu_coverage"]["conditions"][0]["n_hands"] == 1
 
+    def test_hu_eligible_counts_2max_hands_that_reach_the_turn(self, db):
+        """A 2-max table is HU from pre-flop, so ``hu_from_street == 0`` on every
+        hand.  The old predicate asked where HU *began* (``hu_from_street >= 2``)
+        and so reported 0% eligible even though every turn/river node was HU and
+        solvable.  Eligibility is "HU **and** reached the turn or later".
+        """
+        log, _ = db
+        with log.game():
+            for i, term in enumerate(("preflop", "flop", "turn", "river")):
+                gid = log.log_game(_game(
+                    i, condition="vanilla", deck_seed=i, n_players=2,
+                    hu_from_street=0, terminal_street=term,
+                ))
+                log.log_seats(gid, [SeatRow(seat=1, is_hero=0, agent_label="bp")])
+        rep = build_report(log._con)
+        c = rep["hu_coverage"]["conditions"][0]
+        assert c["n_hands"] == 4
+        assert c["hu_frac"] == 1.0
+        # turn + river reach the turn; preflop and flop do not.
+        assert c["eligible_frac"] == 0.5
+
 
 # --------------------------------------------------------------------------- #
 # Cross-condition paired difference (CRN, §10.1)

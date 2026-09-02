@@ -79,6 +79,12 @@ _POSITION_NAMES = {
 # games.hu_from_street values → street names (betting_round indices).
 _STREET_NAME = {0: "preflop", 1: "flop", 2: "turn", 3: "river"}
 
+# ``games.terminal_street`` values (TEXT street names) that mean the hand reached
+# the turn or later — the streets OX-Search-HU can solve.  ⚠️``terminal_street`` is
+# TEXT, so an integer comparison like ``terminal_street >= 2`` is NOT a street test:
+# SQLite sorts TEXT above every INTEGER, so it is trivially true on every row.
+_TURN_OR_LATER = frozenset(("turn", "river"))
+
 # The env's own stage keys → the street names the schema logs (``decisions``/§6).
 # Only used to read the action grid (:func:`_action_grid`) under the schema's names.
 _ENV_STAGE_NAME = {"pre_flop": "preflop", "flop": "flop", "turn": "turn", "river": "river"}
@@ -854,8 +860,15 @@ def _query_hu_coverage(con: sqlite3.Connection) -> dict:
     """HU coverage per condition: where OX-Search (HU) could have fired.
 
     ``games.hu_from_street`` is the earliest street at which a betting round began
-    heads-up with the hero.  ``eligible`` (street ≥ 2, turn or later) is the
-    OX-Search-HU activation predicate (design doc §4.2b).  Reported as **fractions
+    heads-up with the hero.  ``eligible`` is the OX-Search-HU activation predicate
+    (design doc §4.2b): the hand was HU with the hero **and reached the turn or
+    later**, i.e. ``hu_from_street IS NOT NULL AND terminal_street IN
+    ('turn','river')``.  ⚠️It is NOT ``hu_from_street >= 2`` — that asks where HU
+    *began*, so at a 2-max table (HU from pre-flop, ``hu_from_street == 0`` on every
+    hand) it reported 0.0% eligible while every turn/river node was in fact HU and
+    solvable.  The two coincide only multiway, where HU is reached by attrition.
+    HU-ness is monotone once reached (seats only fold), so "HU at onset + reached
+    turn" is exactly "a turn-or-later round began HU".  Reported as **fractions
     of that condition's own hands** — the old raw street counts were summed over
     every arm, so a 400-deal experiment printed street counts near 1200 and no
     denominator to read them against.  Older snapshots (schema v1) lack the column →
@@ -868,14 +881,19 @@ def _query_hu_coverage(con: sqlite3.Connection) -> dict:
     per_cond: Dict[str, Dict[str, object]] = {}
     for r in _rows(
         con,
-        "SELECT condition, hu_from_street, COUNT(*) AS n FROM games "
-        "GROUP BY condition, hu_from_street",
+        "SELECT condition, hu_from_street, terminal_street, COUNT(*) AS n FROM games "
+        "GROUP BY condition, hu_from_street, terminal_street",
     ):
         cond = _condition_label(r["condition"])
-        entry = per_cond.setdefault(cond, {"n_hands": 0, "by_street": {}})
+        entry = per_cond.setdefault(
+            cond, {"n_hands": 0, "by_street": {}, "n_eligible": 0}
+        )
         entry["n_hands"] += int(r["n"])
         if r["hu_from_street"] is not None:
-            entry["by_street"][int(r["hu_from_street"])] = int(r["n"])
+            s_hu = int(r["hu_from_street"])
+            entry["by_street"][s_hu] = entry["by_street"].get(s_hu, 0) + int(r["n"])
+            if r["terminal_street"] in _TURN_OR_LATER:
+                entry["n_eligible"] += int(r["n"])
 
     conditions = []
     for cond in sorted(per_cond, key=_condition_sort_key):
@@ -883,7 +901,7 @@ def _query_hu_coverage(con: sqlite3.Connection) -> dict:
         n_hands = int(e["n_hands"])
         by_street = e["by_street"]
         n_hu = sum(by_street.values())
-        n_eligible = sum(n for s, n in by_street.items() if s >= 2)
+        n_eligible = int(e["n_eligible"])
         conditions.append({
             "condition": cond,
             "n_hands": n_hands,

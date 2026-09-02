@@ -26,13 +26,28 @@ signal, so it is **off by default** (``--regret`` to include it, doubling I/O).
 
 Headline metrics, per street:
 
-- **Play frequencies** (visit-weighted): the strategy tables store the average
-  strategy as visit counts accumulated by the strategy-sampling traversal
-  (:mod:`poker_ai.blueprint.strategy`), so the column-sum over all infosets,
-  normalised by the total mass, is the frequency with which the blueprint
-  plays each abstract action when it acts on that street under its own play.
-  This is the "fold / call / raise probability across streets" headline and
-  the primary sanity signal (uniform → untrained; sharply skewed → learned).
+- **Play frequencies** (mass-weighted): the column-sum over all infosets,
+  normalised by the total row mass.  Good as a *table* summary and as the
+  primary sanity signal (uniform → untrained; sharply skewed → learned).
+
+  ⚠️**This is NOT the frequency the blueprint actually plays the action**, and
+  must never be quoted as a behaviour claim.  Two reasons, both load-bearing:
+
+  1. Only **pre-flop** rows carry real visit counts.  Pluribus Algorithm 1's
+     ``UPDATE-STRATEGY`` is pre-flop only, so training writes a ``strategy_0``
+     chunk and nothing else; :mod:`poker_ai.blueprint.offline_average`
+     synthesises the post-flop rows by regret-matching the retained snapshots
+     and writes them at the fixed ``SIGMA_SCALE_DEFAULT`` (1e6) denominator.
+     Every post-flop row therefore has **identical** mass, so post-flop this
+     "mass-weighted" number is arithmetically the same as the unweighted
+     per-infoset mean below — there is no weighting left to speak of.
+  2. Even where the mass is real, it is a *training* statistic, not a reach
+     probability under the finished blueprint.
+
+  Measured against 1000 played hands (2p/20-card, ``--condition
+  blueprint_only``), the all-in figure here overstates actual play by
+  2.6×–15.5× depending on street.  For a behaviour claim, run
+  ``poker_ai evaluate run`` and read the ACTION MIX block.
 - **Per-infoset mean strategy** (unweighted): each visited row normalised to a
   distribution and averaged with equal weight, so rarely-reached infosets
   count as much as common ones.  Divergence from the visit-weighted numbers

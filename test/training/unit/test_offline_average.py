@@ -11,6 +11,7 @@ Covers the three layers of the offline post-flop average-strategy tool:
   averaged post-flop rows and the carried-through pre-flop average back out.
 """
 
+import inspect
 import os
 
 import joblib
@@ -462,6 +463,7 @@ class TestBuildFinalBlueprint:
         np.save(cp2 / "regret_2_chunk_000000.npy", r2)
 
         out_dir = tmp_path / "final_bp"
+        # No snapshot_weighting → the DEFAULT, which is "linear" (t-weighted).
         build_final_blueprint(train_dir, out_dir, scale=SIGMA_SCALE_DEFAULT)
 
         # Output is a self-contained blueprint dir.
@@ -480,16 +482,38 @@ class TestBuildFinalBlueprint:
             got_phi = restored.strategy[0].get_row_if_exists(preflop_key)
             np.testing.assert_array_equal(got_phi, preflop_phi)
 
-            # Post-flop strategy = averaged regret-matched σ, scaled.
+            # Post-flop strategy = averaged regret-matched σ, scaled.  Under the
+            # default "linear" weighting the snapshots at t=1000 and t=2000 carry
+            # weights 0.5 and 1.0 (normalised by the largest t), so the mean is
+            # (0.5·s1 + 1.0·s2) / 1.5 — the later snapshot counts double.
             s1 = sigma_from_regret_chunk(r1)
             s2 = sigma_from_regret_chunk(r2)
-            expected = np.rint(SIGMA_SCALE_DEFAULT * (s1 + s2) / 2).astype(np.int32)
+            expected = np.rint(
+                SIGMA_SCALE_DEFAULT * (0.5 * s1 + 1.0 * s2) / 1.5
+            ).astype(np.int32)
             for row, key in enumerate(turn_keys):
                 got = restored.strategy[2].get_row_if_exists(key)
                 np.testing.assert_array_equal(got, expected[row])
                 assert int(got.sum()) >= 10  # clears min_strategy_mass
         finally:
             restored.close()
+
+        # …and the "equal" path still reproduces the plain unweighted mean, which
+        # is what regenerating a pre-2026-09-02 blueprint depends on.
+        eq_dir = tmp_path / "final_bp_equal"
+        build_final_blueprint(train_dir, eq_dir, scale=SIGMA_SCALE_DEFAULT,
+                              snapshot_weighting="equal")
+        restored_eq = _new_tables(eq_dir / "lmdb_index", "shm_req")
+        try:
+            apply_warm_start_to_tables(restored_eq, eq_dir, expected_n_players=2)
+            expected_eq = np.rint(
+                SIGMA_SCALE_DEFAULT * (s1 + s2) / 2
+            ).astype(np.int32)
+            for row, key in enumerate(turn_keys):
+                got = restored_eq.strategy[2].get_row_if_exists(key)
+                np.testing.assert_array_equal(got, expected_eq[row])
+        finally:
+            restored_eq.close()
 
     def test_refuses_inconsistent_snapshots(self, tmp_path):
         train_dir = tmp_path / "train"
@@ -582,3 +606,85 @@ class TestBuildFinalBlueprint:
             SIGMA_SCALE_DEFAULT * sigma_from_regret_chunk(late)
         ).astype(np.int32)
         np.testing.assert_array_equal(got, expected)
+
+
+class TestSnapshotWeighting:
+    """``snapshot_weights`` makes the per-row mean weighted (offline_average)."""
+
+    @staticmethod
+    def _snap(tmp_path, name, regret_rows):
+        d = tmp_path / name
+        (d).mkdir(parents=True, exist_ok=True)
+        np.save(d / "regret_1_chunk_000000.npy", np.asarray(regret_rows, dtype=np.int32))
+        return d
+
+    def test_default_is_unweighted_and_linear_favours_late_snapshots(self, tmp_path):
+        from poker_ai.blueprint.offline_average import average_chunk
+
+        # Two snapshots, one row, two actions.  Early prefers action 0, late
+        # prefers action 1 — both with positive regret, so both confirm the row.
+        early = self._snap(tmp_path, "checkpoint_1", [[100, 0]])
+        late = self._snap(tmp_path, "checkpoint_2", [[0, 100]])
+        snaps = [early, late]
+
+        out_eq = tmp_path / "eq"
+        out_eq.mkdir()
+        average_chunk(snaps, late, 1, 0, out_eq, 1_000_000,
+                      min_confirming_snapshots=2, min_confirming_fraction=0.0,
+                      min_snapshot_regret_magnitude=None)
+        eq = np.load(out_eq / "strategy_1_chunk_000000.npy")[0]
+        # Unweighted mean of (1,0) and (0,1) is (0.5, 0.5).
+        assert eq[0] == eq[1]
+
+        out_lin = tmp_path / "lin"
+        out_lin.mkdir()
+        average_chunk(snaps, late, 1, 0, out_lin, 1_000_000,
+                      min_confirming_snapshots=2, min_confirming_fraction=0.0,
+                      min_snapshot_regret_magnitude=None,
+                      snapshot_weights=[1.0, 3.0])
+        lin = np.load(out_lin / "strategy_1_chunk_000000.npy")[0]
+        # Weighted 1:3 → (0.25, 0.75); the late snapshot dominates.
+        assert lin[1] > lin[0]
+        assert lin[0] == pytest.approx(250_000, abs=2)
+        assert lin[1] == pytest.approx(750_000, abs=2)
+
+    def test_weights_do_not_relax_the_confirmation_gate(self, tmp_path):
+        """A heavy snapshot must not publish a row on its own — the tally is a
+        plain count of confirming snapshots, not a weighted sum."""
+        from poker_ai.blueprint.offline_average import average_chunk
+
+        confirming = self._snap(tmp_path, "checkpoint_1", [[100, 0]])
+        silent = self._snap(tmp_path, "checkpoint_2", [[0, 0]])  # no positive regret
+        out = tmp_path / "out"
+        out.mkdir()
+        average_chunk([confirming, silent], silent, 1, 0, out, 1_000_000,
+                      min_confirming_snapshots=2, min_confirming_fraction=0.0,
+                      min_snapshot_regret_magnitude=None,
+                      snapshot_weights=[1000.0, 1.0])
+        row = np.load(out / "strategy_1_chunk_000000.npy")[0]
+        assert row.sum() == 0  # only 1 of 2 confirmed → unpublished
+
+    def test_mismatched_weight_length_is_rejected(self, tmp_path):
+        from poker_ai.blueprint.offline_average import average_chunk
+
+        d = self._snap(tmp_path, "checkpoint_1", [[100, 0]])
+        out = tmp_path / "out"
+        out.mkdir()
+        with pytest.raises(ValueError, match="align positionally"):
+            average_chunk([d], d, 1, 0, out, 1_000_000, snapshot_weights=[1.0, 2.0])
+
+    def test_default_weighting_is_linear_but_average_chunk_stays_unweighted(self):
+        """Two different layers, deliberately not the same default.
+
+        ``SNAPSHOT_WEIGHTING_DEFAULT`` is what a *build* uses (flipped to
+        ``linear`` on measured evidence).  ``average_chunk``'s own
+        ``snapshot_weights=None`` stays the plain unweighted mean, so the
+        low-level primitive is unchanged and old blueprints stay reproducible
+        via ``--snapshot-weighting equal``.
+        """
+        from poker_ai.blueprint import offline_average as oa
+
+        assert oa.SNAPSHOT_WEIGHTING_DEFAULT == "linear"
+        assert set(oa.SNAPSHOT_WEIGHTINGS) == {"equal", "linear"}
+        sig = inspect.signature(oa.average_chunk)
+        assert sig.parameters["snapshot_weights"].default is None
