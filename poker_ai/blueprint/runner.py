@@ -183,7 +183,7 @@ def train():
 )
 @click.option(
     "--c",
-    default=-300000000,
+    default=-3000000,
     help=(
         "Pruning threshold for regret, which means when we are using CFR with "
         "pruning and have a state with a regret of less than `c`, then we'll "
