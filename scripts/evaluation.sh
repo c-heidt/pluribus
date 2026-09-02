@@ -158,7 +158,15 @@ MAX_WALL_SECONDS=${MAX_WALL_SECONDS:-1000.0}
 # per-hand cost that stays in the experiment budget, off the search hot path, and
 # never perturbs the played hand.  Set AIVAT=false for the raw-only baseline.
 AIVAT=${AIVAT:-true}                                # true | false
-AIVAT_HOLE_SAMPLES=${AIVAT_HOLE_SAMPLES:-6}         # belief draws per value eval
+# Baseline playouts averaged per AIVAT value-function evaluation — the estimator's
+# DOMINANT variance knob (measured var_x 1.28 at 6 vs 1.82 at 48), and it saturates
+# by 48; below ~6 it reduces no variance at all.
+AIVAT_ROLLOUTS=${AIVAT_ROLLOUTS:-48}                # baseline rollouts per value eval
+# Turn/river CHANCE corrections by exact enumeration over the undealt deck — the only
+# family of term that removes *board* variance.  OFF by default: measured +3.5%
+# overall (CI straddling 1) for a real per-hand cost.
+AIVAT_CHANCE=${AIVAT_CHANCE:-false}                 # true | false
+AIVAT_CHANCE_ROLLOUTS=${AIVAT_CHANCE_ROLLOUTS:-48}  # baseline rollouts per alternative card
 # Sync-back cadence (§5): every SYNC_INTERVAL_HANDS hands and/or SYNC_INTERVAL_MINUTES.
 SYNC_INTERVAL_HANDS=${SYNC_INTERVAL_HANDS:-500}
 SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES:-20}
@@ -444,7 +452,8 @@ echo "  - Big/small blind:        $BIG_BLIND / $SMALL_BLIND"
 echo "  - Starting stack:         $STARTING_STACK"
 echo "  - Max iterations:         $MAX_ITERATIONS"
 echo "  - Max wall seconds:       $MAX_WALL_SECONDS"
-echo "  - AIVAT:                  $AIVAT (hole samples: $AIVAT_HOLE_SAMPLES)"
+echo "  - AIVAT:                  $AIVAT (rollouts: $AIVAT_ROLLOUTS)"
+echo "  - AIVAT chance corr.:     $AIVAT_CHANCE (rollouts: $AIVAT_CHANCE_ROLLOUTS)"
 echo "  - Sync interval (hands):  $SYNC_INTERVAL_HANDS"
 echo "  - Sync interval (mins):   $SYNC_INTERVAL_MINUTES"
 echo "  - Search core:            ${PLURIBUS_SEARCH_CORE:-0}  (1 = walk + all kernels)"
@@ -460,9 +469,15 @@ echo "  - CPUs:                   ${SLURM_CPUS_PER_TASK:-(unset)}"
 # Build optional flags shared by every arm.
 EXTRA_ARGS=()
 [ -n "$FIXED_SEATS" ]  && EXTRA_ARGS+=(--fixed-seats "$FIXED_SEATS")
-# AIVAT (§10.2): a boolean --aivat/--no-aivat flag + the belief-sample count.
+# AIVAT (§10.2): a boolean --aivat/--no-aivat flag + the rollout counts.  The chance
+# corrections (§10.2 turn/river) require --aivat, so they are only passed inside it.
 if [ "$AIVAT" = "true" ]; then
-  EXTRA_ARGS+=(--aivat --aivat-hole-samples "$AIVAT_HOLE_SAMPLES")
+  EXTRA_ARGS+=(--aivat --aivat-rollouts "$AIVAT_ROLLOUTS")
+  if [ "$AIVAT_CHANCE" = "true" ]; then
+    EXTRA_ARGS+=(--aivat-chance --aivat-chance-rollouts "$AIVAT_CHANCE_ROLLOUTS")
+  else
+    EXTRA_ARGS+=(--no-aivat-chance)
+  fi
 else
   EXTRA_ARGS+=(--no-aivat)
 fi
