@@ -325,15 +325,11 @@ def _drive_to(env, hero_seat: int, target_street: int, n_live: int,
             continue
         act = "call" if "call" in legal else None
         if act is None:
-            # No passive reply here.  Two different causes, and they want
-            # opposite answers:
-            #   * the raise level simply has no call in the abstraction (the
-            #     pre-flop open) — every seat can still act, and folding the
-            #     non-hero seats here would starve the multiway cells, so take
-            #     the cheapest raise and keep everyone in;
-            #   * the stack cannot cover the standing bet — then no raise is
-            #     legal either, and only the hero fights on (it must never fold
-            #     itself out of its own calibration root).
+            # No passive reply here — the stack cannot cover the standing bet.
+            # Prefer the cheapest raise if one is still legal: folding the
+            # non-hero seats would starve the multiway cells.  If no raise is
+            # legal either, only the hero fights on (it must never fold itself
+            # out of its own calibration root).
             act = min(
                 (a for a in legal if a.startswith("raise:")),
                 key=lambda a: float(a.split(":", 1)[1]),

@@ -277,9 +277,11 @@ def test_mccfr_regime_reaches_equilibrium(_seeded):
         for key, row in sigma.items()
     }
     root_expl = turn_exploitability(sub, spliced)
-    # 0.02*scale = 8.0 against a measured worst case of 1.66 — ~5x headroom, and far
-    # sharper than the 0.03*scale the un-spliced number needed.
-    assert root_expl < 0.02 * scale, (
+    # 0.03*scale = 12.0.  The tighter 0.02 this gate briefly carried was calibrated
+    # on the per-level grid (worst case 1.66 there); under the two-cell grid the turn
+    # subgame is a different game and seed 4 measures 9.76, so the bound goes back to
+    # the 0.03 the old grid used.  Re-tighten only against fresh measurements.
+    assert root_expl < 0.03 * scale, (
         f"mccfr turn root-street strategy not an equilibrium given an exact "
         f"continuation: expl={root_expl:.4f} scale={scale}"
     )

@@ -919,10 +919,10 @@ def _query_hu_coverage(con: sqlite3.Connection) -> dict:
 def _action_grid() -> Optional[Dict[str, List[List[str]]]]:
     """The env's action grid as ``{street: [tokens at level 0, level 1, ...]}``.
 
-    The grid is cut per ``(stage, raise level)`` — :data:`RAISE_SIZES_BY_STAGE`
-    crossed with the passive gates (:data:`CALL_ALLOWED_BY_STAGE` /
-    :data:`ALL_IN_ALLOWED_BY_STAGE`) — so those cells are exactly the granularity
-    the action mix is reported at.  Knowing the grid is what lets a cell print a
+    The grid is cut per ``(stage, raise level)``: :data:`RAISE_SIZES_BY_STAGE`
+    offers ``"first_raise"`` at level 0 and ``"subsequent_raise"`` at level 1+,
+    so those two cells are exactly the granularity the action mix is reported
+    at.  ``fold`` / ``call`` / ``all_in`` are in every cell's alphabet.  Knowing the grid is what lets a cell print a
     **dead entry** (an abstraction size offered but never played) as ``0%`` rather
     than leaving it invisible, and mark an off-grid play with ``*``.
 
@@ -934,24 +934,21 @@ def _action_grid() -> Optional[Dict[str, List[List[str]]]]:
     """
     try:
         from environment.poker_env import (       # noqa: PLC0415 — deliberate soft dep
-            ALL_IN_ALLOWED_BY_STAGE,
-            CALL_ALLOWED_BY_STAGE,
             RAISE_SIZES_BY_STAGE,
         )
     except Exception:                             # pragma: no cover - env not importable
         return None
     grid: Dict[str, List[List[str]]] = {}
-    for env_stage, levels in RAISE_SIZES_BY_STAGE.items():
+    for env_stage, cell_cfg in RAISE_SIZES_BY_STAGE.items():
         stage = _ENV_STAGE_NAME.get(env_stage, env_stage)
         cells = []
-        for i, fractions in enumerate(levels):
-            tokens = ["fold"]
-            if CALL_ALLOWED_BY_STAGE[env_stage][i]:
-                tokens.append("call")
-            tokens += [f"raise:{f}" for f in sorted(fractions)]
-            if ALL_IN_ALLOWED_BY_STAGE[env_stage][i]:
-                tokens.append("all_in")
-            cells.append(tokens)
+        for key in ("first_raise", "subsequent_raise"):
+            fractions = cell_cfg.get(key, [])
+            cells.append(
+                ["fold", "call"]
+                + [f"raise:{f}" for f in sorted(fractions)]
+                + ["all_in"]
+            )
         grid[stage] = cells
     return grid
 

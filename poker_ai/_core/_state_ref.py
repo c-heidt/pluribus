@@ -36,12 +36,9 @@ import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from environment.poker_env import (
-    ALL_IN_ALLOWED_BY_STAGE,
-    CALL_ALLOWED_BY_STAGE,
     MAX_RAISES_PER_ROUND,
     RAISE_SIZES_BY_STAGE,
     encode_info_set,
-    raise_level,
 )
 
 # Stage names in play order, mirroring PokerEnv._betting_stage strings.
@@ -253,20 +250,12 @@ class FastStateRef:
             if chips_available > 0:
                 actions.append("all_in")
         else:
-            level = raise_level(self.betting_stage, self.n_raises)
-            # A free check is never gated (mirrors PokerEnv).
-            if (n_chips_to_call == 0
-                    or CALL_ALLOWED_BY_STAGE.get(self.betting_stage, [True])[level]):
-                actions.append("call")
+            actions.append("call")
             # Raises are only meaningful when another live player could call
             # them; facing a lone all-in the only responses are call/fold.
             if (self.n_raises < MAX_RAISES_PER_ROUND
                     and self.n_players_with_moves() >= 2):
                 actions += self._get_available_raise_sizes()
-            if len(actions) == 1:
-                # Only "fold" left — the level drops the passive actions and no
-                # raise fits.  Mirrors PokerEnv._compute_legal_actions.
-                actions.append("all_in")
         return actions
 
     def info_set(self) -> bytes:
@@ -294,12 +283,12 @@ class FastStateRef:
     def _get_available_raise_sizes(self) -> List[str]:
         if self.betting_stage in _TERMINAL_STAGES:
             return []
-        levels = RAISE_SIZES_BY_STAGE.get(self.betting_stage)
-        if not levels:
-            return []
-        level = raise_level(self.betting_stage, self.n_raises)
-        fractions = levels[level]
-        allow_all_in = ALL_IN_ALLOWED_BY_STAGE[self.betting_stage][level]
+        stage_config = RAISE_SIZES_BY_STAGE.get(self.betting_stage, {})
+        fractions = (
+            stage_config.get("first_raise", [1.0])
+            if self.n_raises == 0
+            else stage_config.get("subsequent_raise", [1.0])
+        )
         seat = self.player_i
         biggest_bet = max(self.n_bet_chips)
         n_chips_to_call = biggest_bet - self.n_bet_chips[seat]
@@ -316,7 +305,7 @@ class FastStateRef:
                 continue
             added.add(chips)
             raise_actions.append(f"raise:{fraction}")
-        if allow_all_in and chips_available > 0 and chips_available >= n_chips_to_call:
+        if chips_available > 0 and chips_available >= n_chips_to_call:
             if chips_available not in added:
                 raise_actions.append("all_in")
         return raise_actions

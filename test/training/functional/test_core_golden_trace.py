@@ -74,12 +74,17 @@ _LUT_PATH = "data/20cards_exact"
 # contributes nothing — it is arithmetically identical to the previous plain
 # int32 add for in-range values.  Reproducible across two independent runs.
 # Previous digests:
+#   4c3b2c4f882a078958444c365cfc10999d5da2e3f2c65bc1c898213bcdcbed10  (per-level grid, now reverted)
 #   2239cb1b5ff88c7a3b3be1aea26a7bee55ecc72c25d25aadada7ac9bfd225b2e  (pre grid re-cut)
-#   00cb45e7dc0c67a2a2a7beb14068c3061a8f26be952ecf1c546be42ff147aed2  (pre per-level grid)
 #   7fef05fc8c7c421e8c667bd049530aeb3121c16aeb41ecbeb7f33bdd83243022  (pre preflop-only phi)
 #   4ca50490d570bd4a8318b03112dd40f0466796d89c4fd8ee5a9ddb350b4f99c9  (after _hand_over all-in fix)
 #   e23d93b6b08842048d37b58ee0c166e3c9260fd803712ead082d8efe5f221251  (pre all-in fixes)
-GOLDEN_DIGEST = "4c3b2c4f882a078958444c365cfc10999d5da2e3f2c65bc1c898213bcdcbed10"
+#
+# Reverting the per-level grid to the two-cell ``first_raise`` /
+# ``subsequent_raise`` table restored this digest EXACTLY to its pre-per-level
+# value — an independent check that the revert touched the abstraction and
+# nothing else.
+GOLDEN_DIGEST = "00cb45e7dc0c67a2a2a7beb14068c3061a8f26be952ecf1c546be42ff147aed2"
 
 
 def train_and_digest(save_path: Path, *, n_iterations: int = N_ITERATIONS):

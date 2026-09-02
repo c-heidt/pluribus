@@ -1,9 +1,9 @@
 """Grid-independent helpers for driving a hand under the action abstraction.
 
-``environment.poker_env``'s abstraction is a per-stage, per-raise-level table
-(:data:`~environment.poker_env.RAISE_SIZES_BY_STAGE` and the passive-action
-gates beside it).  Which sizes exist — and whether ``call`` / ``all_in`` exist
-at all — is a *tuning* decision that changes; tests must not encode it.
+``environment.poker_env``'s abstraction is a per-stage table
+(:data:`~environment.poker_env.RAISE_SIZES_BY_STAGE`), cut into a
+``"first_raise"`` cell and a ``"subsequent_raise"`` cell.  Which sizes exist is
+a *tuning* decision that changes; tests must not encode it.
 
 Everything here derives what it needs from the live tables or from
 ``env.legal_actions``, so re-cutting the grid never edits a test:
@@ -11,7 +11,7 @@ Everything here derives what it needs from the live tables or from
 * :func:`passive_action` / :func:`advance_to_round` — walk a hand forward.
 * :func:`smallest_raise` / :func:`largest_raise` — a raise without naming one.
 * :func:`shove_prelude` / :func:`raise_until_shove_legal` — reach a node where
-  a voluntary all-in is in the abstraction (pre-flop that is the 4-bet level).
+  a voluntary all-in is legal (deep stacks make it a raise, not a call).
 * :func:`bracketing_sample` / :func:`level_exclusive_fraction` — inputs for the
   pseudo-harmonic translation tests, read off the live grid.
 """

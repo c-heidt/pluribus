@@ -111,7 +111,7 @@ _N_ITERS = 50
 # NOT this fixture's ``discount_interval=20``: the two knobs are deliberately
 # independent, so this digest is insensitive to the discount cadence.
 # Previous MCCFR: 47f077d65e9f70e00492ae6f2c637dd6ed246718e56f56a475c0337805a3c585
-GOLDEN_DIGEST_MCCFR = "1c15db3d4b50c16beb8c8269ff3ad1beb7f5e745aa8cdbeb6df111abca742c33"
+GOLDEN_DIGEST_MCCFR = "020d801b586f446d6903eb30b3fddd3a8037d3202ab63ba66ab131f602dbf4d4"
 #
 # VECTOR regenerated again 2026-09-01: ``_late_env`` now installs a MULTI-CLUSTER LUT.
 # It used to install a single-cluster stub (every hand → cluster 0), so this fixture's
@@ -121,7 +121,7 @@ GOLDEN_DIGEST_MCCFR = "1c15db3d4b50c16beb8c8269ff3ad1beb7f5e745aa8cdbeb6df111abc
 # is UNCHANGED by that switch: its fixture roots pre-flop, where the subgame ends at the
 # round boundary, so it has no future-street cluster rows to differ over.
 # Previous vector: 1719868eb53769c09b830aed66499efa60a535e7702cb192cb57c0e14b29632d
-GOLDEN_DIGEST_VECTOR = "b501561f629d25be532a2da7b5cd52e2ec45c69e82821342119a40a4e4645f03"
+GOLDEN_DIGEST_VECTOR = "e468496c0a94d61c5b462d1eb735af811b66b80f6beff53d4be27af0f1d8dcb8"
 
 
 def _digest_tables(*tables) -> str:
@@ -244,11 +244,16 @@ class TestGoldenTrace:
         assert st_v.vregret and st_v.vstrat
 
 
-@pytest.mark.skip(reason="regeneration helper — run explicitly with -k regenerate -s")
-def test_regenerate_golden_digests():
+def test_regenerate_golden_digests(request):
     """Print the current digests for pasting into the ``GOLDEN_DIGEST_*`` literals.
 
     Skipped by default; run with ``-k regenerate -s`` after a deliberate change.
+    The guard is a ``-k`` check rather than ``@pytest.mark.skip``: an
+    unconditional skip mark also suppresses the test when it *is* named on the
+    command line, which silently made this documented invocation a no-op (the
+    same footgun already fixed in ``test_core_golden_trace.py``).
     """
+    if "regenerate" not in (request.config.getoption("keyword", default="") or ""):
+        pytest.skip("regeneration helper — run explicitly with -k regenerate -s")
     print(f'\nGOLDEN_DIGEST_MCCFR = "{_mccfr_digest()}"')
     print(f'GOLDEN_DIGEST_VECTOR = "{_vector_digest()}"')

@@ -295,10 +295,11 @@ class TestRun:
             log.close()
         assert rows and all(r[1] is not None for r in rows)
         for stage, level, action in rows:
-            levels = RAISE_SIZES_BY_STAGE[env_stage[stage]]
-            assert 0 <= level <= len(levels) - 1     # clamped, last level repeats
+            cfg = RAISE_SIZES_BY_STAGE[env_stage[stage]]
+            assert level in (0, 1)     # first_raise / subsequent_raise
             if action.startswith("raise:"):
-                assert float(action.split(":", 1)[1]) in levels[level]
+                cell = cfg["first_raise" if level == 0 else "subsequent_raise"]
+                assert float(action.split(":", 1)[1]) in cell
 
     def test_blueprint_round1_decisions_logged(self, tmp_path):
         session = _stub_session(n_players=2, starting_stack=1000)

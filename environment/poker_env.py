@@ -179,86 +179,41 @@ class _NumpyJSONEncoder(json.JSONEncoder):
 # (:meth:`PokerEnv._translate_fraction`), and real-time search re-adds
 # granularity where it matters, so blueprint coarseness here is the cheap
 # axis to give up.
-RAISE_SIZES_BY_STAGE: Dict[str, List[List[float]]] = {
-    "pre_flop": [
-        [1.7],                    # open
-        [1.33, 2.25],             # 3-bet
-        [1.0, 1.5],               # 4-bet
-    ],
-    "flop": [
-        [0.33, 0.75, 1.0, 2.0],   # first in
-        [0.75, 1.0, 1.5],         # facing a bet
-    ],
-    "turn": [
-        [0.33, 0.75, 1.5],        # first in
-        [0.75, 1.5],              # facing a bet
-    ],
-    "river": [
-        [0.33, 0.75, 1.5, 2.0],   # first in
-        [0.75, 1.0],              # facing a bet
-    ],
+RAISE_SIZES_BY_STAGE: Dict[str, Dict[str, List[float]]] = {
+    "pre_flop": {
+        "first_raise":      [1.0, 2.0, 3.0],
+        "subsequent_raise": [1.0],
+    },
+    "flop": {
+        "first_raise":      [0.5, 1.0, 1.5],
+        "subsequent_raise": [1.0],
+    },
+    "turn": {
+        "first_raise":      [0.5, 1.0],
+        "subsequent_raise": [1.0],
+    },
+    "river": {
+        "first_raise":      [0.5, 1.0],
+        "subsequent_raise": [1.0],
+    },
 }
 
-# Whether the *passive* actions are part of the abstraction at each raise
-# level, indexed identically to :data:`RAISE_SIZES_BY_STAGE` (last level
-# repeats).  These gate only the voluntary case — a player who has chips
-# left over after calling:
-#
-# ``CALL_ALLOWED``  False removes the call from the abstraction (pre-flop
-#     level 0: no limping — the opener folds or opens for 1.7 pot).  It never
-#     removes a *free check* (nothing to call — declining to bet is not a
-#     limp), nor the *call-for-less* ``"all_in"`` a player facing a bet bigger
-#     than their stack gets; that branch is a call, not a bet.
-# ``ALL_IN_ALLOWED`` False removes the voluntary shove appended by
-#     :meth:`PokerEnv._get_available_raise_sizes`.
-#
-# A player with chips is never left with fold as the only option: if the
-# gates plus the stack/min-raise filters would empty the voluntary set,
-# ``"all_in"`` is restored (see :meth:`PokerEnv._compute_legal_actions`).
-CALL_ALLOWED_BY_STAGE: Dict[str, List[bool]] = {
-    "pre_flop": [False, True, True],
-    "flop":     [True, True],
-    "turn":     [True, True],
-    "river":    [True, True],
-}
-
-ALL_IN_ALLOWED_BY_STAGE: Dict[str, List[bool]] = {
-    "pre_flop": [False, False, True],
-    "flop":     [True, True],
-    "turn":     [True, True],
-    "river":    [True, True],
-}
-
-# The three tables are indexed by the same (stage, level) pair everywhere;
-# a length mismatch would silently shift a level's passive gates onto the
-# wrong raise grid, so check it once at import.
-for _stage, _levels in RAISE_SIZES_BY_STAGE.items():
-    if not (len(CALL_ALLOWED_BY_STAGE[_stage])
-            == len(ALL_IN_ALLOWED_BY_STAGE[_stage]) == len(_levels)):
-        raise RuntimeError(
-            f"action abstraction tables disagree on the level count for "
-            f"{_stage!r}: {len(_levels)} raise levels vs. "
-            f"{len(CALL_ALLOWED_BY_STAGE[_stage])} call / "
-            f"{len(ALL_IN_ALLOWED_BY_STAGE[_stage])} all-in flags"
-        )
-del _stage, _levels
 
 MAX_RAISES_PER_ROUND: int = 3
 
 
 def raise_level(stage: str, n_raises: int) -> int:
-    """Index into a stage's per-level abstraction tables.
+    """Index of the raise cell :data:`RAISE_SIZES_BY_STAGE` uses at ``n_raises``.
 
-    ``n_raises`` is the count of raises already made this betting round
-    (``PokerEnv._n_raises``); the last configured level repeats for every
-    deeper one, so a stage may configure fewer levels than
-    :data:`MAX_RAISES_PER_ROUND`.  Returns ``0`` for a stage with no grid
-    (terminal / show-down), where the caller has nothing to look up.
+    The grid has exactly two cells per stage — ``"first_raise"`` when no raise
+    has gone in this round, ``"subsequent_raise"`` once one has — so this
+    returns ``0`` or ``1``.  It is the same axis
+    :meth:`PokerEnv._get_available_raise_sizes` selects on, exposed as a small
+    int so the evaluation layer can bucket a decision by the grid cell it was
+    drawn from (``decisions.raise_level``) without importing the env's chip
+    logic.  Reported by the summary's ACTION MIX block as ``L0`` / ``L1``.
     """
-    n_levels = len(RAISE_SIZES_BY_STAGE.get(stage, ()))
-    if n_levels == 0:
-        return 0
-    return min(int(n_raises), n_levels - 1)
+    return 0 if int(n_raises) == 0 else 1
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +244,7 @@ def raise_level(stage: str, n_raises: int) -> int:
 # canonicalised token string equals the on-tree token string and hits the
 # same alphabet byte.  ``_blueprint_info_set`` therefore differs from
 # ``_compute_info_set`` only in passing ``_canonicalize_history(...)``.
-INFO_SET_ENCODING: str = "v3-compact-bytes-per-level-grid"
+INFO_SET_ENCODING: str = "v2-compact-bytes"
 """Version tag for the info-set key encoding.
 
 Persisted in ``server_state.pkl`` and checked as a structural key on
@@ -342,7 +297,10 @@ def _canonical_action_tokens(stage: str) -> List[str]:
     :meth:`PokerEnv.get_canonical_actions`; a unit test asserts the two agree
     so the alphabet can never silently drift from the canonical action set.
     """
-    fracs = sorted({f for level in RAISE_SIZES_BY_STAGE[stage] for f in level})
+    cfg = RAISE_SIZES_BY_STAGE[stage]
+    fracs = sorted(
+        set(cfg.get("first_raise", [])) | set(cfg.get("subsequent_raise", []))
+    )
     return ["fold", "call", "all_in"] + [f"raise:{f}" for f in fracs]
 
 
@@ -1195,20 +1153,18 @@ class PokerEnv:
         list[str]
             Raise action strings of the form ``"raise:<fraction>"`` that
             are legal given the player's stack, the current round's raise
-            count, and the minimum raise increment.  The grid comes from
-            the stage's :func:`raise_level` cell.  ``"all_in"`` is appended
-            when the level allows a voluntary shove and the player can go
-            all-in but not make that same-sized standard raise.
+            count, and the minimum raise increment. ``"all_in"`` is
+            appended when the player can go all-in but not make a
+            standard raise.
         """
         if self._betting_stage in {"terminal", "show_down"}:
             return []
-        stage = self._betting_stage
-        level = raise_level(stage, self._n_raises)
-        levels = RAISE_SIZES_BY_STAGE.get(stage)
-        if not levels:
-            return []
-        fractions = levels[level]
-        allow_all_in = ALL_IN_ALLOWED_BY_STAGE[stage][level]
+        stage_config = RAISE_SIZES_BY_STAGE.get(self._betting_stage, {})
+        fractions = (
+            stage_config.get("first_raise", [1.0])
+            if self._n_raises == 0
+            else stage_config.get("subsequent_raise", [1.0])
+        )
         player = self.current_player
         biggest_bet = max(p.n_bet_chips for p in self.players)
         n_chips_to_call = biggest_bet - player.n_bet_chips
@@ -1225,7 +1181,7 @@ class PokerEnv:
                 continue
             added.add(chips)
             raise_actions.append(f"raise:{fraction}")
-        if allow_all_in and chips_available > 0 and chips_available >= n_chips_to_call:
+        if chips_available > 0 and chips_available >= n_chips_to_call:
             if chips_available not in added:
                 raise_actions.append("all_in")
         return raise_actions
@@ -1252,21 +1208,17 @@ class PokerEnv:
     def _abstraction_fractions(
         stage: str,
         raise_index: int,
-        sizes_by_stage: Dict[str, List[List[float]]] = RAISE_SIZES_BY_STAGE,
+        sizes_by_stage: Dict[str, Dict[str, List[float]]] = RAISE_SIZES_BY_STAGE,
     ) -> List[float]:
         """Sorted abstraction fractions for a ``(stage, raise_index)`` cell.
 
-        ``raise_index`` is the number of raises already made this round;
-        it selects the stage's level list, with the last level repeating
-        for deeper indices (same rule as :func:`raise_level`, applied to
-        ``sizes_by_stage`` so an injected table is honoured).  Depends only
-        on the size table — no chip state — so it is valid for
-        canonicalising a historical action.
+        ``raise_index == 0`` selects the ``"first_raise"`` list, otherwise
+        ``"subsequent_raise"``.  Depends only on the size table — no chip
+        state — so it is valid for canonicalising a historical action.
         """
-        levels = sizes_by_stage.get(stage, [])
-        if not levels:
-            return []
-        return sorted(levels[min(int(raise_index), len(levels) - 1)])
+        cell = sizes_by_stage.get(stage, {})
+        key = "first_raise" if raise_index == 0 else "subsequent_raise"
+        return sorted(cell.get(key, []))
 
     @staticmethod
     def _pseudo_harmonic_neighbours(
@@ -1304,7 +1256,7 @@ class PokerEnv:
         *,
         randomized: bool,
         rng: Optional["np.random.Generator"] = None,
-        sizes_by_stage: Dict[str, List[List[float]]] = RAISE_SIZES_BY_STAGE,
+        sizes_by_stage: Dict[str, Dict[str, List[float]]] = RAISE_SIZES_BY_STAGE,
     ) -> float:
         """Map off-tree pot-fraction ``x`` onto the abstraction grid.
 
@@ -1964,15 +1916,7 @@ class PokerEnv:
             if chips_available > 0:
                 actions.append("all_in")
         else:
-            level = raise_level(self._betting_stage, self._n_raises)
-            # A free check is never gated: ``CALL_ALLOWED`` is about declining
-            # to put chips in (no pre-flop limp), and checking costs nothing.
-            # On-tree the two never coincide — a pre-flop node owing 0 needs a
-            # limp to reach — but an *injected* opponent limp creates exactly
-            # that node, and the actor there must still be able to check.
-            if (n_chips_to_call == 0
-                    or CALL_ALLOWED_BY_STAGE.get(self._betting_stage, [True])[level]):
-                actions.append("call")
+            actions.append("call")
             # Raises (and shove-as-raise) are only meaningful when at least one
             # *other* live player could call them.  Facing a lone all-in — the
             # current player is the only one with chips — the sole legal
@@ -1982,13 +1926,6 @@ class PokerEnv:
             if (self._n_raises < MAX_RAISES_PER_ROUND
                     and dynamics.n_players_with_moves(self) >= 2):
                 actions += self._get_available_raise_sizes()
-            if len(actions) == 1:
-                # Only "fold" survived: the level drops call/all-in from the
-                # abstraction (pre-flop open) and no configured raise fits the
-                # stack or the min-raise.  A player holding chips always keeps
-                # one voluntary line — never a forced fold — so restore the
-                # shove, which is in every stage's canonical alphabet.
-                actions.append("all_in")
         overlay = self._extra_legal_actions.get(public_state)
         if overlay:
             seen = {a for a in actions if a is not None}
@@ -2937,7 +2874,8 @@ class PokerEnv:
         if stage is None:
             raise ValueError(f"betting_round must be 0-3, got {betting_round}")
         all_fracs = sorted(
-            {f for level in RAISE_SIZES_BY_STAGE[stage] for f in level}
+            set(RAISE_SIZES_BY_STAGE[stage].get("first_raise", []))
+            | set(RAISE_SIZES_BY_STAGE[stage].get("subsequent_raise", []))
         )
         return ["fold", "call", "all_in"] + [f"raise:{f}" for f in all_fracs]
 

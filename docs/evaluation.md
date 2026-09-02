@@ -622,9 +622,9 @@ Reading it — "is search correct, and is it doing what it should":
   wall-clock a hand costs, which is what an experiment budget is built from.
 
 **Action mix — what each approach actually plays.** The env's action abstraction is
-cut per **(betting stage, raise level)**: `RAISE_SIZES_BY_STAGE[stage][level]` crossed
-with the passive gates (`CALL_ALLOWED_BY_STAGE` / `ALL_IN_ALLOWED_BY_STAGE`), where
-level 0 opens the betting, level 1 faces one raise, and a stage's last level repeats.
+cut per **(betting stage, raise level)**: `RAISE_SIZES_BY_STAGE[stage]["first_raise"]`
+at level 0, which opens the betting, and `["subsequent_raise"]` at level 1, which faces
+a raise already in — deeper raise counts reuse level 1.
 The played mix is reported at exactly those cells — `decisions.raise_level` is logged
 for that reason — because the legal token set differs cell by cell, so a mix pooled
 over a street averages cells nobody plays.

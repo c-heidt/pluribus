@@ -42,8 +42,6 @@ from environment.poker_env import (
     _ACTION_BYTE,
     _STAGE_ID,
     new_game,
-    ALL_IN_ALLOWED_BY_STAGE,
-    CALL_ALLOWED_BY_STAGE,
 )
 from poker_ai.tables.cfr_tables import CFRTables
 from poker_ai.tables.index import lmdb_map_size_for_players
@@ -59,8 +57,7 @@ from test.training.core_diff import (
 
 # Dump the encoding alphabet + raise grid into the compiled state engine once.
 cy.configure(
-    _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
-    CALL_ALLOWED_BY_STAGE, ALL_IN_ALLOWED_BY_STAGE,
+    _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND
 )
 
 N_PLAYERS = 2

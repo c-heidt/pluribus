@@ -301,12 +301,9 @@ def build_fast_walk_env(root_env):
                 _STAGE_ID,
                 RAISE_SIZES_BY_STAGE,
                 MAX_RAISES_PER_ROUND,
-                ALL_IN_ALLOWED_BY_STAGE,
-                CALL_ALLOWED_BY_STAGE,
             )
             _cystate.configure(
-                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
-                CALL_ALLOWED_BY_STAGE, ALL_IN_ALLOWED_BY_STAGE
+                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND
             )
         fast = _cystate.FastState.from_poker_env(root_env)
         return FastEnvAdapter(fast, root_env.combo_cards)
@@ -338,12 +335,9 @@ def build_fast_mccfr_env(root_env):
                 _STAGE_ID,
                 RAISE_SIZES_BY_STAGE,
                 MAX_RAISES_PER_ROUND,
-                ALL_IN_ALLOWED_BY_STAGE,
-                CALL_ALLOWED_BY_STAGE,
             )
             _cystate.configure(
-                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
-                CALL_ALLOWED_BY_STAGE, ALL_IN_ALLOWED_BY_STAGE
+                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND
             )
         fast = _cystate.FastState.from_poker_env(root_env)
         return FastMCCFRAdapter(fast, root_env.combo_cards, root_env.card_info_lut)

@@ -54,9 +54,11 @@ from typing import Iterable, Iterator, List, Optional
 #     calibration axis for per-street/per-live-count throughput & budget).
 # v7: + decisions.ox_enter_prob (OX-Search Approach B opt-out saturation; NULL for
 #     vanilla/DBR and non-vector subgames, so a non-NULL row is a genuine OX decision).
-# v8: + decisions.raise_level (the env action grid's second axis — raises already in
-#     this round, clamped as `poker_env.raise_level`; lets the summary report the
-#     played action mix at exactly the grid's (stage, level) granularity).
+# v8: + decisions.raise_level (the env action grid's second axis — 0 when no raise
+#     has gone in this round, 1 once one has, i.e. `poker_env.raise_level`, which
+#     is the `first_raise` / `subsequent_raise` split RAISE_SIZES_BY_STAGE is cut
+#     on; lets the summary report the played action mix at exactly the grid's
+#     (stage, level) granularity).
 SCHEMA_VERSION = 8
 
 
@@ -128,7 +130,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     cache_misses    INTEGER,
     action_played   TEXT,
     action_dist     TEXT,
-    raise_level     INTEGER,   -- action-grid level: raises already in this round (clamped)
+    raise_level     INTEGER,   -- action-grid level: 0 = first_raise, 1 = subsequent_raise
     exploitability  REAL,
     game_value      REAL,
     modeled_decision INTEGER,

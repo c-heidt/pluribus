@@ -670,10 +670,11 @@ class TestSearch:
 class TestActionMix:
     """The played action mix, reported at the env action grid's own cells.
 
-    The grid is cut per ``(stage, raise level)`` (``RAISE_SIZES_BY_STAGE`` crossed
-    with the passive gates), so the mix is a share *within* a cell — pooling over a
-    street mixes cells with different legal token sets, and pooling over conditions
-    just multiplies the deal count by the arm count.
+    The grid is cut per ``(stage, raise level)`` — ``RAISE_SIZES_BY_STAGE``'s
+    ``first_raise`` cell at level 0 and ``subsequent_raise`` at level 1+ — so the
+    mix is a share *within* a cell: pooling over a street mixes cells with
+    different legal token sets, and pooling over conditions just multiplies the
+    deal count by the arm count.
     """
 
     def _dec(self, log, gid, stage, level, action, **kw):
@@ -687,48 +688,48 @@ class TestActionMix:
             gid = log.log_game(_game(0))
             # flop L0: 3 plays.  flop L1: 1 play.  A pooled street share would read
             # the L1 fold as 25% of "the flop"; it is 100% of the cell it was made in.
-            for a in ("raise:0.33", "raise:0.33", "call"):
+            for a in ("raise:0.5", "raise:0.5", "call"):
                 self._dec(log, gid, "flop", 0, a)
             self._dec(log, gid, "flop", 1, "fold")
         m = _mix(build_report(log._con))
         l0, l1 = _cell(m, "flop", 0), _cell(m, "flop", 1)
         assert l0["n"] == 3 and l1["n"] == 1
-        assert math.isclose(l0["shares"]["raise:0.33"], 2 / 3)
+        assert math.isclose(l0["shares"]["raise:0.5"], 2 / 3)
         assert math.isclose(l1["shares"]["fold"], 1.0)
 
     def test_dead_grid_entry_is_reported_as_zero(self, db):
         log, _ = db
         with log.game():
             gid = log.log_game(_game(0))
-            self._dec(log, gid, "flop", 0, "raise:0.33")
+            self._dec(log, gid, "flop", 0, "raise:0.5")
         cell = _cell(_mix(build_report(log._con)), "flop", 0)
         # A size the abstraction offers and the policy never takes is a finding, so
         # it stays in the cell with a zero share instead of vanishing.
-        assert cell["counts"]["raise:2.0"] == 0 and cell["shares"]["raise:2.0"] == 0.0
-        assert "raise:2.0" in cell["in_grid"] and cell["off_grid"] == []
+        assert cell["counts"]["raise:1.5"] == 0 and cell["shares"]["raise:1.5"] == 0.0
+        assert "raise:1.5" in cell["in_grid"] and cell["off_grid"] == []
 
     def test_off_grid_play_is_marked(self, db):
         log, _ = db
         with log.game():
             gid = log.log_game(_game(0))
-            # Pre-flop level 0 gates the voluntary limp out of the abstraction, so a
-            # (free-check) "call" logged there is a play the grid does not offer.
-            self._dec(log, gid, "preflop", 0, "call")
-            self._dec(log, gid, "preflop", 0, "raise:1.7")
-        cell = _cell(_mix(build_report(log._con)), "preflop", 0)
-        assert cell["off_grid"] == ["call"]
-        assert math.isclose(cell["shares"]["call"], 0.5)
+            # An off-tree size (search may play one; an opponent certainly can)
+            # is a play the blueprint grid does not offer, so it is marked.
+            self._dec(log, gid, "flop", 0, "raise:0.77")
+            self._dec(log, gid, "flop", 0, "raise:0.5")
+        cell = _cell(_mix(build_report(log._con)), "flop", 0)
+        assert cell["off_grid"] == ["raise:0.77"]
+        assert math.isclose(cell["shares"]["raise:0.77"], 0.5)
         assert "*" in _print_human(build_report(log._con))
 
     def test_last_level_repeats_like_the_env_grid(self, db):
         log, _ = db
         with log.game():
             gid = log.log_game(_game(0))
-            # The turn grid has two levels; level 3 reuses level 1's token set
-            # (poker_env.raise_level clamps), so 0.75 is offered there and 0.33 is not.
-            self._dec(log, gid, "turn", 3, "raise:0.75")
+            # The turn grid has two cells; level 3 reuses the subsequent_raise
+            # token set (the summary clamps), so 1.0 is offered there and 0.5 is not.
+            self._dec(log, gid, "turn", 3, "raise:1.0")
         cell = _cell(_mix(build_report(log._con)), "turn", 3)
-        assert "raise:0.75" in cell["in_grid"] and "raise:0.33" not in cell["in_grid"]
+        assert "raise:1.0" in cell["in_grid"] and "raise:0.5" not in cell["in_grid"]
         assert cell["off_grid"] == []
 
     def test_conditions_are_never_pooled(self, db):

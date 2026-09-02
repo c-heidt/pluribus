@@ -40,8 +40,6 @@ if _core.CORE_AVAILABLE:
         _STAGE_ID,
         RAISE_SIZES_BY_STAGE,
         MAX_RAISES_PER_ROUND,
-        ALL_IN_ALLOWED_BY_STAGE,
-        CALL_ALLOWED_BY_STAGE,
     )
     from poker_ai._core._state_ref import FastStateRef
     from poker_ai._core import _state as _cystate
@@ -49,8 +47,7 @@ if _core.CORE_AVAILABLE:
     # Dump the live alphabet + raise grid into the compiled engine (never
     # hard-coded — same anti-drift discipline as the Phase-1 kernels).
     _cystate.configure(
-        _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
-        CALL_ALLOWED_BY_STAGE, ALL_IN_ALLOWED_BY_STAGE,
+        _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND
     )
     FastState = _cystate.FastState
 

@@ -482,10 +482,11 @@ def _capture_hero_decision(
     solver-run columns come from ``hero.last_search`` (populated in step 1).
     """
     stage = _STAGE.get(env.betting_stage, env.betting_stage)
-    # The action grid's second axis (env ``RAISE_SIZES_BY_STAGE[stage][level]``):
-    # raises already in this round, clamped the way the env clamps it (last level
-    # repeats).  Logged so the summary can report the played action mix at exactly
-    # the granularity the abstraction is cut at, not pooled over a street.
+    # The action grid's second axis: 0 while no raise has gone in this round
+    # (``RAISE_SIZES_BY_STAGE[stage]["first_raise"]``), 1 once one has
+    # (``"subsequent_raise"``).  Logged so the summary can report the played
+    # action mix at exactly the granularity the abstraction is cut at, rather
+    # than pooled over a street.
     level = raise_level(env.betting_stage, env.n_raises_this_round)
     num_live = sum(1 for p in env.players if p.is_active)
     pot_before = float(env.pot_size)

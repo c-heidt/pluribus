@@ -93,12 +93,9 @@ def _core_state():
         if not _cystate.is_configured():
             from environment.poker_env import (
                 _ACTION_BYTE, _STAGE_ID, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
-                ALL_IN_ALLOWED_BY_STAGE,
-                CALL_ALLOWED_BY_STAGE,
             )
             _cystate.configure(
-                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
-                CALL_ALLOWED_BY_STAGE, ALL_IN_ALLOWED_BY_STAGE
+                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND
             )
         return _cystate.FastState
     except Exception:
