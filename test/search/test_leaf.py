@@ -20,14 +20,11 @@ from poker_ai.search.context import SubgameContext
 from poker_ai.search.leaf import LeafConfig, board_rng_for, continuation_value
 from poker_ai.search.policy import BiasClass, Policy
 from test.abstraction_helpers import passive_action
+from test.lut_helpers import install_cluster_lut
 
 
 def _full_deck_env(n_players: int = 2) -> PokerEnv:
     return PokerEnv(players=[Player(i, 10000) for i in range(n_players)])
-
-
-def _stub_lut(env: PokerEnv) -> None:
-    env.card_info_lut = collections.defaultdict(lambda: collections.defaultdict(lambda: 0))
 
 
 def _to_flop(env: PokerEnv) -> None:
@@ -109,7 +106,7 @@ class TestLeafConfig:
 class TestTerminal:
 
     def test_terminal_returns_payout(self):
-        env = _full_deck_env(); _stub_lut(env)
+        env = _full_deck_env(); install_cluster_lut(env)
         ctx = _ctx(env)  # build the ctx while the env is still non-terminal
         env.step_in_place("fold")
         assert env.is_terminal
@@ -118,7 +115,7 @@ class TestTerminal:
         np.testing.assert_array_equal(out, expected)
 
     def test_terminal_consults_no_policy(self):
-        env = _full_deck_env(); _stub_lut(env)
+        env = _full_deck_env(); install_cluster_lut(env)
         pol = _policies()
         ctx = _ctx(env, policies=pol)
         env.step_in_place("fold")
@@ -130,20 +127,20 @@ class TestTerminal:
 class TestRolloutBasics:
 
     def test_shape_and_finite(self):
-        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        env = _full_deck_env(); install_cluster_lut(env); _to_flop(env)
         out = continuation_value(env, _profile(env), _ctx(env))
         assert out.shape == (env.n_players,)
         assert np.isfinite(out).all()
 
     def test_finite_zero_sum(self):
-        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        env = _full_deck_env(); install_cluster_lut(env); _to_flop(env)
         out = continuation_value(env, _profile(env), _ctx(env, seed=123))
         assert np.isfinite(out).all()
         assert abs(out.sum()) < 1e-6
 
     def test_payout_from_env_fold_or_call(self):
         # SB folds pre-flop under FoldOrCall → loses the small blind only.
-        env = _full_deck_env(); _stub_lut(env)
+        env = _full_deck_env(); install_cluster_lut(env)
         out = continuation_value(
             env, _profile(env), _ctx(env, policies=_policies(FoldOrCallPolicy))
         )
@@ -151,7 +148,7 @@ class TestRolloutBasics:
         assert out[0] * out[1] < 0
 
     def test_float32_drift_succeeds(self):
-        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        env = _full_deck_env(); install_cluster_lut(env); _to_flop(env)
 
         class Float32Thirds(Policy):
             def strategy(self, state, bias="none"):
@@ -171,7 +168,7 @@ class TestRolloutBasics:
 class TestDeterminism:
 
     def test_same_seed_identical(self):
-        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        env = _full_deck_env(); install_cluster_lut(env); _to_flop(env)
         np.random.seed(0)
         a = continuation_value(env, _profile(env), _ctx(env, seed=7))
         np.random.seed(0)
@@ -179,7 +176,7 @@ class TestDeterminism:
         np.testing.assert_array_equal(a, b)
 
     def test_different_ctx_seed_diverges(self):
-        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        env = _full_deck_env(); install_cluster_lut(env); _to_flop(env)
         a = continuation_value(env, _profile(env), _ctx(env, seed=1))
         b = continuation_value(env, _profile(env), _ctx(env, seed=2))
         assert not np.array_equal(a, b)
@@ -188,7 +185,7 @@ class TestDeterminism:
 class TestNoResampling:
 
     def test_rollout_uses_frontier_concrete_holes(self, monkeypatch):
-        env = _full_deck_env(n_players=3); _stub_lut(env); _to_flop(env)
+        env = _full_deck_env(n_players=3); install_cluster_lut(env); _to_flop(env)
         expected = [tuple(int(c) for c in env.players[i].cards) for i in range(3)]
         recorded = _spy_with_hole_cards(monkeypatch)
         ctx = SubgameContext.from_runtime(
@@ -205,7 +202,7 @@ class TestNoResampling:
 class TestProfileDrivesBias:
 
     def test_seat_uses_its_profile_bias(self):
-        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        env = _full_deck_env(); install_cluster_lut(env); _to_flop(env)
         pol = _policies()
         profile = {0: "raise", 1: "fold"}
         continuation_value(env, profile, _ctx(env, policies=pol))
@@ -217,7 +214,7 @@ class TestProfileDrivesBias:
                 assert profile[seat] == bias          # and only for seats whose profile is bias
 
     def test_missing_seat_raises(self):
-        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        env = _full_deck_env(); install_cluster_lut(env); _to_flop(env)
         with pytest.raises(ValueError, match="missing acting seat"):
             continuation_value(env, {0: "none"}, _ctx(env))  # seat 1 absent
 
@@ -228,7 +225,7 @@ class TestBlueprintCanonicalisation:
         # Every policy query during a rollout must go through
         # ``policy_state_for(..., for_blueprint=True)`` so off-tree histories
         # canonicalise to populated blueprint rows (§6.3).
-        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        env = _full_deck_env(); install_cluster_lut(env); _to_flop(env)
         seen_flags = []
         original = PokerEnv.policy_state_for
 
@@ -262,14 +259,14 @@ class TestRngOwnership:
     """
 
     def test_rollout_does_not_consume_global_rng(self):
-        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        env = _full_deck_env(); install_cluster_lut(env); _to_flop(env)
         ctx = _ctx(env)
         before = _global_state()
         continuation_value(env, _profile(env), ctx)
         assert _global_state() == before
 
     def test_rollout_is_independent_of_global_stream_position(self):
-        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        env = _full_deck_env(); install_cluster_lut(env); _to_flop(env)
         np.random.seed(1)
         a = continuation_value(env, _profile(env), _ctx(env, seed=9))
         np.random.seed(2)
@@ -278,13 +275,13 @@ class TestRngOwnership:
         np.testing.assert_array_equal(a, b)
 
     def test_from_runtime_derives_a_board_stream(self):
-        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        env = _full_deck_env(); install_cluster_lut(env); _to_flop(env)
         ctx = _ctx(env)
         assert ctx.board_rng is not None
         assert ctx.board_rng is not ctx.rng
 
     def test_board_stream_is_distinct_from_sampling_stream(self):
-        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        env = _full_deck_env(); install_cluster_lut(env); _to_flop(env)
         ctx = _ctx(env)
         a = [float(ctx.rng.random()) for _ in range(8)]
         b = [float(ctx.board_rng.random()) for _ in range(8)]
@@ -292,7 +289,7 @@ class TestRngOwnership:
 
     def test_deriving_board_stream_leaves_sampling_stream_untouched(self):
         """Adding the board split must not change the solver's sampling draws."""
-        env = _full_deck_env(); _stub_lut(env); _to_flop(env)
+        env = _full_deck_env(); install_cluster_lut(env); _to_flop(env)
         baseline = np.random.default_rng(42)
         ctx = _ctx(env, seed=42)
         assert [float(ctx.rng.random()) for _ in range(8)] == \

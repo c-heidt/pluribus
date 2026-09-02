@@ -22,12 +22,7 @@ import pytest
 from environment.player import Player
 from environment.poker_env import PokerEnv
 from test.abstraction_helpers import passive_action
-
-
-def _stub_lut(env):
-    env.card_info_lut = collections.defaultdict(
-        lambda: collections.defaultdict(lambda: 0)
-    )
+from test.lut_helpers import install_cluster_lut
 
 
 def _river_env(seed, stacks, low=11, high=14):
@@ -35,7 +30,7 @@ def _river_env(seed, stacks, low=11, high=14):
     np.random.seed(seed)
     env = PokerEnv(players=[Player(i, s) for i, s in enumerate(stacks)],
                    low_card_rank=low, high_card_rank=high)
-    _stub_lut(env)
+    install_cluster_lut(env)
     g = 0
     while env.betting_round < 3 and not env.is_terminal and g < 80:
         env.step_in_place(passive_action(env))
@@ -48,7 +43,7 @@ def _river_env_folded_seat(seed, stacks=(6000, 6000, 6000), low=11, high=14):
     np.random.seed(seed)
     env = PokerEnv(players=[Player(i, s) for i, s in enumerate(stacks)],
                    low_card_rank=low, high_card_rank=high)
-    _stub_lut(env)
+    install_cluster_lut(env)
     g = 0
     while env.betting_round < 1 and not env.is_terminal and g < 80:
         env.step_in_place(passive_action(env))

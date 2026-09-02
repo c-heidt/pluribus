@@ -22,6 +22,7 @@ import numpy as np
 import pytest
 
 from poker_ai import _core
+from test.lut_helpers import install_cluster_lut
 
 pytestmark = pytest.mark.skipif(
     not _core.CORE_AVAILABLE, reason="compiled core extension not built"
@@ -47,19 +48,13 @@ if _core.CORE_AVAILABLE:
     FastState = _cystate.FastState
 
 
-def _stub_lut(env):
-    env.card_info_lut = collections.defaultdict(
-        lambda: collections.defaultdict(lambda: 0)
-    )
-
-
 def _root(seed, stacks):
     np.random.seed(seed)
     env = PokerEnv(
         players=[Player(i, s) for i, s in enumerate(stacks)],
         low_card_rank=11, high_card_rank=14, small_blind=25, big_blind=50,
     )
-    _stub_lut(env)
+    install_cluster_lut(env)
     return env
 
 

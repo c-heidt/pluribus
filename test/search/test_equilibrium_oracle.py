@@ -34,6 +34,7 @@ from poker_ai.search.policy import SearchPolicy
 from poker_ai.search.solver import solve, SolverState
 from poker_ai.search.vector import _VectorSolver
 from poker_ai.search.solver_state import SolverConfig
+from test.lut_helpers import lossless_lut
 
 from test.search.brute_force_cfr import (
     BruteForceCFR,
@@ -61,6 +62,17 @@ from test.search._helpers import (
 # Fixture: a tiny heads-up river subgame with disjoint small-support ranges
 # --------------------------------------------------------------------------- #
 
+#: Rank floor for the oracle fixtures: ``low=10`` gives a **20-card** deck (T,J,Q,K,A)
+#: instead of the 16-card J..A one.  Sixteen cards was too cramped to produce
+#: strategically varied spots: the fixtures hand seat 0 the two lowest board-free
+#: cards and seat 1 the next four, so with only four ranks in play seat 0 was
+#: systematically drawing dead -- distinct boards kept collapsing onto the same
+#: strategic situation (seeds 0 and 3 gave byte-identical oracle values, solver
+#: values AND exploitability on different boards).  A fifth rank breaks that
+#: degeneracy.  Cost: n_combos 120 -> 190, and the enumerating oracles grow with the
+#: unseen-card count (turn ~1.3x, flop ~1.7x).
+_ORACLE_LOW_RANK = 10
+
 def _river_subgame(seed: int, stacks=(1000, 1000)):
     """Heads-up river env + 2-combo-per-seat ranges over card-disjoint holes.
 
@@ -68,7 +80,7 @@ def _river_subgame(seed: int, stacks=(1000, 1000)):
     disjoint card sets, so every cross pair is a legal joint deal and the betting
     tree still has a live bet at the river root.
     """
-    env = _late_env(3, stacks=stacks, seed=seed)
+    env = _late_env(3, low=_ORACLE_LOW_RANK, stacks=stacks, seed=seed)
     assert env.betting_round == 3 and not env.is_terminal
     # A bet must be available at the river root for the game to be non-trivial.
     assert any(a and (a.startswith("raise") or a == "all_in") for a in env.legal_actions)
@@ -181,41 +193,59 @@ def test_vector_regime_reaches_equilibrium(_seeded):
 
 @pytest.mark.slow
 def test_mccfr_regime_reaches_equilibrium(_seeded):
-    """The MCCFR regime, run directly on the river root, matches the oracle.
+    """The MCCFR regime on a **leaf-free turn** root matches the river-enumerating oracle.
 
-    ``solve`` routes HU river to the vector regime, so the MCCFR path is exercised
-    by instantiating ``_MCCFRSolver`` directly and driving the same iterate/discount
-    loop ``solve`` uses (solver.py:110-118).
+    Rooted at the turn, not the river, because the river is the one street MCCFR never
+    serves: ``_select_regime`` sends heads-up turn AND river to the vector regime, and
+    everything else — pre-flop, heads-up flop, all multiway — to MCCFR.  So the honest
+    MCCFR gate wants an EARLY street.  Pre-flop and multiway-flop roots both carry a
+    depth-limit leaf (``DepthLimit.classify``), which an exact oracle cannot represent;
+    a heads-up turn is the earliest root that is leaf-free (``street_at_root == 2`` ⇒
+    "internal" everywhere, terminal leaves only), so the oracle can enumerate the whole
+    subgame and the comparison stays exact.  ``test_mccfr_flop_reaches_equilibrium``
+    covers the heads-up flop, MCCFR's other leaf-free production cell.
 
-    The MCCFR regime is now **traverser-vectorized**: one walk sweeps the traverser's
-    whole range (opponents/chance still sampled), so both regret AND the average
-    strategy are trained **full-width** on every combo every reachable node — folded
-    into ``vregret``/``vstrat``.  On the meaningfully-reached infosets this converges
-    tightly to the oracle (better than the old scalar walk).
+    ``solve`` would route this root to the vector regime, so the MCCFR path is exercised
+    by instantiating ``_MCCFRSolver`` directly and driving the same iterate/discount loop
+    ``solve`` uses.  The lossless LUT makes the river abstraction a no-op, so any residual
+    gap is walk mechanics, not information loss.
 
-    A subtlety of full-width training: a barely-reached off-path infoset still
-    accumulates a *tiny* reach-weighted average (one-sample noise), where the scalar
-    walk left it exactly 0.  A whole-tree best response exploits that raw off-path
-    noise, so the *raw* average's exploitability is NOT a meaningful bound here (and
-    is not gated) — production plays the final iterate and re-solves on a deviation,
-    so the off-path average never reaches play.
+    Hard gates: (1) the unique zero-sum **game value** matches the oracle, and (2) the
+    ROOT-STREET strategy is an equilibrium given an exact continuation.
 
-    Hard gates: (1) the unique zero-sum **game value** matches the oracle, and (2) on
-    the infosets the walk *meaningfully* trained (accumulated reach ``> 1``), the
-    average is a genuine equilibrium — untrained infosets are filled from the oracle
-    to isolate the claim.
+    On (2): production re-solves at every street boundary, so a turn solve's river rows
+    are never played — they exist only to value the turn decisions.  Scoring them charges
+    the solver for a strategy it discards, and under external sampling those rows are
+    mostly untrained, so the raw number is dominated by one-sample noise rather than by
+    anything the bot does.  Measured across the five seeds, RAW exploitability spans
+    1.0-41.0 (a 40x spread) while the street-spliced number spans 0.78-1.66:
+
+        seed        4      5     23     35     37
+        raw      5.464 41.029 21.382  1.024  9.120
+        spliced  0.948  0.780  1.656  1.024  0.834
+
+    So the gate splices: the solver's ROOT-STREET rows onto the ORACLE's continuation.
+    That is exactly the guarantee re-solving at the boundary gives, and it needs no
+    "trained enough" threshold — the split is by street, which is exact.
+
+    This works BECAUSE the LUT is lossless: the solver's continuation is then the same
+    abstraction as the oracle's, so the root strategy was tuned against the continuation
+    it is being scored with.  Under a bucketed future street the splice would be
+    incoherent (measured: spliced is no better than raw there, sometimes worse) because
+    the root strategy would have been optimised against a coarser continuation.
     """
-    env, r0, r1, s0, s1 = _river_subgame(_seeded)
-    sub = build_subgame(env, r0, r1, s0, s1)
-    scale = _scale(sub)
+    env, r0, r1, s0, s1 = _turn_subgame(_seeded)
+    _install_lossless_lut(env)
+    sub = build_turn_subgame(env, r0, r1, s0, s1)
+    scale = _turn_scale(sub)
 
-    oracle_avg = BruteForceCFR(sub).solve(8000)
-    oracle_value = game_value(sub, oracle_avg)
+    oracle_avg = BruteForceTurnCFR(sub).solve(4000)
+    oracle_value = turn_game_value(sub, oracle_avg)
 
     ranges = {0: r0.astype(np.float32), 1: r1.astype(np.float32)}
     ctx = _ctx(env, ranges=ranges, seed=11)
     cfg = SolverConfig(
-        leaf=ctx.leaf, max_iterations=20000, max_wall_seconds=120.0,
+        leaf=ctx.leaf, max_iterations=20000, max_wall_seconds=300.0,
         discount_interval=2000,
     )
 
@@ -228,39 +258,30 @@ def test_mccfr_regime_reaches_equilibrium(_seeded):
             k = t / delta
             state.discount(k / (k + 1.0))
     assert state.vstrat, "expected the MCCFR regime to accumulate strategy"
-
-    sigma = _solver_sigma(state, env, sub)
-    value = game_value(sub, sigma)
-
-    # Hard gate 1: the unique zero-sum game value matches the independent oracle.
-    assert abs(value - oracle_value) < 0.05 * scale, (
-        f"mccfr game value {value:.4f} != oracle {oracle_value:.4f} (scale {scale})"
+    # The turn root must build cluster-keyed river nodes — that gather/scatter is the
+    # part a turn root exercises and a river root cannot.
+    assert any(rs == "cluster" for rs in state.vrow_space.values()), (
+        "expected cluster-keyed river-stage nodes in a turn subgame"
     )
 
-    # Hard gate: where MCCFR MEANINGFULLY trained an average, it is a genuine
-    # equilibrium.  Because the walk is now full-width (every traverser combo is
-    # updated on every reachable node), a barely-reached off-path infoset still
-    # accumulates a *tiny* reach-weighted ``vstrat`` mass — a one-sample-noise
-    # average, not a converged one (the scalar walk left these exactly 0, sampling
-    # never visiting them).  So "trained" must mean "reached with meaningful reach",
-    # not "reached at all": require at least one full-reach unit of accumulated
-    # strategy (``mass > 1``).  The mass distribution is sharply bimodal — genuinely
-    # reached infosets carry hundreds–thousands, noise ones < 0.1 — so the threshold
-    # is not delicate.  Untrained infosets are filled from the oracle to isolate the
-    # claim (a whole-tree best response would otherwise exploit their sample noise;
-    # production plays the final iterate and re-solves on a deviation, so that noise
-    # never reaches play).
-    REACH_FLOOR = 1.0
-    trained = {}
-    for key, row in sigma.items():
-        seat, hole, pk = key
-        mat = state.vstrat.get(pk)
-        combo = env.combo_index[sub.holes[hole]]
-        is_trained = mat is not None and mat[combo].sum() > REACH_FLOOR
-        trained[key] = row if is_trained else oracle_avg.get(key, row)
-    trained_expl = exploitability(sub, trained)
-    assert trained_expl < 0.03 * scale, (
-        f"mccfr trained strategy not an equilibrium: expl={trained_expl:.4f} scale={scale}"
+    sigma = _solver_turn_sigma(state, env, sub)
+    value = turn_game_value(sub, sigma)
+
+    assert abs(value - oracle_value) < 0.05 * scale, (
+        f"mccfr turn game value {value:.4f} != oracle {oracle_value:.4f} (scale {scale})"
+    )
+
+    # Root street is ``river is None``; every future-street row comes from the oracle.
+    spliced = {
+        key: (row if key[3] is None else oracle_avg.get(key, row))
+        for key, row in sigma.items()
+    }
+    root_expl = turn_exploitability(sub, spliced)
+    # 0.02*scale = 8.0 against a measured worst case of 1.66 — ~5x headroom, and far
+    # sharper than the 0.03*scale the un-spliced number needed.
+    assert root_expl < 0.02 * scale, (
+        f"mccfr turn root-street strategy not an equilibrium given an exact "
+        f"continuation: expl={root_expl:.4f} scale={scale}"
     )
 
 
@@ -277,7 +298,7 @@ def _turn_subgame(seed: int, stacks=_HU_STACKS_SHALLOW):
     Modest stacks keep the two-round (turn + river) betting tree small enough for
     the oracle to enumerate exactly.
     """
-    env = _late_env(2, stacks=stacks, seed=seed)
+    env = _late_env(2, low=_ORACLE_LOW_RANK, stacks=stacks, seed=seed)
     assert env.betting_round == 2 and not env.is_terminal
     board = {int(c) for c in env.community_cards}
     free = sorted({int(x) for x in env.combo_cards.reshape(-1)} - board)
@@ -310,17 +331,20 @@ def _remap_row(src, legal_src, legal_dst):
 def _install_lossless_lut(env):
     """Give ``env`` a lossless card LUT: a unique cluster id per (hole, board).
 
-    The cluster-keyed vector regime buckets future-street infosets by LUT
-    cluster, so a *lossy* LUT would solve a coarser game than the lossless oracle.
-    A per-street counting ``defaultdict`` assigns every distinct hole+board its own
-    id (deterministically, in first-access order), so the abstraction is a no-op
-    and the regime must reduce to the lossless equilibrium — isolating the walk /
-    gather-scatter *code* from abstraction coarseness.
+    The cluster-keyed vector regime buckets future-street infosets by LUT cluster, so a
+    *lossy* LUT would solve a coarser game than the lossless oracle.  A lossless one makes
+    the abstraction a no-op, so the regime must reduce to the lossless equilibrium —
+    isolating the walk / gather-scatter *code* from abstraction coarseness.
+
+    ⚠️ The id must be a PURE FUNCTION of ``(hole, board)``.  This used to be a
+    ``defaultdict(itertools.count().__next__)``, which hands ids out in first-access
+    order and is therefore stateful: anything that traverses in a different order gets
+    different ids for the same key, and every downstream dense-row index shifts with
+    them.  That cost real debugging time on 2026-09-01 — it made the compiled search core
+    look like it diverged from the Python walk when both were correct.  See
+    :class:`test.lut_helpers.LosslessClusterLUT`.
     """
-    env.card_info_lut = {
-        name: collections.defaultdict(itertools.count().__next__)
-        for name in ("pre_flop", "flop", "turn", "river")
-    }
+    env.card_info_lut = lossless_lut(np.unique(env.combo_cards))
 
 
 def _river_universe(env, sub):
@@ -414,7 +438,7 @@ def _flop_subgame(seed: int, stacks=_HU_STACKS_SHALLOW):
     cluster ids.  Modest stacks keep the flop→turn→river betting tree small
     enough for the two-chance-level oracle to enumerate exactly.
     """
-    env = _flop_env(stacks=stacks, seed=seed)
+    env = _flop_env(low=_ORACLE_LOW_RANK, stacks=stacks, seed=seed)
     assert env.betting_round == 1 and not env.is_terminal
     board = {int(c) for c in env.community_cards}
     free = sorted({int(x) for x in env.combo_cards.reshape(-1)} - board)

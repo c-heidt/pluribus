@@ -16,6 +16,7 @@ import joblib
 import numpy as np
 import pytest
 
+from poker_ai.tables.cfr_tables import REGRET_FLOOR
 from evaluation.blueprint_metrics import (
     PRUNE_THRESHOLD,
     _action_labels,
@@ -53,10 +54,12 @@ EXPECTED_PLAY_FREQ = np.array([2, 10, 0, 4]) / 16.0
 # Per-row distributions: [.5,.5,0,0], [0,0,0,1], [0,1,0,0] → mean over 3 rows.
 EXPECTED_MEAN_STRAT = np.array([0.5 / 3, 1.5 / 3, 0.0, 1.0 / 3])
 
+# Reference REGRET_FLOOR symbolically: the first entry means "an action pinned
+# at the floor", which must stay true when the floor is rescaled to track ``c``.
 REGRET_ROWS = np.array(
     [
         [100, -50, 0, 0],
-        [-310_000_000, PRUNE_THRESHOLD - 1, 0, 300],
+        [int(REGRET_FLOOR), PRUNE_THRESHOLD - 1, 0, 300],
     ],
     dtype=np.int32,
 )
@@ -220,8 +223,8 @@ class TestRegretMetrics:
         assert m["n_entries"] == 8
         assert m["frac_positive"] == pytest.approx(2 / 8)     # 100 and 300
         assert m["mean_positive_regret"] == pytest.approx(200.0)
-        assert m["frac_at_floor"] == pytest.approx(1 / 8)     # -310M entry
-        # -310M, PRUNE_THRESHOLD-1 are both < the prune threshold.
+        assert m["frac_at_floor"] == pytest.approx(1 / 8)     # the floored entry
+        # The floored entry and PRUNE_THRESHOLD-1 are both < the prune threshold.
         assert m["frac_prunable"] == pytest.approx(2 / 8)
 
     def test_no_files_returns_none(self):
@@ -530,7 +533,13 @@ class TestHelpers:
         assert _hist_percentile(np.zeros(10, dtype=np.int64), 50, 0.0, 1.0) is None
 
     def test_label_fallback_prefix_is_positional(self):
-        labels, canonical = _action_labels(6, street=2)   # turn is width 5
+        # Derive a width that cannot match the live action space: hardcoding one
+        # silently starts *matching* whenever the raise grid is re-cut (it did,
+        # when 2.0 was dropped from both turn levels and the turn narrowed to 6).
+        from environment.action_space import MAX_ACTIONS_PER_STREET
+
+        width = MAX_ACTIONS_PER_STREET[2] + 1
+        labels, canonical = _action_labels(width, street=2)
         assert canonical is False
         assert labels[:3] == ["fold", "call", "all_in"]
-        assert labels[3:] == ["raise_#1", "raise_#2", "raise_#3"]
+        assert labels[3:] == [f"raise_#{k + 1}" for k in range(width - 3)]

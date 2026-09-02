@@ -185,7 +185,10 @@ def solve(
         raise ValueError(
             f"regime_override must be 'vector', 'mccfr', or None; got {regime_override!r}."
         )
-    if regime_override == "mccfr" and getattr(cfg, "beta", None) is not None:
+    if regime_override == "mccfr" and (
+        getattr(cfg, "beta", None) is not None
+        or getattr(cfg, "ox_kbeta", None) is not None
+    ):
         # The OX-Search gadget root lives only in the vector regime (_VectorSolver).
         # Forcing 'mccfr' with beta set would silently solve the vanilla/DBR tree —
         # no gadget, no opt-out row, ox_enter_prob stays None — with no error, while
@@ -193,9 +196,9 @@ def solve(
         # obligation; enforced here too so a future/alternate caller can't hit it
         # silently.
         raise ValueError(
-            "solve(): regime_override='mccfr' is incompatible with cfg.beta set "
-            "(OX-Search gadget requires the vector regime); leave regime_override "
-            "None or clear cfg.beta."
+            "solve(): regime_override='mccfr' is incompatible with cfg.beta / "
+            "cfg.ox_kbeta set (OX-Search gadget requires the vector regime); leave "
+            "regime_override None or clear the OX knob."
         )
     regime = regime_override if regime_override is not None else _select_regime(ctx)
     # Structural iteration budget (§6.5): replace ``max_iterations`` with the per-replica
@@ -247,8 +250,10 @@ def solve(
     # OX-Search saturation metric (Approach B): read off the solved/merged state's
     # opt-out row, and only in the regime that runs the gadget.  Non-None is the
     # "OX was active" signal the agent uses to play the weighted-average (decision 5).
+    _ox_on = (getattr(cfg, "beta", None) is not None
+              or getattr(cfg, "ox_kbeta", None) is not None)
     ox = (ox_enter_prob(state, root_env, ctx.board_compatible)
-          if getattr(cfg, "beta", None) is not None and regime == "vector" else None)
+          if _ox_on and regime == "vector" else None)
 
     # Root-value convergence signal (calibration): read the pooled linear estimate off
     # the solved/merged state.  ``den == 0`` ⇒ nothing was tracked (bot not live, hand

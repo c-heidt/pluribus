@@ -23,6 +23,7 @@ import pytest
 
 from poker_ai import _core
 from test.abstraction_helpers import passive_action
+from test.lut_helpers import install_cluster_lut
 
 pytestmark = pytest.mark.skipif(
     not _core.CORE_AVAILABLE, reason="compiled core extension not built"
@@ -61,16 +62,11 @@ if _core.CORE_AVAILABLE:
     _BIASES = ("none", "fold", "call", "raise")
 
 
-def _stub_lut(env):
-    env.card_info_lut = collections.defaultdict(
-        lambda: collections.defaultdict(lambda: 0))
-
-
 def _flop_frontier(seed, n=3):
     np.random.seed(seed)
     env = PokerEnv(players=[Player(i, 200) for i in range(n)],
                    low_card_rank=9, high_card_rank=14, small_blind=25, big_blind=50)
-    _stub_lut(env)
+    install_cluster_lut(env)
     g = 0
     while env.betting_round < 1 and not env.is_terminal and g < 20:
         env.step_in_place(passive_action(env))

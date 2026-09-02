@@ -30,6 +30,7 @@ from poker_ai.search.solver import _select_regime
 from poker_ai.search.solver_state import SolverConfig, SolverState
 from poker_ai.search.vector import _regret_match_matrix
 from test.abstraction_helpers import passive_action
+from test.lut_helpers import HoleClusterLUT, install_cluster_lut
 
 
 class _UniformPolicy(Policy):
@@ -38,18 +39,12 @@ class _UniformPolicy(Policy):
         return np.full(n, 1.0 / n, dtype=np.float32) if n else np.array([], np.float32)
 
 
-def _stub_lut(env):
-    env.card_info_lut = collections.defaultdict(
-        lambda: collections.defaultdict(lambda: 0)
-    )
-
-
 def _turn_env_3p(seed, low=9, high=14, stacks=(2000, 2000, 2000)):
     """3-player small-deck env advanced to the turn root (all calls/checks)."""
     np.random.seed(seed)
     env = PokerEnv(players=[Player(i, s) for i, s in enumerate(stacks)],
                    low_card_rank=low, high_card_rank=high)
-    _stub_lut(env)
+    install_cluster_lut(env)
     g = 0
     while env.betting_round < 2 and not env.is_terminal and g < 80:
         env.step_in_place(passive_action(env))
@@ -146,23 +141,13 @@ def test_deterministic_per_seed(seed):
     assert np.allclose(sigma.sum(axis=1), 1.0)
 
 
-class _MultiClusterLUT:
-    """A dict-street stand-in mapping combos to several clusters (hole-based)."""
-
-    def __init__(self, n=4):
-        self.n = n
-
-    def __getitem__(self, key):
-        return (int(key[0]) + int(key[1])) % self.n
-
-
 @pytest.mark.parametrize("seed", [0, 1])
 def test_walk_exercises_multi_cluster_river_nodes(seed):
     """With a real (multi-cluster) river LUT the walk must gather/scatter over
     >1 cluster row at the river and still produce full-width root strategy."""
     env = _turn_env_3p(seed)
     # Swap the stub LUT for a multi-cluster one on the future (river) street.
-    env.card_info_lut = collections.defaultdict(lambda: _MultiClusterLUT(4))
+    env.card_info_lut = collections.defaultdict(lambda: HoleClusterLUT(4))
     ctx = _ctx(env, seed)
     root_pk = env.public_key
     solver, state = _run(env, ctx, iters=40)

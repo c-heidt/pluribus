@@ -31,20 +31,13 @@ def _policies():
     return {c: UniformPolicy() for c in _BIAS_CLASSES}
 
 
-def _stub_lut(env: PokerEnv) -> None:
-    env.card_info_lut = collections.defaultdict(
-        lambda: collections.defaultdict(lambda: 0)
-    )
-
-
 # --------------------------------------------------------------------------- #
 # Real-LUT (multi-cluster) fixture
 # --------------------------------------------------------------------------- #
-# ``_stub_lut`` maps every hand to cluster 0, so every future street collapses to
-# ``n_rows == 1``.  That makes a whole bug class INVISIBLE: anything that depends on
-# the cluster→dense-row mapping (``ClusterMapper._universe`` / ``cof``) is trivially
-# correct when there is only one row.  A board-stale model-row cache, for instance,
-# passed the entire stub-LUT suite unchanged.
+# ``install_cluster_lut`` (test.lut_helpers) is the DATA-FREE multi-cluster stand-in —
+# it replaced a single-cluster stub that mapped every hand to cluster 0, collapsing every
+# future street to ``n_rows == 1`` and making a whole bug class invisible.  Use the real
+# LUT below when a test needs true cluster semantics rather than merely more than one row.
 #
 # ``data/20cards_exact`` is a real 20-card LUT (ranks 10-14, 190 combos) with 25
 # preflop / 50 flop / 50 turn / 45 river clusters, giving ~24-37 dense rows at future
@@ -54,6 +47,7 @@ import functools
 import os
 from pathlib import Path
 from test.abstraction_helpers import passive_action
+from test.lut_helpers import install_cluster_lut
 
 
 @functools.lru_cache(maxsize=1)
@@ -95,9 +89,9 @@ _HU_STACKS_SHALLOW = (400, 400)
 def _real_lut_env(target_round: int, stacks=(10000, 10000), seed=0) -> PokerEnv:
     """Heads-up 20-card env at ``target_round`` under the REAL LUT.
 
-    Unlike :func:`_stub_lut`, future streets have many distinct clusters, so
-    ``ClusterMapper.n_rows`` is >> 1 and the cluster→row path is exercised for real
-    (flop root: 24 turn / 37 river rows; turn root: 29 river rows).
+    Unlike :func:`~test.lut_helpers.install_cluster_lut`'s synthetic clusters, these are
+    the LUT's real ones, so the cluster→row path is exercised against true abstraction
+    semantics (flop root: 24 turn / 37 river rows; turn root: 29 river rows).
     """
     from environment.poker_env import new_game
     np.random.seed(seed)
@@ -120,7 +114,7 @@ def _flop_env(low=11, high=14, stacks=_HU_STACKS, seed=0) -> PokerEnv:
         low_card_rank=low,
         high_card_rank=high,
     )
-    _stub_lut(env)
+    install_cluster_lut(env)
     guard = 0
     while not env.is_terminal and env.betting_round < 1 and guard < 20:
         env.step_in_place(passive_action(env))
@@ -136,7 +130,7 @@ def _preflop_env(low=11, high=14, stacks=_HU_STACKS, seed=0) -> PokerEnv:
         low_card_rank=low,
         high_card_rank=high,
     )
-    _stub_lut(env)
+    install_cluster_lut(env)
     return env
 
 
@@ -157,7 +151,7 @@ def _late_env(target_round, low=11, high=14, stacks=_HU_STACKS, seed=0) -> Poker
         low_card_rank=low,
         high_card_rank=high,
     )
-    _stub_lut(env)
+    install_cluster_lut(env)
     return _advance_to(env, target_round)
 
 

@@ -310,7 +310,8 @@ def freeze_combo(state, pk, sigma, is_root, actor, my_seat, my_combo):
     return None
 
 
-def traverser_update(regret, strat, sigma, child_vs, pi_p, frozen_combo, scatter):
+def traverser_update(regret, strat, sigma, child_vs, pi_p, frozen_combo, scatter,
+                     write_strat: bool = True):
     """The per-combo CFR update at a traverser node; returns ``v`` ``(n_combos,)``.
 
     ``child_vs`` is ``(width, n_combos)`` (one row per action).  Computes the
@@ -321,20 +322,34 @@ def traverser_update(regret, strat, sigma, child_vs, pi_p, frozen_combo, scatter
     (segment-sums each combo's delta into its cluster row).  ``frozen_combo`` (from
     :func:`freeze_combo`), when not ``None``, zeroes that combo's accrual (the
     pinned actual hand neither regrets nor averages).
+
+    ``write_strat=False`` skips ONLY the average-strategy accrual; the regret update
+    is unaffected.  The externally-sampled MCCFR walk passes ``False`` at root-street
+    nodes, where the strategy sum is instead built by
+    :meth:`~poker_ai.search.mccfr._MCCFRSolver.accumulate_strategy` with the
+    opponent's actions enumerated rather than sampled — accruing here as well would
+    double-count the row under two different weightings.  The full-width vector walk
+    leaves it ``True``: it already enumerates opponent actions, so its fused accrual
+    is the correct CFR average.
     """
     cv = np.moveaxis(child_vs, 0, -1)             # (n_combos, width)
     v = (sigma * cv).sum(axis=-1)                 # (n_combos,)
     delta = cv - v[:, None]                       # regret: v_a - v
-    strat_delta = pi_p[:, None] * sigma           # strat-sum: own reach * sigma
     if frozen_combo is not None:
         delta[frozen_combo] = 0.0
-        strat_delta[frozen_combo] = 0.0
+    strat_delta = None
+    if write_strat:
+        strat_delta = pi_p[:, None] * sigma       # strat-sum: own reach * sigma
+        if frozen_combo is not None:
+            strat_delta[frozen_combo] = 0.0
     if scatter is None:
         regret += delta                           # in-place: writes the store
-        strat += strat_delta
+        if strat_delta is not None:
+            strat += strat_delta
     else:
         scatter(regret, delta)
-        scatter(strat, strat_delta)
+        if strat_delta is not None:
+            scatter(strat, strat_delta)
     return v
 
 

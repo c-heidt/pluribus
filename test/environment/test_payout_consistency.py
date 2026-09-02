@@ -24,19 +24,14 @@ from environment.player import Player
 from environment.poker_env import PokerEnv
 from environment.pot import Pot
 from test.abstraction_helpers import passive_action
-
-
-def _stub_lut(env):
-    env.card_info_lut = collections.defaultdict(
-        lambda: collections.defaultdict(lambda: 0)
-    )
+from test.lut_helpers import install_cluster_lut
 
 
 def _river_env(seed, stacks):
     np.random.seed(seed)
     env = PokerEnv(players=[Player(i, s) for i, s in enumerate(stacks)],
                    low_card_rank=11, high_card_rank=14)
-    _stub_lut(env)
+    install_cluster_lut(env)
     g = 0
     while env.betting_round < 3 and not env.is_terminal and g < 60:
         env.step_in_place(passive_action(env))
@@ -159,7 +154,7 @@ def _river_env_with_folded_seat(seed, stacks=(600, 600, 600)):
     np.random.seed(seed)
     env = PokerEnv(players=[Player(i, s) for i, s in enumerate(stacks)],
                    low_card_rank=11, high_card_rank=14)
-    _stub_lut(env)
+    install_cluster_lut(env)
     g = 0
     while env.betting_round < 1 and not env.is_terminal and g < 60:
         env.step_in_place(passive_action(env))
@@ -281,7 +276,7 @@ def _turn_fold_env(seed, stacks):
     np.random.seed(seed)
     env = PokerEnv(players=[Player(i, s) for i, s in enumerate(stacks)],
                    low_card_rank=11, high_card_rank=14)
-    _stub_lut(env)
+    install_cluster_lut(env)
     g = 0
     while env.betting_round < 2 and not env.is_terminal and g < 60:
         env.step_in_place(passive_action(env))
@@ -355,7 +350,7 @@ def _flop_allin_showdown(seed, stacks=(10000, 10000)):
     np.random.seed(seed)
     env = PokerEnv(players=[Player(i, s) for i, s in enumerate(stacks)],
                    low_card_rank=11, high_card_rank=14)
-    _stub_lut(env)
+    install_cluster_lut(env)
     g = 0
     while env.betting_round < 1 and not env.is_terminal and g < 60:
         env.step_in_place(passive_action(env))
@@ -444,7 +439,7 @@ def _fold_env_at(seed, stacks, street):
     np.random.seed(seed)
     env = PokerEnv(players=[Player(i, s) for i, s in enumerate(stacks)],
                    low_card_rank=11, high_card_rank=14)
-    _stub_lut(env)
+    install_cluster_lut(env)
     g = 0
     while env.betting_round < street and not env.is_terminal and g < 60:
         env.step_in_place(passive_action(env))
@@ -563,7 +558,7 @@ def test_terminal_board_len_round_trips_through_make_undo():
     np.random.seed(0)
     fresh = PokerEnv(players=[Player(i, 600) for i in range(2)],
                      low_card_rank=11, high_card_rank=14)
-    _stub_lut(fresh)
+    install_cluster_lut(fresh)
     g = 0
     while fresh.betting_round < 2 and not fresh.is_terminal and g < 60:
         fresh.step_in_place(passive_action(fresh))

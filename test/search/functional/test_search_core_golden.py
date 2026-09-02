@@ -81,8 +81,47 @@ _N_ITERS = 50
 # writes, is different by construction — the digests MUST move.  Previous:
 #   MCCFR  fee362b119ec094ea1e3e9c82dccf37e63b6a196138ff73a68840d9a5613e3ec
 #   vector 7e6e3da6534d92c5e9a808a48b9da06054558cbb4a7ee8727fab0efa23113db2
-GOLDEN_DIGEST_MCCFR = "47f077d65e9f70e00492ae6f2c637dd6ed246718e56f56a475c0337805a3c585"
-GOLDEN_DIGEST_VECTOR = "2ad7afdd79a3d50cbf3f982dd73cef029990b6b38f3df122e4f5ce1b69b3937c"
+#
+# VECTOR ONLY, regenerated 2026-09-01: the fold terminal now returns 0 on a combo
+# holding a card of the iteration's sampled completion, matching the showdown path
+# (which gets it from the env's complete-board mask) and the root conditioning in
+# ``_VectorSolver.iterate``.  Those rows were NOT inert: ``traverser_update`` weights
+# the *strategy* sum by the traverser's own reach but adds the regret delta
+# unweighted (the counterfactual weight lives in the child values), so a zero-reach
+# combo still accrued regret from a fold priced at the full pot against a correctly
+# zeroed showdown -- shoving looked free on exactly those iterations.  Fixing it is
+# what closed the turn/flop oracle residual.  MCCFR is untouched: its terminals settle
+# against concretely dealt opponents, so it never carried the range-vs-range mask.
+# Previous vector: 2ad7afdd79a3d50cbf3f982dd73cef029990b6b38f3df122e4f5ce1b69b3937c
+#
+# MCCFR ONLY, regenerated 2026-09-01: the root-street AVERAGE strategy moved off the
+# externally-sampled walk onto an enumerated pass (``_MCCFRSolver.accumulate_strategy``,
+# driven by ``SolverConfig.strategy_interval``).  External sampling samples the
+# OPPONENT's action, so the fused ``strat += pi_p*sigma`` accrued only on the sampled
+# trajectory and carried an extra ``pi_{-i}(I)`` factor: measured on a real-LUT HU flop
+# root, the MEDIAN root-street node accrued on ~4% of its traverser's iterations.  The
+# pass branches every opponent action instead -- Pluribus's Algorithm 1
+# ``UPDATE-STRATEGY`` fix, already applied to the blueprint trainer.  ``vregret`` is
+# untouched (the regret update needs no such correction, and ``write_strat=False`` skips
+# only the strategy accrual), so this digest moves purely through ``vstrat``.
+# The pass fires on a periodic + power-of-two schedule owned by ``_MCCFRSolver.iterate``
+# (not the orchestrator), so every driver of ``iterate()`` gets the average and the
+# schedule stays a pure function of the iteration count -- which is what keeps the
+# snapshot-ladder invariant intact.  The cadence is ``DEFAULT_STRATEGY_INTERVAL`` (100),
+# NOT this fixture's ``discount_interval=20``: the two knobs are deliberately
+# independent, so this digest is insensitive to the discount cadence.
+# Previous MCCFR: 47f077d65e9f70e00492ae6f2c637dd6ed246718e56f56a475c0337805a3c585
+GOLDEN_DIGEST_MCCFR = "1c15db3d4b50c16beb8c8269ff3ad1beb7f5e745aa8cdbeb6df111abca742c33"
+#
+# VECTOR regenerated again 2026-09-01: ``_late_env`` now installs a MULTI-CLUSTER LUT.
+# It used to install a single-cluster stub (every hand → cluster 0), so this fixture's
+# future streets collapsed to ``n_rows == 1`` and the cluster gather/scatter seam was
+# never exercised here.  The solve is genuinely different, and genuinely more
+# representative — production always runs a bucketed future-street LUT.  MCCFR's digest
+# is UNCHANGED by that switch: its fixture roots pre-flop, where the subgame ends at the
+# round boundary, so it has no future-street cluster rows to differ over.
+# Previous vector: 1719868eb53769c09b830aed66499efa60a535e7702cb192cb57c0e14b29632d
+GOLDEN_DIGEST_VECTOR = "b501561f629d25be532a2da7b5cd52e2ec45c69e82821342119a40a4e4645f03"
 
 
 def _digest_tables(*tables) -> str:

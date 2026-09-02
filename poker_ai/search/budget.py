@@ -39,13 +39,15 @@ def search_approach(ctx: SubgameContext, cfg: SolverConfig) -> str:
     """Which approach this solve is — ``'vanilla'`` | ``'dbr'`` | ``'ox'``.
 
     Inferred from the solve's own inputs, so no caller can label a solve one thing and
-    configure it another: opponent models (``ctx.models``) ⇒ DBR, ``cfg.beta`` ⇒ OX,
-    neither ⇒ the vanilla baseline.  ``runner.for_condition`` makes the two mutually
+    configure it another: opponent models (``ctx.models``) ⇒ DBR, ``cfg.beta`` OR
+    ``cfg.ox_kbeta`` (the deck-agnostic form of the same knob) ⇒ OX, neither ⇒ the
+    vanilla baseline.  ``runner.for_condition`` makes the two mutually
     exclusive, so a solve carrying both is a config bug — prefer DBR (models change the
     walk; ``beta`` outside the vector regime is inert) and warn.
     """
     has_models = bool(getattr(ctx, "models", None))
-    has_beta = getattr(cfg, "beta", None) is not None
+    has_beta = (getattr(cfg, "beta", None) is not None
+                or getattr(cfg, "ox_kbeta", None) is not None)
     if has_models and has_beta:
         logger.warning(
             "solve carries BOTH opponent models and beta=%s — these are mutually "

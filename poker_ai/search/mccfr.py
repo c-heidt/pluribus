@@ -123,6 +123,14 @@ class _MCCFRSolver:
         self._iter_feasible = None
 
         self._live_seats = sorted(ctx.ranges.keys())
+        # Average-strategy cadence.  Owned by the SOLVER, not the orchestrator: several
+        # callers (the equilibrium oracle, the vectorized-walk tests, any probe) drive
+        # ``iterate()`` directly, and an average that only accrued under
+        # ``run_loop`` would silently vanish on those paths.  Firing off ``self._iter``
+        # also keeps the snapshot-ladder invariant — the schedule is a pure function of
+        # the iteration count, so what a ladder rung observes at ``t`` still equals what
+        # a solve with ``max_iterations == t`` produces.
+        self._strat_every = cfg.resolved_strategy_interval()
         all_seats = set(ctx.ranges) | set(ctx.folded_ranges)
         if all_seats != set(range(self.n_players)):
             # with_hole_cards replaces *every* seat, so the joint draw must cover
@@ -293,6 +301,24 @@ class _MCCFRSolver:
         v = self._vectorized_iterate(self._make_walk_env(env), i, holes)
         if self._track_root_value and i == self._my_seat:
             self._record_root_value(v, holes)
+        # Root-street average strategy, opponent actions ENUMERATED (see
+        # :meth:`accumulate_strategy`).  The Linear-CFR discount the orchestrator
+        # applies afterwards weights a pass at ``t`` by ``∝ t``, so this needs no
+        # coordination with the discount cadence.
+        #
+        # Schedule = periodic, PLUS a geometric warm-up at every power of two.  The
+        # warm-up exists because a purely periodic schedule silently yields NO average
+        # at all for a solve shorter than one interval (production budgets are >= 6000
+        # against a default 100, but a probe or a test running 40 iterations would read
+        # back uniform with no indication why).  It must be a pure function of ``t`` —
+        # an end-of-run pass would break the snapshot-ladder invariant, since a short
+        # solve would take a pass that a longer solve observing the same ``t`` does not.
+        # Powers of two are ~log2(interval) extra passes per solve (7 at 100), and
+        # Linear-CFR weighting crushes them to ~0 in a long run, so they cost nothing
+        # and bias nothing while guaranteeing the average is never empty.
+        t = self._iter
+        if self._strat_every and (t % self._strat_every == 0 or (t & (t - 1)) == 0):
+            self.accumulate_strategy()
 
     def _record_root_value(self, v: np.ndarray,
                            holes: Dict[int, Tuple[int, int]]) -> None:
@@ -582,9 +608,88 @@ class _MCCFRSolver:
         scatter = None if is_root else (
             lambda t, pc: self._cmaps.scatter_add(t, pc, street)
         )
+        # ``write_strat=not is_root``: root-street average-strategy rows are built by
+        # :meth:`accumulate_strategy` with the opponent's actions ENUMERATED.  Accruing
+        # here too would double-count them under two different weightings, and the
+        # sampled weighting is the one we are removing.  Future-street rows keep the
+        # fused accrual — nothing in production reads them (the belief update only ever
+        # queries the current betting round, i.e. the root street).
         return traverser_update(
-            regret, strat, sigma, child_vs, pi_p, frozen_combo, scatter
+            regret, strat, sigma, child_vs, pi_p, frozen_combo, scatter,
+            write_strat=not is_root,
         )
+
+    def accumulate_strategy(self) -> None:
+        """Average-strategy pass over the ROOT STREET, opponent actions ENUMERATED.
+
+        External sampling samples the opponent's action, so the strategy sum fused
+        into the regret walk accrues only on the sampled trajectory and carries an
+        extra ``pi_{-i}(I)`` factor the CFR average does not want.  It cancels on
+        normalisation (it is constant across a row), but what survives is that
+        iteration ``t`` is kept only with probability ``pi_{-i}^t(I)`` — measured on a
+        real-LUT HU flop root, the MEDIAN root-street node accrued on ~4% of its
+        traverser's iterations, and the subsample drifts as the opponent converges.
+        A node the opponent rarely reaches still needs a well-formed conditional
+        strategy, because that is exactly the row the belief update reads when the
+        opponent DOES take that line.
+
+        This is Pluribus's fix (Algorithm 1 ``UPDATE-STRATEGY``: branch every opponent
+        action) and the one :mod:`poker_ai.blueprint.strategy` already applies to
+        training.  One refinement over both: the vectorized walk carries an exact
+        ``pi_p``, so this accrues ``pi_p * sigma`` rather than sampling its own action
+        and incrementing a counter — same estimator, strictly lower variance.
+
+        Scope is the root street only: it never descends past the street, and the
+        belief update never reads a deeper row (it queries the node the opponent just
+        acted at, always inside the current betting round, which IS the root street).
+        Driven by :func:`poker_ai.search.parallel.run_loop` on the
+        ``strategy_interval`` cadence; the Linear-CFR discount then weights a pass at
+        ``t`` by ``∝ t`` automatically, at any cadence.
+        """
+        root_street = self.ctx.street_at_root
+        n_combos = self._n_combos
+        env = self._make_walk_env(self.root_env)
+
+        def walk(e, p: int, pi_p: np.ndarray) -> None:
+            if self.ctx.depth_limit.classify(e) in ("terminal", "leaf"):
+                return                                   # nothing to average past here
+            if e.betting_round != root_street:
+                return                                   # left the root street
+            legal = tuple(a for a in e.legal_actions if a is not None)
+            if not legal:
+                return
+            actor = e.player_i
+            pk = e.public_key
+            # Same node preamble as the walk, so the averaged sigma is the one the
+            # solve actually used at this node (the clamp is a no-op without models).
+            sigma, _regret, strat = node_sigma(
+                self.state, pk, legal, actor, True, n_combos, "combo", None, None
+            )
+            sigma = apply_model_clamp(
+                sigma, self.ctx, self.state, e, pk, actor, len(legal),
+                self._combo_cards, None, n_combos, True, None,
+                self._cmaps, root_street, self._root_cluster,
+            )
+            frozen_combo = freeze_combo(
+                self.state, pk, sigma, True, actor, self._my_seat, self._my_combo
+            )
+            if actor == p:
+                delta = pi_p[:, None] * sigma
+                if frozen_combo is not None:
+                    delta[frozen_combo] = 0.0            # pinned hand never averages
+                strat += delta
+                for a_idx, action in enumerate(legal):
+                    token = e.step_in_place(action, settle_winners=False)
+                    walk(e, p, pi_p * sigma[:, a_idx])
+                    e.undo(token)
+            else:
+                for action in legal:                     # ENUMERATE, never sample
+                    token = e.step_in_place(action, settle_winners=False)
+                    walk(e, p, pi_p)
+                    e.undo(token)
+
+        for seat in self._live_seats:
+            walk(env, seat, np.asarray(self._reach[seat], dtype=np.float64))
 
     def _vchild(self, env, p: int, pi_p: np.ndarray,
                 holes: Dict[int, Tuple[int, int]], parent_street: int) -> np.ndarray:

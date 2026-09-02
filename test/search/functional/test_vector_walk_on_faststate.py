@@ -1,6 +1,18 @@
 """Phase-3c gate: the vector walk on the compiled ``FastState`` (via the adapter)
 produces ``vregret`` / ``vstrat`` **byte-identical** to the ``PokerEnv`` walk.
 
+This gate must run on a MULTI-CLUSTER LUT.  It previously built its envs through
+``_late_env``, which installed a single-cluster stub (every hand → cluster 0), so every
+future street collapsed to ``n_rows == 1`` and the cluster gather/scatter seam — the part
+a turn root exists to exercise — was covered with exactly one row.  ``_late_env`` now
+installs a real multi-cluster LUT, and the assertion below pins that, because a fixture
+regression here would be silent.
+
+Production runs the core ON with a multi-cluster LUT and routes heads-up turn to this
+regime, so that is the configuration worth certifying.  (The two engines DO agree on
+multi-cluster LUTs — verified up to 1680 dense river rows.  An apparent divergence on
+2026-09-01 was a fixture artifact: an order-dependent lossless LUT, since fixed.)
+
 The Python ``_VectorSolver._walk`` is unchanged; only the env it walks differs
 (a ``PokerEnv`` root vs a :class:`~poker_ai.search.fast_env.FastEnvAdapter` over a
 ``FastState``).  Driving both from the same empty state with the **same** river
@@ -63,7 +75,12 @@ def _run(env, ctx, *, use_core, seed, iters):
 )
 def test_vector_walk_byte_identical(target_round, stacks):
     """Turn (with river chance) and river subgames, equal + unequal stacks: the
-    FastState-driven walk matches the PokerEnv walk table-for-table."""
+    FastState-driven walk matches the PokerEnv walk table-for-table.
+
+    A turn root is the load-bearing case: it has a future street, so its river nodes are
+    cluster-keyed and the gather/scatter seam is live.  A river root has no future street
+    and therefore no cluster rows at all — it cannot exercise that seam.
+    """
     env = _late_env(target_round, stacks=stacks, seed=0)
     ctx = _ctx(env, seed=1)
 
@@ -71,6 +88,18 @@ def test_vector_walk_byte_identical(target_round, stacks):
     core = _run(env, ctx, use_core=True, seed=7, iters=40)
 
     assert py.vregret, "vector pass allocated no nodes — vacuous"
+    if target_round == 2:
+        # Guard the fixture, not just the result: a turn root MUST produce future-street
+        # nodes with more than one cluster row, or this has silently regressed to the
+        # single-cluster case that hides the divergence.
+        cluster_rows = [py.vregret[pk].shape[0]
+                        for pk, rs in py.vrow_space.items() if rs == "cluster"]
+        assert cluster_rows, "turn root built no cluster-keyed future-street nodes"
+        assert max(cluster_rows) > 1, (
+            f"future streets collapsed to a single cluster row ({cluster_rows}) — this "
+            f"gate is vacuous on a single-cluster LUT; it is exactly the configuration "
+            f"in which the compiled walk and the PokerEnv walk agree by construction"
+        )
     core_diff.assert_tables_equal(
         core_diff.snapshot(py.vregret), core_diff.snapshot(core.vregret)
     )

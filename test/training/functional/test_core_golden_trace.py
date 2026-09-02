@@ -62,12 +62,24 @@ _LUT_PATH = "data/20cards_exact"
 # situation-indexed grid: pre-flop open / 3-bet / 4-bet, post-flop first-in vs
 # facing a bet, with no pre-flop limp).  A different action set means different
 # rows, different widths, and a different traversal — the digest MUST move.
+# Re-baselined again 2026-09-01 for the re-cut raise grid (flop facing-a-bet
+# 0.33 -> 1.0, turn first-in and facing-a-bet both lose 2.0, river facing-a-bet
+# gains 0.75).  Dropping 2.0 from BOTH turn levels also removes it from the turn
+# alphabet, so MAX_ACTIONS_PER_STREET[2] goes 7 -> 6 and turn rows narrow — a
+# different action set and a different traversal, so the digest MUST move.
+# Verified at re-baseline time that the move is attributable to the grid ALONE:
+# re-running with REGRET_FLOOR pushed to an unreachable -(2**31)+1 reproduces
+# this same digest, so the new merge-path floor clamp (which accumulates in
+# int64 and clips to [REGRET_FLOOR, INT32_MAX]) never binds at this scale and
+# contributes nothing — it is arithmetically identical to the previous plain
+# int32 add for in-range values.  Reproducible across two independent runs.
 # Previous digests:
+#   2239cb1b5ff88c7a3b3be1aea26a7bee55ecc72c25d25aadada7ac9bfd225b2e  (pre grid re-cut)
 #   00cb45e7dc0c67a2a2a7beb14068c3061a8f26be952ecf1c546be42ff147aed2  (pre per-level grid)
 #   7fef05fc8c7c421e8c667bd049530aeb3121c16aeb41ecbeb7f33bdd83243022  (pre preflop-only phi)
 #   4ca50490d570bd4a8318b03112dd40f0466796d89c4fd8ee5a9ddb350b4f99c9  (after _hand_over all-in fix)
 #   e23d93b6b08842048d37b58ee0c166e3c9260fd803712ead082d8efe5f221251  (pre all-in fixes)
-GOLDEN_DIGEST = "2239cb1b5ff88c7a3b3be1aea26a7bee55ecc72c25d25aadada7ac9bfd225b2e"
+GOLDEN_DIGEST = "4c3b2c4f882a078958444c365cfc10999d5da2e3f2c65bc1c898213bcdcbed10"
 
 
 def train_and_digest(save_path: Path, *, n_iterations: int = N_ITERATIONS):
@@ -186,13 +198,29 @@ class TestGoldenTrace:
 
 
 @pytest.mark.requires_lut
-@pytest.mark.skip(reason="regeneration helper — run explicitly with -k regenerate -s")
-def test_regenerate_golden_digest(tmp_path):
+def test_regenerate_golden_digest(tmp_path, request):
     """Print the current digest for pasting into ``GOLDEN_DIGEST``.
 
-    Skipped by default; run with ``-k regenerate -s`` after a deliberate
-    abstraction / algorithm change.
+    Skipped unless explicitly selected, so a normal full-suite run never pays
+    for it.  The guard is a ``-k`` check rather than a plain
+    ``@pytest.mark.skip``: an unconditional skip mark also suppresses the test
+    when it *is* named on the command line, which silently made the documented
+    ``-k regenerate -s`` invocation a no-op ("1 skipped") and left the only way
+    to re-baseline being to call :func:`train_and_digest` by hand.
+
+    Run after a deliberate abstraction / algorithm change::
+
+        python -m pytest test/training/functional/test_core_golden_trace.py \\
+            -k regenerate -s -q
+
+    Then paste the printed value into :data:`GOLDEN_DIGEST`, move the old one
+    into the history comment above it with a note on what changed, and confirm
+    the move is attributable to that change alone.
     """
+    if "regenerate" not in (request.config.getoption("keyword", default="") or ""):
+        pytest.skip(
+            "regeneration helper — run explicitly with -k regenerate -s"
+        )
     digest, counts = train_and_digest(tmp_path)
     print(f"\nGOLDEN_DIGEST = \"{digest}\"")
     print(f"counts = {counts}")

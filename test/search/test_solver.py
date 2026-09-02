@@ -34,6 +34,7 @@ from poker_ai.search.policy import SearchPolicy
 from environment.range_showdown import reach_after_removal
 from poker_ai.search.solver import solve, SolverConfig, SolverState, _select_regime
 from poker_ai.search.vector import _VectorSolver, _regret_match_matrix
+from test.lut_helpers import install_cluster_lut
 
 
 # --------------------------------------------------------------------------- #
@@ -49,7 +50,6 @@ from test.search._helpers import (  # noqa: E402  (shared test builders)
     _late_env,
     _policies,
     _preflop_env,
-    _stub_lut,
 )
 
 
@@ -205,7 +205,7 @@ class TestJointSampler:
         np.random.seed(5)
         env = PokerEnv(players=[Player(i, 200) for i in range(3)],
                        low_card_rank=11, high_card_rank=14)
-        _stub_lut(env)
+        install_cluster_lut(env)
         ranges = {s: np.ones(env.n_combos, np.float32) / env.n_combos for s in (0, 1)}
         folded = {2: np.ones(env.n_combos, np.float32) / env.n_combos}
         leaf = LeafConfig(policies=_policies())
@@ -677,7 +677,7 @@ class TestVectorRegime:
         start = [_HU_STACKS[0], 10000]
         env = PokerEnv(players=[Player(0, start[0]), Player(1, start[1])],
                        low_card_rank=11, high_card_rank=14)
-        _stub_lut(env)
+        install_cluster_lut(env)
         _advance_to(env, 3)
         standing = None
         while not env.is_terminal:
@@ -783,7 +783,7 @@ class TestSearchLifetimeCaches:
             players=[Player(i, s) for i, s in enumerate(stacks)],
             low_card_rank=low, high_card_rank=high,
         )
-        _stub_lut(env)
+        install_cluster_lut(env)
         return env
 
     def _count_continuation(self, monkeypatch):

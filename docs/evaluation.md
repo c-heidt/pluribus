@@ -253,6 +253,9 @@ CREATE TABLE decisions (
     cache_misses    INTEGER,
     action_played   TEXT,                  -- the sampled action
     action_dist     TEXT,                  -- JSON: root action distribution
+    raise_level     INTEGER,               -- action-grid level: raises already in this round (clamped
+                                           --   as poker_env.raise_level); the grid's second axis, so
+                                           --   the played mix can be read at the cell it was cut at
     exploitability  REAL,                  -- NULL until the exploitability evaluator exists (§10.3)
     game_value      REAL                   -- NULL until then
 );
@@ -489,6 +492,16 @@ SEARCH — per condition × street (fire rate is within the street)
       turn    vector         86%    2160    3.1s    5.2s       12%    1000     320
       river   vector         89%    2115    1.2s    2.0s        3%     500     420
 
+ACTION MIX — what each approach plays, per condition × street × raise level
+  (share within the cell; – not offered at that level, 0% offered but never played, * played off-grid)
+  vanilla   8965 hero actions   fold 31%  call 39%  raise 27%  all-in 3%
+      preflop lvl       n  fold  call   1.0  1.33   1.5   1.7  2.25 allin
+              L0     1620   58%   9%*     –     –     –   33%     –     –
+              L1      610   44%   31%     –   14%     –     –   11%     –
+      flop    lvl       n  fold  call  0.33  0.75   1.0   1.5   2.0 allin
+              L0     1440    0%   61%   18%   12%    0%     –    5%    4%
+              L1      840   38%   41%     –   12%    6%    0%     –    3%
+
 HU COVERAGE — heads-up with hero (OX-Search-HU fires from the turn on)
   vanilla   HU at some point 61.2%   eligible (turn+) 38.9%   of 3000 hands
       first HU street  preflop 8%  flop 14%  turn 22%  river 17%
@@ -607,6 +620,32 @@ Reading it — "is search correct, and is it doing what it should":
   convergence test exists in the solve loop today, so it is not measured here.)
 - **Cost** — `total_wall / hands` is the summary's one deliberate sum: the
   wall-clock a hand costs, which is what an experiment budget is built from.
+
+**Action mix — what each approach actually plays.** The env's action abstraction is
+cut per **(betting stage, raise level)**: `RAISE_SIZES_BY_STAGE[stage][level]` crossed
+with the passive gates (`CALL_ALLOWED_BY_STAGE` / `ALL_IN_ALLOWED_BY_STAGE`), where
+level 0 opens the betting, level 1 faces one raise, and a stage's last level repeats.
+The played mix is reported at exactly those cells — `decisions.raise_level` is logged
+for that reason — because the legal token set differs cell by cell, so a mix pooled
+over a street averages cells nobody plays.
+
+```sql
+SELECT g.condition, d.betting_stage, d.raise_level, d.action_played, COUNT(*) AS n
+FROM decisions d JOIN games g ON g.game_id = d.game_id
+WHERE d.action_played IS NOT NULL
+GROUP BY g.condition, d.betting_stage, d.raise_level, d.action_played;
+```
+
+Each cell's counts are normalised **within the cell**, and never pooled across
+conditions — the arms replay the same deals, so a pooled action count multiplies the
+deal count by the arm count and hides the very difference the section exists to show.
+The rendering keeps three cases apart: a grid entry with **zero** plays prints `0%`
+(an abstraction size the policy never takes is a finding, not an absence), a token the
+cell's grid does not offer prints `–`, and a token played where the grid does not
+offer it prints its share with a `*` (a free BB check at pre-flop level 0, where the
+abstraction gates the voluntary limp; or an off-tree size). Reading it: this is where
+a strategy change shows up first — an all-in share creeping up in the first-in
+turn/river cells, or a grid entry that is dead everywhere and could be re-cut.
 
 **Range-tracking health — the second headline.** Is the belief helping versus a
 uniform prior, and where does it break down? Joined to `game_seats` so it breaks

@@ -104,14 +104,36 @@ def _cache_capacity(
     )
     return max(base, _DEFAULT_CACHE_CAPACITY[street])
 
-REGRET_FLOOR: np.int32 = np.int32(-310_000_000)
+REGRET_FLOOR: np.int32 = np.int32(-3_100_000)
 """Per-action regret floor.
 
-Taken from the Pluribus supplementary material (Section S2).  Prevents
-int32 underflow during very long training runs and ensures actions
-that have been pruned for a long time can still recover — if regret
-could drop arbitrarily low, the regret-matching step would never
-bring the action back above zero.
+Prevents int32 underflow during very long training runs and ensures
+actions that have been pruned for a long time can still recover — if
+regret could drop arbitrarily low, the regret-matching step would
+never bring the action back above zero.
+
+**Scaled to the CFR-P threshold ``c``.**  The Pluribus supplementary
+material (Section S2) pairs a floor of ``-310_000_000`` with
+``c = -300_000_000`` — the floor sits ~3.3% *below* ``c`` so that a
+floored action is always prune-eligible, yet is only one prune
+threshold away from climbing back above ``c`` and being explored
+again.  This run's ``c`` is ``-3_000_000`` (``scripts/training.sh``),
+two orders of magnitude smaller because the measured regret
+magnitudes are chip-scale, so the floor is rescaled by the same ratio
+to preserve that relationship.  A floor left at the paper's
+``-310_000_000`` against a ``c`` of ``-3_000_000`` would never bind at
+all, which is exactly how the unbounded-accumulation defect below went
+unnoticed.
+
+**Enforced on the main write path**, not only at discount time: every
+regret merge clamps to this value (see the ``floor`` argument of
+:class:`~poker_ai.tables.chunked_table.ChunkedTable`).  It used to be
+applied *only* inside :meth:`CFRTables.apply_discount`, which becomes a
+permanent no-op once the LCFR discount window closes — leaving the
+remainder of a long run accumulating through a raw ``int32`` add with
+no floor, no ceiling, and silent wraparound.  A wrapped large-negative
+regret becomes large-*positive*, which regret matching then reads as a
+near-certain action.
 """
 
 
@@ -201,12 +223,19 @@ class CFRTables:
         if enable_index_cache:
             self._build_index_caches(shm_dir, index_capacities)
 
+        # ``floor`` is passed to the regret tables only: it makes every merge
+        # clamp at REGRET_FLOOR and accumulate wrap-free, so the floor holds on
+        # the main write path rather than only while the LCFR discount window
+        # happens to be open.  The strategy tables deliberately get no floor —
+        # their rows are non-negative visit counts and clamping would bias the
+        # normalised average strategy.
         self.regret: Dict[int, ChunkedTable] = {
             r: ChunkedTable(
                 n_actions=actions_per_street[r],
                 table_name=f"pluribus_regret_{r}",
                 index=self._indexes[r],
                 shm_dir=shm_dir,
+                floor=int(REGRET_FLOOR),
             )
             for r in range(4)
         }

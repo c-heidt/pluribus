@@ -21,6 +21,7 @@ from environment.poker_env import (
     _INFO_SET_DEFAULT,
 )
 from test.abstraction_helpers import advance_to_round, bracketing_sample
+from test.lut_helpers import install_cluster_lut
 
 
 def _env(n_players: int = 2, low: int = 2, high: int = 14, seed: int = 0):
@@ -30,11 +31,6 @@ def _env(n_players: int = 2, low: int = 2, high: int = 14, seed: int = 0):
         low_card_rank=low,
         high_card_rank=high,
     )
-
-
-def _stub_lut(env):
-    env.card_info_lut = defaultdict(lambda: defaultdict(lambda: 0))
-    return env
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +118,9 @@ class TestCanonicalizationEquivalence:
         # An off-tree fraction inside the flop's first bracket and the
         # neighbour it canonicalises to — both read off the live grid.
         _, x, _, neighbour = bracketing_sample("flop", 0)
-        off = _stub_lut(_env(seed=3))
+        off = install_cluster_lut(_env(seed=3))
         _play_to_flop_with(off, f"raise:{x}")
-        on = _stub_lut(_env(seed=3))
+        on = install_cluster_lut(_env(seed=3))
         _play_to_flop_with(on, f"raise:{neighbour}")
         combo = (int(off.combo_cards[0, 0]), int(off.combo_cards[0, 1]))
         # Byte-identical: off-tree blueprint key == on-tree raw key.
@@ -133,7 +129,7 @@ class TestCanonicalizationEquivalence:
         assert off._compute_info_set(combo) != on._compute_info_set(combo)
 
     def test_on_tree_blueprint_is_noop(self):
-        env = _stub_lut(_env(seed=1))
+        env = install_cluster_lut(_env(seed=1))
         _play_to_flop_with(env, "raise:1.0")  # on-tree
         combo = (int(env.combo_cards[0, 0]), int(env.combo_cards[0, 1]))
         assert env._blueprint_info_set(combo) == env._compute_info_set(combo)
@@ -146,7 +142,7 @@ class TestCanonicalizationEquivalence:
 
 class TestBuilders:
     def test_compute_info_set_returns_bytes(self):
-        env = _stub_lut(_env())
+        env = install_cluster_lut(_env())
         combo = (int(env.combo_cards[0, 0]), int(env.combo_cards[0, 1]))
         assert isinstance(env._compute_info_set(combo), bytes)
 

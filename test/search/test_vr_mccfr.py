@@ -26,6 +26,7 @@ from poker_ai.search.policy import Policy
 from poker_ai.search.solver_state import SolverConfig, SolverState
 from poker_ai.search.vform import vr_baseline_estimate
 from test.abstraction_helpers import passive_action
+from test.lut_helpers import install_cluster_lut
 
 
 # --------------------------------------------------------------------------- #
@@ -121,17 +122,11 @@ class _StubModel:
         return 1.0
 
 
-def _stub_lut(env):
-    env.card_info_lut = collections.defaultdict(
-        lambda: collections.defaultdict(lambda: 0)
-    )
-
-
 def _turn_env_3p(seed, low=9, high=14, stacks=(2000, 2000, 2000)):
     np.random.seed(seed)
     env = PokerEnv(players=[Player(i, s) for i, s in enumerate(stacks)],
                    low_card_rank=low, high_card_rank=high)
-    _stub_lut(env)
+    install_cluster_lut(env)
     g = 0
     while env.betting_round < 2 and not env.is_terminal and g < 80:
         env.step_in_place(passive_action(env))

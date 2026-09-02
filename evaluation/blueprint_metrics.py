@@ -100,10 +100,16 @@ log = logging.getLogger("evaluation.blueprint_metrics")
 
 _STREET_NAME = {0: "preflop", 1: "flop", 2: "turn", 3: "river"}
 
-# Pluribus supplementary: actions whose regret sits below this threshold are
-# skipped by negative-regret pruning during training.  Reported as the
-# "prune-eligible" fraction; distinct from the hard REGRET_FLOOR clamp.
-PRUNE_THRESHOLD: int = -300_000_000
+# Actions whose regret sits below this threshold are skipped by negative-regret
+# pruning during training.  Reported as the "prune-eligible" fraction; distinct
+# from the hard REGRET_FLOOR clamp, which sits just *below* it.
+#
+# Must track ``C`` in scripts/training.sh (and REGRET_FLOOR with it).  Left at
+# the Pluribus paper's -300_000_000 this is orders of magnitude below the run's
+# real chip-scale regrets, so ``frac_prunable`` reads ~0 and — now that the floor
+# is scaled to ``c`` — the threshold would even fall below the floor, making
+# ``frac_at_floor`` swallow the prunable band.
+PRUNE_THRESHOLD: int = -3_000_000
 
 _ENTROPY_BINS = 100          # normalised entropy histogram over [0, 1]
 _MAXP_BINS = 100             # max-action-probability histogram over [0, 1]
@@ -420,7 +426,7 @@ def compute_regret_metrics(
 
         floor = int(REGRET_FLOOR)
     except Exception:  # pragma: no cover - keeps the module importable alone
-        floor = -310_000_000
+        floor = -3_100_000
 
     n_entries = 0
     n_at_floor = 0

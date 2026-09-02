@@ -18,6 +18,7 @@ from evaluation.opponents import (
     synthetic_models_for,
 )
 from test.search._helpers import UniformPolicy
+from test.lut_helpers import cluster_lut as _cluster_lut, install_cluster_lut
 
 
 def _env(n_players=2, low=11, high=14):
@@ -26,9 +27,7 @@ def _env(n_players=2, low=11, high=14):
         low_card_rank=low,
         high_card_rank=high,
     )
-    env.card_info_lut = collections.defaultdict(
-        lambda: collections.defaultdict(lambda: 0)
-    )
+    install_cluster_lut(env)
     return env
 
 

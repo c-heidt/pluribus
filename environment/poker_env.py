@@ -187,15 +187,15 @@ RAISE_SIZES_BY_STAGE: Dict[str, List[List[float]]] = {
     ],
     "flop": [
         [0.33, 0.75, 1.0, 2.0],   # first in
-        [0.33, 0.75, 1.5],        # facing a bet
+        [0.75, 1.0, 1.5],         # facing a bet
     ],
     "turn": [
-        [0.33, 0.75, 1.5, 2.0],   # first in
-        [0.75, 1.5, 2.0],         # facing a bet
+        [0.33, 0.75, 1.5],        # first in
+        [0.75, 1.5],              # facing a bet
     ],
     "river": [
         [0.33, 0.75, 1.5, 2.0],   # first in
-        [1.0],                    # facing a bet
+        [0.75, 1.0],              # facing a bet
     ],
 }
 

@@ -14,21 +14,7 @@ import pytest
 from environment.utils import enumerate_combos
 from information_abstraction.lookup import clusters_for_board
 from poker_ai.search.cluster_maps import ClusterMapper
-
-
-class _MultiClusterLUT:
-    """A dict-street stand-in mapping each combo to one of ``n`` clusters.
-
-    ``clusters_for_board`` treats any non-``MemmapLookup`` entry as a dict and
-    indexes it by ``tuple(sorted(hole) + sorted(board))``; the cluster here
-    depends only on the hole cards, so a fixed set of distinct clusters is
-    reachable on every board (exercising a >1-row universe)."""
-
-    def __init__(self, n: int = 4):
-        self.n = n
-
-    def __getitem__(self, key):
-        return (int(key[0]) + int(key[1])) % self.n
+from test.lut_helpers import HoleClusterLUT
 
 
 LOW, HIGH = 11, 14                       # 16-card deck, C(16,2) = 120 combos
@@ -49,7 +35,7 @@ def _root_board_turn():
 def test_universe_is_sorted_unique_reachable_ids():
     cc = _cc()
     board = _root_board_turn()
-    lut = {"river": _MultiClusterLUT(4)}
+    lut = {"river": HoleClusterLUT(4)}
     cm = ClusterMapper(lut, cc, board, street_at_root=2)
     assert cm.n_completion == 1                      # turn root → one river card
 
@@ -68,7 +54,7 @@ def test_universe_is_sorted_unique_reachable_ids():
 def test_refresh_cluster_of_and_feas_match_ground_truth(river_pick):
     cc = _cc()
     board = _root_board_turn()
-    lut = {"river": _MultiClusterLUT(4)}
+    lut = {"river": HoleClusterLUT(4)}
     cm = ClusterMapper(lut, cc, board, street_at_root=2)
     river = int(cm.avail[river_pick % len(cm.avail)])
     cm.refresh((river,))
@@ -106,7 +92,7 @@ def test_scatter_add_segment_sum_matches_reference():
     """``scatter_add`` must equal a plain per-combo grouped add into cluster rows."""
     cc = _cc()
     board = _root_board_turn()
-    lut = {"river": _MultiClusterLUT(4)}
+    lut = {"river": HoleClusterLUT(4)}
     cm = ClusterMapper(lut, cc, board, street_at_root=2)
     river = int(cm.avail[0])
     cm.refresh((river,))

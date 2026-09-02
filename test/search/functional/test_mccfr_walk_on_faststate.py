@@ -25,6 +25,7 @@ import pytest
 
 from poker_ai import _core
 from test.abstraction_helpers import passive_action
+from test.lut_helpers import install_cluster_lut
 
 pytestmark = pytest.mark.skipif(
     not _core.CORE_AVAILABLE, reason="compiled core extension not built"
@@ -56,17 +57,11 @@ def _bind_fast_leaf(monkeypatch):
     )
 
 
-def _stub_lut(env):
-    env.card_info_lut = collections.defaultdict(
-        lambda: collections.defaultdict(lambda: 0)
-    )
-
-
 def _root(target_round, stacks, seed):
     np.random.seed(seed)
     env = PokerEnv(players=[Player(i, s) for i, s in enumerate(stacks)],
                    low_card_rank=11, high_card_rank=14)
-    _stub_lut(env)
+    install_cluster_lut(env)
     g = 0
     while env.betting_round < target_round and not env.is_terminal and g < 60:
         env.step_in_place(passive_action(env))

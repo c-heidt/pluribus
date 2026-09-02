@@ -19,6 +19,7 @@ from poker_ai.search.leaf import LeafConfig
 from poker_ai.search.mccfr import _BIAS_CLASSES
 from poker_ai.search.policy import Policy
 from poker_ai.search.solver_state import SolverConfig
+from test.lut_helpers import cluster_lut as _cluster_lut, install_cluster_lut
 
 
 class _Uniform(Policy):
@@ -31,7 +32,7 @@ def _session(n_players, *, run_seed=7):
     leaf = LeafConfig(policies={c: _Uniform() for c in _BIAS_CLASSES})
     scfg = SolverConfig(leaf=leaf, max_iterations=4, max_wall_seconds=30.0,
                         discount_interval=20)
-    lut = collections.defaultdict(lambda: collections.defaultdict(lambda: 0))
+    lut = _cluster_lut()
     cfg = EvalConfig(
         run_id="t", run_seed=run_seed, table_policy="all_blueprint", fixed_seats=None,
         n_players=n_players, time_budget_hours=0.0, big_blind=100, small_blind=50,

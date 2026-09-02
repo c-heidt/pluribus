@@ -9,6 +9,7 @@ import pytest
 from environment.player import Player
 from environment.poker_env import PokerEnv
 from test.abstraction_helpers import passive_action
+from test.lut_helpers import install_cluster_lut
 from poker_ai.search.ranges import (
     RangeTracker,
     _initial_uniform,
@@ -24,16 +25,11 @@ def _env(low: int = 10, high: int = 14, n_players: int = 2):
     )
 
 
-def _stub_lut(env):
-    """Make ``env.info_set`` resolve for any (hole, board) combination."""
-    env.card_info_lut = defaultdict(lambda: defaultdict(lambda: 0))
-
-
 def _tracker(env=None, my_seat=0, live_seats=(0, 1), stub_lut=False):
     if env is None:
         env = _env()
     if stub_lut:
-        _stub_lut(env)
+        install_cluster_lut(env)
     my_hole = tuple(int(c) for c in env.players[my_seat].cards)
     return env, RangeTracker(env, my_seat, my_hole, live_seats)
 
@@ -42,7 +38,7 @@ def _env_with_seat1_acting():
     """Pre-stub LUT, then advance the env so player 1 is on action.
     Returned env satisfies ``env.player_i == 1``."""
     env = _env()
-    _stub_lut(env)
+    install_cluster_lut(env)
     env.step_in_place(passive_action(env))
     assert env.player_i == 1
     return env

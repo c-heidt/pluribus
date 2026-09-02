@@ -71,7 +71,7 @@ import numpy as np
 import poker_ai  # noqa: F401  (ordering side-effect, not a name use)
 
 from environment.player import Player
-from environment.poker_env import PokerEnv
+from environment.poker_env import PokerEnv, raise_level
 from environment.utils import card_str
 from evaluation.aivat import AivatAccumulator, LeafValue
 from evaluation.opponents import (
@@ -482,6 +482,11 @@ def _capture_hero_decision(
     solver-run columns come from ``hero.last_search`` (populated in step 1).
     """
     stage = _STAGE.get(env.betting_stage, env.betting_stage)
+    # The action grid's second axis (env ``RAISE_SIZES_BY_STAGE[stage][level]``):
+    # raises already in this round, clamped the way the env clamps it (last level
+    # repeats).  Logged so the summary can report the played action mix at exactly
+    # the granularity the abstraction is cut at, not pooled over a street.
+    level = raise_level(env.betting_stage, env.n_raises_this_round)
     num_live = sum(1 for p in env.players if p.is_active)
     pot_before = float(env.pot_size)
     to_call = float(_to_call(env))
@@ -518,6 +523,7 @@ def _capture_hero_decision(
             cache_misses=int(stats.cache_misses),
             action_played=action,
             action_dist=_dist_json(played_legal, played_probs),
+            raise_level=level,
             # 1 iff a modeled solve produced this play (DBR) — the
             # coverage flag the summary restricts the exploitation slice to (§9 A7).
             modeled_decision=1 if hero.has_models else 0,
@@ -541,6 +547,7 @@ def _capture_hero_decision(
         hero_stack=hero_stack,
         action_played=action,
         action_dist=_dist_json(played_legal, played_probs),
+        raise_level=level,
         modeled_decision=0,
     )
 

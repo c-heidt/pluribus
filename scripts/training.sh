@@ -184,39 +184,6 @@ export PLURIBUS_CHUNK_SIZE=${PLURIBUS_CHUNK_SIZE:-4000000}
 # once workers fork, so an undersized street fails LOUDLY and early (before
 # real compute is spent), telling you to raise the value and restart.  The
 # chosen sizes are persisted in the checkpoint so a resume reuses them.
-#
-# Sized against the EXACT ceiling, not a guess.  An info-set key is
-# (cluster, full cross-street history), so
-#     infosets[street] = decision_nodes[street] * buckets_per_street
-# and ``decision_nodes`` is a property of the action abstraction alone.  For
-# N_PLAYERS=4 at the trainer's defaults (50/100 blinds, 10000 chips = 100 bb)
-# under the per-raise-level grid in ``environment/poker_env.py``, an exhaustive
-# walk of the betting tree gives, at 200 buckets/street:
-#
-#   street     decision nodes   infosets      slots needed   this default
-#   pre_flop              823    164,600           2^19          2^20  (23x)
-#   flop               76,026 15,205,200           2^25          2^25  (1.0x)
-#   turn              734,317 146,863,400          2^29          2^29  (1.0x)
-#   river           3,141,925 628,385,000          2^31          2^28  (0.21x)
-#
-# So pre_flop / flop / turn below CANNOT overflow — they cover every node of
-# the tree times every bucket.  Only the river is a budget call: full
-# saturation would need 2^31 slots = 48 GiB, so it keeps 2^28 (134M infosets,
-# 21% of the ceiling).  A 96h run does not come close to saturating the river
-# — external sampling only allocates what it visits — but if the occupancy
-# line in the log ("loaded X (Y% of capacity)") gets near 100%, raise the
-# river to 1073741824 (2^29, +6 GiB) or 2147483648 (2^31, +42 GiB, the
-# guarantee).
-#
-# Totals: 24.8 GiB of shm here, plus the regret chunk tables (also in
-# /dev/shm), which at these cache limits top out near 13 GiB — comfortably
-# inside --mem=100000mb.
-#
-# RE-DERIVE after any change to the action abstraction, the player count, or
-# the stack/blind ratio (all three move the node counts): walk the tree with
-# ``poker_ai._core._state.FastState`` — recurse over ``legal_actions()`` with
-# ``step_in_place``/``undo``, counting nodes per ``betting_round`` — and
-# multiply by the buckets per street.  Takes ~5 s for 4 players.
 export PLURIBUS_INDEX_CACHE=${PLURIBUS_INDEX_CACHE:-1}
 export PLURIBUS_INDEX_CAPACITY=${PLURIBUS_INDEX_CAPACITY:-"1048576,33554432,536870912,268435456"}
 # Compiled Cython core for CFR training — the SINGLE operator switch.  1 = every

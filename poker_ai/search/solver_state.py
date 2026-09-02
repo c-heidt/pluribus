@@ -135,6 +135,23 @@ PublicKey = Tuple
 Key = Tuple[PublicKey, int]
 
 
+#: Default average-strategy cadence (``SolverConfig.strategy_interval is None``).
+#: Set to the ``discount_interval`` DEFAULT, but deliberately NOT coupled to whatever
+#: ``discount_interval`` a caller passes: the two knobs size different things — the
+#: discount sets the resolution of the Linear-CFR *weighting*, this sets how many
+#: snapshots of the trajectory enter the average — and coupling them means widening the
+#: discount silently starves the average.  Measured on the river oracle gate (a river
+#: root is the worst case: ``street_at_root == 3``, so the root street IS the whole
+#: subgame and every strategy row comes from the pass), 20k iterations:
+#:     interval 2000 →  25 passes → trained expl 34.14  (FAILS the 30.0 gate)
+#:     interval  500 →  55 passes → trained expl 11.61
+#:     interval  100 → 215 passes → trained expl  2.57
+#:     interval   20 → 1015 passes → trained expl  0.55
+#: The 2000 row is exactly what "follow the discount" produced for a caller that had
+#: widened the discount to 2000 for unrelated reasons.
+DEFAULT_STRATEGY_INTERVAL = 100
+
+
 @dataclass(frozen=True)
 class SolverConfig:
     """Static solver hyperparameters (§6.5).
@@ -160,6 +177,34 @@ class SolverConfig:
     # at 10-400 firings; even the smallest budget still discounts 8 times.
     # Results-affecting: different discount points give different tables.
     discount_interval: int = 100
+    # Cadence of the MCCFR root-street AVERAGE-STRATEGY pass (``None`` →
+    # :data:`DEFAULT_STRATEGY_INTERVAL`; an independent knob, NOT tied to
+    # ``discount_interval`` — see that constant).
+    #
+    # Why a pass at all: external sampling samples the OPPONENT's action, so the
+    # strategy sum fused into the regret walk only accrues on the sampled trajectory
+    # and carries an extra ``pi_{-i}(I)`` factor the CFR average does not want.  That
+    # factor is constant across a row so it cancels on normalisation, but what
+    # survives is that iteration ``t`` is kept with probability ``pi_{-i}^t(I)`` —
+    # measured on a real-LUT HU flop root, the MEDIAN root-street node accrued on
+    # ~4% of its traverser's iterations, and the subsampling drifts as the opponent
+    # converges.  The pass walks the root street with opponent actions ENUMERATED,
+    # which is the same fix Pluribus applies via its separate ``UPDATE-STRATEGY``
+    # (Algorithm 1: sample own action, branch every opponent action) and the same one
+    # the blueprint trainer already uses (``poker_ai.blueprint.strategy``).
+    #
+    # Cost: one pass ≈ 0.51 iterations-equivalent per live seat (measured), so the
+    # overhead is ``0.51 * n_live / strategy_interval`` — ~1% heads-up at 100.
+    #
+    # Aligning with the discount is SAFE, not merely convenient: regret matching
+    # normalises, so scaling every regret by ``k/(k+1)`` leaves sigma identical, and
+    # sampling on the discount boundary cannot lock onto a biased phase.  The
+    # weighting is also automatic — a pass at ``t`` keeps the remaining discount
+    # factors, i.e. weight ∝ ``t``, exactly Linear CFR, at ANY cadence.
+    # ``0`` disables the pass (the MCCFR root-street average is then never
+    # accumulated and reads back uniform).  The vector regime ignores this: its walk
+    # already enumerates opponent actions, so its average needs no separate pass.
+    strategy_interval: "int | None" = None
     # Structural iteration budget (§6.5) — the *primary* stop, derived from the
     # subgame's structure rather than an online convergence test.  On by default so
     # every production solve is budget-driven; tests / pinned digests that need a fixed
@@ -181,6 +226,25 @@ class SolverConfig:
     # ``p̂``; larger β ⇒ safer (β is an upper bound; OX auto-balances).  Only the
     # heads-up turn/river **vector** regime consumes it; the MCCFR regime ignores it.
     beta: "float | None" = None
+    # DECK-AGNOSTIC alternative to ``beta``.  Set this instead and β is derived per
+    # subgame as ``ox_kbeta / k``, where ``k`` is the count of board-compatible opponent
+    # root combos.
+    #
+    # Why: β never acts alone — the gadget mixes by ``kβ``
+    # (``c_expl = 1/(kβ+1)``, ``c_safe = β/(kβ+1)``), and ``k`` is deck- and
+    # board-dependent: a heads-up river root has ``k = C(47,2) = 1081`` on a 52-card deck
+    # but ``C(15,2) = 105`` on the 20-card test deck.  So a β tuned on one deck lands in a
+    # completely different regime on the other — measured, that is exactly why the OX
+    # gates went degenerate when the test deck widened 16 → 20 cards (k 55 → 105 halved
+    # the exploitation weight at fixed β).
+    #
+    # ``kβ`` IS what the paper specifies: Ge et al. give ``1/(kβ+1)`` directly — 1/16 for
+    # Leduc, 1/51 for Flop Hold'em.  ``DEFAULT_OX_BETA = 0.05`` gives ``kβ ≈ 54`` on a
+    # 52-card river, i.e. essentially the paper's FHP setting — correct for THAT deck, and
+    # only for that deck.  Prefer this knob for anything that must hold across decks or
+    # board sizes; ``beta`` is kept as the raw, deck-dependent form.
+    # Setting either one enables the gadget; setting BOTH is an error.
+    ox_kbeta: "float | None" = None
     # VR-MCCFR variance reduction (opponent_modeling §5.5) — a control-variate baseline
     # on the sampled opponent-action counterfactual values in the MCCFR walk.  DBR-only:
     # it activates ONLY when this flag is set AND the subgame carries opponent models
@@ -190,6 +254,16 @@ class SolverConfig:
     # when updating the per-node baseline (0 ⇒ frozen at init, 1 ⇒ last-sample only).
     variance_reduction: bool = False
     vr_baseline_decay: float = 0.5
+
+    def resolved_strategy_interval(self) -> int:
+        """The average-strategy cadence this config actually runs at.
+
+        ``None`` (the default) → :data:`DEFAULT_STRATEGY_INTERVAL`, independent of
+        ``discount_interval`` (see that constant for why they are not coupled).
+        An explicit ``0`` disables the pass.
+        """
+        iv = self.strategy_interval
+        return DEFAULT_STRATEGY_INTERVAL if iv is None else max(0, int(iv))
 
 
 class _CountingCache:

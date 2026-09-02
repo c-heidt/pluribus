@@ -54,7 +54,10 @@ from typing import Iterable, Iterator, List, Optional
 #     calibration axis for per-street/per-live-count throughput & budget).
 # v7: + decisions.ox_enter_prob (OX-Search Approach B opt-out saturation; NULL for
 #     vanilla/DBR and non-vector subgames, so a non-NULL row is a genuine OX decision).
-SCHEMA_VERSION = 7
+# v8: + decisions.raise_level (the env action grid's second axis — raises already in
+#     this round, clamped as `poker_env.raise_level`; lets the summary report the
+#     played action mix at exactly the grid's (stage, level) granularity).
+SCHEMA_VERSION = 8
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +128,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     cache_misses    INTEGER,
     action_played   TEXT,
     action_dist     TEXT,
+    raise_level     INTEGER,   -- action-grid level: raises already in this round (clamped)
     exploitability  REAL,
     game_value      REAL,
     modeled_decision INTEGER,
@@ -272,6 +276,7 @@ class DecisionRow:
     cache_misses: Optional[int] = None
     action_played: Optional[str] = None
     action_dist: Optional[str] = None            # JSON: root action distribution
+    raise_level: Optional[int] = None            # action-grid level at the node (clamped)
     exploitability: Optional[float] = None
     game_value: Optional[float] = None
     modeled_decision: Optional[int] = None       # 1 iff a modeled solve produced this play (A7)
@@ -387,6 +392,8 @@ class ExperimentLog:
             con.execute("ALTER TABLE decisions ADD COLUMN n_live INTEGER")
         if "ox_enter_prob" not in dhave:  # v6 → v7 (OX-Search opt-out saturation)
             con.execute("ALTER TABLE decisions ADD COLUMN ox_enter_prob REAL")
+        if "raise_level" not in dhave:  # v7 → v8 (action-grid level for the action mix)
+            con.execute("ALTER TABLE decisions ADD COLUMN raise_level INTEGER")
         # Indexes last — after the ALTERs, so an index on a freshly-migrated column
         # (idx_games_condition) has its column to reference.
         con.executescript(_INDEX_DDL)

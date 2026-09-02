@@ -22,8 +22,9 @@ from poker_ai.search.agent import SearchAgent
 from poker_ai.search.leaf import LeafConfig
 from poker_ai.search.solver import SolverConfig
 
-from test.search._helpers import _HU_STACKS, UniformPolicy, _policies, _stub_lut
+from test.search._helpers import _HU_STACKS, UniformPolicy, _policies
 from test.abstraction_helpers import passive_action
+from test.lut_helpers import install_cluster_lut
 
 
 # --------------------------------------------------------------------------- #
@@ -40,7 +41,7 @@ def _env(n_players=2, stacks=None, low=11, high=14) -> PokerEnv:
         low_card_rank=low,
         high_card_rank=high,
     )
-    _stub_lut(env)
+    install_cluster_lut(env)
     return env
 
 

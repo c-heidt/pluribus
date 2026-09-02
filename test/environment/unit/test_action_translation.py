@@ -20,6 +20,7 @@ from environment.poker_env import (
 )
 from poker_ai.blueprint.tree_utils import calculate_strategy_from_row
 from poker_ai.search.policy import BlueprintPolicy
+from test.lut_helpers import install_cluster_lut
 from test.abstraction_helpers import (
     advance_to_round,
     bracketing_sample,
@@ -35,11 +36,6 @@ def _env(n_players: int = 2, low: int = 2, high: int = 14, seed: int = 0):
         low_card_rank=low,
         high_card_rank=high,
     )
-
-
-def _stub_lut(env):
-    """Make ``info_set`` / ``_compute_info_set`` resolve to cluster 0."""
-    env.card_info_lut = defaultdict(lambda: defaultdict(lambda: 0))
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +236,7 @@ class TestBlueprintInfoSet:
 
     def test_no_op_equals_compute_info_set_on_tree(self):
         env = _env()
-        _stub_lut(env)
+        install_cluster_lut(env)
         _play_to_flop_with(env, f"raise:{grid(1, 0)[0]}")  # on-tree
         combo = (int(env.combo_cards[0, 0]), int(env.combo_cards[0, 1]))
         assert env._blueprint_info_set(combo) == env._compute_info_set(combo)
@@ -268,7 +264,7 @@ class TestBlueprintInfoSet:
 
 
 def _stub_and_return(env):
-    _stub_lut(env)
+    install_cluster_lut(env)
     return env
 
 

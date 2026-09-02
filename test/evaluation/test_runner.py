@@ -29,6 +29,7 @@ from evaluation.sqlite_logging import ExperimentLog
 from poker_ai.search.leaf import LeafConfig
 from poker_ai.search.solver import SolverConfig
 from test.search._helpers import UniformPolicy, _policies
+from test.lut_helpers import cluster_lut as _cluster_lut, install_cluster_lut
 
 
 # --------------------------------------------------------------------------- #
@@ -55,7 +56,7 @@ def _stub_session(
     )
     lut = card_info_lut
     if lut is None:
-        lut = collections.defaultdict(lambda: collections.defaultdict(lambda: 0))
+        lut = _cluster_lut()
     cfg = EvalConfig(
         run_id=run_id, run_seed=run_seed, table_policy=table_policy,
         fixed_seats=fixed_seats,
@@ -134,9 +135,7 @@ class TestRun:
         np.random.seed(0)
         env = PokerEnv(players=[Player(i, 600) for i in range(3)],
                        low_card_rank=11, high_card_rank=14)
-        env.card_info_lut = collections.defaultdict(
-            lambda: collections.defaultdict(lambda: 0)
-        )
+        install_cluster_lut(env)
         # Three active seats: not heads-up for anyone.
         assert _hu_street(env, 0, env.betting_round) is None
         # Fold the current actor: exactly two remain.
@@ -277,6 +276,29 @@ class TestRun:
             assert res in (0, 1)
         assert resolved >= 1                              # showdowns did resolve
         assert bad == 0                                   # metrics ⇔ resolved
+
+    def test_raise_level_matches_the_action_grid_cell(self, tmp_path):
+        # decisions.raise_level is the action grid's second axis, so every played
+        # raise must be a size the grid offers at that (stage, level) cell — the
+        # invariant the summary's action-mix section reads the column under.
+        from environment.poker_env import RAISE_SIZES_BY_STAGE
+
+        env_stage = {"preflop": "pre_flop", "flop": "flop",
+                     "turn": "turn", "river": "river"}
+        session = _stub_session(n_players=2, starting_stack=1000)
+        log = ExperimentLog.open(tmp_path / "run.sqlite")
+        try:
+            run_evaluation(log=log, session=session, max_hands=6)
+            rows = _rows(log._con,
+                         "SELECT betting_stage, raise_level, action_played FROM decisions")
+        finally:
+            log.close()
+        assert rows and all(r[1] is not None for r in rows)
+        for stage, level, action in rows:
+            levels = RAISE_SIZES_BY_STAGE[env_stage[stage]]
+            assert 0 <= level <= len(levels) - 1     # clamped, last level repeats
+            if action.startswith("raise:"):
+                assert float(action.split(":", 1)[1]) in levels[level]
 
     def test_blueprint_round1_decisions_logged(self, tmp_path):
         session = _stub_session(n_players=2, starting_stack=1000)

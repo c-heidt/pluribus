@@ -90,6 +90,19 @@ def _street(search_cond, stage):
     return hit
 
 
+def _mix(report, condition="(unlabelled)"):
+    """The action-mix block for one condition."""
+    (hit,) = [c for c in report["action_mix"]["conditions"] if c["condition"] == condition]
+    return hit
+
+
+def _cell(mix_cond, stage, level):
+    """One ``(street, raise level)`` action-grid cell of the action mix."""
+    (st,) = [s for s in mix_cond["streets"] if s["stage"] == stage]
+    (lv,) = [c for c in st["levels"] if c["level"] == level]
+    return lv
+
+
 def _range(report, condition="(unlabelled)"):
     (hit,) = [
         c for c in report["range_quality"]["conditions"] if c["condition"] == condition
@@ -633,6 +646,105 @@ class TestSearch:
 # Orchestration: summarize() end-to-end + edge cases
 # --------------------------------------------------------------------------- #
 
+class TestActionMix:
+    """The played action mix, reported at the env action grid's own cells.
+
+    The grid is cut per ``(stage, raise level)`` (``RAISE_SIZES_BY_STAGE`` crossed
+    with the passive gates), so the mix is a share *within* a cell — pooling over a
+    street mixes cells with different legal token sets, and pooling over conditions
+    just multiplies the deal count by the arm count.
+    """
+
+    def _dec(self, log, gid, stage, level, action, **kw):
+        log.log_decision(gid, DecisionRow(
+            betting_stage=stage, regime="mccfr", searched=1,
+            raise_level=level, action_played=action, **kw))
+
+    def test_shares_are_within_the_grid_cell(self, db):
+        log, _ = db
+        with log.game():
+            gid = log.log_game(_game(0))
+            # flop L0: 3 plays.  flop L1: 1 play.  A pooled street share would read
+            # the L1 fold as 25% of "the flop"; it is 100% of the cell it was made in.
+            for a in ("raise:0.33", "raise:0.33", "call"):
+                self._dec(log, gid, "flop", 0, a)
+            self._dec(log, gid, "flop", 1, "fold")
+        m = _mix(build_report(log._con))
+        l0, l1 = _cell(m, "flop", 0), _cell(m, "flop", 1)
+        assert l0["n"] == 3 and l1["n"] == 1
+        assert math.isclose(l0["shares"]["raise:0.33"], 2 / 3)
+        assert math.isclose(l1["shares"]["fold"], 1.0)
+
+    def test_dead_grid_entry_is_reported_as_zero(self, db):
+        log, _ = db
+        with log.game():
+            gid = log.log_game(_game(0))
+            self._dec(log, gid, "flop", 0, "raise:0.33")
+        cell = _cell(_mix(build_report(log._con)), "flop", 0)
+        # A size the abstraction offers and the policy never takes is a finding, so
+        # it stays in the cell with a zero share instead of vanishing.
+        assert cell["counts"]["raise:2.0"] == 0 and cell["shares"]["raise:2.0"] == 0.0
+        assert "raise:2.0" in cell["in_grid"] and cell["off_grid"] == []
+
+    def test_off_grid_play_is_marked(self, db):
+        log, _ = db
+        with log.game():
+            gid = log.log_game(_game(0))
+            # Pre-flop level 0 gates the voluntary limp out of the abstraction, so a
+            # (free-check) "call" logged there is a play the grid does not offer.
+            self._dec(log, gid, "preflop", 0, "call")
+            self._dec(log, gid, "preflop", 0, "raise:1.7")
+        cell = _cell(_mix(build_report(log._con)), "preflop", 0)
+        assert cell["off_grid"] == ["call"]
+        assert math.isclose(cell["shares"]["call"], 0.5)
+        assert "*" in _print_human(build_report(log._con))
+
+    def test_last_level_repeats_like_the_env_grid(self, db):
+        log, _ = db
+        with log.game():
+            gid = log.log_game(_game(0))
+            # The turn grid has two levels; level 3 reuses level 1's token set
+            # (poker_env.raise_level clamps), so 0.75 is offered there and 0.33 is not.
+            self._dec(log, gid, "turn", 3, "raise:0.75")
+        cell = _cell(_mix(build_report(log._con)), "turn", 3)
+        assert "raise:0.75" in cell["in_grid"] and "raise:0.33" not in cell["in_grid"]
+        assert cell["off_grid"] == []
+
+    def test_conditions_are_never_pooled(self, db):
+        log, _ = db
+        for i, (cond, action) in enumerate((("vanilla", "fold"), ("DBR", "all_in"))):
+            with log.game():
+                gid = log.log_game(_game(i, condition=cond, deck_seed=i))
+                self._dec(log, gid, "flop", 0, action)
+        rep = build_report(log._con)
+        assert _mix(rep, "vanilla")["class_shares"]["fold"] == 1.0
+        assert _mix(rep, "DBR")["class_shares"]["all_in"] == 1.0
+        assert _mix(rep, "vanilla")["n_actions"] == 1
+
+    def test_unlogged_actions_are_not_counted(self, db):
+        log, _ = db
+        with log.game():
+            gid = log.log_game(_game(0))
+            self._dec(log, gid, "flop", 0, "call")
+            # A decision row without action_played (older logging) contributes no cell.
+            log.log_decision(gid, DecisionRow(betting_stage="flop", regime="mccfr",
+                                              searched=1, raise_level=0))
+        assert _cell(_mix(build_report(log._con)), "flop", 0)["n"] == 1
+
+    def test_missing_level_axis_collapses_into_one_cell(self, db):
+        log, _ = db
+        with log.game():
+            gid = log.log_game(_game(0))
+            # Pre-v8 rows carry no raise_level; they keep their counts under a
+            # single NULL-level cell rather than being dropped.
+            log.log_decision(gid, DecisionRow(betting_stage="river", regime="mccfr",
+                                              searched=1, action_played="call"))
+        m = _mix(build_report(log._con))
+        cell = _cell(m, "river", None)
+        assert cell["n"] == 1 and cell["in_grid"] is None
+        assert "ACTION MIX" in _print_human(build_report(log._con))
+
+
 class TestSummarizeEndToEnd:
 
     def test_writes_json_and_prints(self, db, capsys):
@@ -658,6 +770,7 @@ class TestSummarizeEndToEnd:
         assert rep["strength"]["arms"] == []
         assert rep["range_quality"]["conditions"] == []
         assert rep["search"]["conditions"] == []
+        assert rep["action_mix"]["conditions"] == []
         assert rep["paired"]["available"] is False
         _ = rep["flags"]                        # flag evaluation must tolerate NULLs
         assert "STRENGTH" in _print_human(rep)  # …and so must rendering

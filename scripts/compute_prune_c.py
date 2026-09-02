@@ -10,11 +10,15 @@ never pruned) — see ``cfr.py``'s ``_prune``.  ``c`` is a *negative* constant:
   * ``c`` closer to 0  -> more actions fall at/below it -> **more** pruning
   * ``c`` closer to the regret floor -> **less** pruning
 
-The shipped default ``c = -300_000_000`` sits right against
-``REGRET_FLOOR = -310_000_000``.  If the run's actual regret magnitudes never
-approach 3e8 (they usually don't), essentially nothing is <= c and pruning does
-nothing (``frac_prunable ~ 0`` in ``blueprint_metrics``).  Pruning that never
-binds is wasted compute: CFR-P keeps traversing deep, clearly-losing subtrees.
+``c`` must be read together with ``REGRET_FLOOR``, which is deliberately kept
+just *below* it (currently ``c = -3_000_000`` in ``scripts/training.sh`` against
+``REGRET_FLOOR = -3_100_000``) so a floored action is always prune-eligible yet
+stays one threshold away from recovering.  If ``c`` is set far below the run's
+actual regret magnitudes — as the historical ``-300_000_000`` was — essentially
+nothing is <= c and pruning does nothing (``frac_prunable ~ 0`` in
+``blueprint_metrics``).  Pruning that never binds is wasted compute: CFR-P keeps
+traversing deep, clearly-losing subtrees.  Re-run this after any change to ``c``
+so the floor can be rescaled to match.
 
 This script measures the real regret distribution in a checkpoint and recommends
 a ``c`` scaled to it, so pruning actually engages.  Because pruning skips a
@@ -73,9 +77,9 @@ try:
 
     FLOOR = int(REGRET_FLOOR)
 except Exception:  # keep runnable even if the package can't import
-    FLOOR = -310_000_000
+    FLOOR = -3_100_000
 
-CURRENT_C = -300_000_000  # PRUNE_THRESHOLD shipped default
+CURRENT_C = -3_000_000  # C in scripts/training.sh
 
 # Log-magnitude histogram of |negative regret|.  Negatives are int32 <= -1, so
 # magnitude >= 1 and log10 >= 0; upper edge is the floor magnitude.

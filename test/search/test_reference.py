@@ -97,14 +97,23 @@ def _opp_cbv_turn(sub, bot_seat, opp_seat, bot_range):
                     v += r * (p0 if opp_seat == 0 else -p0)
             return v
         if ntype == "chance":
-            inv = 1.0 / len(rivers)
+            # Uniform over the rivers actually DEALABLE, which depends on both hands:
+            # a card either hand holds was cancelled from the deck, not sampled and
+            # discarded.  Dividing by len(rivers) instead would shrink everything
+            # below this node relative to a turn-side FOLD (which never crosses a
+            # chance node), so the opponent's max would compare two measures.  The
+            # divisor is per bot hand, so fold it into the reach.
+            denom = {bh: len([rr for rr in rivers if rr not in sub.holes[oh]
+                              and rr not in sub.holes[bh]])
+                     for bh in bot_reach}
+            scaled = {bh: rv / denom[bh] for bh, rv in bot_reach.items() if denom[bh]}
             v = 0.0
             for rr in rivers:
                 if rr in sub.holes[oh]:
                     continue                       # opp cannot see its own card
-                sub_reach = {bh: rv for bh, rv in bot_reach.items() if rr not in sub.holes[bh]}
+                sub_reach = {bh: rv for bh, rv in scaled.items() if rr not in sub.holes[bh]}
                 if sub_reach:
-                    v += inv * rec(node["child"], oh, sub_reach, int(rr))
+                    v += rec(node["child"], oh, sub_reach, int(rr))
             return v
         legal = node["legal"]
         if node["actor"] == opp_seat:
@@ -350,15 +359,19 @@ def _opp_cbv_turn_bp(sub, env, bot_seat, opp_seat, bot_range):
                     v += r * (p0 if opp_seat == 0 else -p0)
             return v
         if ntype == "chance":
-            inv = 1.0 / len(rivers)
+            # Dealable-river measure — see ``_opp_cbv_turn``.
+            denom = {bh: len([rr for rr in rivers if rr not in sub.holes[oh]
+                              and rr not in sub.holes[bh]])
+                     for bh in bot_reach}
+            scaled = {bh: rv / denom[bh] for bh, rv in bot_reach.items() if denom[bh]}
             v = 0.0
             for rr in rivers:
                 if rr in sub.holes[oh]:
                     continue
-                sub_reach = {bh: rv for bh, rv in bot_reach.items()
+                sub_reach = {bh: rv for bh, rv in scaled.items()
                              if rr not in sub.holes[bh]}
                 if sub_reach:
-                    v += inv * rec(node["child"], oh, sub_reach, int(rr))
+                    v += rec(node["child"], oh, sub_reach, int(rr))
             return v
         legal = node["legal"]
         if node["actor"] == opp_seat:

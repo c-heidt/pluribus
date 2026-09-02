@@ -57,6 +57,39 @@ With 64 workers the expected per-stripe contention ratio is
 meaningful work, while still giving one-lock-per-chunk safety.
 """
 
+INT32_MAX: int = int(np.iinfo(np.int32).max)
+"""Saturation ceiling for a floored table.
+
+Rows are ``int32``.  A plain ``np.add`` into an ``int32`` view wraps
+silently on overflow, which for a regret table is catastrophic — a
+wrapped large-negative regret reappears as large-*positive* and regret
+matching reads it as a near-certain action.  Tables built with a
+``floor`` accumulate in ``int64`` and saturate here instead.  Only the
+*sign flip* is prevented; ordinary training never approaches this bound.
+"""
+
+
+def _clamped_add(row: np.ndarray, delta: np.ndarray, floor: int) -> None:
+    """Add ``delta`` into the ``int32`` ``row`` in place, clamped, wrap-free.
+
+    ``row + delta`` is evaluated in ``int64`` (``delta`` is coerced, so an
+    ``int32`` delta cannot silently keep the sum in ``int32``) and clipped to
+    ``[floor, INT32_MAX]`` before being written back, so neither bound can be
+    crossed by an intermediate value.
+
+    Parameters
+    ----------
+    row : np.ndarray
+        1-D ``int32`` view into shared memory, modified in place.
+    delta : np.ndarray
+        1-D integer array of the same length to add.
+    floor : int
+        Lower clamp, e.g. :data:`~poker_ai.tables.cfr_tables.REGRET_FLOOR`.
+    """
+    acc = row + np.asarray(delta, dtype=np.int64)
+    np.clip(acc, floor, INT32_MAX, out=acc)
+    row[:] = acc
+
 
 def list_orphaned_blocks(shm_dir: str = "/dev/shm") -> List[str]:
     """Return paths of any leftover ``pluribus_*`` shared-memory files.
@@ -120,6 +153,7 @@ class ChunkedTable:
         table_name: str,
         index: Optional[InfosetIndex] = None,
         shm_dir: str = "/dev/shm",
+        floor: Optional[int] = None,
     ) -> None:
         """Create a new :class:`ChunkedTable`.
 
@@ -138,12 +172,21 @@ class ChunkedTable:
         shm_dir : str, optional
             Directory for shared-memory chunk files.  Defaults to
             ``/dev/shm``.
+        floor : int, optional
+            Lower clamp applied to every value this table writes, and the
+            switch that makes writes wrap-free (accumulated in ``int64``,
+            saturated at :data:`INT32_MAX`).  Pass
+            :data:`~poker_ai.tables.cfr_tables.REGRET_FLOOR` for a **regret**
+            table.  Leave ``None`` for a **strategy** table: those rows are
+            non-negative visit counts, and clamping them would bias the
+            normalised distribution.
         """
         if n_actions < 1:
             raise ValueError(f"n_actions must be >= 1, got {n_actions}")
 
         self._n_actions = n_actions
         self._table_name = table_name
+        self._floor: Optional[int] = None if floor is None else int(floor)
 
         if index is None:
             import tempfile as _tempfile
@@ -277,7 +320,14 @@ class ChunkedTable:
         lock = self.get_stripe_lock(chunk_id)
         lock.acquire()
         try:
-            self._store.view(chunk_id)[local_row, action_idx] += amount
+            view = self._store.view(chunk_id)
+            if self._floor is None:
+                view[local_row, action_idx] += amount
+            else:
+                total = int(view[local_row, action_idx]) + int(amount)
+                view[local_row, action_idx] = min(
+                    max(total, self._floor), INT32_MAX
+                )
             self._store.mark_dirty(chunk_id)
         finally:
             lock.release()
@@ -296,17 +346,19 @@ class ChunkedTable:
             Information-set string.  Allocated if not yet present.
         delta : np.ndarray
             1-D integer array of length ``n_actions`` to add to the
-            row.  Cast to int32 before the add.
+            row.  On a floored table the add is evaluated in int64 and
+            clamped to ``[floor, INT32_MAX]``; otherwise it is a plain
+            int32 add.
         """
         chunk_id, local_row = self._locate_row(info_set)
         lock = self.get_stripe_lock(chunk_id)
         lock.acquire()
         try:
-            np.add(
-                self._store.view(chunk_id)[local_row],
-                delta.astype(np.int32),
-                out=self._store.view(chunk_id)[local_row],
-            )
+            row = self._store.view(chunk_id)[local_row]
+            if self._floor is None:
+                np.add(row, delta.astype(np.int32), out=row)
+            else:
+                _clamped_add(row, delta, self._floor)
             self._store.mark_dirty(chunk_id)
         finally:
             lock.release()
@@ -344,12 +396,16 @@ class ChunkedTable:
             lock.acquire()
             try:
                 view = self._store.view(chunk_id)
-                for local_row, delta in rows:
-                    np.add(
-                        view[local_row],
-                        delta.astype(np.int32),
-                        out=view[local_row],
-                    )
+                if self._floor is None:
+                    for local_row, delta in rows:
+                        np.add(
+                            view[local_row],
+                            delta.astype(np.int32),
+                            out=view[local_row],
+                        )
+                else:
+                    for local_row, delta in rows:
+                        _clamped_add(view[local_row], delta, self._floor)
                 self._store.mark_dirty(chunk_id)
             finally:
                 lock.release()

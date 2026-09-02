@@ -8,6 +8,7 @@ from collections import defaultdict
 from environment.player import Player
 from environment.poker_env import PokerEnv
 from test.abstraction_helpers import advance_to_round, passive_action
+from test.lut_helpers import cluster_lut as _cluster_lut, install_cluster_lut
 
 
 def _env(n_players: int = 2):
@@ -80,7 +81,7 @@ class TestPublicKey:
         # ``public_key`` / the overlay must be a true read: the info-set
         # string and ``_history`` are unchanged afterwards.
         env = _env()
-        env.card_info_lut = defaultdict(lambda: defaultdict(lambda: 0))
+        install_cluster_lut(env)
         combo = (int(env.players[0].cards[0]), int(env.players[0].cards[1]))
         info_before = env._compute_info_set(combo)
         history_before = {k: list(v) for k, v in env._history.items()}

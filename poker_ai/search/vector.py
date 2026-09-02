@@ -200,7 +200,8 @@ class _VectorSolver:
         # is set, in which case the solve is byte-for-byte the vanilla/DBR walk.  A
         # finite β swaps the opponent's fixed root reach for the belief/opt-out
         # gadget mix and adds the CBV_ref-anchored opt-out row (see :meth:`_ox_setup`).
-        self._ox = getattr(cfg, "beta", None) is not None
+        self._ox = (getattr(cfg, "beta", None) is not None
+                    or getattr(cfg, "ox_kbeta", None) is not None)
         if self._ox:
             # Defense in depth for the adaptation-safety guarantee (Thm 4.3): the
             # in-subgame opponent must be a true regret-matching adversary, with the
@@ -232,8 +233,16 @@ class _VectorSolver:
         row **inside** ``state.vregret`` so it is Linear-CFR discounted and
         cross-replica accumulated exactly like every other regret table.
         """
-        beta = float(self.cfg.beta)
-        if beta < 0.0:
+        kbeta = getattr(self.cfg, "ox_kbeta", None)
+        if kbeta is not None and self.cfg.beta is not None:
+            raise ValueError(
+                "OX-Search: set beta OR ox_kbeta, not both "
+                f"(beta={self.cfg.beta}, ox_kbeta={kbeta})."
+            )
+        if kbeta is not None and float(kbeta) < 0.0:
+            raise ValueError(f"OX-Search ox_kbeta must be >= 0, got {kbeta}.")
+        beta = None if kbeta is not None else float(self.cfg.beta)
+        if beta is not None and beta < 0.0:
             raise ValueError(f"OX-Search beta must be >= 0, got {beta}.")
         bot = int(self.ctx.my_seat)
         if bot not in self._seats:
@@ -249,6 +258,11 @@ class _VectorSolver:
         k = float(bc.sum())
         if k <= 0.0:
             raise ValueError("OX-Search: no board-compatible root combos (k = 0).")
+        # ``ox_kbeta`` is the DECK-AGNOSTIC form: it fixes ``kβ`` (and so the
+        # exploitation weight ``1/(kβ+1)``, which is what the paper specifies) instead of
+        # β, whose meaning moves with ``k``.  Derive β from it here, once k is known.
+        if beta is None:
+            beta = float(kbeta) / k
         denom = k * beta + 1.0
         self._ox_c_expl = 1.0 / denom          # exploitation branch: chance, entry ∝ p̂
         self._ox_c_safe = beta / denom         # safety branch: chance·(1/k), opt-out q
@@ -299,21 +313,37 @@ class _VectorSolver:
         q_enter = q[:, _OX_ENTER]
         opp_entry = (self._ox_c_expl * self._ox_phat
                      + self._ox_c_safe * q_enter) * self._ox_bc
+        # Condition this pass on the iteration's sampled completion, exactly as the
+        # vanilla path does (see :meth:`iterate`).  ``_ox_bc`` masks against the ROOT
+        # board only; without ``feas_full`` a combo holding a completion card would
+        # still be updated on branches that terminate before the chance node while
+        # contributing ~0 below it — the same inconsistent conditioning that made the
+        # vanilla walk call off drawing-dead hands.
+        ff = self._cmaps.feas_full
+        bot_reach = self._reach[bot]
+        if ff is not None:
+            opp_entry = opp_entry * ff
+            bot_reach = bot_reach * ff
         # Bot best-responds to the gadget-weighted opponent (bot regrets update here).
-        v_bot = self._walk(self._walk_env, bot, self._reach[bot], opp_entry)
+        v_bot = self._walk(self._walk_env, bot, bot_reach, opp_entry)
         # Calibration root-value signal: the bot's conditional EV vs the gadget-weighted
         # opponent, normalised by the entry mass its walk actually used (the OX analogue
         # of the vanilla ``_opp_mass``).  Pure side-effect; solve stays byte-identical.
         self._record_root_value(bot, v_bot, opp_mass=float(opp_entry.sum()))
         # Opponent adapts; its per-combo subgame root value is the opt-out ENTER value.
-        v_enter = self._walk(self._walk_env, opp, opp_entry, self._reach[bot])
+        v_enter = self._walk(self._walk_env, opp, opp_entry, bot_reach)
         # Opt-out CFR update: ENTER → subgame CFV, OUT → CBV_ref; counterfactual weight
         # is the safety-branch chance reach ``c_safe``.  Infeasible combos have
         # v_enter == CBV_ref == 0, so their rows never move.
         v_out = self._ox_cbv
         node_v = q_enter * v_enter + q[:, _OX_OUT] * v_out
-        optr[:, _OX_ENTER] += self._ox_c_safe * (v_enter - node_v)
-        optr[:, _OX_OUT] += self._ox_c_safe * (v_out - node_v)
+        # Weight the opt-out update by the same completion feasibility: a combo
+        # incompatible with this iteration's board has ``v_enter == 0`` by the
+        # masking above while ``v_out`` (CBV_ref) is unconditioned, so without this
+        # the ENTER/OUT comparison would be exactly the asymmetry being fixed.
+        c_safe = self._ox_c_safe if ff is None else self._ox_c_safe * ff
+        optr[:, _OX_ENTER] += c_safe * (v_enter - node_v)
+        optr[:, _OX_OUT] += c_safe * (v_out - node_v)
         feas = self._ox_bc > 0.0
         self.ox_enter_prob = float(q_enter[feas].mean()) if feas.any() else float("nan")
 
@@ -477,7 +507,26 @@ class _VectorSolver:
             # Fold: pi_o is already masked to the fold's street by the crossings
             # below; vector_payout's fold path selects the board it saw via
             # terminal_board_len.
-            return env.vector_payout(p, opp, pi_o, runout=runout)
+            #
+            # The env's fold mask is the board the hand actually reached (4 cards
+            # for a turn-side fold), but this regime conditions the WHOLE pass on
+            # the sampled completion (see :meth:`iterate`), so a combo holding a
+            # completion card does not exist in this sample anywhere in the tree.
+            # A showdown gets that for free — its ``valid`` is the complete board —
+            # while the fold path would price such a combo at the full pot.
+            #
+            # Those rows are NOT harmless despite carrying zero traverser reach:
+            # ``traverser_update`` weights the *strategy* sum by ``pi_p`` but adds the
+            # regret delta unweighted, because the counterfactual weight already lives
+            # in the child values.  So a zero-reach combo still accrued regret from a
+            # fold priced at the full pot against a showdown correctly zeroed by the
+            # env — shoving looked free on exactly the iterations where the combo held
+            # a completion card.  That is what made the solver call off drawing-dead
+            # hands and what the turn/flop oracles were measuring as residual
+            # exploitability.
+            val = env.vector_payout(p, opp, pi_o, runout=runout)
+            ff = self._cmaps.feas_full
+            return val if ff is None else np.multiply(val, ff, out=val)
 
         if env.betting_round > parent_street:
             # Crossed a chance node (the board grew by one card): mask both reaches

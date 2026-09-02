@@ -20,10 +20,18 @@ from poker_ai.tables.cfr_tables import CFRTables, REGRET_FLOOR
 from poker_ai.tables.index import InfosetIndex
 from environment.action_space import MAX_ACTIONS_PER_STREET
 from poker_ai.tables.chunked_table import (
+    INT32_MAX,
     N_STRIPE_LOCKS,
     ChunkedTable,
     list_orphaned_blocks,
 )
+
+TRAINING_C = -3_000_000
+"""The CFR-P threshold ``c`` this run trains with (``C`` in scripts/training.sh).
+
+Duplicated here on purpose: ``REGRET_FLOOR`` is only meaningful *relative* to
+``c``, and a floor left unscaled when ``c`` moves silently stops binding.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +424,82 @@ class TestChunkedTableDiscount:
             np.testing.assert_array_equal(
                 cfr_tables.regret[0].get_row(f"noop_is_{k}"), initial
             )
+
+
+# ---------------------------------------------------------------------------
+# REGRET_FLOOR on the main write path (not only at discount time)
+# ---------------------------------------------------------------------------
+
+
+class TestRegretFloorOnMergePath:
+    """The floor must hold on every regret merge, with no discount involved.
+
+    Regression tests for the defect where ``REGRET_FLOOR`` was applied *only*
+    inside ``apply_discount``: once the LCFR discount window closed, the rest of
+    the run accumulated through a raw int32 add with no floor, no ceiling and
+    silent wraparound — and a wrapped large-negative regret reappears as
+    large-*positive*, which regret matching reads as a near-certain action.
+    """
+
+    def _delta(self, table, value):
+        return np.full(table.n_actions, value, dtype=np.int64)
+
+    def test_merge_delta_row_clamps_at_floor(self, cfr_tables):
+        table = cfr_tables.regret[0]
+        table.merge_delta_row("floor_merge", self._delta(table, int(REGRET_FLOOR)))
+        table.merge_delta_row("floor_merge", self._delta(table, int(REGRET_FLOOR)))
+        assert np.all(table.get_row("floor_merge") == int(REGRET_FLOOR))
+
+    def test_merge_delta_rows_clamps_at_floor(self, cfr_tables):
+        table = cfr_tables.regret[0]
+        d = self._delta(table, int(REGRET_FLOOR))
+        table.merge_delta_rows([("batch_floor", d), ("batch_floor", d)])
+        assert np.all(table.get_row("batch_floor") == int(REGRET_FLOOR))
+
+    def test_no_int32_wraparound_on_extreme_negative(self, cfr_tables):
+        """A delta far past int32 range must saturate, never flip sign."""
+        table = cfr_tables.regret[0]
+        table.merge_delta_row("no_wrap", self._delta(table, -(2 ** 40)))
+        row = table.get_row("no_wrap")
+        assert np.all(row == int(REGRET_FLOOR)), row
+        assert np.all(row < 0), "regret wrapped to positive — the whole defect"
+
+    def test_no_int32_wraparound_on_extreme_positive(self, cfr_tables):
+        table = cfr_tables.regret[0]
+        table.merge_delta_row("no_wrap_pos", self._delta(table, 2 ** 40))
+        row = table.get_row("no_wrap_pos")
+        assert np.all(row == INT32_MAX), row
+        assert np.all(row > 0), "regret wrapped to negative"
+
+    def test_ordinary_merges_are_unchanged(self, cfr_tables):
+        """The clamp must be invisible for normal chip-scale regrets."""
+        table = cfr_tables.regret[0]
+        table.merge_delta_row("normal", self._delta(table, 1500))
+        table.merge_delta_row("normal", self._delta(table, -400))
+        assert np.all(table.get_row("normal") == 1100)
+
+    def test_strategy_table_is_not_floored(self, cfr_tables):
+        """Strategy rows are visit counts — clamping them would bias the average.
+
+        The floor is passed to the regret tables only, so a strategy table keeps
+        the plain int32 add.
+        """
+        table = cfr_tables.strategy[0]
+        assert table._floor is None
+        table.merge_delta_row("strat", self._delta(table, 7))
+        assert np.all(table.get_row("strat") == 7)
+
+    def test_floor_is_below_prune_threshold(self):
+        """A floored action must be prune-eligible but able to recover.
+
+        ``cfrp`` explores an action iff its regret is strictly greater than
+        ``c``, so the floor has to sit below ``c`` — otherwise a floored action
+        is never pruned and the floor/threshold pair is incoherent.
+        """
+        assert int(REGRET_FLOOR) < TRAINING_C
+        # ...but only just below: a floor orders of magnitude under ``c`` never
+        # binds, which is how the unbounded accumulation went unnoticed.
+        assert int(REGRET_FLOOR) > 2 * TRAINING_C
 
 
 # ---------------------------------------------------------------------------

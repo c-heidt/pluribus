@@ -79,6 +79,10 @@ _POSITION_NAMES = {
 # games.hu_from_street values → street names (betting_round indices).
 _STREET_NAME = {0: "preflop", 1: "flop", 2: "turn", 3: "river"}
 
+# The env's own stage keys → the street names the schema logs (``decisions``/§6).
+# Only used to read the action grid (:func:`_action_grid`) under the schema's names.
+_ENV_STAGE_NAME = {"pre_flop": "preflop", "flop": "flop", "turn": "turn", "river": "river"}
+
 # Street print/sort order; anything unknown sorts last under its own name.
 _STAGE_ORDER = {"preflop": 0, "flop": 1, "turn": 2, "river": 3}
 
@@ -894,6 +898,191 @@ def _query_hu_coverage(con: sqlite3.Connection) -> dict:
     return {"available": True, "grain": "condition", "conditions": conditions}
 
 
+def _action_grid() -> Optional[Dict[str, List[List[str]]]]:
+    """The env's action grid as ``{street: [tokens at level 0, level 1, ...]}``.
+
+    The grid is cut per ``(stage, raise level)`` — :data:`RAISE_SIZES_BY_STAGE`
+    crossed with the passive gates (:data:`CALL_ALLOWED_BY_STAGE` /
+    :data:`ALL_IN_ALLOWED_BY_STAGE`) — so those cells are exactly the granularity
+    the action mix is reported at.  Knowing the grid is what lets a cell print a
+    **dead entry** (an abstraction size offered but never played) as ``0%`` rather
+    than leaving it invisible, and mark an off-grid play with ``*``.
+
+    Imported lazily and defensively: this module is otherwise a pure
+    schema-reader that must run standalone against any past snapshot, possibly
+    without the env's dependencies installed.  ``None`` degrades the section to
+    "observed tokens only" — every played action still shows up, only the
+    never-played grid entries and the off-grid marks are lost.
+    """
+    try:
+        from environment.poker_env import (       # noqa: PLC0415 — deliberate soft dep
+            ALL_IN_ALLOWED_BY_STAGE,
+            CALL_ALLOWED_BY_STAGE,
+            RAISE_SIZES_BY_STAGE,
+        )
+    except Exception:                             # pragma: no cover - env not importable
+        return None
+    grid: Dict[str, List[List[str]]] = {}
+    for env_stage, levels in RAISE_SIZES_BY_STAGE.items():
+        stage = _ENV_STAGE_NAME.get(env_stage, env_stage)
+        cells = []
+        for i, fractions in enumerate(levels):
+            tokens = ["fold"]
+            if CALL_ALLOWED_BY_STAGE[env_stage][i]:
+                tokens.append("call")
+            tokens += [f"raise:{f}" for f in sorted(fractions)]
+            if ALL_IN_ALLOWED_BY_STAGE[env_stage][i]:
+                tokens.append("all_in")
+            cells.append(tokens)
+        grid[stage] = cells
+    return grid
+
+
+def _grid_tokens(grid, stage, level) -> Optional[List[str]]:
+    """Tokens the grid offers at ``(stage, level)``; last level repeats (env rule)."""
+    if grid is None or level is None:
+        return None
+    cells = grid.get(stage)
+    if not cells:
+        return None
+    return cells[min(int(level), len(cells) - 1)]
+
+
+def _action_class(token: str) -> str:
+    """Coarse class of a played token — the four-way roll-up above the grid cells."""
+    if token.startswith("raise:"):
+        return "raise"
+    return token if token in ("fold", "call", "all_in") else "other"
+
+
+def _token_sort_key(token: str) -> Tuple[int, float, str]:
+    """Canonical action order: fold, call, raises ascending, all-in, then the rest."""
+    if token == "fold":
+        return (0, 0.0, "")
+    if token == "call":
+        return (1, 0.0, "")
+    if token.startswith("raise:"):
+        try:
+            return (2, float(token.split(":", 1)[1]), "")
+        except ValueError:
+            return (2, math.inf, token)
+    if token == "all_in":
+        return (3, 0.0, "")
+    return (4, 0.0, token)
+
+
+def _query_action_mix(con: sqlite3.Connection) -> dict:
+    """What each approach actually **plays**, at the env action grid's own grain.
+
+    The grid is cut per ``(betting stage, raise level)`` — level 0 opens the
+    betting, level 1 faces one raise, and a stage's last level repeats — and the
+    legal token set differs cell by cell, so a mix pooled over a street is a mix
+    over cells nobody plays.  Every number here is therefore a share **within one
+    (condition, street, level) cell**: ``count(action) ÷ that cell's decisions``.
+
+    Conditions are never pooled (the module rule): two arms replay the same deals,
+    so a pooled action count just multiplies the deal count by the arm count and
+    hides the very difference the section exists to show.
+
+    Grid cells with **zero** plays are kept (reported as ``in_grid`` tokens with a
+    zero share) — a size the abstraction offers and the policy never takes is a
+    finding, not an absence.  Tokens played *outside* the cell's grid (a free BB
+    check at pre-flop level 0, where the abstraction gates the voluntary limp; an
+    off-tree size) are kept too, listed in ``off_grid``.
+
+    ``decisions.raise_level`` arrived in schema v8; older snapshots have no level
+    axis, so their rows collapse into a single ``level: None`` cell rather than
+    being dropped.
+    """
+    dhave = {r[1] for r in con.execute("PRAGMA table_info(decisions)")}
+    level_expr = "d.raise_level" if "raise_level" in dhave else "NULL"
+    rows = _rows(
+        con,
+        f"""
+        SELECT g.condition     AS condition,
+               d.betting_stage AS stage,
+               {level_expr}    AS level,
+               d.action_played AS action,
+               COUNT(*)        AS n
+        FROM decisions d JOIN games g ON g.game_id = d.game_id
+        WHERE d.action_played IS NOT NULL
+        GROUP BY g.condition, d.betting_stage, level, d.action_played
+        """,
+    )
+    grid = _action_grid()
+
+    # condition -> stage -> level -> {token: n}
+    tally: Dict[str, Dict[str, Dict[Optional[int], Dict[str, int]]]] = {}
+    for r in rows:
+        cond = _condition_label(r["condition"])
+        level = None if r["level"] is None else int(r["level"])
+        cell = tally.setdefault(cond, {}).setdefault(r["stage"], {}).setdefault(level, {})
+        cell[r["action"]] = cell.get(r["action"], 0) + int(r["n"])
+
+    conditions = []
+    for cond in sorted(tally, key=_condition_sort_key):
+        by_stage = tally[cond]
+        streets, classes, n_cond = [], {}, 0
+        for stage in sorted(by_stage, key=_stage_sort_key):
+            by_level = by_stage[stage]
+            # Column set for the street: every token the grid offers at any of its
+            # levels, plus anything actually played off-grid.
+            columns = set()
+            for cells in ((grid or {}).get(stage) or []):
+                columns.update(cells)
+            for counts in by_level.values():
+                columns.update(counts)
+            levels = []
+            for level in sorted(by_level, key=lambda x: (x is None, x)):
+                counts = dict(by_level[level])
+                offered = _grid_tokens(grid, stage, level)
+                n = sum(counts.values())
+                n_cond += n
+                for token, c in counts.items():
+                    cls = _action_class(token)
+                    classes[cls] = classes.get(cls, 0) + c
+                if offered:
+                    counts.update({t: counts.get(t, 0) for t in offered})
+                levels.append({
+                    "level": level,
+                    "n": n,
+                    "counts": dict(sorted(counts.items(), key=lambda kv: _token_sort_key(kv[0]))),
+                    "shares": {
+                        t: (c / n) if n else None
+                        for t, c in sorted(counts.items(), key=lambda kv: _token_sort_key(kv[0]))
+                    },
+                    # Which of those tokens the grid offers here — the split that
+                    # separates a dead abstraction entry from an off-grid play.
+                    "in_grid": list(offered) if offered else None,
+                    "off_grid": sorted(
+                        (t for t, c in counts.items() if c and offered and t not in offered),
+                        key=_token_sort_key,
+                    ) if offered else [],
+                })
+            streets.append({
+                "stage": stage,
+                "tokens": sorted(columns, key=_token_sort_key),
+                "n": sum(c["n"] for c in levels),
+                "levels": levels,
+            })
+        conditions.append({
+            "condition": cond,
+            "n_actions": n_cond,
+            "class_shares": {
+                c: (classes.get(c, 0) / n_cond) if n_cond else None
+                for c in ("fold", "call", "raise", "all_in", "other")
+                if classes.get(c, 0) or c != "other"
+            },
+            "streets": streets,
+        })
+    return {
+        "grain": "condition x betting_stage x raise_level",
+        "grid_available": grid is not None,
+        "level_axis": "raise_level" in dhave,
+        "conditions": conditions,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Flags (§8 "Automated flags") — the only threshold-gated output
 # --------------------------------------------------------------------------- #
@@ -1077,6 +1266,7 @@ def _print_human(report: dict) -> str:
     _aivat_block(L, report)
     _range_block(L, report)
     _search_block(L, report)
+    _action_block(L, report)
     _hu_block(L, report)
 
     if report["flags"]:
@@ -1295,6 +1485,63 @@ def _search_block(L: List[str], report: dict) -> None:
             )
 
 
+def _token_label(token: str) -> str:
+    """Compact column head for a token: ``raise:0.75`` → ``0.75``, ``all_in`` → ``allin``."""
+    if token.startswith("raise:"):
+        return token.split(":", 1)[1]
+    return "allin" if token == "all_in" else str(token)
+
+
+def _level_label(level) -> str:
+    """``L0``/``L1``/… for a raise level; ``?`` for a pre-v8 row with no level axis."""
+    return "?" if level is None else f"L{int(level)}"
+
+
+def _action_block(L: List[str], report: dict) -> None:
+    mix = report["action_mix"]
+    conds = mix["conditions"]
+    L.append("")
+    L.append(
+        "ACTION MIX — what each approach plays, per condition × street × raise level"
+    )
+    if not conds:
+        L.append("  (no hero actions logged)")
+        return
+    if mix["grid_available"]:
+        L.append(
+            "  (share within the cell; – not offered at that level, "
+            "0% offered but never played, * played off-grid)"
+        )
+    if not mix["level_axis"]:
+        L.append("  (pre-v8 snapshot: no raise-level axis, all levels collapse into ?)")
+    for c in conds:
+        cls = c["class_shares"]
+        L.append(
+            f"  {c['condition']}   {c['n_actions']} hero actions   "
+            + "  ".join(
+                f"{k.replace('all_in', 'all-in')} {_fmt(v, '.0%')}"
+                for k, v in cls.items() if v is not None
+            )
+        )
+        for st in c["streets"]:
+            heads = "".join(f"{_token_label(t):>6}" for t in st["tokens"])
+            L.append(f"      {str(st['stage']):<8}{'lvl':<4}{'n':>7}{heads}")
+            for lv in st["levels"]:
+                cells = ""
+                for t in st["tokens"]:
+                    share, count = lv["shares"].get(t), lv["counts"].get(t)
+                    offered = lv["in_grid"]
+                    if count:
+                        mark = "*" if offered is not None and t not in offered else ""
+                        cells += f"{_fmt(share, '.0%') + mark:>6}"
+                    elif offered is None:
+                        cells += f"{'—' if count is None else '0%':>6}"
+                    else:
+                        cells += f"{'0%' if t in offered else '–':>6}"
+                L.append(
+                    f"      {'':<8}{_level_label(lv['level']):<4}{lv['n']:>7}{cells}"
+                )
+
 def _hu_block(L: List[str], report: dict) -> None:
     hc = report["hu_coverage"]
     if not hc.get("available") or not hc.get("conditions"):
@@ -1339,6 +1586,9 @@ def build_report(con: sqlite3.Connection, metric: str = "auto") -> dict:
         "range_quality": _query_range_health(con),
         "hu_coverage": _query_hu_coverage(con),
         "search": _query_search(con),
+        # What the arms actually play, at the action grid's own (street, level)
+        # cells — the mix a strategy change shows up in first.
+        "action_mix": _query_action_mix(con),
     }
     if aivat_ok:
         alt = "raw" if report["strength"]["used_aivat"] else "aivat"

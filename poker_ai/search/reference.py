@@ -80,6 +80,11 @@ class _ReferenceWalk:
 
         self.n_combos = int(root_env.combo_cards.shape[0])
         self._combo_cards = root_env.combo_cards
+        # Cards the two hands hold between them — the rivers an (opp, bot) combo pair
+        # cancels out of the deck.  This is the chance node's divisor correction (see
+        # :meth:`_integrate_river`); derived from the hand width rather than written
+        # as a literal so it tracks the game, not this file.
+        self._cards_in_play = 2 * int(root_env.combo_cards.shape[1])
         bc = np.asarray(ctx.board_compatible, dtype=np.float64)
         # Counterfactual weight carried down the tree = the bot's reach (its range,
         # board-masked; its blueprint σ is folded in at each bot node).  The opponent's
@@ -190,10 +195,22 @@ class _ReferenceWalk:
         """Average ``fn()`` over every available river, refreshing the overlay each.
 
         ``fn`` reads ``self._completion`` / the cluster maps for the current river.
-        Uniform ``1/|avail|`` weighting = the chance measure the vector regime samples;
-        per-combo feasibility (applied inside ``fn``) handles card removal, so a combo
+        Per-combo feasibility (applied inside ``fn``) handles card removal, so a combo
         holding the dealt river contributes 0 for that river.  Restores the prior
         overlay on the way out so sibling branches see a clean state.
+
+        The divisor is the number of rivers actually **dealable**, not ``len(avail)``.
+        Both hands are known to the dealer, so for any (opp combo, bot combo) pair the
+        four cards they hold are not in the deck: exactly ``len(avail) - 4`` of the
+        summed terms are nonzero, and the other four were cancelled, not sampled.
+        Dividing by ``len(avail)`` would shrink every value below the chance node by
+        ``(len(avail)-4)/len(avail)`` while a turn-side FOLD — which sits above this
+        node and takes no divisor at all — kept full weight.  That is the same
+        fold-vs-showdown measure split already fixed in the vector regime and in the
+        brute-force oracle: it does not cancel in a best response, because the max is
+        taken across terminals on both sides of the chance node.  The count is exact:
+        removal guarantees the two hands are disjoint, board-incompatible combos carry
+        no reach, and ``avail`` already excludes the root community.
         """
         prev = self._completion
         acc = np.zeros(self.n_combos, dtype=np.float64)
@@ -205,7 +222,7 @@ class _ReferenceWalk:
         self._completion = prev
         if prev:
             self._cmaps.refresh(prev)   # restore the parent's overlay for later reads
-        return acc / float(len(avail))
+        return acc / float(len(avail) - self._cards_in_play)
 
     # ------------------------------------------------------------------ #
     # Bot blueprint strategy, vectorised per combo (cluster query → combo expand).
