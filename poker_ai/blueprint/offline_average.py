@@ -88,8 +88,20 @@ log = logging.getLogger("poker_ai.blueprint.offline_average")
 #: Approximate peak resident memory of one in-flight ``(street, chunk)`` task at
 #: the default ``PLURIBUS_CHUNK_SIZE`` (4M rows): the float64 accumulator, the
 #: int64 presence counter, one int32 snapshot chunk, and NumPy's temporaries.
-#: Measured ~650-800 MB.  Total peak ≈ ``workers * _TASK_PEAK_MB``, which is how
-#: ``--workers`` doubles as the memory dial.
+#: Total peak ≈ ``workers * _TASK_PEAK_MB``, which is how ``--workers`` doubles as
+#: the memory dial.
+#:
+#: ⚠This is a SINGLE number for a quantity that scales with the row width, so it is
+#: optimistic on a wide grid.  Per task the live bytes are roughly
+#:
+#:     rows * (32 * n_actions + 16)          [+ 8 * rows when snapshot-weighted]
+#:
+#: — accumulator (8) + snapshot chunk (4) + regret-matched sigma (8) + the clip
+#: temporary (4) + the fancy-index temporary (8), all per action column, plus the
+#: int64 counter and the float64 weighted divisor per row.  At 4M rows that is
+#: ~530 MB on a 4-wide street but **~1.1 GB on an 8-wide one**, so a 16-worker run
+#: on a wide post-flop grid needs ~17 GB, not the ~13 GB this constant implies.
+#: Size ``--workers`` from the formula, not from this number, when the grid is wide.
 _TASK_PEAK_MB = 800
 
 #: Integer scale applied to the averaged probability vector before it is stored
@@ -280,7 +292,13 @@ def average_chunk(
     ).shape
     acc = np.zeros((n_rows, n_actions), dtype=np.float64)
     count = np.zeros(n_rows, dtype=np.int64)   # unweighted: the confirmation tally
-    wsum = np.zeros(n_rows, dtype=np.float64)  # weighted: the mean's divisor
+    # The weighted divisor is only needed when the weights are not all 1 — with equal
+    # weights it IS ``count``.  Skipping the allocation keeps the equal-weight path's
+    # memory profile exactly what it was before weighting existed (see _TASK_PEAK_MB:
+    # the pool sizes ``workers`` by it, so a per-worker regression here is what turns
+    # a 16-worker production run into an OOM kill).
+    weighted = snapshot_weights is not None
+    wsum = np.zeros(n_rows, dtype=np.float64) if weighted else None
 
     if snapshot_weights is None:
         weights: Sequence[float] = [1.0] * len(snapshot_dirs)
@@ -317,9 +335,16 @@ def average_chunk(
             has_signal = pos_sum > 0.0
         if has_signal.any():
             sigma = sigma_from_regret_chunk(chunk)
-            acc[:k][has_signal] += float(w) * sigma[has_signal]
+            # Scale IN PLACE on the fresh array.  ``w * sigma[has_signal]`` would
+            # allocate a second (n_signal, n_actions) float64 temporary on top of the
+            # one fancy indexing already makes — per snapshot, per worker — which is a
+            # ~250 MB/worker regression on production-sized chunks.
+            if weighted and float(w) != 1.0:
+                sigma *= float(w)
+            acc[:k][has_signal] += sigma[has_signal]
             count[:k][has_signal] += 1
-            wsum[:k][has_signal] += float(w)
+            if weighted:
+                wsum[:k][has_signal] += float(w)
         del arr  # release the ~80 MB snapshot chunk before the next load
 
     # The fraction requirement scales with THIS run's own snapshot count, so
@@ -333,7 +358,8 @@ def average_chunk(
     out = np.zeros((n_rows, n_actions), dtype=np.int32)
     present = count >= required
     if present.any():
-        mean = acc[present] / wsum[present][:, None]
+        denom = wsum if weighted else count
+        mean = acc[present] / denom[present][:, None]
         out[present] = np.rint(scale * mean).astype(np.int32)
     # Rows present in no snapshot, present but never showing (sufficient)
     # positive regret, or confirmed by fewer than `required` independent
