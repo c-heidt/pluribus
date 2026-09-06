@@ -917,6 +917,17 @@ final VACUUM INTO; run the §8 summary
   what makes the cursor exact.
 - **Config persisted** as `config.yaml` next to the snapshot (mirrors the blueprint
   runner); `config_fingerprint = hash(solver + leaf + table_policy)`.
+- **Progress** (`progress_interval`, default every 100 hands; `0` silences it): a log
+  line carrying the arm label, hands done / target, elapsed and estimated remaining
+  time. Arms run one after another (each is its own invocation), so this is one
+  progress stream per method under test. Deliberately a periodic log line and not a
+  redrawing bar — these runs are read back from a Slurm job log far more often than
+  watched in a terminal. Remaining extrapolates the average hand cost *so far*, which
+  is lumpy by construction (most hands fold pre-flop; a few are minutes-long turn
+  solves), and is measured over the hands played in **this** invocation so a resumed
+  run never inherits the pace of the attempt that was interrupted. Under the parallel
+  runner the count is the pool's shared *finished* counter, read on the parent's
+  worker-health poll, so a line can land a few hands past a round number.
 
 **Cross-condition pairing (common random numbers).** The single highest-leverage
 variance lever for comparing approaches (vanilla / DBR of
@@ -988,8 +999,8 @@ locks it:
 
 **Run config fields:** `run_id`, `run_seed`, `table_policy`, `time_budget`,
 `max_hands` (paired mode; mutually exclusive with `time_budget`), `condition`,
-`big_blind`, `starting_stack`, `n_players = 6`, `sync_interval`, scratch/permanent
-paths.
+`big_blind`, `starting_stack`, `n_players = 6`, `sync_interval`, `progress_interval`,
+scratch/permanent paths.
 
 **Arm labels (the model-error sweep).** The eval's question is *how good must the
 opponent model be* for each approach to gain ([opponent_modeling.md](opponent_modeling.md),

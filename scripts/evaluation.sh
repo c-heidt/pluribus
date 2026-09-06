@@ -168,8 +168,12 @@ AIVAT_ROLLOUTS=${AIVAT_ROLLOUTS:-48}                # baseline rollouts per valu
 AIVAT_CHANCE=${AIVAT_CHANCE:-false}                 # true | false
 AIVAT_CHANCE_ROLLOUTS=${AIVAT_CHANCE_ROLLOUTS:-48}  # baseline rollouts per alternative card
 # Sync-back cadence (§5): every SYNC_INTERVAL_HANDS hands and/or SYNC_INTERVAL_MINUTES.
-SYNC_INTERVAL_HANDS=${SYNC_INTERVAL_HANDS:-500}
+SYNC_INTERVAL_HANDS=${SYNC_INTERVAL_HANDS:-100}
 SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES:-20}
+# Progress cadence: every N hands each arm logs its condition, hands done, elapsed and
+# estimated remaining time into this job log.  Arms run one after another, so it is one
+# progress stream per method.  0 silences it.
+PROGRESS_INTERVAL=${PROGRESS_INTERVAL:-100}
 LUT_PATH=${LUT_PATH:-"$WORKSPACE/exact"}
 
 # Permanent-FS destination for the snapshot + config.yaml (analysis reads this).
@@ -524,6 +528,7 @@ run_arm() {
     --sync-path "$PERM_SNAPSHOT" \
     --sync-interval-hands "$SYNC_INTERVAL_HANDS" \
     --sync-interval-minutes "$SYNC_INTERVAL_MINUTES" \
+    --progress-interval "$PROGRESS_INTERVAL" \
     --blueprint-path "$BLUEPRINT_PATH" \
     --lut-path "$LUT_PATH" \
     --table-policy "$TABLE_POLICY" \

@@ -995,6 +995,107 @@ def _best_effort_sync(sync_fn: Callable[[], None], run_id: str) -> None:
         )
 
 
+PROGRESS_INTERVAL_HANDS = 100
+"""Default cadence of the per-arm progress line (0 disables it)."""
+
+
+def _fmt_hms(seconds: float) -> str:
+    """``H:MM:SS``, the one format that stays readable from seconds to hours."""
+    return str(datetime.timedelta(seconds=int(max(0.0, seconds))))
+
+
+class _ProgressReporter:
+    """Periodic "how far along is this arm" log line — one stream per method.
+
+    Every experiment arm (``vanilla``, ``DBR(...)``, ``OX(...)``, ``blueprint_only``)
+    is its own ``evaluate run`` invocation — scripts/evaluation.sh runs them in turn
+    into one shared db — so a line tagged with the condition IS a line per method.
+    A log line every ``interval`` hands rather than a live bar: these runs are watched
+    through a Slurm job log far more often than a terminal, and a redrawing bar turns
+    into thousands of log lines there.
+
+    Elapsed and remaining are measured over the hands played **this call**, so a
+    resumed run never extrapolates from the pace of the attempt that was interrupted;
+    the resume offset still counts toward the displayed total.  Remaining comes from
+    the paired-mode hand target when there is one and from the wall budget otherwise
+    (the two stop criteria are mutually exclusive, §10.1) — and is only ever an
+    extrapolation of the average hand cost so far, which is lumpy by nature: most
+    hands fold pre-flop, a few are minutes-long turn solves.
+    """
+
+    def __init__(
+        self,
+        label: Optional[str],
+        total: Optional[int],
+        *,
+        done: int = 0,
+        interval: int = PROGRESS_INTERVAL_HANDS,
+        budget_s: float = 0.0,
+    ) -> None:
+        self._label = label or "eval"
+        self._total = total if total and total > 0 else None
+        self._budget_s = float(budget_s)
+        self._interval = int(interval)
+        self._start_done = int(done)
+        self._done = int(done)
+        self._t0 = time.monotonic()
+        self._next = self._threshold_after(self._done)
+        self._last_emit: Optional[int] = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._interval > 0
+
+    def _threshold_after(self, n: int) -> int:
+        """Next multiple of the interval strictly above ``n`` (absolute, not relative).
+
+        Anchoring on absolute hand counts keeps a resumed run's lines on the same
+        round numbers as the run it continues.
+        """
+        if self._interval <= 0:
+            return 0
+        return ((n // self._interval) + 1) * self._interval
+
+    def update_to(self, n_done: int) -> None:
+        """Report cumulative progress (absolute count, monotonic)."""
+        if not self.enabled or n_done <= self._done:
+            return
+        self._done = int(n_done)
+        if self._done >= self._next:
+            self._emit()
+            self._next = self._threshold_after(self._done)
+
+    def bump(self, n: int = 1) -> None:
+        self.update_to(self._done + n)
+
+    def finish(self) -> None:
+        """Final line, unless the last periodic one already reported this same count."""
+        if self.enabled and self._done > self._start_done and self._done != self._last_emit:
+            self._emit(final=True)
+
+    def _emit(self, final: bool = False) -> None:
+        self._last_emit = self._done
+        elapsed = time.monotonic() - self._t0
+        played = self._done - self._start_done
+        rate = played / elapsed if elapsed > 0 and played > 0 else 0.0
+        if self._total is not None:
+            pct = 100.0 * self._done / self._total
+            head = f"{self._done}/{self._total} hands ({pct:.1f}%)"
+            remaining = (self._total - self._done) / rate if rate > 0 else None
+        else:
+            head = f"{self._done} hands"
+            remaining = (self._budget_s - elapsed) if self._budget_s > 0 else None
+        logger.info(
+            "[%s] %s | elapsed %s | remaining %s | %.2f hand/s%s",
+            self._label,
+            head,
+            _fmt_hms(elapsed),
+            ("~" + _fmt_hms(remaining)) if remaining is not None else "unknown",
+            rate,
+            " (done)" if final else "",
+        )
+
+
 def run_evaluation(
     session: EvalSession,
     log: ExperimentLog,
@@ -1006,6 +1107,7 @@ def run_evaluation(
     sync_fn: Optional[Callable[[], None]] = None,
     max_hands: Optional[int] = None,
     max_consecutive_failures: Optional[int] = 20,
+    progress_interval: int = PROGRESS_INTERVAL_HANDS,
 ) -> int:
     """Play hands until the budget ends (or ``should_stop``); return hands attempted.
 
@@ -1046,6 +1148,9 @@ def run_evaluation(
         (§10.1) prefer ``EvalConfig.max_hands``, which is *total*-based (resume-safe)
         and disables the wall-clock budget; ``None`` here + ``cfg.max_hands=None`` →
         budget-bound only.
+    progress_interval
+        Log a progress line (arm label, hands done, elapsed, remaining) every this
+        many hands; ``0`` silences it.  See :class:`_ProgressReporter`.
     """
     cfg = session.config
     _validate_config(cfg)
@@ -1067,6 +1172,15 @@ def run_evaluation(
     consecutive_failures = 0
     hands_since_sync = 0
     last_sync = time.monotonic()
+    # ``hand_index`` is the resume cursor, i.e. hands already logged for this run_id —
+    # so it is both the starting count and, with ``call_cap``, the run's total.
+    progress = _ProgressReporter(
+        cfg.condition,
+        (hand_index + call_cap) if call_cap is not None else None,
+        done=hand_index,
+        interval=progress_interval,
+        budget_s=budget_s,
+    )
 
     while True:
         if should_stop is not None and should_stop():
@@ -1081,6 +1195,7 @@ def run_evaluation(
         hand_index += 1
         n_attempted += 1
         hands_since_sync += 1
+        progress.update_to(hand_index)
         if ok:
             consecutive_failures = 0
         else:
@@ -1109,6 +1224,7 @@ def run_evaluation(
             hands_since_sync = 0
             last_sync = time.monotonic()
 
+    progress.finish()
     if n_failed:
         logger.warning(
             "run %s: %d of %d hands failed this session (see hand_failures)",
@@ -1226,6 +1342,7 @@ def run_evaluation_parallel(
     sync_fn: Optional[Callable[[], None]] = None,
     max_hands: Optional[int] = None,
     stop_event=None,
+    progress_interval: int = PROGRESS_INTERVAL_HANDS,
 ) -> int:
     """Play hands **in parallel** — one hand per core, search ``workers=1`` (no nested pool).
 
@@ -1262,6 +1379,12 @@ def run_evaluation_parallel(
     Stop: ``max_hands`` (or ``cfg.max_hands``) as a **total** target (resume-safe), else
     the wall budget ``cfg.time_budget_hours``; ``stop_event`` (an ``mp.Event``) is polled
     at each hand boundary for SIGTERM.  Returns hands attempted this call.
+
+    Progress (arm label, hands done, elapsed, remaining) is logged every
+    ``progress_interval`` hands — ``0`` silences it.  The count is the pool's shared
+    *finished* counter read on the parent's worker-health poll, so it is a real
+    completion count and not the (up to ``n_workers`` ahead) hand-out cursor; it can
+    therefore land a few hands past a round number before it is read.
     """
     from evaluation.hand_pool import run_index_pool
     from evaluation.sqlite_logging import merge_logs
@@ -1277,6 +1400,13 @@ def run_evaluation_parallel(
         tlog.close()
     target = max_hands if max_hands is not None else cfg.max_hands
     budget_s = 0.0 if target is not None else cfg.time_budget_hours * 3600.0
+    # Resume: ``skip`` is what a prior attempt already logged, so it is the starting
+    # count, and the pool's counter only ever counts hands played THIS call.
+    progress = _ProgressReporter(
+        cfg.condition, target, done=len(skip),
+        interval=progress_interval, budget_s=budget_s,
+    )
+    n_skipped = len(skip)
     shared = {
         "session": session, "cfg": cfg, "fingerprint": fingerprint,
         "now_fn": now_fn, "git_sha": git_sha, "hostname": hostname,
@@ -1291,7 +1421,9 @@ def run_evaluation_parallel(
             process=_eval_worker_process, teardown=_eval_worker_teardown,
             shared=shared, target=target, skip=skip,
             wall_budget_s=budget_s, stop_event=stop_event,
+            progress=lambda n: progress.update_to(n_skipped + n),
         )
+    progress.finish()
     payloads = [p for p in payloads if p is not None]
     merge_logs(os.fspath(target_db_path), [p["path"] for p in payloads])
     n_ok = sum(p["n_ok"] for p in payloads)
@@ -1846,6 +1978,15 @@ def _cli():
         "neither across worker counts nor across runs.  Ignored under --sequential.",
     )
     @click.option(
+        "--progress-interval",
+        default=PROGRESS_INTERVAL_HANDS,
+        type=int,
+        show_default=True,
+        help="Log a progress line for this arm every N hands (label, hands done, "
+        "elapsed, estimated remaining); 0 silences it. Each arm is its own run, so "
+        "this is one progress stream per method under test.",
+    )
+    @click.option(
         "--sequential",
         is_flag=True,
         default=False,
@@ -1953,6 +2094,7 @@ def _cli():
                 hostname=socket.gethostname(),
                 sync_fn=(_sync_par if sync_path is not None else None),
                 stop_event=stop_event,
+                progress_interval=opts["progress_interval"],
             )
             dest = sync_path if sync_path is not None else db_path
             click.echo(f"played {n} hands for run_id={cfg.run_id} "
@@ -1977,6 +2119,7 @@ def _cli():
                 hostname=socket.gethostname(),
                 should_stop=should_stop,
                 sync_fn=sync_fn,
+                progress_interval=opts["progress_interval"],
             )
         finally:
             log.close()

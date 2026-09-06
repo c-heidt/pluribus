@@ -26,6 +26,11 @@ pickled, since we fork):
   ``worker_state``: append a row, write a DB, bump a counter).
 - ``teardown(worker_state) -> payload`` — return this worker's picklable result (row
   list, counts, DB path); the pool returns the list of the H payloads.
+
+An optional ``progress`` callback is invoked **in the parent** with the running count
+of finished jobs, so a caller can report how far along a run is without any of the
+workers needing to know (they only bump a shared counter).  It rides the existing
+worker-health poll, so it costs no extra synchronisation.
 """
 
 from __future__ import annotations
@@ -45,6 +50,14 @@ _POOL_SHARED: dict = {}
 
 _HEALTH_POLL_S = 5.0
 """How often :func:`run_index_pool` checks its workers for an abrupt death."""
+
+_PROGRESS_POLL_S = 1.0
+"""Poll period once a ``progress`` callback is supplied.
+
+The parent is idle while the pool runs, so polling more often is free — and it has to
+be well under the caller's reporting cadence, or a fast-folding run would cross several
+reporting thresholds inside one poll and report far more coarsely than asked.
+"""
 
 
 class WorkerDiedError(RuntimeError):
@@ -77,10 +90,11 @@ def _worker(worker_id: int):
     wall_budget_s: float = S["wall_budget_s"]
     run_start: float = S["run_start"]
     stop_event = S["stop_event"]
+    done = S["done"]
 
     try:
         return _worker_loop(worker_id, setup, process, teardown, shared, counter, lock,
-                            target, skip, wall_budget_s, run_start, stop_event)
+                            target, skip, wall_budget_s, run_start, stop_event, done)
     except BaseException:
         # Log HERE, in the worker: a setup/teardown failure is re-raised in the parent by
         # ``map_async.get()``, but only if it pickles — and an unpicklable exception would
@@ -90,7 +104,7 @@ def _worker(worker_id: int):
 
 
 def _worker_loop(worker_id, setup, process, teardown, shared, counter, lock,
-                 target, skip, wall_budget_s, run_start, stop_event):
+                 target, skip, wall_budget_s, run_start, stop_event, done=None):
     state = setup(worker_id, shared)
     while True:
         if stop_event is not None and stop_event.is_set():
@@ -108,6 +122,9 @@ def _worker_loop(worker_id, setup, process, teardown, shared, counter, lock,
             process(idx, state, shared)
         except Exception:               # a bad job must not kill the worker (job logs itself)
             logger.exception("pool worker %d: job index %d raised", worker_id, idx)
+        if done is not None:            # ATTEMPTS, so a failing job still shows progress
+            with done.get_lock():
+                done.value += 1
     return teardown(state) if teardown is not None else None
 
 
@@ -122,6 +139,7 @@ def run_index_pool(
     skip: Optional[Sequence[int]] = None,
     wall_budget_s: float = 0.0,
     stop_event=None,
+    progress: Optional[Callable[[int], None]] = None,
 ) -> List[Any]:
     """Fan an index-keyed job over ``n_workers`` single-core forked workers.
 
@@ -129,6 +147,11 @@ def run_index_pool(
     until ``target`` jobs (``None`` ⇒ unbounded, wall/stop-bound), ``wall_budget_s``
     (``0`` ⇒ none), or ``stop_event`` set.  Returns the list of per-worker ``teardown``
     payloads.  ``n_workers == 1`` runs inline (no fork) for tests / trivial runs.
+
+    ``progress`` (optional) is called in the PARENT with the cumulative number of jobs
+    finished so far — on each worker-health poll for the forked path, after each job
+    inline.  It is advisory reporting only: it never gates the loop, and it is called
+    from one place so it needs no locking of its own.
     """
     n = max(1, int(n_workers))
     shared = shared or {}
@@ -137,6 +160,7 @@ def run_index_pool(
     if n == 1:
         # Inline path — deterministic, fork-free (unit tests, tiny runs).
         counter = {"v": 0}
+        n_done = 0
         state = setup(0, shared)
         start = time.monotonic()
         while True:
@@ -153,18 +177,24 @@ def run_index_pool(
                 process(idx, state, shared)
             except Exception:
                 logger.exception("inline pool: job index %d raised", idx)
+            n_done += 1
+            if progress is not None:
+                progress(n_done)
         return [teardown(state) if teardown is not None else None]
 
     try:
         ctx = mp.get_context("fork")
     except ValueError:  # platform without fork
         ctx = mp.get_context()
+    # Jobs FINISHED, as opposed to ``counter`` (jobs handed OUT, which runs ahead by up
+    # to one per worker) — the parent reads it for ``progress``.
+    done = ctx.Value("q", 0)
     global _POOL_SHARED
     _POOL_SHARED = {
         "setup": setup, "process": process, "teardown": teardown, "shared": shared,
         "counter": ctx.Value("q", 0), "lock": ctx.Lock(),
         "target": target, "skip": skip_set, "wall_budget_s": float(wall_budget_s),
-        "run_start": time.monotonic(), "stop_event": stop_event,
+        "run_start": time.monotonic(), "stop_event": stop_event, "done": done,
     }
     try:
         with ctx.Pool(processes=n) as pool:
@@ -177,8 +207,11 @@ def run_index_pool(
             # ORIGINAL worker processes and abort loudly the moment one exits non-zero.
             async_res = pool.map_async(_worker, range(n))
             procs = list(getattr(pool, "_pool", []))    # private, but stable across 3.x
+            poll_s = _PROGRESS_POLL_S if progress is not None else _HEALTH_POLL_S
             while not async_res.ready():
-                async_res.wait(_HEALTH_POLL_S)
+                async_res.wait(poll_s)
+                if progress is not None:
+                    progress(done.value)
                 if async_res.ready():
                     break
                 dead = [p for p in procs
@@ -197,6 +230,8 @@ def run_index_pool(
                         "SIGKILL, the node ran out of memory — lower the concurrency cap "
                         "or raise the job's --mem." % (len(dead), n, detail))
             payloads = async_res.get()
+            if progress is not None:
+                progress(done.value)
     finally:
         _POOL_SHARED = {}
     return payloads
