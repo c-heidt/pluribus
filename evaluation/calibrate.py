@@ -62,8 +62,10 @@ import numpy as np
 from evaluation.aivat import LeafValue, _preserve_global_random
 from evaluation.opponents import HERO_LABEL, ModelSpec
 from evaluation.runner import (
+    DEFAULT_OX_KBETA,
     EvalConfig,
     EvalSession,
+    _ProgressReporter,
     assign_seats,
     build_blueprint_session,
     derive_seeds,
@@ -984,6 +986,14 @@ def _sweep_teardown(state: dict):
     return state["results"]
 
 
+PROGRESS_INTERVAL_SOLVES = 10
+"""Cadence of the sweep's progress line, in solves (0 disables it).
+
+Coarser than the eval's per-hand cadence because a solve is coarser: the sweep is a few
+hundred of them over hours, where the eval is thousands of hands.
+"""
+
+
 def sweep_jobs(
     jobs: Sequence[dict],
     prod_cfg: SolverConfig,
@@ -995,6 +1005,7 @@ def sweep_jobs(
     crn_value: bool = False,
     crn_worlds: int = 32,
     max_concurrent_multiway: Optional[int] = None,
+    progress_interval: int = PROGRESS_INTERVAL_SOLVES,
 ) -> List[SweepRow]:
     """Solve EVERY ``(job, sample, rep, budget)`` in ONE core-parallel pool.
 
@@ -1014,6 +1025,14 @@ def sweep_jobs(
     post-processing (solves don't depend on it), which is what lets all jobs share one
     pool.  The **primary** convergence signal is the hero root-value gap (mbb, hot-path);
     hot-L1 + argmax-stability are diagnostics; full-policy L1 is a column only.
+
+    Progress (solves done, elapsed, estimated remaining) is logged every
+    ``progress_interval`` solves; ``0`` silences it.  ONE stream, not one per condition:
+    unlike the eval — where each arm is its own invocation — every condition's solves
+    share this pool by design, so "how far along" is a property of the pool.  Remaining
+    is a crude extrapolation: the schedule is longest-processing-time-FIRST, so the
+    average solve gets cheaper as the sweep runs and the estimate reads pessimistic
+    early on.
     """
     from evaluation.hand_pool import run_index_pool
 
@@ -1087,11 +1106,14 @@ def sweep_jobs(
         "crn_value": bool(crn_value), "crn_worlds": int(crn_worlds),
         "mw_sem": mw_sem, "heavy_idx": heavy_idx,
     }
+    progress = _ProgressReporter("sweep", len(all_specs), interval=progress_interval,
+                                 unit="solve")
     payloads = run_index_pool(
         n_workers=min(int(pool_workers), len(all_specs)) or 1,
         setup=_sweep_setup, process=_sweep_process, teardown=_sweep_teardown,
-        shared=shared, target=len(all_specs),
+        shared=shared, target=len(all_specs), progress=progress.update_to,
     )
+    progress.finish()
     # Parent-side LMDB reopen after the pool fork (MDB_BAD_RSLOT).
     try:
         from poker_ai.search.parallel import _reopen_leaf_fleet_lmdb
@@ -1357,6 +1379,21 @@ def _production_regime(street: int, n_live: int) -> str:
     return "vector" if (int(n_live) == 2 and int(street) in (2, 3)) else "mccfr"
 
 
+def _ox_active(solver_cfg) -> bool:
+    """Is the OX-Search gadget on for this solver config?
+
+    The knob has TWO encodings on :class:`SolverConfig`: ``ox_kbeta`` (deck-agnostic —
+    β is derived per subgame as ``kβ / k``) and the raw, deck-dependent ``beta``.
+    :func:`~evaluation.runner.build_blueprint_session` — which is how calibrate builds
+    its session — sets only ``ox_kbeta``, so testing ``beta`` alone (what this module
+    did before the kβ migration) reads every OX arm as vanilla: the regime A/B would
+    switch back on and the MCCFR cells OX never changes would be re-swept as if they
+    were the gadget's.  Both forms have to be checked.
+    """
+    return (getattr(solver_cfg, "beta", None) is not None
+            or getattr(solver_cfg, "ox_kbeta", None) is not None)
+
+
 def _approach_of(condition: str) -> str:
     """Map a calibration condition label onto a budget-table approach key.
 
@@ -1606,6 +1643,7 @@ def run_calibration(
     lut_path: str,
     conditions: Sequence[str],
     model_spec: Optional[ModelSpec],
+    ox_k_beta: Optional[float] = None,
     n_players: int,
     workers: Optional[int],
     variance_reduction: bool = True,
@@ -1638,6 +1676,7 @@ def run_calibration(
     out_dir: Path,
     wall_target: Optional[float],
     regime_ab_streets: Sequence[int] = (2,),
+    progress_interval: int = PROGRESS_INTERVAL_SOLVES,
 ) -> Dict[str, object]:
     out_dir.mkdir(parents=True, exist_ok=True)
     # Each cell's ladder is WALL-ANCHORED: its top rung is the deepest solve that fits the
@@ -1686,7 +1725,7 @@ def run_calibration(
         # seed only for OX (reach-only), the full clamp spec for DBR — with the label's
         # own parameters overriding it.
         return EvalConfig.for_condition(
-            condition, model_spec=model_spec,
+            condition, model_spec=model_spec, ox_k_beta=ox_k_beta,
             run_id="calibrate", run_seed=run_seed, table_policy=table_policy,
             fixed_seats=fixed_seats,
             n_players=n_players, big_blind=big_blind, small_blind=small_blind,
@@ -1696,14 +1735,14 @@ def run_calibration(
 
     cond_cfgs = {c: _cfg_for(c) for c in conditions}
     # Calibrate opens the blueprint LMDB once and SHARES a single ``solver_cfg`` (hence
-    # one ``beta``) across every condition's sweep, so it cannot mix an OX arm (``beta``
-    # set) with vanilla/DBR (``beta`` None) in one run.  Assert agreement so that is a
+    # one ``kβ``) across every condition's sweep, so it cannot mix an OX arm (``k_beta``
+    # set) with vanilla/DBR (``k_beta`` None) in one run.  Assert agreement so that is a
     # LOUD error rather than a silent inflation of one arm into the other's regime.
-    _betas = {c: cfg.beta for c, cfg in cond_cfgs.items()}
-    if len(set(_betas.values())) > 1:
+    _kbetas = {c: cfg.k_beta for c, cfg in cond_cfgs.items()}
+    if len(set(_kbetas.values())) > 1:
         raise ValueError(
             "calibrate shares one solver_cfg across conditions, so all conditions must "
-            f"share beta; got mixed {_betas}. Run OX-Search conditions in a separate "
+            f"share k_beta; got mixed {_kbetas}. Run OX-Search conditions in a separate "
             "calibrate invocation from vanilla/DBR."
         )
     base_cfg = cond_cfgs[conditions[0]]
@@ -1766,14 +1805,14 @@ def run_calibration(
         # full-range settlement cost (vector) and the sampling variance (MCCFR).  Vector
         # is exact-per-iteration on every HU postflop street, so vector@top is the shared
         # exact reference both regimes' gaps are measured against.  Disabled under
-        # OX-Search (``beta`` set): the gadget root exists solely in the vector regime.
+        # OX-Search: the gadget root exists solely in the vector regime.
         ab_streets = set(int(s) for s in regime_ab_streets)
-        ab_on = bool(ab_streets) and getattr(prod_cfg, "beta", None) is None
-        # OX-Search (``beta`` set) only changes the VECTOR regime (the gadget root lives in
-        # HU turn/river vector); its MCCFR path is byte-identical to vanilla, so re-sweeping
-        # MCCFR cells here would just re-measure the vanilla budget.  So under OX we skip
-        # non-vector cells entirely and calibrate the gadget game's vector budgets only.
-        ox_on = getattr(prod_cfg, "beta", None) is not None
+        ox_on = _ox_active(prod_cfg)
+        ab_on = bool(ab_streets) and not ox_on
+        # OX-Search only changes the VECTOR regime (the gadget root lives in HU turn/river
+        # vector); its MCCFR path is byte-identical to vanilla, so re-sweeping MCCFR cells
+        # here would just re-measure the vanilla budget.  So under OX we skip non-vector
+        # cells entirely and calibrate the gadget game's vector budgets only.
         for cell, sample_list in samples.items():
             _cond, _regime, street, n_live = cell
             if ox_on and str(_regime) != "vector":
@@ -1836,7 +1875,8 @@ def run_calibration(
     all_rows = sweep_jobs(jobs, prod_cfg, pool_workers=resolved_workers, reps=reps,
                           base_seed=run_seed, big_blind=big_blind,
                           crn_value=crn_value, crn_worlds=crn_worlds,
-                          max_concurrent_multiway=max_concurrent_multiway)
+                          max_concurrent_multiway=max_concurrent_multiway,
+                          progress_interval=progress_interval)
 
     # Aggregate.
     by_cell: Dict[Cell, List[SweepRow]] = defaultdict(list)
@@ -1971,8 +2011,18 @@ def _cli():
     @click.option("--model-p-max", default=1.0, type=float, show_default=True,
                   help="DBR confidence cap (used only for a DBR condition; 1.0 = "
                   "naive best response).")
+    @click.option("--model-confidence", default=1.0, type=float, show_default=True,
+                  help="Default DBR mixture weight c before the --model-p-max clamp "
+                  "(overridable per arm as 'DBR(confidence=...)'). Set it to whatever "
+                  "the EVAL will run: c is what decides how hard the clamp bites, so a "
+                  "budget calibrated at c=1.0 does not describe an eval played at 0.8. "
+                  "Inert for OX (reach-only) and for vanilla.")
     @click.option("--model-error", default=0.0, type=float, show_default=True)
     @click.option("--model-seed", default=0, type=int, show_default=True)
+    @click.option("--ox-k-beta", default=None, type=float,
+                  help="Default OX-Search safety parameter kβ for an OX arm whose label "
+                  f"gives none (code default {DEFAULT_OX_KBETA}). Deck-agnostic: the "
+                  "solver derives β = kβ / k. Inert for every non-OX arm.")
     @click.option("--workers", default=None, type=int,
                   help="Sweep pool size — concurrent solves, one core each; each search "
                        "runs serially (default: SLURM_CPUS_PER_TASK-1).")
@@ -2094,6 +2144,11 @@ def _cli():
                   "'none' disables. Auto-off under OX-Search (gadget is vector-only). "
                   "WARNING: 'flop' is SLOW (full-width vector flop ~1.3 it/s) — use a "
                   "small --max-iters/--collect-hands when including it.")
+    @click.option("--progress-interval", default=PROGRESS_INTERVAL_SOLVES, type=int,
+                  show_default=True,
+                  help="Log a sweep progress line every N solves (done, elapsed, "
+                  "estimated remaining); 0 silences it. One stream for the whole pool — "
+                  "every condition's solves share it by design.")
     @click.option("--out-dir", default="calibration_out", type=str, show_default=True)
     def run(**o):
         """Collect roots, sweep budgets, and emit a suggested SolverConfig block."""
@@ -2115,6 +2170,7 @@ def _cli():
                          and not c.strip().lower().startswith("ox")
                          for c in conditions)
         model_spec = (ModelSpec(p_max=float(o["model_p_max"]),
+                                confidence=float(o["model_confidence"]),
                                 error=float(o["model_error"]),
                                 seed=int(o["model_seed"]))
                       if need_model else None)
@@ -2137,6 +2193,7 @@ def _cli():
         run_calibration(
             blueprint_path=o["blueprint_path"], lut_path=o["lut_path"],
             conditions=conditions, model_spec=model_spec,
+            ox_k_beta=o["ox_k_beta"],
             n_players=o["n_players"], workers=o["workers"],
             max_concurrent_multiway=o["max_concurrent_multiway"],
             variance_reduction=o["variance_reduction"],
@@ -2156,6 +2213,7 @@ def _cli():
             low_card_rank=o["low_card_rank"], high_card_rank=o["high_card_rank"],
             out_dir=Path(o["out_dir"]), wall_target=o["wall_target"],
             regime_ab_streets=regime_ab_streets,
+            progress_interval=o["progress_interval"],
         )
 
     return calibrate

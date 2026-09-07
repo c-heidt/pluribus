@@ -72,9 +72,20 @@ MODEL_ERROR=${MODEL_ERROR:-0.2}           # target ℓ1 error of σ̂ vs the tru
                                           #   0.3 is the more conservative choice).  Uniform proxy for the
                                           #   street-graded realistic profile (low preflop→high river); the
                                           #   schedule form (schedules.street_error) is not yet on the CLI.
-MODEL_P_MAX=${MODEL_P_MAX:-0.8}           # confidence cap (Approach A default).  1.0 = B1 naive-BR ceiling;
-                                          #   0.8 blends σ̃=c·σ̂+(1−c)·x, de-polarising the exploitation — the
-                                          #   biggest lever on the tail-driven variance we've been chasing.
+MODEL_P_MAX=${MODEL_P_MAX:-1.0}           # confidence CAP; 1.0 = inert, so MODEL_CONFIDENCE below is the
+                                          #   single mixture knob (the two collapse to min(c, p_max), and the
+                                          #   eval parameterises it this way — see scripts/evaluation.sh).
+                                          #   c blends σ̃=c·σ̂+(1−c)·x, de-polarising the exploitation — the
+                                          #   biggest lever on the tail-driven variance we have been chasing;
+                                          #   c=1.0 AND p_max=1.0 AND error=0 is the B1 naive-BR ceiling.
+MODEL_CONFIDENCE=${MODEL_CONFIDENCE:-0.8} # DBR mixture weight c before the p_max clamp.  MUST match what the
+                                          #   EVAL plays (scripts/evaluation.sh MODEL_CONFIDENCE): c is what
+                                          #   decides how hard the clamp bites, so a budget calibrated at a
+                                          #   different c does not describe the run it is meant to size.
+OX_KBETA=${OX_KBETA:-}                    # default kβ for a bare "OX" arm; empty → runner.DEFAULT_OX_KBETA.
+                                          #   Deck-agnostic (β = kβ/k), so it carries across deck sizes.
+PROGRESS_INTERVAL=${PROGRESS_INTERVAL:-10} # log sweep progress every N solves (0 = off): done, elapsed,
+                                          #   estimated remaining.  ONE stream — every condition shares the pool.
 WORKERS=${WORKERS:-}                       # empty → SLURM_CPUS_PER_TASK-1 (production)
 MAX_CONCURRENT_MULTIWAY=${MAX_CONCURRENT_MULTIWAY:-16}  # peak-RAM cap: at most this many multiway (≥3 live) MCCFR solves run at once (biggest tables); cheap solves backfill the rest. Wall is heavy-bound ≈ (multiway core-hours ~152)/K → K=32 gives ~4.7h (≤5h). Uncapped (~52 concurrent) would front-load the RAM and likely exceed the node. Empty → no cap. Peak RAM ≈ K*multiway + (WORKERS-K)*light; size --mem to that. Lower K = less RAM but a longer wall (K=16→~9.5h).
 COLLECT_HANDS=${COLLECT_HANDS:-400}
@@ -294,6 +305,7 @@ run_calibrate() {  # $1 = conditions, $2 = out-dir
   [ -n "$WORKERS" ]     && extra+=(--workers "$WORKERS")
   [ -n "$MAX_CONCURRENT_MULTIWAY" ] && extra+=(--max-concurrent-multiway "$MAX_CONCURRENT_MULTIWAY")
   [ -n "$WALL_TARGET" ] && extra+=(--wall-target "$WALL_TARGET")
+  [ -n "$OX_KBETA" ]    && extra+=(--ox-k-beta "$OX_KBETA")
   if [ "$CRN_VALUE" = "true" ]; then extra+=(--crn-value --crn-worlds "$CRN_WORLDS"); else extra+=(--internal-value); fi
   python -m evaluation.calibrate run \
     --blueprint-path "$BLUEPRINT_PATH" \
@@ -301,7 +313,9 @@ run_calibrate() {  # $1 = conditions, $2 = out-dir
     --n-players "$N_PLAYERS" \
     --conditions "$conds" \
     --model-p-max "$MODEL_P_MAX" \
+    --model-confidence "$MODEL_CONFIDENCE" \
     --model-error "$MODEL_ERROR" \
+    --progress-interval "$PROGRESS_INTERVAL" \
     --collect-hands "$COLLECT_HANDS" \
     --per-cell-cap "$PER_CELL_CAP" \
     --per-cell-cap-deterministic "$PER_CELL_CAP_DETERMINISTIC" \

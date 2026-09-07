@@ -125,7 +125,7 @@ MAX_HANDS=${MAX_HANDS:-}
 # consume none; OX takes MODEL_ERROR and MODEL_SEED only — it is reach-only, and never
 # reads a cap or a confidence).  These are the knobs held FIXED while `error` sweeps.
 MODEL_P_MAX=${MODEL_P_MAX:-1.0}          # DBR confidence CAP; 1.0 = inert, confidence rules
-MODEL_ERROR=${MODEL_ERROR:-0.0}          # default target ℓ1 model error (the sweep axis)
+MODEL_ERROR=${MODEL_ERROR:-0.2}          # default target ℓ1 model error (the sweep axis)
 MODEL_CONFIDENCE=${MODEL_CONFIDENCE:-0.8} # DBR mixture weight c (inert for OX)
 MODEL_SEED=${MODEL_SEED:-0}              # per-info-set perturbation seed (offset per seat)
 # Default OX-Search safety parameter kβ for an OX arm whose label gives none.  Empty =

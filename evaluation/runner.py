@@ -1014,6 +1014,10 @@ class _ProgressReporter:
     through a Slurm job log far more often than a terminal, and a redrawing bar turns
     into thousands of log lines there.
 
+    ``unit`` names what is being counted, so the calibration sweep
+    (:mod:`evaluation.calibrate`, which counts *solves*) can share this rather than
+    grow a near-copy.
+
     Elapsed and remaining are measured over the hands played **this call**, so a
     resumed run never extrapolates from the pace of the attempt that was interrupted;
     the resume offset still counts toward the displayed total.  Remaining comes from
@@ -1031,8 +1035,10 @@ class _ProgressReporter:
         done: int = 0,
         interval: int = PROGRESS_INTERVAL_HANDS,
         budget_s: float = 0.0,
+        unit: str = "hand",
     ) -> None:
         self._label = label or "eval"
+        self._unit = str(unit)
         self._total = total if total and total > 0 else None
         self._budget_s = float(budget_s)
         self._interval = int(interval)
@@ -1080,13 +1086,13 @@ class _ProgressReporter:
         rate = played / elapsed if elapsed > 0 and played > 0 else 0.0
         if self._total is not None:
             pct = 100.0 * self._done / self._total
-            head = f"{self._done}/{self._total} hands ({pct:.1f}%)"
+            head = f"{self._done}/{self._total} {self._unit}s ({pct:.1f}%)"
             remaining = (self._total - self._done) / rate if rate > 0 else None
         else:
-            head = f"{self._done} hands"
+            head = f"{self._done} {self._unit}s"
             remaining = (self._budget_s - elapsed) if self._budget_s > 0 else None
         logger.info(
-            "[%s] %s | elapsed %s | remaining %s | %.2f hand/s%s",
+            "[%s] %s | elapsed %s | remaining %s | %.2f " + self._unit + "/s%s",
             self._label,
             head,
             _fmt_hms(elapsed),
