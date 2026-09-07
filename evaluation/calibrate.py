@@ -1484,6 +1484,33 @@ def suggest_config(summaries: Sequence[CellSummary]) -> Dict[str, object]:
 # --------------------------------------------------------------------------- #
 # Emit
 # --------------------------------------------------------------------------- #
+def _json_key(key) -> str:
+    """Render a budget-table key for JSON.  ``(street, n_live)`` -> ``"flop/n2"``."""
+    if isinstance(key, tuple):
+        if len(key) == 2 and all(isinstance(k, int) for k in key):
+            street, n_live = key
+            return f"{_STREET_NAME.get(street, street)}/n{n_live}"
+        return "/".join(str(k) for k in key)
+    return str(key)
+
+
+def _jsonable(obj):
+    """Recursively make ``obj`` encodable — specifically, STRINGIFY TUPLE KEYS.
+
+    The budget tables are keyed ``(street, n_live)`` — the shape production reads — and
+    ``json.dumps`` refuses that outright ("keys must be str, int, float, bool or None,
+    not tuple").  It refuses it at the very END of ``run_calibration``, after every solve
+    has already been paid for, so an unconverted key costs the whole run's wall-clock and
+    not just the file.  Converting here (rather than at each construction site) means a
+    new tuple-keyed table added to the summary cannot reintroduce that.
+    """
+    if isinstance(obj, dict):
+        return {_json_key(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    return obj
+
+
 def _write_rows_csv(rows: Sequence[SweepRow], path: Path) -> None:
     import csv
     with open(path, "w", newline="") as fh:
@@ -1926,9 +1953,8 @@ def run_calibration(
         # PER REGIME: sampled MCCFR has a Monte-Carlo floor that full-width vector lacks.
         "hot_l1_tol": {"mccfr": float(hot_l1_tol_mccfr),
                        "vector": float(hot_l1_tol_vector)},
-        "suggested_config": {
-            k: (list(v) if isinstance(v, tuple) else v) for k, v in config.items()
-        },
+        # ``_jsonable`` below stringifies this block's ``(street, n_live)`` keys.
+        "suggested_config": config,
         "cells": [
             {
                 "condition": s.cell[0], "regime": s.cell[1],
@@ -1981,8 +2007,13 @@ def run_calibration(
                 for (cond, street), d in sorted(ab_pairs.items())
             ],
         }
-    (out_dir / "calibration_summary.json").write_text(json.dumps(summary_json, indent=2))
+    # Report FIRST, then write.  The printed block is the run's actual product and the
+    # rows CSV is already on disk, so an encoding failure here can no longer take the
+    # suggested budgets down with it — a calibration is hours of solves, and the last
+    # one was lost to exactly that at this line.
     _print_report(summaries, config, wall_target, core_on=core_on)
+    summary_json = _jsonable(summary_json)
+    (out_dir / "calibration_summary.json").write_text(json.dumps(summary_json, indent=2))
     logger.info("wrote %s and %s", out_dir / "calibration_rows.csv",
                 out_dir / "calibration_summary.json")
     return summary_json

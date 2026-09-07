@@ -1324,17 +1324,127 @@ def _eval_worker_setup(worker_id: int, shared: dict):
     return {"log": ExperimentLog.open(wpath), "path": wpath, "n_ok": 0, "n_fail": 0}
 
 
-def _eval_worker_process(hand_index: int, state: dict, shared: dict) -> None:
+def _eval_worker_process(hand_index: int, state: dict, shared: dict) -> bool:
+    """Play + log one hand.  Returns success, which is what arms the pool's breaker."""
     ok = _play_and_log_one(
         shared["session"], state["log"], shared["cfg"], shared["fingerprint"],
         hand_index, shared["now_fn"], shared["git_sha"], shared["hostname"],
     )
     state["n_ok" if ok else "n_fail"] += 1
+    return ok
 
 
 def _eval_worker_teardown(state: dict) -> dict:
     state["log"].close()
     return {"path": state["path"], "n_ok": state["n_ok"], "n_fail": state["n_fail"]}
+
+
+def _worker_db_paths(worker_dir: str) -> List[str]:
+    """Every per-worker DB on disk, whether or not its worker lived to hand one back.
+
+    The pool's teardown payloads die with a worker, but the paths are deterministic
+    (``_eval_worker_setup``), so the hands a killed run already committed stay
+    recoverable from the directory alone.
+    """
+    import glob
+
+    return sorted(glob.glob(os.path.join(worker_dir, "w*.sqlite")))
+
+
+def _checkpoint_parallel(target_db_path, worker_dir: str, sync_path) -> None:
+    """Snapshot the run-so-far to the permanent FS **without disturbing the workers**.
+
+    The parallel runner merges only at the very end, so until then the target DB holds
+    nothing this attempt produced and the ordinary sync-back would copy an empty file.
+    A hard kill — the cgroup OOM killer, a node failure, a wall-clock overrun past the
+    grace period — would therefore lose every hand played.  So the parent, which is
+    idle while the pool works, builds the snapshot itself on the §5 cadence:
+
+    1. ``VACUUM INTO`` each live worker DB through a **read-only** connection.  That is
+       safe to run against a worker that is actively writing: it takes only a read
+       transaction, so the copy is a consistent point-in-time cut, and the per-hand
+       transaction (§4) means the cut never lands inside a hand.  Verified against a
+       concurrent writer, not assumed.
+    2. Merge those copies into a fresh copy of the target.  Rebuilt from scratch every
+       time, so a checkpoint is a pure function of what exists now and repeating one
+       cannot double-count rows the way merging into a live target would.
+    3. ``os.replace`` over the permanent path — the same atomic swap
+       :meth:`ExperimentLog.sync_to` uses, so a reader never sees a half-written file
+       and the previous good checkpoint survives until this one is complete.
+
+    The result is a COMPLETE, readable experiment DB, not a partial artifact needing
+    reassembly: if the run dies, the checkpoint is the run minus at most one cadence.
+    """
+    import shutil
+    import sqlite3
+    import tempfile
+
+    from evaluation.sqlite_logging import merge_logs
+
+    workers = _worker_db_paths(worker_dir)
+    # Stage NODE-LOCAL, beside the target: the copies and the merge are scratch, and
+    # doing them on the permanent (network) FS would make a checkpoint N+1 network
+    # writes instead of the one that actually has to go there.
+    staging = tempfile.mkdtemp(
+        prefix=".ckpt.", dir=os.path.dirname(os.fspath(target_db_path)) or "."
+    )
+    try:
+        # (1) consistent copies of the live worker DBs
+        copies = []
+        for i, wpath in enumerate(workers):
+            dst = os.path.join(staging, f"w{i:03d}.sqlite")
+            con = sqlite3.connect(f"file:{wpath}?mode=ro", uri=True)
+            try:
+                con.execute("VACUUM INTO ?", (dst,))
+            finally:
+                con.close()
+            copies.append(dst)
+        # (2) a fresh target copy (carrying any prior attempt's merged rows), + merge
+        base = os.path.join(staging, "base.sqlite")
+        tlog = ExperimentLog.open(os.fspath(target_db_path))
+        try:
+            tlog.snapshot(base)
+        finally:
+            tlog.close()
+        merge_logs(base, copies)
+        # (3) one network write, atomically swapped — the same path sync_to takes
+        blog = ExperimentLog.open(base)
+        try:
+            blog.sync_to(sync_path)
+        finally:
+            blog.close()
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _rescue_worker_logs(target_db_path, worker_dir: str, sync_fn, run_id: str) -> None:
+    """Merge + sync whatever the workers finished, after the pool died mid-run.
+
+    A worker killed outright (OOM) makes :func:`~evaluation.hand_pool.run_index_pool`
+    raise, and that raise lands BEFORE the end-of-run merge — so without this the hands
+    the *surviving* workers had already committed are complete rows in their own
+    node-local DBs that nothing ever reads, and the job script's ``EXIT`` trap then
+    deletes the scratch directory holding them.  Measured: one worker killed out of
+    three cost 399 finished jobs.
+
+    Every step is best-effort and logged: the run is already failing, and a rescue that
+    raises would replace the operator's real error with its own.
+    """
+    from evaluation.sqlite_logging import merge_logs
+
+    paths = _worker_db_paths(worker_dir)
+    if not paths:
+        return
+    try:
+        merge_logs(os.fspath(target_db_path), paths)
+        logger.warning("run %s: pool aborted — merged %d worker DBs so the completed "
+                       "hands survive", run_id, len(paths))
+    except Exception:
+        logger.exception("run %s: could not merge worker DBs after the pool aborted; "
+                         "they are still on disk under %s", run_id, worker_dir)
+        return
+    if sync_fn is not None:
+        _best_effort_sync(sync_fn, run_id)
 
 
 def run_evaluation_parallel(
@@ -1346,9 +1456,11 @@ def run_evaluation_parallel(
     git_sha: Optional[str] = None,
     hostname: Optional[str] = None,
     sync_fn: Optional[Callable[[], None]] = None,
+    sync_path=None,
     max_hands: Optional[int] = None,
     stop_event=None,
     progress_interval: int = PROGRESS_INTERVAL_HANDS,
+    max_consecutive_failures: Optional[int] = 20,
 ) -> int:
     """Play hands **in parallel** — one hand per core, search ``workers=1`` (no nested pool).
 
@@ -1386,6 +1498,21 @@ def run_evaluation_parallel(
     the wall budget ``cfg.time_budget_hours``; ``stop_event`` (an ``mp.Event``) is polled
     at each hand boundary for SIGTERM.  Returns hands attempted this call.
 
+    **Losing as little as possible when this dies.**  Three things, because the
+    default execution mode used to keep everything it produced in per-worker DBs that
+    were read exactly once, at the end:
+
+    - the parent checkpoints to ``sync_path`` on the ``EvalConfig.sync_interval_*``
+      cadence (:func:`_checkpoint_parallel`) — before this, those knobs were live in
+      the sequential loop only and silently inert here, which is the mode the cluster
+      script actually runs;
+    - a pool abort (a worker killed by the OOM killer, or the breaker below) still
+      merges + syncs what the other workers finished (:func:`_rescue_worker_logs`)
+      before re-raising;
+    - ``max_consecutive_failures`` in a row **within one worker** aborts the pool, the
+      same circuit breaker :func:`run_evaluation` has.  A systematic error otherwise
+      spends the entire wall budget writing ``hand_failures`` rows and exits 0.
+
     Progress (arm label, hands done, elapsed, remaining) is logged every
     ``progress_interval`` hands — ``0`` silences it.  The count is the pool's shared
     *finished* counter read on the parent's worker-health poll, so it is a real
@@ -1413,22 +1540,70 @@ def run_evaluation_parallel(
         interval=progress_interval, budget_s=budget_s,
     )
     n_skipped = len(skip)
+    # The pool reports jobs finished THIS call; both the progress line and the
+    # checkpoint cadence read it, so keep the latest value where each can see it.
+    _seen = {"n": 0}
+
+    def _on_progress(n: int) -> None:
+        _seen["n"] = n_skipped + n
+        progress.update_to(_seen["n"])
+
+    def progress_done() -> int:
+        return _seen["n"]
+
     shared = {
         "session": session, "cfg": cfg, "fingerprint": fingerprint,
         "now_fn": now_fn, "git_sha": git_sha, "hostname": hostname,
         "worker_dir": f"{os.fspath(target_db_path)}.workers",
     }
+    # Periodic checkpoint (§5): the parent is idle while the pool works, and it is the
+    # only process that can see every worker at once, so it is what snapshots the run.
+    # ``None`` sync_path ⇒ the node-local db is the only artifact, nothing to checkpoint.
+    ckpt_state = {"hands": 0, "t": time.monotonic(), "cost": 0.0}
+
+    def _heartbeat() -> None:
+        n_done = progress_done() - n_skipped
+        idle = time.monotonic() - ckpt_state["t"]
+        if not _sync_due(cfg, n_done - ckpt_state["hands"], idle):
+            return
+        # Self-throttle: a checkpoint rewrites the whole DB to the permanent (network)
+        # FS, and its cost grows with the run.  The hand-count cadence is sized for the
+        # sequential loop's cheap per-hand sync, so on a fast-folding arm it can come
+        # due far quicker than a checkpoint takes — hold off until at least twice the
+        # last one's duration has passed, capping the write amplification instead of
+        # letting checkpoints chase each other.
+        if idle < 2.0 * ckpt_state["cost"]:
+            return
+        t0 = time.monotonic()
+        _checkpoint_parallel(target_db_path, shared["worker_dir"], sync_path)
+        ckpt_state["cost"] = time.monotonic() - t0
+        ckpt_state["hands"] = n_done
+        ckpt_state["t"] = time.monotonic()
+        logger.info("checkpointed run %s (%d hands, %.1fs) -> %s",
+                    cfg.run_id, n_done, ckpt_state["cost"], sync_path)
+
     # Both halves of the fork protocol: the parent's envs are closed across the fork
     # (here) and each worker opens its own in ``_eval_worker_setup``.  Neither half
     # is sufficient alone — see :func:`_parent_lmdb_closed`.
-    with _parent_lmdb_closed(session):
-        payloads = run_index_pool(
-            n_workers=n_workers, setup=_eval_worker_setup,
-            process=_eval_worker_process, teardown=_eval_worker_teardown,
-            shared=shared, target=target, skip=skip,
-            wall_budget_s=budget_s, stop_event=stop_event,
-            progress=lambda n: progress.update_to(n_skipped + n),
-        )
+    try:
+        with _parent_lmdb_closed(session):
+            payloads = run_index_pool(
+                n_workers=n_workers, setup=_eval_worker_setup,
+                process=_eval_worker_process, teardown=_eval_worker_teardown,
+                shared=shared, target=target, skip=skip,
+                wall_budget_s=budget_s, stop_event=stop_event,
+                progress=_on_progress,
+                heartbeat=(_heartbeat if sync_path is not None else None),
+                max_consecutive_failures=max_consecutive_failures,
+            )
+    except BaseException:
+        # The pool died (a worker was killed, or the breaker fired) and the teardown
+        # payloads went with it — but the finished hands are committed rows in the
+        # worker DBs on disk.  Merge + sync them before the error propagates and the
+        # caller's cleanup removes the scratch directory.
+        progress.finish()
+        _rescue_worker_logs(target_db_path, shared["worker_dir"], sync_fn, cfg.run_id)
+        raise
     progress.finish()
     payloads = [p for p in payloads if p is not None]
     merge_logs(os.fspath(target_db_path), [p["path"] for p in payloads])
@@ -2099,6 +2274,7 @@ def _cli():
                 git_sha=_git_sha(),
                 hostname=socket.gethostname(),
                 sync_fn=(_sync_par if sync_path is not None else None),
+                sync_path=sync_path,
                 stop_event=stop_event,
                 progress_interval=opts["progress_interval"],
             )

@@ -152,6 +152,22 @@ unsafe (§4). The SLURM wrapper that stages scratch and forwards SIGTERM is
   Because it is one file, the copy is cheap — none of the many-small-files overhead
   of the chunked table checkpoints. Periodic syncs are **best-effort** (a transient
   FS hiccup is logged and retried next interval, never fatal — bounded loss).
+  Under the **parallel** runner (the default) the cadence is driven by the parent, not
+  a hand loop: workers write their own node-local DBs and the target is empty until the
+  final merge, so the parent snapshots each live worker DB (a read-only `VACUUM INTO`,
+  safe against a concurrent writer) and merges the copies into a fresh permanent
+  snapshot — `runner._checkpoint_parallel`. It self-throttles to keep checkpoint cost
+  off the critical path, so the hand cadence is an upper bound on how often one runs.
+  Each checkpoint is a complete, readable experiment DB, not a partial needing
+  reassembly.
+- **A dead worker does not take the run with it.** A worker killed outright (the
+  cgroup OOM killer) makes the pool raise before the end-of-run merge, so the hands its
+  siblings already committed would never be read. `runner._rescue_worker_logs` merges
+  and syncs whatever is on disk before the error propagates — the worker DB paths are
+  deterministic, so nothing depends on the dead worker handing anything back.
+- **Systematic failure stops the run.** `max_consecutive_failures` (default 20) in one
+  worker aborts the pool, the same circuit breaker the sequential loop has. Without it
+  a bad config spends the entire wall budget writing `hand_failures` rows and exits 0.
 - **Final sync on SIGTERM / preemption.** The runner polls a SIGTERM/SIGINT event
   at each hand boundary (the signal-handling pattern already in the blueprint
   runners, [poker_ai/blueprint/multiprocess/server.py](../poker_ai/blueprint/multiprocess/server.py),

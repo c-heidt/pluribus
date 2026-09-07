@@ -30,7 +30,15 @@ pickled, since we fork):
 An optional ``progress`` callback is invoked **in the parent** with the running count
 of finished jobs, so a caller can report how far along a run is without any of the
 workers needing to know (they only bump a shared counter).  It rides the existing
-worker-health poll, so it costs no extra synchronisation.
+worker-health poll, so it costs no extra synchronisation, as does the ``heartbeat``
+hook beside it — the seam a caller uses to checkpoint mid-run from the parent, which
+is the only process in a position to do it while the workers keep going.
+
+``max_consecutive_failures`` is the pool's circuit breaker: ``process`` returning
+``False`` counts a job as failed (a raise does too), and that many in a row in ONE
+worker aborts the pool.  Without it a systematic error — a bad config, a missing
+artifact — is indistinguishable from bad luck, and the run burns its whole wall budget
+producing nothing while every per-job exception is quietly swallowed below.
 """
 
 from __future__ import annotations
@@ -91,10 +99,12 @@ def _worker(worker_id: int):
     run_start: float = S["run_start"]
     stop_event = S["stop_event"]
     done = S["done"]
+    max_consecutive_failures = S["max_consecutive_failures"]
 
     try:
         return _worker_loop(worker_id, setup, process, teardown, shared, counter, lock,
-                            target, skip, wall_budget_s, run_start, stop_event, done)
+                            target, skip, wall_budget_s, run_start, stop_event, done,
+                            max_consecutive_failures)
     except BaseException:
         # Log HERE, in the worker: a setup/teardown failure is re-raised in the parent by
         # ``map_async.get()``, but only if it pickles — and an unpicklable exception would
@@ -104,8 +114,10 @@ def _worker(worker_id: int):
 
 
 def _worker_loop(worker_id, setup, process, teardown, shared, counter, lock,
-                 target, skip, wall_budget_s, run_start, stop_event, done=None):
+                 target, skip, wall_budget_s, run_start, stop_event, done=None,
+                 max_consecutive_failures=None):
     state = setup(worker_id, shared)
+    consecutive_failures = 0
     while True:
         if stop_event is not None and stop_event.is_set():
             break
@@ -119,13 +131,43 @@ def _worker_loop(worker_id, setup, process, teardown, shared, counter, lock,
         if skip and idx in skip:
             continue                    # already completed in a prior attempt (resume)
         try:
-            process(idx, state, shared)
+            # ``False`` = the job ran but did not succeed (the eval logs its own failed
+            # hands and returns False); ``None`` = a caller that reports no outcome, so
+            # it can never trip the breaker.
+            failed = process(idx, state, shared) is False
         except Exception:               # a bad job must not kill the worker (job logs itself)
             logger.exception("pool worker %d: job index %d raised", worker_id, idx)
+            failed = True
         if done is not None:            # ATTEMPTS, so a failing job still shows progress
             with done.get_lock():
                 done.value += 1
+        if not failed:
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+            if (max_consecutive_failures is not None
+                    and consecutive_failures >= max_consecutive_failures):
+                # Systematic, not bad luck.  Raise rather than keep spending the budget:
+                # the parent re-raises this out of ``map_async.get()``, and it is the
+                # caller's job to preserve whatever the other workers already produced.
+                raise RuntimeError(
+                    "aborting pool worker %d: %d consecutive job failures (through "
+                    "index %d) — a systematic error, not bad luck."
+                    % (worker_id, consecutive_failures, idx))
     return teardown(state) if teardown is not None else None
+
+
+def _beat(heartbeat: Optional[Callable[[], None]]) -> None:
+    """Run the parent's heartbeat, swallowing anything it raises.
+
+    A checkpoint is insurance; a broken one must not destroy the run it is insuring.
+    """
+    if heartbeat is None:
+        return
+    try:
+        heartbeat()
+    except Exception:
+        logger.exception("pool heartbeat failed (continuing)")
 
 
 def run_index_pool(
@@ -140,6 +182,8 @@ def run_index_pool(
     wall_budget_s: float = 0.0,
     stop_event=None,
     progress: Optional[Callable[[int], None]] = None,
+    heartbeat: Optional[Callable[[], None]] = None,
+    max_consecutive_failures: Optional[int] = None,
 ) -> List[Any]:
     """Fan an index-keyed job over ``n_workers`` single-core forked workers.
 
@@ -152,6 +196,14 @@ def run_index_pool(
     finished so far — on each worker-health poll for the forked path, after each job
     inline.  It is advisory reporting only: it never gates the loop, and it is called
     from one place so it needs no locking of its own.
+
+    ``heartbeat`` (optional) is called in the PARENT on the same schedule but with no
+    arguments — the seam for periodic checkpointing.  It runs while the workers keep
+    working, so it must not touch their state; an exception from it is logged and
+    swallowed, since a failed checkpoint must never take down a live run.
+
+    ``max_consecutive_failures`` (optional) aborts the pool once one worker sees that
+    many failed jobs in a row — see the module docstring.  ``None`` disables it.
     """
     n = max(1, int(n_workers))
     shared = shared or {}
@@ -180,6 +232,7 @@ def run_index_pool(
             n_done += 1
             if progress is not None:
                 progress(n_done)
+            _beat(heartbeat)
         return [teardown(state) if teardown is not None else None]
 
     try:
@@ -195,6 +248,7 @@ def run_index_pool(
         "counter": ctx.Value("q", 0), "lock": ctx.Lock(),
         "target": target, "skip": skip_set, "wall_budget_s": float(wall_budget_s),
         "run_start": time.monotonic(), "stop_event": stop_event, "done": done,
+        "max_consecutive_failures": max_consecutive_failures,
     }
     try:
         with ctx.Pool(processes=n) as pool:
@@ -207,11 +261,13 @@ def run_index_pool(
             # ORIGINAL worker processes and abort loudly the moment one exits non-zero.
             async_res = pool.map_async(_worker, range(n))
             procs = list(getattr(pool, "_pool", []))    # private, but stable across 3.x
-            poll_s = _PROGRESS_POLL_S if progress is not None else _HEALTH_POLL_S
+            poll_s = (_PROGRESS_POLL_S if (progress is not None or heartbeat is not None)
+                      else _HEALTH_POLL_S)
             while not async_res.ready():
                 async_res.wait(poll_s)
                 if progress is not None:
                     progress(done.value)
+                _beat(heartbeat)
                 if async_res.ready():
                     break
                 dead = [p for p in procs
