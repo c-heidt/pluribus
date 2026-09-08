@@ -228,6 +228,9 @@ def collect_roots(
                 solver_cfg=collect_cfg,
                 rng=np.random.default_rng(hero_ss),
                 models=models,
+                # Without this the agent defaults to 'full' and an OX arm's models
+                # reach the solve, which the gadget forbids — see _construct_one.
+                model_scope=cfg.model_scope,
                 search_enabled=True,
                 collector=collector,
             )
@@ -255,7 +258,8 @@ def collect_roots(
 # Phase 1' — CONSTRUCT roots directly (deterministic, full cell coverage)
 # --------------------------------------------------------------------------- #
 def _target_cells(n_players: int,
-                  n_live_filter: Optional[Sequence[int]] = None) -> List[Tuple[int, int]]:
+                  n_live_filter: Optional[Sequence[int]] = None,
+                  vector_only: bool = False) -> List[Tuple[int, int]]:
     """The ``(street, n_live)`` grid the sweep should cover for an ``n_players`` game.
 
     **POST-FLOP ONLY.**  Pre-flop is not calibrated: the bot plays it from the blueprint
@@ -272,11 +276,20 @@ def _target_cells(n_players: int,
     later.  Splitting is LOSSLESS: each root's seed is keyed on ``(street, n_live, k)``
     (see :func:`construct_roots`), not on its position in this list, so a cell yields
     byte-identical roots whether or not the other cells ran alongside it.
+
+    ``vector_only`` keeps just the cells production routes to the VECTOR regime — the
+    2-player turn and river.  That is the whole grid an OX-Search run needs: its gadget
+    lives at the HU vector root and nowhere else, and off it OX falls back to vanilla and
+    takes vanilla's budget, so every other cell is compute spent on a number that is
+    thrown away.  Because the seed is keyed on the cell, the two cells it does build are
+    byte-identical to the ones a full grid would have built.
     """
     keep = None if n_live_filter is None else {int(x) for x in n_live_filter}
     cells = []
     for street in (1, 2, 3):                       # flop, turn, river (NO pre-flop)
         for n_live in range(2, n_players + 1):
+            if vector_only and _production_regime(street, n_live) != "vector":
+                continue
             cells.append((street, n_live))
     return [c for c in cells if keep is None or c[1] in keep]
 
@@ -379,7 +392,16 @@ def _construct_one(session: EvalSession, cfg: EvalConfig, collect_cfg: SolverCon
     my_hole = tuple(int(c) for c in env.players[hero_seat].cards)
     ctx = SubgameContext.from_runtime(
         env, hero_seat, my_hole, ranges, folded, collect_cfg.leaf,
-        np.random.default_rng(hero_ss), models=models,
+        np.random.default_rng(hero_ss),
+        # ``model_scope`` decides how far the models reach, exactly as
+        # ``SearchAgent`` gates it (poker_ai/search/agent.py): DBR puts them in the
+        # subgame, OX-Search ('belief_only') must NOT — its gadget assumes a
+        # model-free adversary inside the subgame and ``vector.py`` asserts an empty
+        # ``ctx.models``.  An OX arm still carries a spec (it is what shapes the
+        # beliefs), so gating on ``model_spec is None`` here would not do it.  These
+        # roots are built with maximum-entropy beliefs anyway, so there is nothing
+        # for a belief-side model to have shaped.
+        models=(models if cfg.model_scope == "full" else None),
     )
     legal = [a for a in env.legal_actions if a is not None]
     if not legal:
@@ -403,6 +425,7 @@ def construct_roots(
     run_seed: int,
     per_cell_deterministic: Optional[int] = None,
     n_live_filter: Optional[Sequence[int]] = None,
+    vector_only: bool = False,
 ) -> Dict[Cell, List[RootSample]]:
     """CONSTRUCT ``per_cell`` roots for EVERY ``(street, n_live)`` cell, deterministically.
 
@@ -420,7 +443,7 @@ def construct_roots(
     per_cell_deterministic = (per_cell if per_cell_deterministic is None
                               else int(per_cell_deterministic))
     out: Dict[Cell, List[RootSample]] = defaultdict(list)
-    for street, n_live in _target_cells(n_players, n_live_filter):
+    for street, n_live in _target_cells(n_players, n_live_filter, vector_only=vector_only):
         # DETERMINISTIC cells (vector river) get MORE hands instead of reps: their reps are
         # byte-identical, so root variety is the only thing extra compute can buy there.
         n_roots = (per_cell_deterministic
@@ -632,25 +655,26 @@ def _probe_setup(worker_id: int, shared: dict):
 
 def _probe_process(idx: int, state: dict, shared: dict) -> None:
     """Time ONE wall-bounded solve; record the cell's achieved iterations/second."""
-    s = shared["probe_samples"][idx % len(shared["probe_samples"])]
+    i = idx % len(shared["probe_samples"])
+    s = shared["probe_samples"][i]
+    # Per-cell config: an OX ladder must be probed WITH the gadget (its root is a bigger
+    # game and runs at its own rate), a vanilla/DBR ladder without it.
     cfg = dataclasses.replace(
-        shared["prod_cfg"], auto_budget=False, max_iterations=10 ** 9,
+        shared["probe_cfgs"][i], auto_budget=False, max_iterations=10 ** 9,
         max_wall_seconds=float(shared["probe_seconds"]),
     )
     env = copy.deepcopy(s.env)
     ctx = dataclasses.replace(s.ctx, rng=np.random.default_rng(shared["base_seed"] + idx))
-    res = solve(env, ctx, cfg, regime_override=shared["probe_regimes"][
-        idx % len(shared["probe_samples"])])
+    res = solve(env, ctx, cfg, regime_override=shared["probe_regimes"][i])
     if res.wall_seconds > 0:
-        state["out"].append((idx % len(shared["probe_samples"]),
-                             float(res.iterations_run) / float(res.wall_seconds)))
+        state["out"].append((i, float(res.iterations_run) / float(res.wall_seconds)))
 
 
 def _probe_teardown(state: dict):
     return state["out"]
 
 
-def probe_throughput(cell_samples: Sequence[tuple], prod_cfg: SolverConfig, *,
+def probe_throughput(cell_samples: Sequence[tuple], *,
                      seconds: float, workers: int, base_seed: int) -> Dict[int, float]:
     """Measure it/s per cell by running short solves that SATURATE the box.
 
@@ -660,17 +684,20 @@ def probe_throughput(cell_samples: Sequence[tuple], prod_cfg: SolverConfig, *,
     ``seconds``-bounded solve, round-robin over the cells, so total probe wall is ~one
     ``seconds`` regardless of cell count; the per-cell **median** is returned.
 
-    ``cell_samples`` is ``[(sample, force_regime), ...]``, one entry per ladder to build.
+    ``cell_samples`` is ``[(sample, force_regime, solver_cfg), ...]``, one entry per
+    ladder to build.  The config is per cell because the arms do not share one: an
+    OX-Search ladder is probed with the gadget live, which is a different (bigger) root
+    than the same cell under vanilla/DBR and runs at its own rate.
     """
     from evaluation.hand_pool import run_index_pool
 
     if not cell_samples:
         return {}
     shared = {
-        "probe_samples": [s for s, _r in cell_samples],
-        "probe_regimes": [r for _s, r in cell_samples],
-        "prod_cfg": prod_cfg, "probe_seconds": float(seconds),
-        "base_seed": int(base_seed),
+        "probe_samples": [s for s, _r, _c in cell_samples],
+        "probe_regimes": [r for _s, r, _c in cell_samples],
+        "probe_cfgs": [c for _s, _r, c in cell_samples],
+        "probe_seconds": float(seconds), "base_seed": int(base_seed),
     }
     n = max(len(cell_samples), int(workers))
     payloads = run_index_pool(
@@ -899,7 +926,7 @@ def _sweep_setup(worker_id: int, shared: dict):
     """After fork: reopen the leaf-fleet LMDB (MDB_BAD_RSLOT), start a result list."""
     try:
         from poker_ai.search.parallel import _reopen_leaf_fleet_lmdb
-        for samples, _fr in shared["jobs"]:
+        for samples, _fr, _cfg in shared["jobs"]:
             if samples:
                 _reopen_leaf_fleet_lmdb(samples[0].ctx)
                 break
@@ -922,7 +949,7 @@ def _sweep_process(spec_idx: int, state: dict, shared: dict) -> None:
     the *same* roots draw the same seeds a sequential per-cell sweep would.
     """
     j, si, rep = shared["all_specs"][spec_idx]
-    samples, force_regime = shared["jobs"][j]
+    samples, force_regime, job_cfg = shared["jobs"][j]
     ladder = shared["ladders"][j]
     s = samples[si]
     seed = shared["base_seed"] + 1000 * si + rep
@@ -938,8 +965,7 @@ def _sweep_process(spec_idx: int, state: dict, shared: dict) -> None:
         ctx_t = dataclasses.replace(s.ctx, rng=np.random.default_rng(seed))
         top = int(ladder[-1])
         cfg_t = dataclasses.replace(
-            shared["prod_cfg"], auto_budget=False, max_iterations=top,
-            max_wall_seconds=1e9,
+            job_cfg, auto_budget=False, max_iterations=top, max_wall_seconds=1e9,
         )
         # One row per rung, captured mid-search.  ``sig`` must be COPIED: the policy reads
         # the live state, which keeps evolving after the snapshot returns.
@@ -1100,7 +1126,10 @@ def sweep_jobs(
             except ValueError:  # no fork (non-POSIX) — cap is a no-op there
                 mw_sem = None
     shared = {
-        "jobs": [(job["samples"], job.get("force_regime")) for job in jobs],
+        # ``cfg`` is the arm's own solver config — the arms differ in kβ, so one sweep
+        # can hold vanilla/DBR/OX jobs side by side.  Absent ⇒ the run-wide default.
+        "jobs": [(job["samples"], job.get("force_regime"), job.get("cfg") or prod_cfg)
+                 for job in jobs],
         "ladders": [[int(t) for t in job["ladder"]] for job in jobs],
         "prod_cfg": prod_cfg, "base_seed": int(base_seed), "all_specs": all_specs,
         "crn_value": bool(crn_value), "crn_worlds": int(crn_worlds),
@@ -1410,6 +1439,27 @@ def _approach_of(condition: str) -> str:
     return VANILLA
 
 
+def _ladder_key(job) -> Tuple[str, int, int, str]:
+    """Which wall-anchored ladder a job belongs to: its cell, plus the APPROACH.
+
+    A ladder's top rung is the deepest solve that fits the cell's wall budget at the
+    measured throughput, so a ladder is only correct for the arm it was probed under —
+    and the approaches do not run at the same rate.  DBR carries the model clamp (and
+    VR-MCCFR) and is slower than vanilla; OX solves a larger gadget root.  Keying on the
+    cell alone made every arm share the ladder probed for whichever condition happened to
+    be listed first in ``--conditions``: the slower arms' top rung then no longer fits
+    their wall, and the faster arms' ladder stops short of where they actually converge,
+    which reads as "still moving at the top rung" — an order-dependent mis-sizing with
+    nothing in the output to show for it.
+
+    Two arms of the SAME approach — a DBR error sweep, say — still share one ladder:
+    they differ in model noise, not in what a solve costs.
+    """
+    cond, regime, street, n_live = job["cell"]
+    return (str(job.get("force_regime") or regime), int(street), int(n_live),
+            _approach_of(cond))
+
+
 def _shipped_budget(regime: str) -> Dict[str, Dict[Tuple[int, int], int]]:
     """The per-cell budget tables :class:`SolverConfig` actually ships.
 
@@ -1436,6 +1486,12 @@ def suggest_config(summaries: Sequence[CellSummary]) -> Dict[str, object]:
     the lowest rung means the real budget is somewhere below the ladder, so the rung is an
     over-estimate, not a measurement.
 
+    **OX-Search stands alone.**  It is not a DBR variant, and nothing about DBR feeds its
+    row.  The gadget is live only in the 2-player VECTOR cells, so those are what an OX
+    run measures and what it emits; everywhere else — multiway, and every MCCFR cell — it
+    falls back to vanilla and runs vanilla's own code, so it takes VANILLA's budget there
+    (including a vanilla number measured by this same run, not the stale shipped one).
+
     No wall cap is emitted: production uses a single flat ``max_wall_seconds`` backstop.
     ⚠ The emitted numbers are convergence points only — they are NOT clipped to any wall.
     A cell whose budget does not fit the per-search wall must be clipped by hand against
@@ -1444,6 +1500,7 @@ def suggest_config(summaries: Sequence[CellSummary]) -> Dict[str, object]:
     mccfr = _shipped_budget("mccfr")
     vector = _shipped_budget("vector")
     unresolved: List[str] = []
+    ox_measured: Dict[str, set] = {"mccfr": set(), "vector": set()}
     for s in summaries:
         cond, regime, street, n_live = s.cell
         # Skip forced-alternate A/B cells (a regime production never routes this
@@ -1463,13 +1520,22 @@ def suggest_config(summaries: Sequence[CellSummary]) -> Dict[str, object]:
             )
             continue
         target = vector if regime == "vector" else mccfr
-        target.setdefault(approach, {})[(int(street), int(n_live))] = _round_up(int(val))
-    # Decided policy (mirrors solver_state): OX is sized like DBR in the VECTOR regime,
-    # where its gadget root is live and costs about what a modelled solve does, and like
-    # VANILLA in MCCFR, where ``beta`` is inert and the solve is an ordinary best response.
-    # Mirrored here so the emitted block matches production rather than leaving OX stale.
-    vector[OX] = dict(vector[DBR])
-    mccfr[OX] = dict(mccfr[VANILLA])
+        key = (int(street), int(n_live))
+        target.setdefault(approach, {})[key] = _round_up(int(val))
+        if approach == OX:
+            ox_measured[str(regime)].add(key)
+    # OX-Search is NOT a variant of DBR, and nothing about DBR feeds its row.  Its gadget
+    # is live only in the 2-player VECTOR cells; everywhere else — multiway, and every
+    # MCCFR cell — OX falls back to vanilla and runs vanilla's own code, so it takes
+    # VANILLA's budget there.  Applied per cell and AFTER the loop, which matters twice:
+    # a cell this run measured for OX keeps its measurement, and a cell this run measured
+    # for VANILLA propagates its fresh number into the OX row instead of the stale shipped
+    # one.  (The old code assigned DBR's whole vector row over OX's here, which silently
+    # discarded everything an OX arm measured — the run emitted the numbers it began with.)
+    for table, regime_name in ((mccfr, "mccfr"), (vector, "vector")):
+        for cell_key, budget in table[VANILLA].items():
+            if cell_key not in ox_measured[regime_name]:
+                table.setdefault(OX, {})[cell_key] = budget
     return {
         "hot_l1_tol": {
             r: next((s.hot_l1_tol for s in summaries if s.cell[1] == r), None)
@@ -1761,17 +1827,6 @@ def run_calibration(
         )
 
     cond_cfgs = {c: _cfg_for(c) for c in conditions}
-    # Calibrate opens the blueprint LMDB once and SHARES a single ``solver_cfg`` (hence
-    # one ``kβ``) across every condition's sweep, so it cannot mix an OX arm (``k_beta``
-    # set) with vanilla/DBR (``k_beta`` None) in one run.  Assert agreement so that is a
-    # LOUD error rather than a silent inflation of one arm into the other's regime.
-    _kbetas = {c: cfg.k_beta for c, cfg in cond_cfgs.items()}
-    if len(set(_kbetas.values())) > 1:
-        raise ValueError(
-            "calibrate shares one solver_cfg across conditions, so all conditions must "
-            f"share k_beta; got mixed {_kbetas}. Run OX-Search conditions in a separate "
-            "calibrate invocation from vanilla/DBR."
-        )
     base_cfg = cond_cfgs[conditions[0]]
     # Keep the PRODUCTION ``max_iterations`` (build_blueprint_session's default == the
     # config ceiling): the per-cell ladder centre is that production budget, so this must
@@ -1784,7 +1839,18 @@ def run_calibration(
     # VR-MCCFR (opponent_modeling §5.5): set the flag on the shared prod_cfg so every
     # derived sweep cfg inherits it; it is gated on ``ctx.models`` inside the solver, so
     # it only affects the DBR condition (vanilla/OX carry no models → byte-identical).
-    prod_cfg = dataclasses.replace(prod_cfg, variance_reduction=bool(variance_reduction))
+    # ``kβ`` is the ONLY solver knob the arms differ in, so one invocation holds them
+    # all: strip it from the run-wide config and stamp each arm's own onto a copy.  The
+    # blueprint LMDB is still opened exactly once (opening it twice corrupts it) — the
+    # per-arm object is a cheap dataclass replace over the same tables.  Everything
+    # downstream (probe, sweep) takes its config from the job, so an OX job solves the
+    # gadget while a vanilla job beside it does not.
+    prod_cfg = dataclasses.replace(prod_cfg, variance_reduction=bool(variance_reduction),
+                                   ox_kbeta=None)
+    cond_solver_cfgs = {
+        c: dataclasses.replace(prod_cfg, ox_kbeta=cfg.k_beta)
+        for c, cfg in cond_cfgs.items()
+    }
     # ``workers`` here sizes the SWEEP's job pool (one core per concurrent solve), not
     # search replicas — every search runs serially (the production deployment model).
     resolved_workers = resolve_workers(workers)
@@ -1803,7 +1869,19 @@ def run_calibration(
         # Per-arm config from ``for_condition`` (guards enforced): OX ⇒ beta set,
         # no model; DBR ⇒ model, no beta; vanilla ⇒ neither.
         cond_cfg = cond_cfgs[condition]
+        cond_solver_cfg = cond_solver_cfgs[condition]
         session = dataclasses.replace(session, config=cond_cfg)
+        # PER ARM: an OX arm's grid collapses to the 2-player VECTOR cells — the only
+        # place its gadget exists.  Off them OX falls back to vanilla and takes vanilla's
+        # budget, so every other cell would be built, probed and swept only to have its
+        # number discarded.  The other arms in the same run keep the full grid.
+        ox_on = _ox_active(cond_solver_cfg)
+        if ox_on:
+            logger.info(
+                "condition=%s is OX-Search: calibrating the 2-player VECTOR cells only "
+                "(%s) — off the gadget OX plays vanilla and takes vanilla's budget",
+                condition, _target_cells(n_players, n_live_filter, vector_only=True),
+            )
         if construct_roots_mode:
             # CONSTRUCT roots (deterministic, full cell coverage) — the default, so
             # rare multiway / HU-turn/river cells are never starved by sampling.
@@ -1812,7 +1890,7 @@ def run_calibration(
                 session, cond_cfg, collect_cfg, condition,
                 per_cell=per_cell_cap, run_seed=run_seed,
                 per_cell_deterministic=per_cell_cap_deterministic,
-                n_live_filter=n_live_filter,
+                n_live_filter=n_live_filter, vector_only=ox_on,
             )
         else:
             logger.info("collecting roots (sampled play) for condition=%s", condition)
@@ -1834,7 +1912,6 @@ def run_calibration(
         # exact reference both regimes' gaps are measured against.  Disabled under
         # OX-Search: the gadget root exists solely in the vector regime.
         ab_streets = set(int(s) for s in regime_ab_streets)
-        ox_on = _ox_active(prod_cfg)
         ab_on = bool(ab_streets) and not ox_on
         # OX-Search only changes the VECTOR regime (the gadget root lives in HU turn/river
         # vector); its MCCFR path is byte-identical to vanilla, so re-sweeping MCCFR cells
@@ -1842,6 +1919,9 @@ def run_calibration(
         # cells entirely and calibrate the gadget game's vector budgets only.
         for cell, sample_list in samples.items():
             _cond, _regime, street, n_live = cell
+            # Redundant under --construct-roots (the grid above already stops at the
+            # vector cells) but not under --sample-roots, which harvests whatever the
+            # played hands happen to reach.
             if ox_on and str(_regime) != "vector":
                 continue
             ctx0 = sample_list[0].ctx  # all roots in a cell share street / n_live
@@ -1849,37 +1929,35 @@ def run_calibration(
             if ab_on and is_ab:
                 vidx = len(jobs)  # the paired vector job the mccfr job references
                 jobs.append(dict(cell=cell, samples=sample_list, force_regime="vector",
-                                 ref_from=None))
+                                 ref_from=None, cfg=cond_solver_cfg))
                 jobs.append(dict(cell=cell, samples=sample_list, force_regime="mccfr",
-                                 ref_from=vidx))
+                                 ref_from=vidx, cfg=cond_solver_cfg))
             else:
                 jobs.append(dict(cell=cell, samples=sample_list, force_regime=None,
-                                 ref_from=None))
+                                 ref_from=None, cfg=cond_solver_cfg))
 
-    # --- Wall-anchored ladders (one probe pass, shared by every condition) -----------
-    # The ladder is keyed on (regime, street, n_live) ONLY — conditions share it, so a
-    # vanilla/DBR comparison is made on identical rungs (and the probe runs once).
-    def _lkey(job) -> Tuple[str, int, int]:
-        cond, regime, street, n_live = job["cell"]
-        return (str(job.get("force_regime") or regime), int(street), int(n_live))
-
-    keys = sorted({_lkey(j) for j in jobs})
+    # --- Wall-anchored ladders: one per (cell, approach) -----------------------------
+    # See :func:`_ladder_key` — the arms solve at different rates, so each gets a ladder
+    # probed under its own config rather than inheriting the first condition's.
+    keys = sorted({_ladder_key(j) for j in jobs})
     rep_for = {}
     for j in jobs:
-        rep_for.setdefault(_lkey(j), (j["samples"][0], j.get("force_regime")))
+        rep_for.setdefault(_ladder_key(j),
+                           (j["samples"][0], j.get("force_regime"),
+                            j.get("cfg") or prod_cfg))
     logger.info("probing throughput for %d ladders (%.0fs, box-saturating)",
                 len(keys), probe_seconds)
-    thr_by_i = probe_throughput([rep_for[k] for k in keys], prod_cfg,
+    thr_by_i = probe_throughput([rep_for[k] for k in keys],
                                 seconds=probe_seconds, workers=resolved_workers,
                                 base_seed=run_seed)
     ladders: Dict[Tuple[str, int, int], List[int]] = {}
     for i, k in enumerate(keys):
-        regime, street, _n_live = k
+        regime, street, _n_live, _approach = k
         thr = thr_by_i.get(i)
         secs = _top_seconds_for(regime, street, ladder_top_seconds,
                                 ladder_top_seconds_vector)
         if thr is None or thr <= 0:        # probe failed — fall back to the prod budget
-            top_iters = max(1, int(iteration_budget(rep_for[k][0].ctx, prod_cfg,
+            top_iters = max(1, int(iteration_budget(rep_for[k][0].ctx, rep_for[k][2],
                                                     regime_override=rep_for[k][1])))
             ladders[k] = _ladder_wall_anchored(top_iters / max(1e-9, secs), secs,
                                                ladder_points, lo_frac=ladder_lo)
@@ -1889,7 +1967,7 @@ def run_calibration(
         logger.info("ladder %-22s %6.1f it/s x %4.0fs -> top %d  rungs %s",
                     str(k), thr or float("nan"), secs, ladders[k][-1], ladders[k])
     for j in jobs:
-        j["ladder"] = ladders[_lkey(j)]
+        j["ladder"] = ladders[_ladder_key(j)]
 
     # One SEARCH per (sample, rep) — the ladder is snapshotted from it, so rungs no longer
     # multiply the solve count.  Deterministic cells run a single rep.

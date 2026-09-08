@@ -59,9 +59,11 @@ LUT_PATH=${LUT_PATH:-"$WORKSPACE/exact"}
 # Calibration parameters (see `python -m evaluation.calibrate run --help`).
 N_PLAYERS=${N_PLAYERS:-4}
 CONDITIONS=${CONDITIONS:-vanilla,DBR,OX}   # any of: vanilla | DBR | blueprint_only | OX | OX(k_beta=X).
-                                           # OX arms are auto-split into their OWN calibrate run (gadget = a
-                                           # different game tree, β must agree → cannot share a solver_cfg with
-                                           # vanilla/DBR) and calibrate VECTOR cells only (OX's MCCFR path == vanilla).
+                                           # All arms run in ONE calibration, into one rows CSV + summary; each
+                                           # carries its own solver config.  An OX arm measures ONLY the 2-player
+                                           # VECTOR cells — the only place its gadget exists; off them it falls
+                                           # back to vanilla and takes vanilla's budget, so the other cells would
+                                           # be compute spent on a discarded number.
                                            # Bare "OX" uses the code-default kβ (runner.DEFAULT_OX_KBETA).
 # DBR model realism (opponent_modeling.md §3/§6.2).  A calibration on a PERFECT model
 # (error 0.0, p_max 1.0) is condition B1 — the exact-model, unconstrained "unsafe EV
@@ -346,24 +348,10 @@ run_calibrate() {  # $1 = conditions, $2 = out-dir
   CUR_PID=""
 }
 
-# Split CONDITIONS: OX arms calibrate SEPARATELY (gadget = different tree, β must agree, so
-# they cannot share a solver_cfg with vanilla/DBR) into $PERM_DIR/ox; the rest run together.
-BASE_CONDS=""; OX_CONDS=""
-IFS=',' read -ra _CONDS <<< "$CONDITIONS"
-for c in "${_CONDS[@]}"; do
-  c_trim=$(echo "$c" | xargs); [ -z "$c_trim" ] && continue
-  case "$(echo "$c_trim" | tr '[:upper:]' '[:lower:]')" in
-    ox|ox\(*) OX_CONDS="${OX_CONDS:+$OX_CONDS,}$c_trim" ;;
-    *)        BASE_CONDS="${BASE_CONDS:+$BASE_CONDS,}$c_trim" ;;
-  esac
-done
-
-if [ -n "$BASE_CONDS" ]; then
-  echo "=== Base calibration ($BASE_CONDS) → $PERM_DIR ==="
-  run_calibrate "$BASE_CONDS" "$LOCAL_OUT"
-fi
-if [ -n "$OX_CONDS" ]; then
-  echo "=== OX-Search calibration ($OX_CONDS, vector cells only) → $PERM_DIR/ox ==="
-  run_calibrate "$OX_CONDS" "$LOCAL_OUT/ox"
-fi
+# ONE calibration for every arm, into one calibration_rows.csv + calibration_summary.json.
+# Each arm carries its own solver config (kβ set for OX, unset otherwise), so OX no longer
+# needs its own invocation or its own output directory; it simply contributes the 2-player
+# VECTOR cells, which is the only grid its gadget changes.
+echo "=== Calibration ($CONDITIONS) → $PERM_DIR ==="
+run_calibrate "$CONDITIONS" "$LOCAL_OUT"
 echo "Calibration finished; results in $PERM_DIR"
