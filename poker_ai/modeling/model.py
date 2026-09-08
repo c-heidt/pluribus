@@ -48,7 +48,11 @@ class OpponentModel(ABC):
 
     @abstractmethod
     def confidence(self, state: PolicyState) -> float:
-        """The per-infoset confidence ``c ∈ [0, p_max]`` at ``state.info_set``."""
+        """The per-infoset confidence ``c ∈ [0, p_max]`` at ``state.info_set``.
+
+        DBR composes this as ``P_conf(I) = p_max · g(I)`` with ``g ∈ [0, 1]`` — see
+        :meth:`SyntheticOpponentModel.confidence`.
+        """
 
 
 def _stable_hash(info_set: bytes) -> int:
@@ -68,8 +72,9 @@ class SyntheticOpponentModel(OpponentModel):
     ``BlueprintOpponent`` bias variants), so a synthetic model of a runner opponent
     is exact by construction.  Two knobs implement the design-doc §6.2 sweeps:
 
-    - ``confidence`` — a constant ``c`` or a callable ``c(state)`` (the schedule),
-      clamped to ``[0, p_max]``.  ``c ≡ 1`` (``p_max = 1``) is naive best response (the unsafe ceiling).
+    - ``confidence`` — a constant ``g`` or a callable ``g(state)`` (the schedule), taken
+      as the [0, 1] shape DBR's ``p_max`` scales: ``c = p_max · g``.  ``g ≡ 1`` with
+      ``p_max = 1`` is naive best response (the unsafe ceiling).
     - ``error`` — a **target ℓ1 distance** for a seeded per-infoset perturbation of
       ``σ̂``, either a constant or a callable ``error(state)`` (a *schedule*, e.g.
       street-graded or per-infoset-noisy — see :mod:`poker_ai.modeling.schedules`).
@@ -90,7 +95,9 @@ class SyntheticOpponentModel(OpponentModel):
     confidence
         Constant ``c`` or a ``c(state)`` schedule (default ``1.0``).
     p_max
-        Confidence cap (default ``1.0``); the returned ``c`` is clamped to it.
+        The exploitation/exploitability dial (default ``1.0``), the paper's ``P_max``:
+        the returned confidence is ``p_max · g``, so it is the value ``c`` approaches as
+        the schedule saturates — NOT a clamp.  See :meth:`confidence`.
     error
         Target ℓ1 perturbation magnitude — constant or ``error(state)`` schedule
         (default ``0.0`` — exact).
@@ -131,8 +138,27 @@ class SyntheticOpponentModel(OpponentModel):
         return sigma
 
     def confidence(self, state: PolicyState) -> float:
+        """``P_conf(I) = p_max · g(I)`` — the paper's mixture, not a clamp.
+
+        Johanson & Bowling (AISTATS 2009) §5.2 define every ``P_conf`` variant as
+        ``p_max`` multiplying a [0, 1]-valued function of the observation count — the
+        s-Curve "returns ``p_max (n_I / (s + n_I))``", the 0-10 Linear returns
+        ``(n_I · p_max) / 10`` below the knee — and say of the s-Curve that "as we obtain
+        more observations, the function APPROACHES ``p_max``".  A product approaches its
+        supremum; a clamp would reach ``p_max`` exactly and sit there.  Their prose calls
+        ``p_max`` "a maximum for P_conf", which is consistent (``sup p_max·g = p_max``)
+        and is literally a clamp only for the two STEP variants, where ``g ∈ {0, 1}``.
+
+        This used to be ``min(p_max, c)``.  That is more confident than the paper exactly
+        where the data is thinnest — at ``g = 0.5`` a clamp with ``p_max = 0.3`` returns
+        0.3 whether the infoset was seen once or a thousand times, discarding the
+        data-dependence that is the whole point of DBR — so it erred toward less safety.
+
+        ``p_max = 1`` (the default) is unaffected: ``min(1, c) == 1 · c``.
+        """
         c = self._confidence(state) if callable(self._confidence) else self._confidence
-        return float(min(self._p_max, max(0.0, float(c))))
+        g = min(1.0, max(0.0, float(c)))
+        return float(self._p_max * g)
 
     def reopen_after_fork(self) -> None:
         """Reopen the wrapped policy's LMDB env after a ``fork`` (parallel replicas).

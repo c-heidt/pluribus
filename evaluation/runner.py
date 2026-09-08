@@ -171,7 +171,7 @@ _ARM_PARAMS: Mapping[str, frozenset] = {
 DEFAULT_OX_KBETA = 50.0
 
 # Code default ``p_max`` for a DBR arm that names none (neither in its label nor via
-# ``--model-p-max``).  1.0 leaves the cap INERT so ``confidence`` alone sets the DBR
+# ``--model-p-max``).  1.0 leaves the scale INERT so ``confidence`` alone sets the DBR
 # mixture — the predictable reading of ``DBR(confidence=0.8, error=0.2)`` — and keeps
 # ``p_max`` as the ceiling that matters when confidence is a *schedule*.  (Naive best
 # response needs p_max=1 AND confidence=1 AND error=0, i.e. an unclamped exact model;
@@ -290,7 +290,7 @@ def _arm_model_spec(
     (``vanilla``, ``blueprint_only``) are settled in :meth:`EvalConfig.for_condition`
     without reaching here.
 
-    **DBR** takes the full spec — ``p_max`` cap, ``confidence`` mixture, ``error`` — the
+    **DBR** takes the full spec — ``p_max`` scale, ``confidence`` shape, ``error`` — the
     model driving both the belief likelihood and the solver clamp.
 
     **OX-Search is reach-only** (plan decision 6), which is a statement about *where* the
@@ -2097,8 +2097,9 @@ def _cli():
         default=DEFAULT_DBR_P_MAX,
         type=float,
         show_default=True,
-        help="Default confidence cap for a DBR arm (overridable per arm as "
-        "'DBR(p_max=...)'). The cap is inert at 1.0, leaving --model-confidence as the "
+        help="DBR's exploitation/exploitability dial for an arm (overridable per arm as "
+        "'DBR(p_max=...)'). It SCALES the confidence (c = p_max * --model-confidence, the "
+        "paper's mixture), so it is inert at 1.0, leaving --model-confidence as the "
         "DBR mixture knob; naive best response is p_max=1 AND confidence=1 AND error=0. "
         "Ignored by vanilla / blueprint_only / OX (reach-only) arms.",
     )

@@ -60,14 +60,16 @@ class ModelSpec:
     injecting a target ℓ1 error and capping confidence — the design-doc §6.2 sweep
     axes.  This spec captures the two knobs plus the perturbation seed:
 
-    - ``p_max`` — confidence cap.  ``1.0`` with ``error = 0`` is **naive best
-      response** (the exact-model, unconstrained EV ceiling — the "unsafe" envelope);
+    - ``p_max`` — DBR's exploitation/exploitability dial, which SCALES the confidence
+      (``c = p_max · confidence``, the paper's mixture — not a cap; see
+      :meth:`~poker_ai.modeling.model.SyntheticOpponentModel.confidence`).  ``1.0`` with
+      ``error = 0`` is **naive best response** (the exact-model, unconstrained EV ceiling — the "unsafe" envelope);
       a lower cap is the safe DBR mixture.
     - ``error`` — target ℓ1 perturbation of ``σ̂`` (0.0 = exact).  A single float here
       is a constant target across info-sets; a **schedule-shaped** error (street-graded
       or per-infoset-noisy) is supplied via ``error_schedule`` below.
-    - ``confidence`` — constant ``c`` before the ``p_max`` clamp (default 1.0, so
-      ``p_max`` alone sets the cap); a **schedule** (calibrated / anti-calibrated /
+    - ``confidence`` — the [0, 1] shape ``g`` that ``p_max`` scales (default 1.0, so
+      ``p_max`` alone sets the level); a **schedule** (calibrated / anti-calibrated /
       flat) is supplied via ``confidence_schedule`` below.
     - ``error_schedule`` / ``confidence_schedule`` — optional JSON-string descriptors
       (mirroring the runner's ``--fixed-seats`` JSON) resolved by

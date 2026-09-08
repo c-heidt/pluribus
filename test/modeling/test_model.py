@@ -2,7 +2,8 @@
 
 Covers :class:`SyntheticOpponentModel`: exact pass-through of the wrapped policy,
 the seeded ℓ1 perturbation (valid distribution, bounded distance, reproducible), and
-the confidence schedule + ``p_max`` clamp (naive best response is ``c ≡ 1``).
+the confidence schedule scaled by ``p_max`` as DBR's mixture ``c = p_max · g``
+(naive best response is ``g ≡ 1`` at ``p_max = 1``).
 """
 
 import numpy as np
@@ -84,20 +85,33 @@ class TestSynthetic:
         m = SyntheticOpponentModel(FakePolicy([0.0, 1.0, 0.0]), error=0.5)
         assert np.allclose(m.strategy(_state()), [0.0, 1.0, 0.0])
 
-    def test_confidence_constant_and_clamped(self):
+    def test_confidence_scales_by_p_max(self):
+        """``c = p_max · g``: the paper's mixture, so p_max scales rather than caps.
+
+        A clamp would return 0.8 here (0.9 capped); the product returns 0.72.  The
+        difference is the whole safety behaviour — under a clamp, p_max stops mattering
+        once the schedule exceeds it, and a low p_max would ignore the schedule entirely.
+        """
         m = SyntheticOpponentModel(FakePolicy([1.0]), confidence=0.9, p_max=0.8)
-        assert m.confidence(_state()) == 0.8       # clamped to p_max
+        assert np.isclose(m.confidence(_state()), 0.72)
         m2 = SyntheticOpponentModel(FakePolicy([1.0]), confidence=-0.5, p_max=0.8)
-        assert m2.confidence(_state()) == 0.0      # clamped to >= 0
+        assert m2.confidence(_state()) == 0.0      # the shape g is clipped to >= 0
+
+    def test_p_max_one_is_unchanged(self):
+        """The shipped default is behaviour-identical: ``min(1, g) == 1 · g``."""
+        for g in (0.0, 0.37, 1.0):
+            m = SyntheticOpponentModel(FakePolicy([1.0]), confidence=g, p_max=1.0)
+            assert np.isclose(m.confidence(_state()), g)
 
     def test_confidence_b1_is_one(self):
         m = SyntheticOpponentModel(FakePolicy([1.0]), confidence=1.0, p_max=1.0)
         assert m.confidence(_state()) == 1.0
 
     def test_confidence_schedule_callable(self):
-        # c(state) = 0.1 * betting_round, clamped to p_max=0.95.
+        # g(state) = 0.1 * betting_round, scaled by p_max=0.95 and clipped at g=1.
         m = SyntheticOpponentModel(
             FakePolicy([1.0]), confidence=lambda s: 0.1 * s.betting_round, p_max=0.95
         )
-        assert np.isclose(m.confidence(_state(r=3)), 0.3)
-        assert m.confidence(_state(r=20)) == 0.95  # 2.0 clamped to p_max
+        assert np.isclose(m.confidence(_state(r=3)), 0.95 * 0.3)
+        # g saturates at 1, so the confidence approaches p_max — never exceeds it.
+        assert np.isclose(m.confidence(_state(r=20)), 0.95)
