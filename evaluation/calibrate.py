@@ -719,7 +719,8 @@ def _top_seconds_for(regime: str, street: int, mccfr_secs: Sequence[float],
 
     - **hard vs easy** — flop/turn are still moving at their production budgets (hot_l1
       0.23-0.43) so they get the full wall; the river converges in seconds (mccfr n3:
-      hot_l1 0.06 at 9000 iters / 22 s), and giving it 600 s would only burn compute.
+      hot_l1 0.06 at 9000 iters / 22 s), and giving it the flop/turn wall would only
+      burn compute.
     - **the ladder must BRACKET the convergence point** — otherwise a cell that settles
       below the lowest rung reports that rung as its budget, a large over-estimate.  The
       river cells settle at wildly different iteration counts by regime (vector 1071 vs
@@ -1751,8 +1752,8 @@ def run_calibration(
     reps: int,
     ladder_points: int,
     ladder_lo: float,
-    ladder_top_seconds: Sequence[float] = (600.0, 600.0, 60.0),
-    ladder_top_seconds_vector: Sequence[float] = (600.0, 600.0, 15.0),
+    ladder_top_seconds: Sequence[float] = (750.0, 750.0, 60.0),
+    ladder_top_seconds_vector: Sequence[float] = (750.0, 750.0, 15.0),
     probe_seconds: float = 30.0,
     hot_l1_tol_mccfr: float = DEFAULT_HOT_L1_TOL_MCCFR,
     hot_l1_tol_vector: float = DEFAULT_HOT_L1_TOL_VECTOR,
@@ -2182,13 +2183,13 @@ def _cli():
                        "extra compute buys a tighter mean hot_l1.")
     @click.option("--ladder-points", default=6, type=int, show_default=True,
                   help="Rungs per ladder, walking DOWN from the wall-anchored top.")
-    @click.option("--ladder-top-seconds", default="600,600,60", show_default=True,
+    @click.option("--ladder-top-seconds", default="750,750,60", show_default=True,
                   help="MCCFR per-street wall budget (flop,turn,river) for the ladder's TOP "
                        "rung: top = probed it/s * this, i.e. the deepest solve that fits.  "
                        "Hard cells (flop/turn — still moving at their production budgets) get "
                        "the full wall; the river converges in seconds, so a big budget there "
                        "only burns compute AND pushes the whole ladder above the crossing.")
-    @click.option("--ladder-top-seconds-vector", default="600,600,15", show_default=True,
+    @click.option("--ladder-top-seconds-vector", default="750,750,15", show_default=True,
                   help="Same, for the VECTOR cells.  Separate because the regimes converge at "
                        "very different iteration counts (2026-08: HU river vector settles at "
                        "~1071 iters vs ~9000 for multiway river MCCFR), so one per-street "
