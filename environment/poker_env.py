@@ -222,6 +222,38 @@ CALL_ALLOWED_BY_STAGE: Dict[str, List[bool]] = {
     "river":    [True, True],
 }
 
+# ---------------------------------------------------------------------------
+# Search-only raise grid
+# ---------------------------------------------------------------------------
+# Search branches on every raise size in the cell, so the grid drives the subgame's
+# branching factor directly.  Measured blueprint usage (4,282 hero actions,
+# ``evaluate run --condition blueprint_only``) shows two cells carry a size the
+# blueprint essentially never plays:
+#
+#   flop  L0   0.33 18%   0.75 15%   1.0  5%   2.0 0%   <- 2.0 dropped
+#   river L0   0.33 17%   0.75 16%   1.5  5%   2.0 3%   <- 2.0 dropped
+#
+# Every other cell is already at most three sizes (pre-flop 1/2/2, flop L1 3,
+# turn 3/2, river L1 2), so trimming to "at most 3" touches exactly these two.
+#
+# ⚠**The LEVEL COUNT per stage is identical to** :data:`RAISE_SIZES_BY_STAGE`.  That is
+# load-bearing: :func:`raise_level` derives the level from the canonical grid, and
+# ALL_IN_ALLOWED_BY_STAGE / CALL_ALLOWED_BY_STAGE are indexed by the same level, so
+# dropping a LEVEL (rather than a size within one) would desynchronise all three.
+#
+# ⚠**This never changes the info-set encoding.**  ``_ACTION_BYTE`` and
+# :data:`INFO_SET_ENCODING` derive from the canonical grid, which is untouched — a
+# trimmed size is simply never *offered*, so every blueprint key stays valid and the
+# blueprint's mass on a dropped size is renormalised across the survivors by name in
+# ``BlueprintPolicy.strategy`` / ``strategy_for``.  Applying this to TRAINING would be a
+# different matter and is not supported: it is set per-env, by the search agent only.
+SEARCH_RAISE_SIZES_BY_STAGE = {
+    "pre_flop": [[1.7], [1.33, 2.25], [1.0, 1.5]],
+    "flop":     [[0.33, 0.75, 1.0], [0.75, 1.0, 1.5]],
+    "turn":     [[0.33, 0.75, 1.5], [0.75, 1.5]],
+    "river":    [[0.33, 0.75, 1.5], [0.75, 1.0]],
+}
+
 ALL_IN_ALLOWED_BY_STAGE: Dict[str, List[bool]] = {
     "pre_flop": [False, False, True],
     "flop":     [True, True],
@@ -614,6 +646,10 @@ class PokerEnv:
         self._extra_legal_actions: Dict[
             Tuple[str, Tuple[str, ...]], FrozenSet[str]
         ] = {}
+        # Trimmed raise grid for SEARCH only (see SEARCH_RAISE_SIZES_BY_STAGE).  ``None``
+        # on every env by default, so play, training and evaluation are untouched; the
+        # search agent sets it on the copy it hands the solver.
+        self._search_raise_grid = None
         # Monotone version of the overlay above, held in a 1-element list so the
         # whole deepcopy lineage shares ONE counter by reference (exactly like
         # ``_extra_legal_actions`` itself).  ``inject_action`` / ``reset_overlay``
@@ -765,6 +801,7 @@ class PokerEnv:
             "_initial_n_chips", "_initial_chips_by_seat",
             "_betting_stage_to_round", "_player_i_lut",
             "_extra_legal_actions", "_overlay_version",
+            "_search_raise_grid",
             "card_info_lut",
         ):
             object.__setattr__(new, attr, getattr(self, attr))
@@ -1207,7 +1244,17 @@ class PokerEnv:
         levels = RAISE_SIZES_BY_STAGE.get(stage)
         if not levels:
             return []
-        fractions = levels[level]
+        # A search env may carry a trimmed grid (see SEARCH_RAISE_SIZES_BY_STAGE); the
+        # level itself still comes from the canonical grid above, so the two stay in step.
+        trimmed = self._search_raise_grid
+        if trimmed is not None:
+            t_levels = trimmed.get(stage)
+            if t_levels and level < len(t_levels):
+                fractions = t_levels[level]
+            else:
+                fractions = levels[level]
+        else:
+            fractions = levels[level]
         allow_all_in = ALL_IN_ALLOWED_BY_STAGE[stage][level]
         player = self.current_player
         biggest_bet = max(p.n_bet_chips for p in self.players)

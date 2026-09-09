@@ -25,13 +25,15 @@ A runner instantiates the agent and drives these four hooks (plus
 from __future__ import annotations
 
 import copy
+import os
 import logging
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
-from environment.poker_env import PokerEnv
+from environment.poker_env import PokerEnv, SEARCH_RAISE_SIZES_BY_STAGE
+from poker_ai._core.flags import search_core_enabled
 from information_abstraction.lookup import clusters_for_board
 from poker_ai.search.cluster_maps import _STREET_NAME
 from poker_ai.search.context import SubgameContext
@@ -166,8 +168,40 @@ class SearchAgent:
         self._folded = False
         # Frozen at pre-flop start; the overlay dict is shared by reference so
         # later injections into the live env are visible here automatically.
-        self._root_env = copy.deepcopy(env)
+        self._root_env = self._for_search(copy.deepcopy(env))
         env.reset_overlay()
+
+    @staticmethod
+    def _for_search(env: PokerEnv) -> PokerEnv:
+        """Stamp the trimmed raise grid onto an env the solver will walk.
+
+        Search branches on every raise size in the cell, so the grid sets the subgame's
+        branching factor.  Two cells carried a size the blueprint essentially never plays
+        (flop L0 ``2.0`` at 0%, river L0 ``2.0`` at 3%, over 4,282 measured hero actions);
+        dropping them takes every cell to at most three sizes.
+
+        Applied HERE and nowhere else: the live game env, training and evaluation keep the
+        full grid, so only the solver's own walk is narrowed.  The canonical grid — and
+        therefore ``INFO_SET_ENCODING`` and every blueprint key — is untouched; the
+        blueprint's mass on a dropped size is renormalised across the survivors by name.
+
+        Opt out with ``PLURIBUS_SEARCH_FULL_GRID=1``.
+        """
+        if os.environ.get("PLURIBUS_SEARCH_FULL_GRID", "") == "1":
+            return env
+        if search_core_enabled():
+            # The compiled walk reads a PROCESS-WIDE grid dumped via
+            # ``_cystate.configure()`` and shared with the training core, so it cannot be
+            # narrowed per-env.  Diverging silently from the Python walk would be far
+            # worse than refusing: fail loudly instead.
+            raise RuntimeError(
+                "The trimmed search raise grid is not supported with the compiled search "
+                "core (PLURIBUS_SEARCH_CORE=1): the core's grid is process-wide and "
+                "shared with training, so it cannot be narrowed for search alone. Run "
+                "without the search core, or set PLURIBUS_SEARCH_FULL_GRID=1."
+            )
+        env._search_raise_grid = SEARCH_RAISE_SIZES_BY_STAGE
+        return env
 
     def on_board_update(self, env: PokerEnv, new_cards) -> None:
         """A new betting round has begun; ``env`` is the round-start root.
@@ -188,7 +222,7 @@ class SearchAgent:
         # range-quality logging meaningful) but nothing consumes ``last_search``.
         # (Vanilla Pluribus keeps ``search_enabled=True`` and DOES solve here.)
         if self._search_enabled:
-            self._solve_and_store(copy.deepcopy(env))
+            self._solve_and_store(self._for_search(copy.deepcopy(env)))
         self.pending_actions = []
 
     def on_observed_action(self, env_before: PokerEnv, seat: int, action: str) -> None:
