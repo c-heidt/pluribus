@@ -293,6 +293,34 @@ def _log(msg: str) -> None:
     print("[%3d:%02d] %s" % (int(el // 60), int(el % 60), msg), flush=True)
 
 
+def tables_of(type_list, n_opp):
+    """Chunk archetypes into tables of ``n_opp``, cycling to fill the last one."""
+    if n_opp <= 1:
+        return [(t,) for t in type_list]
+    out_t, i = [], 0
+    while i < len(type_list):
+        chunk = list(type_list[i:i + n_opp])
+        while len(chunk) < n_opp:                 # pad from the front, never empty
+            chunk.append(type_list[len(chunk) % len(type_list)])
+        out_t.append(tuple(chunk))
+        i += n_opp
+    return out_t
+
+
+def seat_map(hand: int, n_p: int, n_opp: int):
+    """``(hero_seat, {identity: seat}, {seat: identity})`` for one hand.
+
+    Both the hero seat and the identity-to-seat map rotate, so an archetype is observed
+    from every position.  Without this, position is confounded with type — a nit that
+    always sits on the button produces a positional effect the model would attribute to
+    the archetype.
+    """
+    hero = hand % n_p
+    opp_seats = [s for s in range(n_p) if s != hero]
+    seat_of = {i: opp_seats[(i + hand) % n_opp] for i in range(n_opp)}
+    return hero, seat_of, {v: k for k, v in seat_of.items()}
+
+
 def _token_bag(acts, opp) -> list:
     """Counts over the repo's OWN action vocabulary, per (stage, actor, token).
 
@@ -533,6 +561,10 @@ def main() -> None:
                          "independent once the population fit exists, so this is a pure "
                          "wall-clock win; WITHIN a trial the scoring is prequential and "
                          "must stay serial.")
+    ap.add_argument("--n-players", type=int, default=2,
+                    help="Table size. >2 models EVERY non-hero seat at once (one hand is "
+                         "evidence on all of them) and adds a live-player axis to the "
+                         "model's situations. Use 4 with --low-card-rank 2 for production.")
     ap.add_argument("--shm-dir", default="/dev/shm",
                     help="Shared-memory dir for the blueprint's chunk tables. Give each "
                          "concurrent job its OWN dir on a shared node: block names are "
@@ -577,7 +609,7 @@ def main() -> None:
     # first.  Harmless on a private laptop, a correctness hazard on a shared cluster node.
     tables = CFRTables(index_path=index_root, shm_dir=args.shm_dir,
                        actions_per_street=MAX_ACTIONS_PER_STREET)
-    apply_warm_start_to_tables(tables, args.blueprint_path, 2)
+    apply_warm_start_to_tables(tables, args.blueprint_path, int(args.n_players))
     strength = cluster_strength(args.lut_path)
     spread = cluster_spread(args.lut_path)
     potential = cluster_potential(args.lut_path)
@@ -603,53 +635,70 @@ def main() -> None:
     _NPAR = 2 * _n_feats()
 
     n_lv = 3 if args.split == "raises" else 2
+    n_p = int(args.n_players)
+    # The model's partition gains a live-player axis multiway: a bet into three players is
+    # not the node a bet heads-up is, and pooling them asks one coefficient to describe
+    # both.  Heads-up this collapses to the old 2-tuple, so HU situation counts and every
+    # heads-up measurement already taken are unchanged.
+    multiway = n_p > 2
+    live_axis = tuple(range(2, n_p + 1)) if multiway else (2,)
 
     def sit_of(env):
-        """The situation key: street plus how much aggression has already happened."""
+        """The situation key: street, aggression so far, and (multiway) the field size."""
         if args.split == "raises":
-            return (env.betting_stage, min(int(env._n_raises), 2))
-        return _class_of(env)
+            base = (env.betting_stage, min(int(env._n_raises), 2))
+        else:
+            base = _class_of(env)
+        return base + (_P.n_live(env),) if multiway else base
 
     walker = policy_at(1.0)
     types = list(PROFILES)
-    sits = [(s, lv) for s in _POSTFLOP for lv in range(n_lv)]
+
+    sits = ([(s, lv, k) for s in _POSTFLOP for lv in range(n_lv) for k in live_axis]
+            if multiway else [(s, lv) for s in _POSTFLOP for lv in range(n_lv)])
     sit_ix = {c: i for i, c in enumerate(sits)}
     n_sit = len(sits)
     checkpoints = sorted({int(x) for x in args.checkpoints.split(",") if x.strip()})
     board_cache: dict = {}
 
-    def play(true_type, n_hands, seed_base, score=None, record=None):
-        """Play ``n_hands``; yield a :class:`Hand` per hand that had opponent decisions.
+    def play(table_types, n_hands, seed_base, record_by_id=None):
+        """Play ``n_hands`` at a table of ``len(table_types)`` opponents at once.
 
-        ``score(sit, mask, took, x_true, belief_x, belief_w, true_row_cls, true_marg_cls)``
-        is called at each opponent decision BEFORE the action is drawn, for prequential
-        evaluation.  It never sees the blueprint.
+        Every non-hero seat is an opponent we learn about, so one hand yields evidence on
+        all of them rather than on one — the whole point of a multiway table, and free
+        data: the simulation cost is per hand, not per opponent.
+
+        Opponents are IDENTITIES, not seats.  Each hand rotates both the hero seat and the
+        identity-to-seat map, so an archetype is observed from every position instead of
+        having its position confounded with its type (a nit that always sits on the button
+        looks like a positional effect).
+
+        Returns ``{identity: [Hand, ...]}``; ``record_by_id`` collects the per-decision
+        scoring inputs the same way, one list per identity.
         """
-        out = []
+        n_opp = len(table_types)
+        out = {i: [] for i in range(n_opp)}
         for hand in range(1, n_hands + 1):
-            opp_seat = hand % 2
-            hero_seat = 1 - opp_seat
+            hero_seat, seat_of, id_of = seat_map(hand, n_p, n_opp)
             np.random.seed(seed_base + hand)
-            players = [Player(i, args.starting_stack) for i in range(2)]
+            players = [Player(i, args.starting_stack) for i in range(n_p)]
             env = PokerEnv(players=players, small_blind=args.small_blind,
                            big_blind=args.big_blind, low_card_rank=args.low_card_rank,
                            high_card_rank=args.high_card_rank)
             env.card_info_lut = lut
             rng = np.random.RandomState(seed_base * 3 + hand)
             hero_cards = [int(c) for c in env.players[hero_seat].cards]
-            # pi_0: every holding the opponent could have, board- and hero-masked.  All
-            # public — no blueprint, no strategy assumption.
+            # pi_0: every holding an opponent could hold, board- and hero-masked.  The
+            # OTHER opponents' cards stay in: we do not observe them, so removing them
+            # would be information the modeller does not have.
             live0 = (~np.isin(env.combo_cards[:, 0], hero_cards)
                      & ~np.isin(env.combo_cards[:, 1], hero_cards))
-            # The ORACLE-blind reference belief, kept by the search's own tracker: it
-            # knows the opponent's true policy but not its hole, and updates by Bayes as
-            # the hand goes on.  Card removal, board re-masking and fold-time retention
-            # all come from the tracker rather than being re-implemented here.
-            tracker = RangeTracker(env, hero_seat, tuple(hero_cards), [opp_seat])
+            tracker = RangeTracker(env, hero_seat, tuple(hero_cards),
+                                   sorted(seat_of.values()))
             seen_board = set(int(c) for c in env.community_cards)
-            dec_sit, dec_mask, dec_took, dec_cluster = [], [], [], []
-            dec_feat, dec_ctx = [], []
-            acts = {}  # stage -> [(player, token)]
+            D = {i: {"sit": [], "mask": [], "took": [], "cl": [], "ft": [], "cx": [],
+                     "rec": []} for i in range(n_opp)}
+            acts = {}  # stage -> [(seat, token)]
 
             guard = 0
             while not env.is_terminal and guard < 200:
@@ -659,16 +708,19 @@ def main() -> None:
                 if not legal:
                     break
                 stage = env.betting_stage
-                if int(env.player_i) != opp_seat or stage not in _POSTFLOP:
+                seat = int(env.player_i)
+                if seat == hero_seat or stage not in _POSTFLOP:
                     row = np.asarray(walker.strategy(ps, "none"), np.float64)
                     c = np.cumsum(np.clip(row, 0, None))
                     i = (int(np.searchsorted(c, rng.random_sample() * c[-1]))
                          if c[-1] > 0 else int(rng.randint(len(legal))))
                     tok = legal[min(i, len(legal) - 1)]
-                    acts.setdefault(stage, []).append((int(env.player_i), tok))
+                    acts.setdefault(stage, []).append((seat, tok))
                     env.step_in_place(tok)
                     continue
 
+                oid = id_of[seat]
+                true_type = table_types[oid]
                 now_board = set(int(c) for c in env.community_cards)
                 new_cards = sorted(now_board - seen_board)
                 if new_cards:
@@ -683,21 +735,15 @@ def main() -> None:
                 eqs = strength[stage]
                 sps = spread[stage]
                 sit = sit_of(env)
+                k_live = _P.n_live(env)
                 live_now = live0 & (cl >= 0)
-                # x1: percentile among the holdings still LIVE here — a hand's rank among
-                # HANDS, per node.  x2: absolute equity.  Both are functions of the board
-                # and the holding, so both are available for any candidate holding.
                 le = np.sort(eqs[cl[live_now]]) if live_now.any() else np.array([0.5])
                 nlive = max(le.size, 1)
 
-                # Pot odds: public, holding-independent, constant across candidates at
-                # this node — but it varies hugely BETWEEN nodes the situation label calls
-                # identical, which is the point.
                 _bets = [int(pl.n_bet_chips) for pl in env.players]
-                _to_call = max(0, max(_bets) - _bets[opp_seat])
+                _to_call = max(0, max(_bets) - _bets[seat])
                 _pot = float(env.pot_size) + float(sum(_bets))
                 _odds = (_to_call / (_pot + _to_call)) if _to_call > 0 else 0.0
-
                 p_up, p_dn, p_top, p_bot = potential[stage]
 
                 def _x(cid):
@@ -713,29 +759,31 @@ def main() -> None:
                     mask[_ACTION_CLASSES.index(_action_class(a))] = True
 
                 actual = int(cl[env.combo_index[
-                    tuple(sorted(int(c) for c in env.players[opp_seat].cards))]])
-                # The opponent's own policy (archetype) — for driving play and for the
-                # oracle ceilings only; never visible to the model.
+                    tuple(sorted(int(c) for c in env.players[seat].cards))]])
                 live = live_now
                 present = [int(c) for c in np.unique(cl[live])]
                 if actual not in present:
                     present.append(actual)
                 true_by_cl = {}
                 bias, centre, width = _entry(PROFILES[true_type], sit)
+                # Field size scales the LEAK, not the base policy: the blueprint already
+                # adjusts multiway on its own, and what separates archetypes is how far
+                # each over- or under-does that.  Exactly 1.0 heads-up.
+                ms = _P.multiway_scale(true_type, k_live)
                 for cid in present:
                     ps_c = env.policy_state_for(view.rep[cid], public=public)
                     b = np.asarray(walker.strategy(ps_c, "none"), np.float64)
                     kw = (0.0 if bias == "none"
-                          else _kernel_weight(ranks, stage, cid, centre, width))
+                          else _kernel_weight(ranks, stage, cid, centre, width) * ms)
                     true_by_cl[cid] = (b if (bias == "none" or kw <= 0.0)
                                        else np.asarray(policy_at(
                                            1.0 + (mult - 1.0) * kw).strategy(ps_c, bias),
                                            np.float64))
 
                 rec = None
-                if score is not None or record is not None:
+                if record_by_id is not None:
                     try:
-                        ob = np.asarray(tracker.range_of(opp_seat), dtype=np.float64)
+                        ob = np.asarray(tracker.range_of(seat), dtype=np.float64)
                     except KeyError:                 # seat already folded out
                         ob = live.astype(np.float64)
                     cnt = np.bincount(cl[live], weights=ob[live],
@@ -745,10 +793,8 @@ def main() -> None:
                     for i, cid in enumerate(present):
                         if bw[i] > 0:
                             tm += bw[i] * true_by_cl[cid][:len(legal)]
-                    zc = np.asarray([_odds - 0.25] + _token_bag(acts, opp_seat),
+                    zc = np.asarray([_odds - 0.25] + _token_bag(acts, seat),
                                     dtype=np.float64)
-                    # Collapse legal-action rows to the three classes HERE: the mapping
-                    # depends only on the node, so every arm would otherwise redo it.
                     tw3, tmc3 = np.zeros(3), np.zeros(3)
                     trow = true_by_cl[actual][:len(legal)]
                     for i, a in enumerate(legal):
@@ -764,65 +810,70 @@ def main() -> None:
                 a_idx = (int(np.searchsorted(c, rng.random_sample() * c[-1]))
                          if c[-1] > 0 else int(rng.randint(len(legal))))
                 a_idx = min(a_idx, len(legal) - 1)
-                dec_sit.append(sit_ix[sit])
-                dec_mask.append(mask)
-                dec_took.append(_ACTION_CLASSES.index(_action_class(legal[a_idx])))
-                dec_cluster.append(cl.copy())
-                dec_feat.append({c: _x(c) for c in np.unique(cl[live_now])})
-                dec_ctx.append([_odds - 0.25] + _token_bag(acts, opp_seat))
+                d = D[oid]
+                d["sit"].append(sit_ix[sit])
+                d["mask"].append(mask)
+                d["took"].append(_ACTION_CLASSES.index(_action_class(legal[a_idx])))
+                d["cl"].append(cl.copy())
+                d["ft"].append({c2: _x(c2) for c2 in np.unique(cl[live_now])})
+                d["cx"].append([_odds - 0.25] + _token_bag(acts, seat))
                 if rec is not None:
-                    rec[6] = dec_took[-1]
-                    if record is not None:
-                        record.append(rec)
-                if score is not None:
-                    score.observe(dec_took[-1])
-                # The search's own Bayes update.  ``sigma_for_combo`` is a per-combo
-                # lookup because holdings in the same cluster share a policy row — the
-                # tracker does not care whose policy it is, which is what lets the same
-                # call serve the true-policy reference here and a learned model later.
+                    rec[6] = d["took"][-1]
+                    d["rec"].append(rec)
+
                 def _sigma_for_combo(hidx, _cl=cl, _tb=true_by_cl, _n=len(legal)):
                     cid = int(_cl[hidx])
-                    row = _tb.get(cid)
-                    if row is None:
+                    r0 = _tb.get(cid)
+                    if r0 is None:
                         return np.full(_n, 1.0 / max(_n, 1))
-                    r = np.asarray(row[:_n], dtype=np.float64)
+                    r = np.asarray(r0[:_n], dtype=np.float64)
                     t = r.sum()
                     return r / t if t > 0 else np.full(_n, 1.0 / max(_n, 1))
 
-                acts.setdefault(stage, []).append((opp_seat, legal[a_idx]))
-                tracker.on_action(opp_seat, env, legal[a_idx], _sigma_for_combo)
+                acts.setdefault(stage, []).append((seat, legal[a_idx]))
+                tracker.on_action(seat, env, legal[a_idx], _sigma_for_combo)
                 if _action_class(legal[a_idx]) == "fold":
-                    tracker.on_seat_folded(opp_seat)
+                    tracker.on_seat_folded(seat)
                 env.step_in_place(legal[a_idx])
 
-            if not dec_sit:
-                continue
-            # Trajectories: holdings that share a cluster at every decision are
-            # indistinguishable, so collapse them and carry their count as the weight.
-            C = np.stack(dec_cluster, axis=1)                 # (n_combos, T)
-            keep = live0 & (C >= 0).all(axis=1)
-            if not keep.any():
-                continue
-            traj, inv = np.unique(C[keep], axis=0, return_inverse=True)
-            w = np.bincount(inv).astype(np.float64)
-            X = np.zeros(traj.shape + (7,), dtype=np.float64)
-            _zero7 = (0.0,) * 7
-            for t in range(traj.shape[1]):
-                fmap = dec_feat[t]
-                for j in range(traj.shape[0]):
-                    X[j, t] = fmap.get(int(traj[j, t]), _zero7)
-            # Showdown reveals the holding: pi collapses onto its trajectory.
-            if sum(1 for p in env.players if p.is_active) >= 2:
-                ai = env.combo_index[
-                    tuple(sorted(int(c) for c in env.players[opp_seat].cards))]
-                if keep[ai]:
-                    w = np.zeros_like(w)
-                    w[inv[np.flatnonzero(keep) == ai]] = 1.0
-                    if w.sum() == 0:
-                        w = np.bincount(inv).astype(np.float64)
-            out.append(Hand(dec_sit, dec_mask, dec_took, X, w,
-                            np.asarray(dec_ctx, dtype=np.float64)))
+            n_show = sum(1 for p in env.players if p.is_active)
+            for oid in range(n_opp):
+                d = D[oid]
+                if not d["sit"]:
+                    continue
+                C = np.stack(d["cl"], axis=1)                 # (n_combos, T)
+                keep = live0 & (C >= 0).all(axis=1)
+                if not keep.any():
+                    continue
+                traj, inv = np.unique(C[keep], axis=0, return_inverse=True)
+                w = np.bincount(inv).astype(np.float64)
+                X = np.zeros(traj.shape + (7,), dtype=np.float64)
+                _zero7 = (0.0,) * 7
+                for t in range(traj.shape[1]):
+                    fmap = d["ft"][t]
+                    for j in range(traj.shape[0]):
+                        X[j, t] = fmap.get(int(traj[j, t]), _zero7)
+                # A showdown reveals THIS opponent's holding, collapsing its prior onto
+                # the one trajectory it actually took.
+                s_seat = seat_of[oid]
+                if n_show >= 2 and env.players[s_seat].is_active:
+                    ai = env.combo_index[
+                        tuple(sorted(int(c) for c in env.players[s_seat].cards))]
+                    if keep[ai]:
+                        w2 = np.zeros_like(w)
+                        w2[inv[np.flatnonzero(keep) == ai]] = 1.0
+                        if w2.sum() > 0:
+                            w = w2
+                # Tagged with the HAND NUMBER: checkpoints count hands played, not hands
+                # that happened to give this opponent a postflop decision, and those
+                # differ by a large factor multiway.
+                out[oid].append((hand, Hand(d["sit"], d["mask"], d["took"], X, w,
+                                            np.asarray(d["cx"], dtype=np.float64))))
+                if record_by_id is not None:
+                    record_by_id.setdefault(oid, []).append((hand, d["rec"]))
         return out
+
+
 
     def parallel_map(n_items, work, n_workers):
         """Run ``work(i)`` for i in range(n_items) across forked workers.
@@ -874,20 +925,26 @@ def main() -> None:
     per_type = max(1, args.population_hands // len(types))
     # Hands are independent given their seed, so the population phase forks by archetype
     # instead of running ~5,000 simulations serially in the parent ahead of every trial.
+    pop_tables = tables_of(types, n_p - 1)
+    per_table = max(1, args.population_hands // max(len(pop_tables), 1))
+
     def _pop_one(ti):
         t0 = time.time()
-        hs = play(types[ti], per_type, args.seed * 7919 + 1000 * ti + 1)
-        _log("  pop %-12s %d hands -> %d with decisions (%.0fs)"
-             % (types[ti], per_type, len(hs), time.time() - t0))
-        return hs
+        got = play(pop_tables[ti], per_table, args.seed * 7919 + 1000 * ti + 1)
+        got = {oid: [h for _n, h in v] for oid, v in got.items()}
+        _log("  pop table %d %s: %d hands -> %s with decisions (%.0fs)"
+             % (ti + 1, "/".join(pop_tables[ti]), per_table,
+                "/".join(str(len(v)) for v in got.values()), time.time() - t0))
+        return got
 
-    _pop = parallel_map(len(types), _pop_one, args.workers)
+    _pop = parallel_map(len(pop_tables), _pop_one, args.workers)
     pop_hands = []
-    per_arch_hands = {}
-    for ti, t in enumerate(types):
-        hs = _pop[ti] or []
-        per_arch_hands[t] = hs
-        pop_hands += hs
+    per_arch_hands = defaultdict(list)
+    for ti, tbl in enumerate(pop_tables):
+        got = _pop[ti] or {}
+        for oid, hs in got.items():
+            per_arch_hands[tbl[oid]] += hs
+            pop_hands += hs
     def _lambda_for(theta_pop_a):
         """Empirical-Bayes shrinkage strength for one arm.
 
@@ -959,85 +1016,91 @@ def main() -> None:
     print("\nphase 2: refinement, %d hands per opponent, %d trials per archetype"
           % (args.hands, args.trials_per_type))
     res = {a["name"]: {c: defaultdict(list) for c in checkpoints} for a in arms}
-    trials = [(t, r) for t in types for r in range(args.trials_per_type)]
+    # A trial is a TABLE of opponents, not a single archetype: multiway, one table
+    # produces a refined model per seat from the same hands.
+    trials = tables_of(types, n_p - 1) * max(1, args.trials_per_type)
 
     def run_trial(trial_i):
-        """Simulate this trial's hands ONCE, then fit and score every arm on them."""
-        true_type, _rep = trials[trial_i]
+        """Simulate one TABLE once, then fit and score every arm on every opponent.
+
+        A multiway hand is evidence about all ``n_opp`` opponents at once, so the
+        simulation — which is the expensive half — is shared not just across arms but
+        across opponents.  Each opponent still gets its OWN refined model: that is what
+        DBR deploys, and pooling them would measure a different thing.
+        """
+        table = trials[trial_i]
         base = args.seed * 104729 + trial_i * 7919 + 77
-        sim_hands, sim_recs = [], []
+        recs = {}
         t_col = time.time()
-        for h in range(args.hands):
-            rec = []
-            sim_hands.append(play(true_type, 1, base + h, None, rec))
-            sim_recs.append(rec)
-            if args.progress_every and (h + 1) % args.progress_every == 0:
-                _log("  t%d %-12s collect %d/%d (%.0fs)"
-                     % (trial_i + 1, true_type, h + 1, args.hands, time.time() - t_col))
+        sim = play(table, args.hands, base, recs)
         col_s = time.time() - t_col
-        _log("  t%d %-12s collected %d hands in %.0fs"
-             % (trial_i + 1, true_type, args.hands, col_s))
+        _log("  t%d %-24s collected %d hands -> %s decisions (%.0fs)"
+             % (trial_i + 1, "/".join(table), args.hands,
+                "/".join(str(len(v)) for v in sim.values()) or "0", col_s))
 
         out = {}
         for arm in arms:
             use_arm(arm)
             theta_pop_a = arm["theta_pop"]
-            theta = theta_pop_a.copy()
-            seen, done, fit_s = [], 0, 0.0
-            sc = {c: defaultdict(float) for c in checkpoints}
-            while done < args.hands:
-                chunk = min(args.refit_every, args.hands - done)
-                for h in range(chunk):
-                    hand_no = done + h + 1
-                    cp = next((c for c in checkpoints if hand_no <= c), None)
-                    if cp is not None:
-                        Hh, Ch = unpack(theta, n_sit)
-                        Hp, Cp = unpack(theta_pop_a, n_sit)
-                        for sit, mask, x_true, zc, tw3, tmc3, took in sim_recs[done + h]:
-                            si = sit_ix[sit]
-                            pm = act_probs(theta_sit(Hh, Ch, si), mask, x_true, zc)[0]
-                            pp = act_probs(theta_sit(Hp, Cp, si), mask, x_true, zc)[0]
-                            tws = tw3.sum()
-                            twn = tw3 / tws if tws > 0 else np.full(3, 1.0 / 3.0)
-                            sc[cp]["n"] += 1
-                            sc[cp]["hit"] += 1.0 if int(np.argmax(pm)) == took else 0.0
-                            sc[cp]["conf"] += float(np.max(pm))
-                            sc[cp]["pop"] += 1.0 if int(np.argmax(pp)) == took else 0.0
-                            sc[cp]["oh"] += 1.0 if int(np.argmax(tw3)) == took else 0.0
-                            sc[cp]["ob"] += 1.0 if int(np.argmax(tmc3)) == took else 0.0
-                            # TV to the opponent's TRUE distribution: top-1 error is
-                            # scored against a single draw from a mixed strategy, so it
-                            # carries an unreachable ~0.2 floor that TV does not.
-                            sc[cp]["tv"] += float(0.5 * np.abs(pm - twn).sum())
-                            sc[cp]["tvpop"] += float(0.5 * np.abs(pp - twn).sum())
-                    seen += sim_hands[done + h]
-                done += chunk
-                t_f = time.time()
-                theta = fit(seen, n_sit, theta0=theta, prior=theta_pop_a,
-                            lam=arm["lam"], ridge=args.ridge)
-                fit_s += time.time() - t_f
-                if args.progress_every:
-                    _log("  t%d %-12s %-16s refit @%d hands (%d obs) %.0fs"
-                         % (trial_i + 1, true_type, arm["name"], done, len(seen),
-                            time.time() - t_f))
-            res_a = {}
-            for cp in checkpoints:
-                if sc[cp]["n"] > 0:
-                    n = sc[cp]["n"]
-                    res_a[cp] = {k: sc[cp][k] / n
-                                 for k in ("hit", "conf", "pop", "oh", "ob", "tv", "tvpop")}
-            _log("  t%d %-12s %-16s fits %.0fs total"
-                 % (trial_i + 1, true_type, arm["name"], fit_s))
-            out[arm["name"]] = res_a
-        _log("trial %2d/%2d %-12s DONE (collect %.0fs + %d arms)"
-             % (trial_i + 1, len(trials), true_type, col_s, len(arms)))
+            per_arm = {}
+            for oid, tname in enumerate(table):
+                hand_list = sim.get(oid, [])
+                rec_list = recs.get(oid, [])
+                if not hand_list:
+                    continue
+                theta = theta_pop_a.copy()
+                seen, done, fit_s, ptr = [], 0, 0.0, 0
+                sc = {c: defaultdict(float) for c in checkpoints}
+                while done < args.hands:
+                    chunk = min(args.refit_every, args.hands - done)
+                    hi = done + chunk
+                    Hh, Ch = unpack(theta, n_sit)
+                    Hp, Cp = unpack(theta_pop_a, n_sit)
+                    while ptr < len(hand_list) and hand_list[ptr][0] <= hi:
+                        hno, hobj = hand_list[ptr]
+                        cp = next((c for c in checkpoints if hno <= c), None)
+                        if cp is not None and ptr < len(rec_list):
+                            for sit, mask, x_true, zc, tw3, tmc3, took in rec_list[ptr][1]:
+                                si = sit_ix[sit]
+                                pm = act_probs(theta_sit(Hh, Ch, si), mask, x_true, zc)[0]
+                                pp = act_probs(theta_sit(Hp, Cp, si), mask, x_true, zc)[0]
+                                tws = tw3.sum()
+                                twn = tw3 / tws if tws > 0 else np.full(3, 1.0 / 3.0)
+                                sc[cp]["n"] += 1
+                                sc[cp]["hit"] += 1.0 if int(np.argmax(pm)) == took else 0.0
+                                sc[cp]["conf"] += float(np.max(pm))
+                                sc[cp]["pop"] += 1.0 if int(np.argmax(pp)) == took else 0.0
+                                sc[cp]["oh"] += 1.0 if int(np.argmax(tw3)) == took else 0.0
+                                sc[cp]["ob"] += 1.0 if int(np.argmax(tmc3)) == took else 0.0
+                                sc[cp]["tv"] += float(0.5 * np.abs(pm - twn).sum())
+                                sc[cp]["tvpop"] += float(0.5 * np.abs(pp - twn).sum())
+                        seen.append(hobj)
+                        ptr += 1
+                    done = hi
+                    t_f = time.time()
+                    theta = fit(seen, n_sit, theta0=theta, prior=theta_pop_a,
+                                lam=arm["lam"], ridge=args.ridge)
+                    fit_s += time.time() - t_f
+                res_a = {}
+                for cp in checkpoints:
+                    if sc[cp]["n"] > 0:
+                        n = sc[cp]["n"]
+                        res_a[cp] = {k: sc[cp][k] / n for k in
+                                     ("hit", "conf", "pop", "oh", "ob", "tv", "tvpop")}
+                per_arm[tname] = res_a
+                _log("  t%d %-12s %-16s %d obs, fits %.0fs"
+                     % (trial_i + 1, tname, arm["name"], len(seen), fit_s))
+            out[arm["name"]] = per_arm
+        _log("trial %2d/%2d %-24s DONE (collect %.0fs, %d arms x %d opponents)"
+             % (trial_i + 1, len(trials), "/".join(table), col_s, len(arms), len(table)))
         return out
 
     def _collect(out):
-        for arm_name, per_cp in out.items():
-            for cp, d in per_cp.items():
-                for k, v in d.items():
-                    res[arm_name][cp][k].append(v)
+        for arm_name, per_type_res in out.items():
+            for _tname, per_cp in per_type_res.items():
+                for cp, d in per_cp.items():
+                    for k, v in d.items():
+                        res[arm_name][cp][k].append(v)
 
     for out in parallel_map(len(trials), run_trial, args.workers):
         if out:

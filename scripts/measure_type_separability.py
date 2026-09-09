@@ -221,18 +221,69 @@ PROFILES = {
 _STREETS = ("pre_flop", "flop", "turn", "river")
 _POSTFLOP = ("flop", "turn", "river")
 
+# How each archetype's leak responds to the SIZE OF THE FIELD.
+#
+# The profile table is keyed on (street, facing-a-bet), which is complete heads-up but not
+# multiway: folding to a bet with three players still live is a different decision from
+# folding heads-up, and an archetype that ignores that is not a coherent player.  The
+# blueprint already tightens multiway on its own (it is trained 4-handed); what varies by
+# type is how far each one OVER- or UNDER-does that adjustment, so the sensitivity is
+# applied to the LEAK, not to the base policy.
+#
+# Scale is ``1 + sens * (n_live - 2)``, so every value is exactly 1.0 heads-up: the
+# two-player behaviour — and therefore every heads-up measurement already taken — is
+# unchanged by construction.
+MULTIWAY_SENS = {
+    "solid_reg":   0.00,   # no leak to scale
+    "nit":        +0.25,   # the defining error: gives up even more against a big field
+    "station":     0.00,   # calls down regardless of who else is in — that IS the type
+    "fit_or_fold":+0.25,   # "gives up when it misses" bites harder multiway
+    "lag":        -0.25,   # loose but not stupid: tones the steal down into a field
+    "maniac":      0.00,   # strength- AND count-blind by definition
+}
+
+
+def n_live(env) -> int:
+    """Players still contesting the pot (active and not folded)."""
+    try:
+        return max(2, int(sum(1 for p in env.players if p.is_active)))
+    except Exception:
+        return 2
+
 
 def _class_of(env) -> tuple:
-    """The strategic class of the node the env is at: ``(street, facing-a-bet)``."""
+    """The strategic class of the node the env is at: ``(street, facing-a-bet)``.
+
+    This is the ARCHETYPE key and stays two-dimensional on purpose — the profile table is
+    written per street and per facing-a-bet, with the field size entering through
+    :data:`MULTIWAY_SENS` instead of multiplying the number of table rows by three.
+    """
     from environment.poker_env import raise_level
 
     stage = env.betting_stage
     return (stage, raise_level(stage, env.n_raises_this_round))
 
 
+def sit_of(env, multiway: bool = False) -> tuple:
+    """The MODEL's situation key: ``(street, facing-a-bet[, n_live])``.
+
+    The model's partition is separate from the archetype's, and needs the field size: a
+    bet into three players is not the node a bet heads-up is, and pooling them would ask
+    one coefficient to describe both.  Heads-up (``multiway=False``) this is exactly the
+    old two-tuple, so existing situation counts are unchanged.
+    """
+    cls = _class_of(env)
+    return cls + (n_live(env),) if multiway else cls
+
+
 def _entry(profile: dict, cls: tuple) -> tuple:
     """``(bias, centre, width)`` for ``cls`` — ``("none", ...)`` where unbiased."""
-    return profile.get(cls, ("none", 0.0, 1.0))
+    return profile.get(cls[:2], ("none", 0.0, 1.0))
+
+
+def multiway_scale(type_name: str, k: int) -> float:
+    """Field-size scale on the leak strength; exactly 1.0 heads-up."""
+    return max(0.0, 1.0 + MULTIWAY_SENS.get(type_name, 0.0) * (int(k) - 2))
 
 
 def cluster_strength(lut_path) -> dict:
