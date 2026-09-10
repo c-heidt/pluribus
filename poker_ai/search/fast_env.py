@@ -117,11 +117,12 @@ class FastEnvAdapter(_PolicyStateMixin):
     :meth:`FastState.vector_payout` (the engine owns everything else).
     """
 
-    __slots__ = ("_fast", "_combo_cards", "_players")
+    __slots__ = ("_fast", "_combo_cards", "_players", "_search_raise_grid")
 
-    def __init__(self, fast, combo_cards) -> None:
+    def __init__(self, fast, combo_cards, search_raise_grid=None) -> None:
         self._fast = fast
         self._combo_cards = combo_cards
+        self._search_raise_grid = search_raise_grid
         self._players: List[_SeatView] = [
             _SeatView(fast, s) for s in range(fast.n_players)
         ]
@@ -215,13 +216,15 @@ class FastMCCFRAdapter(_PolicyStateMixin):
     exposed ``_fast`` and clones it rather than rebuilding from a ``PokerEnv``.
     """
 
-    __slots__ = ("_fast", "combo_cards", "n_combos", "card_info_lut", "_players")
+    __slots__ = ("_fast", "combo_cards", "n_combos", "card_info_lut", "_players",
+                  "_search_raise_grid")
 
-    def __init__(self, fast, combo_cards, card_info_lut) -> None:
+    def __init__(self, fast, combo_cards, card_info_lut, search_raise_grid=None) -> None:
         self._fast = fast
         self.combo_cards = combo_cards
         self.n_combos = int(combo_cards.shape[0])
         self.card_info_lut = card_info_lut
+        self._search_raise_grid = search_raise_grid
         self._players = [_McSeatView(fast, s) for s in range(fast.n_players)]
 
     # --- read-only public-state surface (byte-identical to PokerEnv) ---
@@ -302,7 +305,10 @@ def build_fast_walk_env(root_env):
         # was built from.  ensure_state_configured refuses a conflicting second grid.
         ensure_state_configured(grid_for_env(root_env))
         fast = _cystate.FastState.from_poker_env(root_env)
-        return FastEnvAdapter(fast, root_env.combo_cards)
+        return FastEnvAdapter(
+            fast, root_env.combo_cards,
+            search_raise_grid=getattr(root_env, "_search_raise_grid", None),
+        )
     except CoreGridMismatch:
         raise                      # a silent fallback here would hide a real misconfig
     except Exception:
@@ -332,7 +338,10 @@ def build_fast_mccfr_env(root_env):
         # was built from.  ensure_state_configured refuses a conflicting second grid.
         ensure_state_configured(grid_for_env(root_env))
         fast = _cystate.FastState.from_poker_env(root_env)
-        return FastMCCFRAdapter(fast, root_env.combo_cards, root_env.card_info_lut)
+        return FastMCCFRAdapter(
+            fast, root_env.combo_cards, root_env.card_info_lut,
+            search_raise_grid=getattr(root_env, "_search_raise_grid", None),
+        )
     except CoreGridMismatch:
         raise
     except Exception:

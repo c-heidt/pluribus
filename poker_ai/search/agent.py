@@ -423,12 +423,14 @@ class SearchAgent:
         if self._searched_this_round and self.last_search is not None:
             pk = self._solved_public_key(env_before)
             legal = [a for a in env_before.legal_actions if a is not None]
-            avg = self.last_search.average_policy
+            legal_at = self.last_search.state.legal_at.get(pk)
+            if legal_at is not None and set(legal) <= set(legal_at):
+                avg = self.last_search.average_policy
 
-            def sigma(h: int) -> np.ndarray:
-                return np.asarray(avg.strategy_for(pk, h, legal), dtype=np.float64)
+                def sigma(h: int) -> np.ndarray:
+                    return np.asarray(avg.strategy_for(pk, h, legal), dtype=np.float64)
 
-            return sigma
+                return sigma
 
         combo_cards = env_before.combo_cards
         # The legal set + valid mask are combo-independent, so compute them once

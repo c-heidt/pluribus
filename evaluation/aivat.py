@@ -234,9 +234,13 @@ class LeafValue:
         hero_seat = int(self._hero.my_seat)
         profile, holes, ctx = self._rollout_setup(env_before)
         m = max(self._m, 1)
+        env_legal = set(env_before.legal_actions)
+        to_inject = [a for a in legal if a not in env_legal]
         with _preserve_global_random():
             for _ in range(m):
                 base = env_before.with_hole_cards(holes, rng=self._board_rng)
+                for a in to_inject:
+                    base.inject_action(a)
                 sample_rng = self._rng.bit_generator.state
                 sample_board = self._board_rng.bit_generator.state
                 for a in legal:
@@ -287,8 +291,11 @@ class LeafValue:
         if not alternatives:
             return None
 
+        needs_inject = action not in set(env_before.legal_actions)
         with _preserve_global_random():
             base = env_before.with_hole_cards(holes, rng=board_rng)
+            if needs_inject:
+                base.inject_action(action)
             # Probe the step for its chance event.  The betting engine is
             # board-independent, so the card count and terminality do not depend on
             # the copy's reshuffled deck order.
@@ -303,6 +310,8 @@ class LeafValue:
             for r in range(m):
                 if r:
                     base = env_before.with_hole_cards(holes, rng=board_rng)
+                    if needs_inject:
+                        base.inject_action(action)
                 round_rng = rng.bit_generator.state
                 round_board = board_rng.bit_generator.state
                 for i, card in enumerate(alternatives):
