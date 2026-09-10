@@ -33,7 +33,6 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Mapping, Optional, Tuple
 import numpy as np
 
 from environment.poker_env import PokerEnv, SEARCH_RAISE_SIZES_BY_STAGE
-from poker_ai._core.flags import search_core_enabled
 from information_abstraction.lookup import clusters_for_board
 from poker_ai.search.cluster_maps import _STREET_NAME
 from poker_ai.search.context import SubgameContext
@@ -185,21 +184,16 @@ class SearchAgent:
         therefore ``INFO_SET_ENCODING`` and every blueprint key — is untouched; the
         blueprint's mass on a dropped size is renormalised across the survivors by name.
 
+        Works with the compiled search core: the engine is configured from the env's own
+        grid via ``poker_ai._core.state_config``, which refuses a conflicting second grid
+        rather than letting the compiled and Python walks diverge.  Because that config is
+        process-wide and once-only, search and TRAINING cannot share a process — which
+        they never do.
+
         Opt out with ``PLURIBUS_SEARCH_FULL_GRID=1``.
         """
         if os.environ.get("PLURIBUS_SEARCH_FULL_GRID", "") == "1":
             return env
-        if search_core_enabled():
-            # The compiled walk reads a PROCESS-WIDE grid dumped via
-            # ``_cystate.configure()`` and shared with the training core, so it cannot be
-            # narrowed per-env.  Diverging silently from the Python walk would be far
-            # worse than refusing: fail loudly instead.
-            raise RuntimeError(
-                "The trimmed search raise grid is not supported with the compiled search "
-                "core (PLURIBUS_SEARCH_CORE=1): the core's grid is process-wide and "
-                "shared with training, so it cannot be narrowed for search alone. Run "
-                "without the search core, or set PLURIBUS_SEARCH_FULL_GRID=1."
-            )
         env._search_raise_grid = SEARCH_RAISE_SIZES_BY_STAGE
         return env
 

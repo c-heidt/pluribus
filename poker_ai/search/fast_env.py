@@ -21,6 +21,10 @@ from typing import List, Optional
 
 import numpy as np
 
+from poker_ai._core.state_config import (
+    CoreGridMismatch, ensure_state_configured, grid_for_env,
+)
+
 
 class _PolicyStateMixin:
     """Cluster-keyed :class:`PolicyState` construction, shared by both adapters.
@@ -293,23 +297,14 @@ def build_fast_walk_env(root_env):
         if not CORE_AVAILABLE:
             return None
         from poker_ai._core import _state as _cystate
-        if not _cystate.is_configured():
-            # Dump the live alphabet + raise grid once per process (idempotent) —
-            # never a hard-coded copy (anti-drift, same as the blueprint runner).
-            from environment.poker_env import (
-                _ACTION_BYTE,
-                _STAGE_ID,
-                RAISE_SIZES_BY_STAGE,
-                MAX_RAISES_PER_ROUND,
-                ALL_IN_ALLOWED_BY_STAGE,
-                CALL_ALLOWED_BY_STAGE,
-            )
-            _cystate.configure(
-                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
-                CALL_ALLOWED_BY_STAGE, ALL_IN_ALLOWED_BY_STAGE
-            )
+        # The env may carry a narrowed SEARCH grid; the core must be configured with the
+        # SAME one or the compiled walk enumerates a different game than the PokerEnv it
+        # was built from.  ensure_state_configured refuses a conflicting second grid.
+        ensure_state_configured(grid_for_env(root_env))
         fast = _cystate.FastState.from_poker_env(root_env)
         return FastEnvAdapter(fast, root_env.combo_cards)
+    except CoreGridMismatch:
+        raise                      # a silent fallback here would hide a real misconfig
     except Exception:
         return None
 
@@ -332,20 +327,13 @@ def build_fast_mccfr_env(root_env):
         if not CORE_AVAILABLE:
             return None
         from poker_ai._core import _state as _cystate
-        if not _cystate.is_configured():
-            from environment.poker_env import (
-                _ACTION_BYTE,
-                _STAGE_ID,
-                RAISE_SIZES_BY_STAGE,
-                MAX_RAISES_PER_ROUND,
-                ALL_IN_ALLOWED_BY_STAGE,
-                CALL_ALLOWED_BY_STAGE,
-            )
-            _cystate.configure(
-                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
-                CALL_ALLOWED_BY_STAGE, ALL_IN_ALLOWED_BY_STAGE
-            )
+        # The env may carry a narrowed SEARCH grid; the core must be configured with the
+        # SAME one or the compiled walk enumerates a different game than the PokerEnv it
+        # was built from.  ensure_state_configured refuses a conflicting second grid.
+        ensure_state_configured(grid_for_env(root_env))
         fast = _cystate.FastState.from_poker_env(root_env)
         return FastMCCFRAdapter(fast, root_env.combo_cards, root_env.card_info_lut)
+    except CoreGridMismatch:
+        raise
     except Exception:
         return None

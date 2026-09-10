@@ -35,6 +35,9 @@ import numpy as np
 
 from environment.action_space import ACTION_TO_IDX, CANONICAL_ACTIONS
 from environment.poker_env import PolicyState
+from poker_ai._core.state_config import (
+    CoreGridMismatch, ensure_state_configured, grid_for_env,
+)
 from poker_ai.blueprint.tree_utils import sample_index
 from poker_ai.search.context import SubgameContext
 from poker_ai.search.leaf import continuation_value_vector
@@ -83,26 +86,31 @@ def _resolve_core_policy(policies, profile):
     return p if p._ensure_core() is not None else None
 
 
-def _core_state():
-    """Return a configured ``FastState`` class, or ``None`` if unavailable."""
+def _core_state(env=None):
+    """Return a configured ``FastState`` class, or ``None`` if unavailable.
+
+    ``env`` supplies the raise grid to configure with: a search frontier inherits the
+    solver's (possibly narrowed) grid, and the compiled engine must match it or it walks a
+    different game than the env it was built from.
+    """
     try:
         from poker_ai._core import CORE_AVAILABLE
         if not CORE_AVAILABLE:
             return None
         from poker_ai._core import _state as _cystate
-        if not _cystate.is_configured():
-            from environment.poker_env import (
-                _ACTION_BYTE, _STAGE_ID, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
-                ALL_IN_ALLOWED_BY_STAGE,
-                CALL_ALLOWED_BY_STAGE,
-            )
-            _cystate.configure(
-                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
-                CALL_ALLOWED_BY_STAGE, ALL_IN_ALLOWED_BY_STAGE
-            )
+        ensure_state_configured(grid_for_env(env) if env is not None
+                                else _canonical_grid())
         return _cystate.FastState
+    except CoreGridMismatch:
+        raise                      # never silently fall back from a real misconfig
     except Exception:
         return None
+
+
+def _canonical_grid():
+    from environment.poker_env import RAISE_SIZES_BY_STAGE
+
+    return RAISE_SIZES_BY_STAGE
 
 
 def _policy_state(fs, legal: Tuple[str, ...]) -> PolicyState:
@@ -148,7 +156,7 @@ def continuation_value_vector_fast(
     """
     n = frontier_env.n_players
     cfg = ctx.leaf
-    FastState = _core_state()
+    FastState = _core_state(frontier_env)
     if (
         FastState is None
         or frontier_env.is_terminal

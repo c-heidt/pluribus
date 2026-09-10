@@ -115,11 +115,12 @@ class CoreDriver:
         # Dump the encoding alphabet + raise grid into the state engine once
         # per process.  Never a hard-coded copy — these derive from the raise
         # grid and would silently drift.  Idempotent across processes.
-        if not _cy_state.is_configured():
-            _cy_state.configure(
-                _STAGE_ID, _ACTION_BYTE, RAISE_SIZES_BY_STAGE, MAX_RAISES_PER_ROUND,
-                CALL_ALLOWED_BY_STAGE, ALL_IN_ALLOWED_BY_STAGE
-            )
+        # Through the shared entry point so a raise grid installed by SEARCH (which may
+        # narrow it) can never be silently inherited by training, which must always use
+        # the canonical one.
+        from poker_ai._core.state_config import ensure_state_configured
+
+        ensure_state_configured(RAISE_SIZES_BY_STAGE)
 
         self._FastState = _cy_state.FastState
         self._traverse_rng = _cy_traverse.traverse_rng
