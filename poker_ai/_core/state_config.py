@@ -51,25 +51,36 @@ def ensure_state_configured(raise_sizes_by_stage) -> None:
         MAX_RAISES_PER_ROUND,
         ALL_IN_ALLOWED_BY_STAGE,
         CALL_ALLOWED_BY_STAGE,
+        RAISE_SIZES_BY_STAGE,
     )
 
     want = _key(raise_sizes_by_stage)
+    canonical = _key(RAISE_SIZES_BY_STAGE)
     if _cystate.is_configured():
         if _CONFIGURED_KEY is None:
-            # Configured by a path that bypassed this helper: we cannot read the grid back
-            # out of the core, so we cannot prove agreement.  Treat as a mismatch.
-            raise CoreGridMismatch(
-                "The compiled state core was configured without ensure_state_configured(), "
-                "so its raise grid cannot be verified against this caller's. Route every "
-                "configure() through poker_ai._core.state_config."
-            )
+            # Configured by a path that bypassed this helper (a test fixture calling
+            # ``_state.configure`` directly, say).  The core exposes no getter, so its grid
+            # cannot be read back — but refusing outright would break every legitimate
+            # direct caller while protecting nothing.  Refuse only in the direction that
+            # can actually corrupt: asking for a NARROWED grid against a core whose grid is
+            # unverifiable.  A canonical request is what every direct caller in this repo
+            # uses, so it is allowed through and recorded.
+            if want != canonical:
+                raise CoreGridMismatch(
+                    "The compiled state core was already configured by a path that bypassed "
+                    "ensure_state_configured(), so its raise grid cannot be verified — and "
+                    "this caller wants a NARROWED grid. Route that configure() through "
+                    "poker_ai._core.state_config, or run without the search-grid trim."
+                )
+            _CONFIGURED_KEY = want
+            return
         if _CONFIGURED_KEY != want:
             raise CoreGridMismatch(
                 "The compiled state core is already configured with a DIFFERENT raise "
                 "grid in this process. It is process-wide and once-only, so search (which "
                 "may narrow the grid) and training (which must not) cannot share a "
-                "process. Run them separately, or set PLURIBUS_SEARCH_FULL_GRID=1 to make "
-                "search use the canonical grid."
+                "process. Run them separately, or pass --no-trim-search-grid so search "
+                "uses the canonical grid."
             )
         return
 

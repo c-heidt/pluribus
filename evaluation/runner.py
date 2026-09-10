@@ -71,7 +71,9 @@ import numpy as np
 import poker_ai  # noqa: F401  (ordering side-effect, not a name use)
 
 from environment.player import Player
-from environment.poker_env import PokerEnv, raise_level
+from environment.poker_env import (
+    PokerEnv, SEARCH_RAISE_SIZES_BY_STAGE, raise_level,
+)
 from environment.utils import card_str
 from evaluation.aivat import AivatAccumulator, LeafValue
 from evaluation.opponents import (
@@ -374,6 +376,14 @@ class EvalConfig:
     # (search on, no models) are exactly vanilla Pluribus — an existing run is
     # unchanged.
     search_enabled: bool = True
+    # Run the searching arms on the reduced raise grid (SEARCH_RAISE_SIZES_BY_STAGE).
+    # ON by default: blueprint usage measured two cells carrying a size it essentially
+    # never plays (flop L0 2.0 at 0%, river L0 2.0 at 3% over 4,282 hero actions), so
+    # dropping them cuts the solver's branching there at no measurable strategic cost.
+    # The BLUEPRINT still reads the full abstraction, so the opponent is unchanged and a
+    # blueprint action outside the search grid is injected like any off-tree size.
+    # ``--no-trim-search-grid`` restores the canonical grid for the A/B.
+    trim_search_grid: bool = True
     model_spec: Optional[ModelSpec] = None
     # How that ``model_spec`` is CONSUMED.  ``'full'`` (DBR) hands the models to both the
     # belief likelihood and the solver clamp.  ``'belief_only'`` (OX-Search) hands them to
@@ -442,6 +452,7 @@ class EvalConfig:
             "policy": self.table_policy,
             "fixed_seats": self.fixed_seats,
             "search_enabled": self.search_enabled,
+            "trim_search_grid": self.trim_search_grid,
             "model_spec": (self.model_spec.as_json()
                            if self.model_spec is not None else None),
             # Same spec, different consumer: a belief-only (OX) model and a DBR clamp
@@ -538,6 +549,15 @@ class EvalSession:
             high_card_rank=cfg.high_card_rank,
         )
         env.card_info_lut = self.card_info_lut
+        # ONE grid per hand, for every seat.  When the arm searches, the whole env runs on
+        # the (narrower) search grid: the solver, the hero's played action list, off-tree
+        # detection, the belief update and the compiled core then all read the same env and
+        # agree by construction.  Narrowing only the solver's copy desynchronises them —
+        # the frozen-row assertion in ``SearchAgent.act`` fires and the belief update
+        # silently scores dropped sizes at zero.  A non-searching arm (blueprint_only)
+        # keeps the canonical grid, so it remains a clean pipeline reference.
+        if cfg.search_enabled and cfg.trim_search_grid:
+            env._search_raise_grid = SEARCH_RAISE_SIZES_BY_STAGE
         return env
 
     def build_models(
@@ -863,6 +883,18 @@ def play_hand(
         else:
             action = opponents[seat].sample(env, seat, opp_rng)
         hero.on_observed_action(env_before, seat, action)
+        # The documented runtime contract: whether to inject is a membership check on
+        # ``legal_actions``.  It fires when the env runs a narrowed search grid and a
+        # BLUEPRINT decision (which reads the full canonical abstraction) picks a size the
+        # search grid dropped — the size is real and must be played, so it is injected
+        # into the tree exactly like a genuinely off-grid one, and the agent's overlay is
+        # the same object by reference, so its solver sees the branch too.
+        if action not in env.legal_actions:
+            if not env.inject_action(action):
+                raise RuntimeError(
+                    "cannot play %r at %s: the env refused to inject it"
+                    % (action, env.betting_stage)
+                )
         env.step_in_place(action)
 
     return _finish_hand(
@@ -2169,6 +2201,17 @@ def _cli():
         "this is one progress stream per method under test.",
     )
     @click.option(
+        "--trim-search-grid/--no-trim-search-grid",
+        default=True,
+        help="Run the SEARCHING arms on the reduced raise grid: at most three raise sizes "
+        "per cell, dropping flop-L0 2.0 and river-L0 2.0, which the blueprint plays 0% "
+        "and 3% of the time. ON by default (fewer solver branches at no measurable "
+        "strategic cost). The BLUEPRINT keeps the full abstraction either way, so the "
+        "opponent is unchanged and a blueprint action outside the search grid is injected "
+        "like any off-tree size. Non-searching arms (blueprint_only) always use the "
+        "canonical grid. Use --no-trim-search-grid for the A/B.",
+    )
+    @click.option(
         "--sequential",
         is_flag=True,
         default=False,
@@ -2211,6 +2254,7 @@ def _cli():
             run_id=opts["run_id"],
             condition=arm.condition,
             search_enabled=arm.search_enabled,
+            trim_search_grid=bool(opts["trim_search_grid"]),
             model_spec=arm.model_spec,
             model_scope=arm.model_scope,
             k_beta=arm.k_beta,

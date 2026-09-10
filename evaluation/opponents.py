@@ -189,7 +189,13 @@ class BlueprintOpponent:
         aligned to ``legal_actions`` and summing to 1.
         """
         hole = tuple(int(c) for c in env.players[seat].cards)
-        state = env.policy_state_for(hole, for_blueprint=True)
+        # The blueprint is CHOOSING here, so it reads the full canonical abstraction: it
+        # was trained on it, and narrowing the opponent's options would change the player
+        # being measured rather than the bot's search.  A pick outside the (possibly
+        # trimmed) search grid is injected by the runner before it is stepped.
+        state = env.policy_state_for(
+            hole, for_blueprint=True, public=env.policy_public_fields(canonical=True)
+        )
         legal = list(state.legal_actions)
         probs = np.asarray(self._policy.strategy(state, bias=self._bias), dtype=np.float64)
         total = probs.sum()

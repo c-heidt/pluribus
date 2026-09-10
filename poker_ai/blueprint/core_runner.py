@@ -92,14 +92,7 @@ class CoreDriver:
             CANONICAL_ACTIONS,
             MAX_ACTIONS_PER_STREET,
         )
-        from environment.poker_env import (
-            MAX_RAISES_PER_ROUND,
-            RAISE_SIZES_BY_STAGE,
-            _ACTION_BYTE,
-            _STAGE_ID,
-            ALL_IN_ALLOWED_BY_STAGE,
-            CALL_ALLOWED_BY_STAGE,
-        )
+        from environment.poker_env import RAISE_SIZES_BY_STAGE
         from poker_ai._core import _state as _cy_state
         from poker_ai._core import _traverse as _cy_traverse
         import numpy as np

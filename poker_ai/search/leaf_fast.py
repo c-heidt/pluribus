@@ -86,7 +86,7 @@ def _resolve_core_policy(policies, profile):
     return p if p._ensure_core() is not None else None
 
 
-def _core_state(env=None):
+def _core_state(env):
     """Return a configured ``FastState`` class, or ``None`` if unavailable.
 
     ``env`` supplies the raise grid to configure with: a search frontier inherits the
@@ -98,19 +98,12 @@ def _core_state(env=None):
         if not CORE_AVAILABLE:
             return None
         from poker_ai._core import _state as _cystate
-        ensure_state_configured(grid_for_env(env) if env is not None
-                                else _canonical_grid())
+        ensure_state_configured(grid_for_env(env))
         return _cystate.FastState
     except CoreGridMismatch:
         raise                      # never silently fall back from a real misconfig
     except Exception:
         return None
-
-
-def _canonical_grid():
-    from environment.poker_env import RAISE_SIZES_BY_STAGE
-
-    return RAISE_SIZES_BY_STAGE
 
 
 def _policy_state(fs, legal: Tuple[str, ...]) -> PolicyState:

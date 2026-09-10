@@ -245,8 +245,16 @@ CALL_ALLOWED_BY_STAGE: Dict[str, List[bool]] = {
 # :data:`INFO_SET_ENCODING` derive from the canonical grid, which is untouched — a
 # trimmed size is simply never *offered*, so every blueprint key stays valid and the
 # blueprint's mass on a dropped size is renormalised across the survivors by name in
-# ``BlueprintPolicy.strategy`` / ``strategy_for``.  Applying this to TRAINING would be a
-# different matter and is not supported: it is set per-env, by the search agent only.
+# ``BlueprintPolicy.strategy`` / ``strategy_for``.
+#
+# ⚠**It is a property of the RUN, applied to the env itself, not of one agent.**  Every
+# seat, the solver and the compiled core then walk ONE grid, which is what keeps the
+# system consistent: the solver's recorded ``legal_at``, the hero's played action list,
+# off-tree detection and the belief update all read the same env and therefore agree by
+# construction.  Narrowing only the solver's copy breaks all four at once — the frozen-row
+# assertion in ``SearchAgent.act`` fires, and off-tree detection and the belief update
+# degrade silently — so this is set on the env at hand construction, never on a deepcopy.
+# Applying it to TRAINING is a different matter and is not supported.
 SEARCH_RAISE_SIZES_BY_STAGE = {
     "pre_flop": [[1.7], [1.33, 2.25], [1.0, 1.5]],
     "flop":     [[0.33, 0.75, 1.0], [0.75, 1.0, 1.5]],
@@ -648,7 +656,7 @@ class PokerEnv:
         ] = {}
         # Trimmed raise grid for SEARCH only (see SEARCH_RAISE_SIZES_BY_STAGE).  ``None``
         # on every env by default, so play, training and evaluation are untouched; the
-        # search agent sets it on the copy it hands the solver.
+        # runner stamps it at hand construction when search is enabled.
         self._search_raise_grid = None
         # Monotone version of the overlay above, held in a 1-element list so the
         # whole deepcopy lineage shares ONE counter by reference (exactly like
@@ -1224,7 +1232,7 @@ class PokerEnv:
             n_chips_to_add = max(n_chips_to_add, n_chips_to_call + self._last_raise_amount)
         return n_chips_to_add
 
-    def _get_available_raise_sizes(self) -> List[str]:
+    def _get_available_raise_sizes(self, grid=None) -> List[str]:
         """Return legal raise action strings for the current player and stage.
 
         Returns
@@ -1246,7 +1254,7 @@ class PokerEnv:
             return []
         # A search env may carry a trimmed grid (see SEARCH_RAISE_SIZES_BY_STAGE); the
         # level itself still comes from the canonical grid above, so the two stay in step.
-        trimmed = self._search_raise_grid
+        trimmed = self._search_raise_grid if grid is None else grid
         if trimmed is not None:
             t_levels = trimmed.get(stage)
             if t_levels and level < len(t_levels):
@@ -1999,8 +2007,13 @@ class PokerEnv:
             return list(actions)
         return list(cached[1])
 
-    def _compute_legal_actions(self, public_state: Tuple) -> List[Optional[str]]:
-        """Derive the legal-action list for ``public_state`` (the current state)."""
+    def _compute_legal_actions(self, public_state: Tuple, grid=None) -> List[Optional[str]]:
+        """Derive the legal-action list for ``public_state`` (the current state).
+
+        ``grid`` overrides the raise grid for this derivation only — used by
+        :meth:`canonical_legal_actions` to answer what the FULL abstraction offers here
+        while the env itself runs on a narrowed search grid.
+        """
         if not self.current_player.is_active:
             return [None]
         biggest_bet = max(p.n_bet_chips for p in self.players)
@@ -2028,7 +2041,7 @@ class PokerEnv:
             # live player, so ``>= 2`` means another live player remains.
             if (self._n_raises < MAX_RAISES_PER_ROUND
                     and dynamics.n_players_with_moves(self) >= 2):
-                actions += self._get_available_raise_sizes()
+                actions += self._get_available_raise_sizes(grid)
             if len(actions) == 1:
                 # Only "fold" survived: the level drops call/all-in from the
                 # abstraction (pre-flop open) and no configured raise fits the
@@ -2221,7 +2234,7 @@ class PokerEnv:
             legal_actions=legal,
         )
 
-    def policy_public_fields(self) -> PublicPolicyFields:
+    def policy_public_fields(self, canonical: bool = False) -> PublicPolicyFields:
         """The combo-independent fields of a :class:`PolicyState` at the current state.
 
         ``legal_actions`` and ``valid_mask`` (plus ``player_i`` / ``betting_round``)
@@ -2229,9 +2242,16 @@ class PokerEnv:
         state computes them once here and threads them into
         :meth:`policy_state_for` via ``public=`` — only the per-combo ``info_set`` is
         then rebuilt per combo.  The returned ``valid_mask`` is immutable.
+
+        ``canonical`` reads the FULL abstraction (:meth:`canonical_legal_actions`) instead
+        of the env's possibly-narrowed search grid — what a blueprint lookup is entitled
+        to play.  Both the legal list AND the mask must come from the same source: the
+        mask gates regret-matching, so a canonical legal list over a narrowed mask would
+        still give a dropped size zero probability.
         """
-        legal = tuple(a for a in self.legal_actions if a is not None)
-        mask = self.get_valid_mask()
+        src = self.canonical_legal_actions() if canonical else self.legal_actions
+        legal = tuple(a for a in src if a is not None)
+        mask = self.get_valid_mask(canonical=canonical)
         mask.setflags(write=False)
         return PublicPolicyFields(
             player_i=self.player_i,
@@ -2276,6 +2296,14 @@ class PokerEnv:
             here, so the result is identical either way.
         """
         if public is None:
+            # The env's OWN action view.  ``for_blueprint`` canonicalises the HISTORY, not
+            # the action set: solver-internal blueprint reads (leaf rollout, vform anchor,
+            # belief sweep) must stay aligned to the tree the solver branches on, and a
+            # canonical set here would let a rollout sample an action the env does not
+            # offer — ``step_in_place`` then silently remaps it to the nearest legal one
+            # and the continuation value is quietly wrong.  A caller that is deciding what
+            # the blueprint actually PLAYS passes ``public=policy_public_fields(
+            # canonical=True)`` explicitly; see BlueprintOpponent.action_probs.
             public = self.policy_public_fields()
         info_set = (
             self._blueprint_info_set(combo)
@@ -2988,8 +3016,34 @@ class PokerEnv:
         )
         return ["fold", "call", "all_in"] + [f"raise:{f}" for f in all_fracs]
 
-    def get_valid_mask(self) -> np.ndarray:
+    def canonical_legal_actions(self) -> List[Optional[str]]:
+        """Legal actions under the FULL canonical raise grid, ignoring any search trim.
+
+        The env may run on a narrowed grid so the solver branches less
+        (:data:`SEARCH_RAISE_SIZES_BY_STAGE`), but the BLUEPRINT was trained on the full
+        abstraction and must keep playing it: restricting it would change the opponent
+        being measured, not just the bot's search.  Blueprint lookups therefore read this,
+        the solver reads :attr:`legal_actions`, and a blueprint action that falls outside
+        the search grid is handled by the ordinary off-tree path — the runtime injects it
+        (:meth:`inject_action`) before stepping, exactly as it does for a genuinely
+        off-grid size.
+
+        ⚠**Recomputed, not filtered.**  ``all_in`` is appended only when the actor can
+        shove but cannot make that *same-sized* standard raise, and the "only fold
+        survived" restore also depends on which fractions are present — so the two grids
+        can differ by more than the dropped ``raise:<f>`` strings.
+        """
+        if self._search_raise_grid is None:
+            return list(self.legal_actions)
+        return self._compute_legal_actions(
+            self._current_public_state(), RAISE_SIZES_BY_STAGE
+        )
+
+    def get_valid_mask(self, canonical: bool = False) -> np.ndarray:
         """Return a boolean mask over the canonical action set for this state.
+
+        ``canonical=True`` masks against :meth:`canonical_legal_actions` — what a
+        blueprint lookup may play — rather than the (possibly narrowed) search set.
 
         Returns
         -------
@@ -2997,9 +3051,10 @@ class PokerEnv:
             1-D boolean array of length ``len(get_canonical_actions(...))``.
             Entry ``i`` is ``True`` when canonical action ``i`` is legal.
         """
-        canonical = PokerEnv.get_canonical_actions(self.betting_round)
-        legal_set = {a for a in self.legal_actions if a is not None}
-        return np.array([a in legal_set for a in canonical], dtype=bool)
+        canon = PokerEnv.get_canonical_actions(self.betting_round)
+        src = self.canonical_legal_actions() if canonical else self.legal_actions
+        legal_set = {a for a in src if a is not None}
+        return np.array([a in legal_set for a in canon], dtype=bool)
 
 
 

@@ -25,14 +25,13 @@ A runner instantiates the agent and drives these four hooks (plus
 from __future__ import annotations
 
 import copy
-import os
 import logging
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
-from environment.poker_env import PokerEnv, SEARCH_RAISE_SIZES_BY_STAGE
+from environment.poker_env import PokerEnv
 from information_abstraction.lookup import clusters_for_board
 from poker_ai.search.cluster_maps import _STREET_NAME
 from poker_ai.search.context import SubgameContext
@@ -167,35 +166,8 @@ class SearchAgent:
         self._folded = False
         # Frozen at pre-flop start; the overlay dict is shared by reference so
         # later injections into the live env are visible here automatically.
-        self._root_env = self._for_search(copy.deepcopy(env))
+        self._root_env = copy.deepcopy(env)
         env.reset_overlay()
-
-    @staticmethod
-    def _for_search(env: PokerEnv) -> PokerEnv:
-        """Stamp the trimmed raise grid onto an env the solver will walk.
-
-        Search branches on every raise size in the cell, so the grid sets the subgame's
-        branching factor.  Two cells carried a size the blueprint essentially never plays
-        (flop L0 ``2.0`` at 0%, river L0 ``2.0`` at 3%, over 4,282 measured hero actions);
-        dropping them takes every cell to at most three sizes.
-
-        Applied HERE and nowhere else: the live game env, training and evaluation keep the
-        full grid, so only the solver's own walk is narrowed.  The canonical grid — and
-        therefore ``INFO_SET_ENCODING`` and every blueprint key — is untouched; the
-        blueprint's mass on a dropped size is renormalised across the survivors by name.
-
-        Works with the compiled search core: the engine is configured from the env's own
-        grid via ``poker_ai._core.state_config``, which refuses a conflicting second grid
-        rather than letting the compiled and Python walks diverge.  Because that config is
-        process-wide and once-only, search and TRAINING cannot share a process — which
-        they never do.
-
-        Opt out with ``PLURIBUS_SEARCH_FULL_GRID=1``.
-        """
-        if os.environ.get("PLURIBUS_SEARCH_FULL_GRID", "") == "1":
-            return env
-        env._search_raise_grid = SEARCH_RAISE_SIZES_BY_STAGE
-        return env
 
     def on_board_update(self, env: PokerEnv, new_cards) -> None:
         """A new betting round has begun; ``env`` is the round-start root.
@@ -216,7 +188,7 @@ class SearchAgent:
         # range-quality logging meaningful) but nothing consumes ``last_search``.
         # (Vanilla Pluribus keeps ``search_enabled=True`` and DOES solve here.)
         if self._search_enabled:
-            self._solve_and_store(self._for_search(copy.deepcopy(env)))
+            self._solve_and_store(copy.deepcopy(env))
         self.pending_actions = []
 
     def on_observed_action(self, env_before: PokerEnv, seat: int, action: str) -> None:
@@ -334,7 +306,12 @@ class SearchAgent:
                 return legal, prob, True
         # Blueprint fallback (no search, failed solve, or a node the search does
         # not cover) — play the blueprint, never a uniform guess.
-        state = env.policy_state_for(self.my_hole, for_blueprint=True)
+        # A real decision (not a solver-internal read), so the blueprint gets its full
+        # canonical action set; the runner injects anything outside the search grid.
+        state = env.policy_state_for(
+            self.my_hole, for_blueprint=True,
+            public=env.policy_public_fields(canonical=True),
+        )
         prob = np.asarray(self._blueprint.strategy(state, "none"), dtype=np.float64)
         return list(state.legal_actions), prob, False
 
